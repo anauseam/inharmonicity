@@ -1,0 +1,13 @@
+[package]
+name = "tuner-core"
+version.workspace = true
+edition = "2024"
+
+[dependencies]
+# Use the workspace-defined versions
+anyhow = "1.0.100" # For easier error handling
+crossbeam-channel = "0.5.15"
+cpal = { workspace = true }
+rustfft = { workspace = true }
+# Add other dependencies for math, etc.
+once_cell = "1.18"

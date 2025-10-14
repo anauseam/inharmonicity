@@ -1,0 +1,17 @@
+[package]
+name = "tuner-gui"
+version.workspace = true
+edition = "2024"
+
+[dependencies]
+# Dependency on the local core logic crate
+tuner-core = { path = "../tuner-core" }
+
+# Iced is a popular choice for GUIs in Rust
+iced = { version = "0.13.1", features = ["canvas", "tokio", "advanced"] }
+cpal = { workspace = true }
+
+
+# For running audio on a separate thread and communicating
+crossbeam-channel = "0.5.15"
+anyhow = "1.0.100" # For easier error handling

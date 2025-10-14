@@ -1,0 +1,17 @@
+[workspace]
+members = [
+"tuner-core",
+"tuner-gui",
+]
+resolver = "2" # Use the modern feature resolver
+
+# Workspace version
+[workspace.package]
+version = "0.1.0"
+
+# Define common dependencies for the workspace to ensure version consistency
+[workspace.dependencies]
+cpal = "0.16.0"
+rustfft = "6.4.1"
+
+# Add other common dependencies here
