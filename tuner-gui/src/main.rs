@@ -279,6 +279,17 @@ fn update(app: &mut TunerApp, message: Message) {
             std::process::exit(0);
         }
         Message::KeySelected(key_index) => {
+            // Check if the same key is already selected - if so, switch to auto mode
+            if let TuningMode::Manual { key_index: current_key, .. } = &app.tuning_mode {
+                if *current_key == key_index {
+                    // Same key clicked again - switch to auto mode
+                    app.tuning_mode = TuningMode::Auto;
+                    app.smoothing_buffer.clear();
+                    return;
+                }
+            }
+            
+            // Different key or not in manual mode - switch to manual mode with new key
             let (note_name, target_freq) = tuning::find_nearest_note_by_index(key_index);
             app.tuning_mode = TuningMode::Manual {
                 key_index,
@@ -361,7 +372,7 @@ fn update(app: &mut TunerApp, message: Message) {
 /// The layout is responsive and adapts to tool visibility states.
 fn view(app: &TunerApp) -> Element<'_, Message> {
     eprintln!("[VIEW] Rendering GUI with state: spectrogram={}, cent_meter={}, key_select={}, partials={}", 
-              app.spectrogram_visible, app.cent_meter_visible, app.key_select_visible, app.partials_visible);
+            app.spectrogram_visible, app.cent_meter_visible, app.key_select_visible, app.partials_visible);
     
     if app.audio_worker.is_none() && app.analysis_sender.is_none() {
         return container(text("Shutting down...").size(40))
@@ -380,32 +391,27 @@ fn view(app: &TunerApp) -> Element<'_, Message> {
         .map(|a| a.spectrogram_data.clone())
         .unwrap_or_default();
     
-    let spectrogram_content = if app.spectrogram_visible {
-        container(
+    let spectrogram_panel = if app.spectrogram_visible {
+        let spectrogram_content = container(
             widgets::spectrogram::Spectrogram::new(spectrogram_data).view()
         )
         .width(Length::Fill)
-        .height(Length::Fill)
+        .height(Length::Fill);
+        
+        Some(container(
+            column![
+                text("Spectrogram").size(18),
+                Space::with_height(10),
+                spectrogram_content
+            ]
+            .spacing(5)
+            .padding(15)
+        )
+        .width(Length::Fill)
+        .height(Length::Fixed(250.0)))
     } else {
-        container(text("Spectrogram Hidden").size(18))
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .center_x(Length::Fill)
-            .center_y(Length::Fill)
+        None
     };
-    
-    let spectrogram_panel = container(
-        column![
-            text("Spectrogram").size(18),
-            Space::with_height(10),
-            spectrogram_content
-        ]
-        .spacing(5)
-        .padding(15)
-    )
-    .width(Length::FillPortion(2))
-    .height(Length::Fixed(250.0))
-    ;
 
     // --- CENT METER PANEL (Smaller) ---
     let smoothed_cents = if app.smoothing_buffer.is_empty() { 
@@ -425,15 +431,15 @@ fn view(app: &TunerApp) -> Element<'_, Message> {
         ("--".to_string(), "0.00 Hz".to_string(), "0%".to_string()) 
     };
 
-    let cent_meter_content = if app.cent_meter_visible {
-        column![
-        row![
+    let cent_meter_panel = if app.cent_meter_visible {
+        let cent_meter_content = column![
+            row![
                 text("Note").size(14),
                 horizontal_space(),
                 text("Confidence").size(14),
             ],
             Space::with_height(5),
-        row![
+            row![
                 text(note_name).size(24),
                 Space::with_width(10),
                 text(freq_text).size(24),
@@ -443,58 +449,50 @@ fn view(app: &TunerApp) -> Element<'_, Message> {
             ]
             .align_y(Alignment::Center),
             Space::with_height(10),
-        widgets::cent_meter::CentMeter::new(smoothed_cents).view()
+            widgets::cent_meter::CentMeter::new(smoothed_cents).view()
         ]
-        .spacing(5)
+        .spacing(5);
+        
+        Some(container(
+            column![
+                text("Cent Meter").size(18),
+                Space::with_height(10),
+                cent_meter_content
+            ]
+            .spacing(5)
+            .padding(15)
+        )
+        .width(Length::Fill)
+        .height(Length::Fixed(180.0)))
     } else {
-        column![
-            text("Cent Meter Hidden").size(18)
-        ]
-        .spacing(5)
+        None
     };
-    
-    let cent_meter_panel = container(
-        column![
-            text("Cent Meter").size(18),
-            Space::with_height(10),
-            cent_meter_content
-        ]
-        .spacing(5)
-        .padding(15)
-    )
-    .width(Length::FillPortion(1))
-    .height(Length::Fixed(180.0))
-    ;
 
     // --- PARTIALS PANEL (Smaller) ---
-    let partials_content = if app.partials_visible {
-        column![
+    let partials_panel = if app.partials_visible {
+        let partials_content = column![
             partial_row("Partial 1", "21"),
             partial_row("Partial 2", "42"),
             partial_row("Partial 3", "84"),
             partial_row("Partial 4", "130"),
             partial_row("Partial 5", "240"),
         ]
-        .spacing(8)
+        .spacing(8);
+        
+        Some(container(
+            column![
+                text("Partials").size(18),
+                Space::with_height(10),
+                partials_content
+            ]
+            .spacing(5)
+            .padding(15)
+        )
+        .width(Length::Fill)
+        .height(Length::Fixed(180.0)))
     } else {
-        column![
-            text("Partials Hidden").size(18)
-        ]
-        .spacing(8)
+        None
     };
-    
-    let partials_panel = container(
-        column![
-            text("Partials").size(18),
-            Space::with_height(10),
-            partials_content
-        ]
-        .spacing(5)
-        .padding(15)
-    )
-    .width(Length::FillPortion(1))
-    .height(Length::Fixed(180.0))
-    ;
 
     // --- KEYBOARD PANEL (Larger) ---
     let (detected_key, selected_key) = if let Some(analysis) = &app.last_analysis {
@@ -510,30 +508,25 @@ fn view(app: &TunerApp) -> Element<'_, Message> {
     
     let piano_keyboard = widgets::piano_keyboard::PianoKeyboard::new(detected_key, selected_key);
 
-    let keyboard_content = if app.key_select_visible {
-        container(piano_keyboard.view())
+    let keyboard_panel = if app.key_select_visible {
+        let keyboard_content = container(piano_keyboard.view())
             .width(Length::Fill)
-            .height(Length::Fill)
+            .height(Length::Fill);
+        
+        Some(container(
+            column![
+                text("KEYBOARD Key Select").size(18),
+                Space::with_height(10),
+                keyboard_content
+            ]
+            .spacing(5)
+            .padding(15)
+        )
+        .width(Length::Fill)
+        .height(Length::Fixed(200.0)))
     } else {
-        container(text("Key Select Hidden").size(18))
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .center_x(Length::Fill)
-            .center_y(Length::Fill)
+        None
     };
-    
-    let keyboard_panel = container(
-        column![
-            text("KEYBOARD Key Select").size(18),
-            Space::with_height(10),
-            keyboard_content
-        ]
-        .spacing(5)
-        .padding(15)
-    )
-    .width(Length::FillPortion(2))
-    .height(Length::Fixed(200.0))
-    ;
 
     // --- RIGHT SIDEBAR ---
     let sidebar = container(
@@ -564,24 +557,58 @@ fn view(app: &TunerApp) -> Element<'_, Message> {
     .height(Length::Fill)
     ;
 
+    // Build top row dynamically based on visibility
+    let top_row: Element<Message> = match (spectrogram_panel, cent_meter_panel) {
+        (Some(spectrogram), Some(cent_meter)) => {
+            row![
+                spectrogram,
+                Space::with_width(10),
+                cent_meter,
+            ]
+            .align_y(Alignment::Start)
+            .into()
+        }
+        (Some(spectrogram), None) => {
+            row![spectrogram].align_y(Alignment::Start).into()
+        }
+        (None, Some(cent_meter)) => {
+            row![cent_meter].align_y(Alignment::Start).into()
+        }
+        (None, None) => {
+            Space::with_height(0).into()
+        }
+    };
+    
+    // Build bottom row dynamically based on visibility
+    let bottom_row: Element<Message> = match (keyboard_panel, partials_panel) {
+        (Some(keyboard), Some(partials)) => {
+            row![
+                keyboard,
+                Space::with_width(10),
+                partials,
+            ]
+            .align_y(Alignment::Start)
+            .into()
+        }
+        (Some(keyboard), None) => {
+            row![keyboard].align_y(Alignment::Start).into()
+        }
+        (None, Some(partials)) => {
+            row![partials].align_y(Alignment::Start).into()
+        }
+        (None, None) => {
+            Space::with_height(0).into()
+        }
+    };
+    
     // Main layout - matching the reference image structure
     let main_content = row![
         column![
             title,
             Space::with_height(20),
-            row![
-                spectrogram_panel,
-                Space::with_width(10),
-                cent_meter_panel,
-            ]
-            .align_y(Alignment::Start),
+            top_row,
             Space::with_height(10),
-            row![
-                keyboard_panel,
-                Space::with_width(10),
-                partials_panel,
-            ]
-            .align_y(Alignment::Start),
+            bottom_row,
         ]
         .width(Length::Fill)
         .spacing(10),
