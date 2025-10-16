@@ -11,78 +11,6 @@
 //! - Parabolic interpolation for sub-sample accuracy
 //! - Spectrum refinement for improved precision
 
-/// A robust implementation of the YIN pitch detection algorithm.
-/// 
-/// This version is optimized for piano tuning with several enhancements:
-/// - Octave error prevention through careful threshold selection
-/// - Noise rejection using clarity checking
-/// - Parabolic interpolation for sub-sample accuracy
-/// - Amplitude gating to filter out silence
-/// 
-/// # Arguments
-/// * `signal` - Input audio signal
-/// * `sample_rate` - Sample rate in Hz
-/// * `amplitude_threshold` - Minimum amplitude for pitch detection
-/// 
-/// # Returns
-/// * `Some(frequency)` - Detected frequency in Hz
-/// * `None` - No pitch detected (silence, noise, or invalid signal)
-pub fn detect_pitch_yin(
-    signal: &[f32],
-    sample_rate: u32,
-    amplitude_threshold: f32,
-) -> Option<f32> {
-    let frame_size = signal.len();
-    let mut yin_buffer = vec![0.0; frame_size / 2];
-
-    // --- Noise Gate: Calculate RMS to filter out silence/noise ---
-    let rms = (signal.iter().map(|&s| s * s).sum::<f32>() / frame_size as f32).sqrt();
-    if rms < amplitude_threshold {
-        return None;
-    }
-
-    // --- Steps 1-3: Calculate the YIN buffer ---
-    yin_difference(signal, frame_size, &mut yin_buffer);
-
-    // --- Step 4 & 5: Find the first significant dip to avoid octave errors ---
-    let mut period = 0;
-    let threshold = 0.10; // Fixed threshold
-
-    for tau in 2..(frame_size / 2) {
-        if yin_buffer[tau] < threshold {
-            // Now check if this is a local minimum
-            if yin_buffer[tau] < yin_buffer[tau-1] {
-                period = tau;
-                break;
-            }
-        }
-    }
-    
-    if period == 0 {
-        return None;
-    }
-
-    // --- Step 6: Parabolic interpolation ---
-    if period + 1 >= frame_size / 2 { 
-        return None;
-    }
-
-    let y1 = yin_buffer[period - 1];
-    let y2 = yin_buffer[period];
-    let y3 = yin_buffer[period + 1];
-
-    let offset = parabolic_interpolation_offset(y1, y2, y3).unwrap_or(0.0);
-    let period_float = period as f32 + offset;
-
-    let frequency = sample_rate as f32 / period_float;
-
-    if frequency.is_finite() && frequency > 20.0 {
-        Some(frequency)
-    } else {
-        None
-    }   
-}
-
 /// A robust implementation of the pYIN pitch detection algorithm (stateless).
 ///
 /// This version finds the most probable pitch candidate within a single frame
@@ -399,4 +327,78 @@ fn parabolic_interpolation_offset(y_left: f32, y_center: f32, y_right: f32) -> O
 
     let offset = (y_left - y_right) / (2.0 * denominator);
     Some(offset)
+}
+
+/// Optional algorithms for pitch detection:
+
+/// A robust implementation of the YIN pitch detection algorithm.
+/// 
+/// This version is optimized for piano tuning with several enhancements:
+/// - Octave error prevention through careful threshold selection
+/// - Noise rejection using clarity checking
+/// - Parabolic interpolation for sub-sample accuracy
+/// - Amplitude gating to filter out silence
+/// 
+/// # Arguments
+/// * `signal` - Input audio signal
+/// * `sample_rate` - Sample rate in Hz
+/// * `amplitude_threshold` - Minimum amplitude for pitch detection
+/// 
+/// # Returns
+/// * `Some(frequency)` - Detected frequency in Hz
+/// * `None` - No pitch detected (silence, noise, or invalid signal)
+pub fn detect_pitch_yin(
+    signal: &[f32],
+    sample_rate: u32,
+    amplitude_threshold: f32,
+) -> Option<f32> {
+    let frame_size = signal.len();
+    let mut yin_buffer = vec![0.0; frame_size / 2];
+
+    // --- Noise Gate: Calculate RMS to filter out silence/noise ---
+    let rms = (signal.iter().map(|&s| s * s).sum::<f32>() / frame_size as f32).sqrt();
+    if rms < amplitude_threshold {
+        return None;
+    }
+
+    // --- Steps 1-3: Calculate the YIN buffer ---
+    yin_difference(signal, frame_size, &mut yin_buffer);
+
+    // --- Step 4 & 5: Find the first significant dip to avoid octave errors ---
+    let mut period = 0;
+    let threshold = 0.10; // Fixed threshold
+
+    for tau in 2..(frame_size / 2) {
+        if yin_buffer[tau] < threshold {
+            // Now check if this is a local minimum
+            if yin_buffer[tau] < yin_buffer[tau-1] {
+                period = tau;
+                break;
+            }
+        }
+    }
+    
+    if period == 0 {
+        return None;
+    }
+
+    // --- Step 6: Parabolic interpolation ---
+    if period + 1 >= frame_size / 2 { 
+        return None;
+    }
+
+    let y1 = yin_buffer[period - 1];
+    let y2 = yin_buffer[period];
+    let y3 = yin_buffer[period + 1];
+
+    let offset = parabolic_interpolation_offset(y1, y2, y3).unwrap_or(0.0);
+    let period_float = period as f32 + offset;
+
+    let frequency = sample_rate as f32 / period_float;
+
+    if frequency.is_finite() && frequency > 20.0 {
+        Some(frequency)
+    } else {
+        None
+    }   
 }
