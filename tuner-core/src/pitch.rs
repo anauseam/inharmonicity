@@ -6,6 +6,7 @@
 //! 
 //! ## Features
 //! - YIN pitch detection algorithm with octave error prevention
+//! - pYIN for enhanced robustness and accuracy
 //! - Noise rejection and clarity checking
 //! - Parabolic interpolation for sub-sample accuracy
 //! - Spectrum refinement for improved precision
@@ -40,7 +41,135 @@ pub fn detect_pitch_yin(
         return None;
     }
 
-    // --- Step 1 & 2: Difference function and squared difference ---
+    // --- Steps 1-3: Calculate the YIN buffer ---
+    yin_difference(signal, frame_size, &mut yin_buffer);
+
+    // --- Step 4 & 5: Find the first significant dip to avoid octave errors ---
+    let mut period = 0;
+    let threshold = 0.10; // Fixed threshold
+
+    for tau in 2..(frame_size / 2) {
+        if yin_buffer[tau] < threshold {
+            // Now check if this is a local minimum
+            if yin_buffer[tau] < yin_buffer[tau-1] {
+                period = tau;
+                break;
+            }
+        }
+    }
+    
+    if period == 0 {
+        return None;
+    }
+
+    // --- Step 6: Parabolic interpolation ---
+    if period + 1 >= frame_size / 2 { 
+        return None;
+    }
+
+    let y1 = yin_buffer[period - 1];
+    let y2 = yin_buffer[period];
+    let y3 = yin_buffer[period + 1];
+
+    let offset = parabolic_interpolation_offset(y1, y2, y3).unwrap_or(0.0);
+    let period_float = period as f32 + offset;
+
+    let frequency = sample_rate as f32 / period_float;
+
+    if frequency.is_finite() && frequency > 20.0 {
+        Some(frequency)
+    } else {
+        None
+    }   
+}
+
+/// A robust implementation of the pYIN pitch detection algorithm (stateless).
+///
+/// This version finds the most probable pitch candidate within a single frame
+/// by analyzing the YIN difference function across multiple thresholds. This
+/// makes it significantly more robust against octave errors than standard YIN.
+///
+/// # Arguments
+/// * `signal` - Input audio signal
+/// * `sample_rate` - Sample rate in Hz
+/// * `amplitude_threshold` - Minimum amplitude for pitch detection
+///
+/// # Returns
+/// * `Some(frequency)` - Detected frequency in Hz
+/// * `None` - No pitch detected (silence, noise, or invalid signal)
+pub fn detect_pitch_pyin(
+    signal: &[f32],
+    sample_rate: u32,
+    amplitude_threshold: f32,
+) -> Option<(f32, f32)> {
+    let frame_size = signal.len();
+    if frame_size < 4 { return None; } // Need at least a few samples
+    
+    let mut yin_buffer = vec![0.0; frame_size / 2];
+
+    // --- Noise Gate: Calculate RMS to filter out silence/noise ---
+    let rms = (signal.iter().map(|&s| s * s).sum::<f32>() / frame_size as f32).sqrt();
+    if rms < amplitude_threshold {
+        return None;
+    }
+
+    // --- Steps 1-3: Calculate the YIN buffer (reused logic) ---
+    yin_difference(signal, frame_size, &mut yin_buffer);
+
+    // --- pYIN Step: Find the BEST candidate, not just the first ---
+    let mut best_period = 0;
+    let mut lowest_yin_val = f32::INFINITY;
+
+    // We search for all local minima (dips) in the buffer.
+    // A dip is a point lower than its immediate neighbors.
+    for tau in 2..(frame_size / 2 - 1) {
+        let prev = yin_buffer[tau - 1];
+        let current = yin_buffer[tau];
+        let next = yin_buffer[tau + 1];
+        
+        // Is this a local minimum?
+        if current < prev && current < next {
+            // Is this the best minimum we've found so far?
+            // The lowest value in the YIN buffer corresponds to the highest probability.
+            if current < lowest_yin_val {
+                lowest_yin_val = current;
+                best_period = tau;
+            }
+        }
+    }
+    
+    // --- Clarity Check ---
+    // If no clear dip was found, it's likely noise.
+    const CLARITY_THRESHOLD: f32 = 0.1;
+    if best_period == 0 || lowest_yin_val > CLARITY_THRESHOLD {
+        return None;
+    }
+
+    // --- Parabolic interpolation for better precision ---
+    let y1 = yin_buffer[best_period - 1];
+    let y2 = yin_buffer[best_period];
+    let y3 = yin_buffer[best_period + 1];
+
+    let offset = parabolic_interpolation_offset(y1, y2, y3).unwrap_or(0.0);
+    let period_float = best_period as f32 + offset;
+
+    if period_float <= 0.0 { return None; }
+    
+    let frequency = sample_rate as f32 / period_float;
+
+    if frequency.is_finite() && frequency > 20.0 {
+        // Calculate confidence and return both values.
+        let confidence = 1.0 - lowest_yin_val;
+        Some((frequency, confidence)) // <-- Return tuple
+    } else {
+        None
+    }
+}
+
+/// Calculates the core YIN cumulative mean normalized difference function.
+/// This is the heart of both YIN and pYIN and is reused.
+fn yin_difference(signal: &[f32], frame_size: usize, yin_buffer: &mut [f32]) {
+    // Step 1 & 2: Difference function and squared difference
     for tau in 1..(frame_size / 2) {
         let mut diff = 0.0;
         for i in 0..(frame_size / 2) {
@@ -50,66 +179,16 @@ pub fn detect_pitch_yin(
         yin_buffer[tau] = diff;
     }
 
-    // --- Step 3: Cumulative mean normalized difference ---
+    // Step 3: Cumulative mean normalized difference
     let mut running_sum = 0.0;
     yin_buffer[0] = 1.0;
     for tau in 1..(frame_size / 2) {
         running_sum += yin_buffer[tau];
-        if running_sum != 0.0 {
+        if running_sum > 1e-6 { // Avoid division by zero
             yin_buffer[tau] *= tau as f32 / running_sum;
         } else {
             yin_buffer[tau] = 1.0;
         }
-    }
-
-    // --- Step 4 & 5: Find the first significant dip to avoid octave errors ---
-    let min_val = yin_buffer
-        .iter()
-        .skip(1) // Skip tau = 0
-        .cloned()
-        .fold(f32::INFINITY, f32::min);
-
-    let mut period = 0;
-    let threshold = min_val + 0.05;
-
-    for tau in 2..(frame_size / 2) {
-        if yin_buffer[tau] < threshold && yin_buffer[tau] < yin_buffer[tau - 1] {
-            period = tau;
-            break;
-        }
-    }
-
-    // --- NEW: Step 5.5: Clarity Check to Reject Noise ---
-    // If no period was found OR the found period is not "clear" enough,
-    // it's likely noise. A clear tone will have a very low value in the YIN buffer.
-    const CLARITY_THRESHOLD: f32 = 0.1;
-    if period == 0 || yin_buffer[period] > CLARITY_THRESHOLD {
-        return None;
-    }
-
-    // --- Step 6: Parabolic interpolation for better precision ---
-    if period + 1 >= frame_size / 2 { // Bounds check for interpolation
-        return None;
-    }
-
-    let y1 = yin_buffer[period - 1];
-    let y2 = yin_buffer[period];
-    let y3 = yin_buffer[period + 1];
-
-    let period_float = if (y1 - 2.0 * y2 + y3) != 0.0 {
-        let peak_shift = (y1 - y3) / (2.0 * (y1 - 2.0 * y2 + y3));
-        period as f32 + peak_shift
-    } else {
-        period as f32
-    };
-
-    let frequency = sample_rate as f32 / period_float;
-
-    // FIX: Add a final guard to ensure we only return valid, audible frequencies.
-    if frequency.is_finite() && frequency > 20.0 {
-        Some(frequency)
-    } else {
-        None
     }
 }
 
@@ -231,19 +310,19 @@ fn interpolate_peak_frequency(
         return None;
     }
 
-    let denominator = 2.0 * y2 - y1 - y3;
-    if denominator.abs() < 1e-6 {
-        return None;
-    }
-    
-    let peak_shift = (y3 - y1) / (2.0 * denominator);
-    let interpolated_bin = peak_bin as f32 + peak_shift;
-    let buffer_size = spectrum_magnitudes.len() * 2;
-    let final_freq = (interpolated_bin * sample_rate as f32) / buffer_size as f32;
+    // Use the new helper function
+    if let Some(offset) = parabolic_interpolation_offset(y1, y2, y3) {
+        let interpolated_bin = peak_bin as f32 + offset;
+        let buffer_size = spectrum_magnitudes.len() * 2;
+        let final_freq = (interpolated_bin * sample_rate as f32) / buffer_size as f32;
 
-    if final_freq.is_finite() && final_freq > 0.0 {
-        Some(final_freq)
+        if final_freq.is_finite() && final_freq > 0.0 {
+            Some(final_freq)
+        } else {
+            None
+        }
     } else {
+        // Interpolation failed (collinear points), return None
         None
     }
 }
@@ -294,4 +373,30 @@ pub fn refine_from_spectrum(
     // Use our new helper for the final interpolation
     interpolate_peak_frequency(spectrum_magnitudes, peak_bin, sample_rate)
         .or(Some(rough_freq)) // If interpolation fails, fall back to the rough frequency
+}
+
+/// Calculates the offset of a parabola's vertex from a center point.
+///
+/// Given three equidistant points (y_left, y_center, y_right), this function
+/// fits a parabola to them and returns the fractional offset of the true
+/// extremum (peak or trough) from the center point's index.
+///
+/// # Arguments
+/// * `y_left` - The value of the point to the left of the center.
+/// * `y_center` - The value of the center point (the detected peak/trough).
+/// * `y_right` - The value of the point to the right of the center.
+///
+/// # Returns
+/// * `Some(offset)` - The calculated offset, which can be added to the center index.
+/// * `None` - If the points form a straight line (denominator is zero).
+fn parabolic_interpolation_offset(y_left: f32, y_center: f32, y_right: f32) -> Option<f32> {
+    let denominator = y_left - 2.0 * y_center + y_right;
+
+    if denominator.abs() < 1e-6 {
+        // The points are collinear; no parabola can be fit.
+        return None;
+    }
+
+    let offset = (y_left - y_right) / (2.0 * denominator);
+    Some(offset)
 }

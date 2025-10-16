@@ -16,6 +16,8 @@ pub mod tuning;
 pub struct AnalysisResult {
     /// The primary detected frequency in Hz.
     pub detected_frequency: Option<f32>,
+    /// The confidence of the detected frequency (0.0 to 1.0).
+    pub confidence: Option<f32>,
     /// The deviation from the target note in cents.
     pub cents_deviation: Option<f32>,
     /// The name of the nearest note.
