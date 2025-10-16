@@ -7,7 +7,7 @@ resolver = "2" # Use the modern feature resolver
 
 # Workspace version
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 
 # Define common dependencies for the workspace to ensure version consistency
 [workspace.dependencies]

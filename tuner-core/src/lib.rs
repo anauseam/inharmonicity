@@ -22,4 +22,6 @@ pub struct AnalysisResult {
     pub note_name: Option<String>,
     /// Data for the spectrogram visualization.
     pub spectrogram_data: Vec<f32>,
+    /// Frequencies of the detected partials.
+    pub partials: Vec<f32>,
 }
