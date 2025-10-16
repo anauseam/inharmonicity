@@ -12,11 +12,11 @@ An open source professional-grade piano tuning application built in Rust with re
 - **Spectrogram Visualization**: Real-time frequency spectrum display
 - **Cent Meter**: Visual tuning accuracy indicator with color-coded feedback
 - **Interactive Piano Keyboard**: 88-key piano interface with click-to-select frequency functionality
+- **Cent Meter Confidence**: Probabilistic confidence value for auto-detected notes
+- **Partials Analysis**: Harmonic partial frequency display
 
 ### Planned Features
 
-- **Cent Meter Confidence**: Probabilistic confidence value for auto-detected notes
-- **Partials Analysis**: Harmonic partial frequency display
 - **Inharmonicity Compensation**: Professional piano-specific tuning curves
 - **Buffer Size Selection**: Choice between 2048 and 4096 sample buffers
 
@@ -36,7 +36,7 @@ inharmonicity/
 │   ├── src/
 │   │   ├── audio.rs     # CPAL audio capture and stream management
 │   │   ├── fft.rs       # FFT processing and spectrum analysis
-│   │   ├── pitch.rs     # YIN pitch detection algorithm
+│   │   ├── pitch.rs     # stateless pYIN pitch detection algorithm
 │   │   └── tuning.rs    # Musical note calculations and cent deviation, inharmonicity curve calculation
 │   └── Cargo.toml
 ├── tuner-gui/           # Iced-based GUI application
@@ -97,7 +97,6 @@ cargo run -p tuner-gui
 - **Temperament Settings**: Various tuning temperaments (Equal, Just, etc.)
 - **Tuning Profiles**: Save/load custom tuning configurations
 - **Sample Buffer Adjustment**: Configurable audio buffer sizes (2048/4096)
-- **Probabilistic YIN**: Confidence values for auto-detected notes
 - **Audio Device Selection**: Choose input device from GUI
 - **Export Functionality**: Save tuning data and reports
 
@@ -109,15 +108,9 @@ The application features a professional layout with:
 
 1. **Spectrogram Panel**: Real-time frequency spectrum visualization
 2. **Cent Meter**: Tuning accuracy indicator (-50 to +50 cents)
-3. **Piano Keyboard**: Interactive 88-key piano for manual key selection
+3. **Piano Keyboard**: Interactive 88-key piano for manual note selection
 4. **Partials Panel**: Harmonic partial frequency display
 5. **Control Sidebar**: Tool visibility toggles and settings
-
-### Working Tools
-
-- **Spectrogram**: Toggle visibility of frequency spectrum display
-- **Cent Meter**: Toggle visibility of tuning accuracy meter
-- **Key Select**: Toggle visibility of interactive piano keyboard
 
 ## ⚠️ Known Issues
 
