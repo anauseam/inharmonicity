@@ -202,6 +202,7 @@ impl TunerApp {
                                     eprintln!("[AUDIO-THREAD] Analysis panicked, using default result");
                                     AnalysisResult {
                                         detected_frequency: None,
+                                        confidence: None,
                                         cents_deviation: None,
                                         note_name: None,
                                         spectrogram_data: vec![],
@@ -486,7 +487,12 @@ impl TunerApp {
                 TuningMode::Auto => analysis.note_name.clone().unwrap_or_else(|| "--".to_string()),
                 TuningMode::Manual { note_name, .. } => note_name.clone(),
             };
-            (note_text, format!("{:.2} Hz", current_freq), "81%".to_string())
+            // Convert the confidence value (0.0-1.0) to a percentage string.
+            let confidence_text = analysis.confidence
+                .map(|c| format!("{:.0}%", c * 100.0))
+                .unwrap_or_else(|| "0%".to_string());
+            
+            (note_text, format!("{:.2} Hz", current_freq), confidence_text)
         } else { 
             ("--".to_string(), "0.00 Hz".to_string(), "0%".to_string()) 
         };
@@ -696,8 +702,15 @@ fn perform_analysis(
 ) -> AnalysisResult {
     let complex_spectrum = fft::perform_fft(audio_frame);
     let spectrogram_data = fft::spectrum_to_magnitudes(&complex_spectrum);
-    let detected_frequency = pitch::detect_pitch_yin(audio_frame, sample_rate, AMPLITUDE_THRESHOLD)
-        .and_then(|rf| pitch::refine_from_spectrum(&spectrogram_data, rf, sample_rate));
+    
+    // --- Unpack the frequency and confidence ---
+    let (detected_frequency, confidence) = 
+        if let Some((freq, conf)) = pitch::detect_pitch_pyin(audio_frame, sample_rate, AMPLITUDE_THRESHOLD) {
+            let refined_freq = pitch::refine_from_spectrum(&spectrogram_data, freq, sample_rate);
+            (refined_freq, Some(conf))
+        } else {
+            (None, None)
+        };
 
     let (cents_deviation, note_name) = if let Some(freq) = detected_frequency {
         let (name, target_freq) = tuning::find_nearest_note(freq);
@@ -716,6 +729,7 @@ fn perform_analysis(
 
     AnalysisResult {
         detected_frequency,
+        confidence,
         cents_deviation,
         note_name,
         spectrogram_data,
