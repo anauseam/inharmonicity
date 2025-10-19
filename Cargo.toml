@@ -7,11 +7,16 @@ resolver = "2" # Use the modern feature resolver
 
 # Workspace version
 [workspace.package]
-version = "0.3.1"
+version = "0.4.0"
 
 # Define common dependencies for the workspace to ensure version consistency
 [workspace.dependencies]
 cpal = "0.16.0"
 rustfft = "6.4.1"
+serde = "1.0"
+serde_json = "1.0"
+
+# Dependencies for profile saving and loading
+
 
 # Add other common dependencies here

@@ -14,4 +14,10 @@ cpal = { workspace = true }
 
 # For running audio on a separate thread and communicating
 crossbeam-channel = "0.5.15"
+
+# For profile saving and loading
+serde = { workspace = true }
+serde_json = { workspace = true }
+
 anyhow = "1.0.100" # For easier error handling
+

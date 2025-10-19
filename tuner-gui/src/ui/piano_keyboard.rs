@@ -41,6 +41,11 @@ pub struct PianoKeyboard {
 }
 
 impl PianoKeyboard {
+    /// Creates a new piano keyboard widget.
+    /// 
+    /// # Arguments
+    /// * `detected_key_index` - Currently detected key from audio analysis (0-87)
+    /// * `selected_key_index` - User-selected key from mouse clicks (0-87)
     pub fn new(detected_key_index: Option<u8>, selected_key_index: Option<u8>) -> Self {
         Self {
             detected_key_index,
@@ -48,7 +53,10 @@ impl PianoKeyboard {
         }
     }
 
-    // This now consumes `self` to fix the lifetime error.
+    /// Creates the view element for the piano keyboard.
+    /// 
+    /// This method consumes the PianoKeyboard instance to create an Iced Element
+    /// that can be embedded in the GUI layout.
     pub fn view(self) -> Element<'static, super::super::Message> {
         container(
             canvas::Canvas::new(self)
@@ -58,6 +66,19 @@ impl PianoKeyboard {
         .into()
     }
 
+    /// Determines which piano key was clicked based on mouse position.
+    /// 
+    /// Calculates the key index (0-87) from a mouse click position on the keyboard.
+    /// Handles both white and black keys, with black keys taking priority since
+    /// they are drawn on top. Returns the key index if a valid key was clicked.
+    /// 
+    /// # Arguments
+    /// * `bounds` - Size of the keyboard widget
+    /// * `pos` - Mouse click position within the keyboard bounds
+    /// 
+    /// # Returns
+    /// * `Some(u8)` - Key index (0-87) if a key was clicked
+    /// * `None` - If click was outside any key area
     fn key_index_from_pos(&self, bounds: Size, pos: Point) -> Option<u8> {
         let white_key_width = bounds.width / WHITE_KEY_COUNT as f32;
         let black_key_width = white_key_width * 0.6;
