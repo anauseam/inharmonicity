@@ -23,8 +23,10 @@ impl PartialsDisplay {
         Self { partials }
     }
 
-    /// Renders the widget's view as a Canvas element.
-    // This now correctly refers to the parent's message type, just like your other widgets.
+    /// Creates the view element for the partials display.
+    /// 
+    /// This method consumes the PartialsDisplay instance to create an Iced Element
+    /// that can be embedded in the GUI layout.
     pub fn view(self) -> Element<'static, super::super::Message> {
         container(
             canvas::Canvas::new(self)
@@ -50,19 +52,6 @@ impl<Message> canvas::Program<Message> for PartialsDisplay {
         let mut frame = Frame::new(renderer, bounds.size());
         let text_color = theme.palette().text;
 
-        // Draw the title "Partials"
-        let title_text = Text {
-            content: "Partials".to_string(),
-            position: Point::new(bounds.width / 2.0, 15.0),
-            color: text_color,
-            size: 18.0.into(),
-            horizontal_alignment: iced::alignment::Horizontal::Center,
-            vertical_alignment: iced::alignment::Vertical::Center,
-            ..Text::default()
-        };
-        frame.fill_text(title_text);
-
-
         if self.partials.is_empty() {
             // Display a placeholder message if no partials are detected
             let placeholder = Text {
@@ -77,8 +66,8 @@ impl<Message> canvas::Program<Message> for PartialsDisplay {
             frame.fill_text(placeholder);
         } else {
             // Define layout constants
-            let start_y: f32 = 40.0;
-            let line_height: f32 = 18.0;
+            let start_y: f32 = 0.0;
+            let line_height: f32 = 15.0;
             let padding: f32 = 15.0;
 
             // Draw each partial's information

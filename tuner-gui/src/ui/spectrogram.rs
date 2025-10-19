@@ -28,10 +28,18 @@ pub struct Spectrogram {
 }
 
 impl Spectrogram {
+    /// Creates a new spectrogram widget.
+    /// 
+    /// # Arguments
+    /// * `data` - Magnitude spectrum data from FFT analysis
     pub fn new(data: Vec<f32>) -> Self {
         Self { data }
     }
 
+    /// Creates the view element for the spectrogram.
+    /// 
+    /// This method consumes the Spectrogram instance to create an Iced Element
+    /// that can be embedded in the GUI layout.
     pub fn view(self) -> Element<'static, super::super::Message> {
         container(
             canvas::Canvas::new(self)

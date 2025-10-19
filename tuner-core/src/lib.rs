@@ -9,6 +9,7 @@ pub mod audio;
 pub mod fft;
 pub mod pitch;
 pub mod tuning;
+pub mod inharmonicity;
 
 /// Represents the result of a single audio analysis frame.
 // This derive is necessary for the struct to be used in the `CustomEvent` enum.

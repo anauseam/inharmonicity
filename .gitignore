@@ -23,3 +23,6 @@ target
 # Generated markdown preview files
 README_files/
 README.html
+
+# Generated JSON files
+tuning_profile.json

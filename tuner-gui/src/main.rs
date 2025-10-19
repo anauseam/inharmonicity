@@ -10,23 +10,26 @@
 //! - **Communication**: Crossbeam channels for thread-safe data exchange
 //! - **Updates**: 60 FPS continuous updates via subscription system
 
-mod widgets;
+mod ui;
 
 use crossbeam_channel::{Receiver, Sender};
 use cpal::traits::StreamTrait;
-use iced::widget::{
-    button, column, container, row, text, horizontal_space, Space
-};
 use iced::{
-    self, Alignment, Element, Length, Theme, Subscription
+    self, Element, Theme, Subscription
 };
 use std::collections::VecDeque;
 use std::thread::{self, JoinHandle};
-use tuner_core::{audio, fft, pitch, tuning, AnalysisResult};
+use tuner_core::{
+    audio, fft, pitch, tuning, AnalysisResult,
+    inharmonicity::{InharmonicityProfile, KeyMeasurement, Partial}
+};
+use ui::main_display::{create_main_view, AppDisplayData};
 
 // Audio processing constants
 const SMOOTHING_FACTOR: usize = 5;  // Number of samples for cent smoothing
 const AMPLITUDE_THRESHOLD: f32 = 0.01;  // Minimum amplitude for pitch detection
+
+
 
 /// Main entry point for the Inharmonicity application.
 /// 
@@ -53,8 +56,14 @@ pub enum Message {
     KeySelected(u8),           // User selected a piano key (0-87)
     SwitchToAutoMode,          // Switch from manual to automatic pitch detection
     
+    // --- Messages for Inharmonicity Measurement & Profile ---
+    ToggleMeasurementMode,     // Toggle the partial measurement mode
+    CaptureMeasurement,        // Capture the current note's partials
+    SaveProfile,               // Save the current inharmonicity profile
+    LoadProfile,               // Load an inharmonicity profile from file
+    // ----------------------------------------------
+    
     // Settings menu items (placeholder for future implementation)
-    PartialMeasurement,        // Partial measurement settings
     Temperament,              // Temperament selection
     TuningStandard,           // Tuning standard (A440, etc.)
     InharmonicCurve,          // Inharmonicity curve adjustment
@@ -106,6 +115,12 @@ struct TunerApp {
     tuning_mode: TuningMode,                             // Current tuning mode
     smoothing_buffer: VecDeque<f32>,                      // Buffer for cent smoothing
     
+    // --- New Inharmonicity State ---
+    in_measurement_mode: bool,
+    capture_button_clicked: bool,  // Track if capture button has been clicked
+    inharmonicity_profile: InharmonicityProfile,
+    // ---------------------------------
+    
     // UI visibility states
     spectrogram_visible: bool,    // Show/hide spectrogram panel
     cent_meter_visible: bool,     // Show/hide cent meter panel
@@ -142,6 +157,11 @@ impl Default for TunerApp {
             last_analysis: None,
             smoothing_buffer: VecDeque::with_capacity(SMOOTHING_FACTOR),
             tuning_mode: TuningMode::Auto,
+            // --- Initialize new state ---
+            in_measurement_mode: false,
+            capture_button_clicked: false,
+            inharmonicity_profile: InharmonicityProfile::default(),
+            // ----------------------------
             // Initialize all tools as visible by default
             spectrogram_visible: true,
             cent_meter_visible: true,
@@ -306,9 +326,72 @@ impl TunerApp {
                 self.tuning_mode = TuningMode::Auto;
                 self.smoothing_buffer.clear();
             }
-            Message::PartialMeasurement => {
-                // Placeholder for partial measurement functionality
+            Message::ToggleMeasurementMode => {
+                self.in_measurement_mode = !self.in_measurement_mode;
+                self.capture_button_clicked = false; // Reset capture button state
+                eprintln!("[MAIN] Measurement mode set to: {}", self.in_measurement_mode);
             }
+            Message::CaptureMeasurement => {
+                if !self.in_measurement_mode { return; }
+                
+                // Toggle capture button state
+                self.capture_button_clicked = !self.capture_button_clicked;
+                
+                if self.capture_button_clicked {
+                    // Only capture when button is being activated (not deactivated)
+                    if let Some(analysis) = &self.last_analysis {
+                        if let (Some(note_name), Some(freq)) = (&analysis.note_name, analysis.detected_frequency) {
+                            let key_index = tuning::get_key_index_from_name(note_name);
+
+                            // Create the fundamental partial (n=1)
+                            let mut all_partials = vec![Partial { number: 1, frequency: freq }];
+                            
+                            // Create the overtone partials (n=2, 3, 4...)
+                            let overtone_partials = analysis.partials.iter().enumerate()
+                                .map(|(i, &freq)| Partial {
+                                    number: (i + 2) as u32, // find_partials starts at the 2nd partial
+                                    frequency: freq,
+                                });
+                            all_partials.extend(overtone_partials);
+                            
+                            let mut measurement = KeyMeasurement {
+                                key_index,
+                                partials: all_partials,
+                                calculated_b: None,
+                            };
+                            
+                            // Calculate the 'B' value immediately
+                            measurement.calculate_b_value();
+                            
+                            eprintln!("[MAIN] Captured measurement for {}: B={:?}", note_name, measurement.calculated_b);
+                            
+                            // Store it in the profile
+                            self.inharmonicity_profile.measurements.insert(key_index, measurement);
+                        } else {
+                            eprintln!("[MAIN] Capture failed: No stable note detected.");
+                        }
+                    }
+                } else {
+                    eprintln!("[MAIN] Capture ended.");
+                }
+            }
+            Message::SaveProfile => {
+                match save_profile(&self.inharmonicity_profile, "tuning_profile.json") {
+                    Ok(_) => eprintln!("[MAIN] Tuning profile saved successfully."),
+                    Err(e) => eprintln!("[MAIN] Error saving profile: {}", e),
+                }
+            }
+            Message::LoadProfile => {
+                match load_profile("tuning_profile.json") {
+                    Ok(profile) => {
+                        self.inharmonicity_profile = profile;
+                        eprintln!("[MAIN] Tuning profile loaded successfully.");
+                    }
+                    Err(e) => eprintln!("[MAIN] Error loading profile: {}", e),
+                }
+            }
+            // ------------------------------------------
+
             Message::Temperament => {
                 // Placeholder for temperament settings
             }
@@ -367,281 +450,23 @@ impl TunerApp {
 
     /// Renders the main application interface.
     /// 
-    /// Creates the complete GUI layout including:
-    /// - Title and main content area
-    /// - Spectrogram and cent meter panels (top row)
-    /// - Piano keyboard and partials panels (bottom row)
-    /// - Settings sidebar with tool controls
-    /// 
-    /// The layout is responsive and adapts to tool visibility states.
+    /// Delegates all UI rendering to the main_display module,
+    /// keeping this function focused on application logic only.
     fn view(&self) -> Element<'_, Message> {
-        eprintln!("[VIEW] Rendering GUI...");
-            
-        if self.audio_worker.is_none() && self.analysis_sender.is_none() {
-            return container(text("Shutting down...").size(40))
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .center_x(Length::Fill)
-                .center_y(Length::Fill)
-                .into();
-        }
-
-        let title = text("Inharmonicity").size(28);
-
-        // Build UI panels using dedicated helper methods
-        let spectrogram_panel = self.view_spectrogram_panel();
-        let cent_meter_panel = self.view_cent_meter_panel();
-        let keyboard_panel = self.view_keyboard_panel();
-        let partials_panel = self.view_partials_panel();
-        let sidebar = self.view_sidebar();
-
-        // Build top row dynamically based on visibility
-        let top_row = match (spectrogram_panel, cent_meter_panel) {
-            (Some(s), Some(c)) => row![s, Space::with_width(10), c],
-            (Some(s), None) => row![s],
-            (None, Some(c)) => row![c],
-            (None, None) => row![], // Return an empty row
-        }
-        .align_y(Alignment::Start);
-        
-        // Build bottom row dynamically based on visibility
-        let bottom_row = match (keyboard_panel, partials_panel) {
-            (Some(k), Some(p)) => row![k, Space::with_width(10), p],
-            (Some(k), None) => row![k],
-            (None, Some(p)) => row![p],
-            (None, None) => row![],
-        }
-        .align_y(Alignment::Start);
-        
-        // Assemble the final layout
-        let main_content = row![
-            column![
-                title,
-                Space::with_height(20),
-                top_row,
-                Space::with_height(10),
-                bottom_row,
-            ]
-            .width(Length::Fill)
-            .spacing(10),
-            Space::with_width(10),
-            sidebar,
-        ]
-        .align_y(Alignment::Start)
-        .padding(20);
-
-        container(main_content)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
-    }
-
-    // --- View Helper Methods ---
-
-    /// Builds the spectrogram panel widget.
-    fn view_spectrogram_panel(&self) -> Option<Element<'_, Message>> {
-        if !self.spectrogram_visible {
-            return None;
-        }
-
-        let spectrogram_data = self.last_analysis.as_ref()
-            .map(|a| a.spectrogram_data.clone())
-            .unwrap_or_default();
-        
-        let spectrogram_content = container(
-            widgets::spectrogram::Spectrogram::new(spectrogram_data).view()
-        )
-        .width(Length::Fill)
-        .height(Length::Fill);
-        
-        let panel = container(
-            column![
-                text("Spectrogram").size(18),
-                Space::with_height(10),
-                spectrogram_content
-            ]
-            .spacing(5)
-            .padding(15)
-        )
-        .width(Length::Fill)
-        .height(Length::Fixed(250.0));
-
-        Some(panel.into())
-    }
-
-    /// Builds the cent meter panel widget.
-    fn view_cent_meter_panel(&self) -> Option<Element<'_, Message>> {
-        if !self.cent_meter_visible {
-            return None;
-        }
-
-        let smoothed_cents = if self.smoothing_buffer.is_empty() { 
-            None 
-        } else { 
-            Some(self.smoothing_buffer.iter().sum::<f32>() / self.smoothing_buffer.len() as f32) 
-        };
-        
-        let (note_name, freq_text, confidence) = if let Some(analysis) = &self.last_analysis {
-            let current_freq = analysis.detected_frequency.unwrap_or(0.0);
-            let note_text = match &self.tuning_mode {
-                TuningMode::Auto => analysis.note_name.clone().unwrap_or_else(|| "--".to_string()),
-                TuningMode::Manual { note_name, .. } => note_name.clone(),
-            };
-            // Convert the confidence value (0.0-1.0) to a percentage string.
-            let confidence_text = analysis.confidence
-                .map(|c| format!("{:.0}%", c * 100.0))
-                .unwrap_or_else(|| "0%".to_string());
-            
-            (note_text, format!("{:.2} Hz", current_freq), confidence_text)
-        } else { 
-            ("--".to_string(), "0.00 Hz".to_string(), "0%".to_string()) 
+        let display_data = AppDisplayData {
+            audio_worker_active: self.audio_worker.is_some(),
+            last_analysis: self.last_analysis.clone(),
+            smoothing_buffer: self.smoothing_buffer.iter().cloned().collect(),
+            spectrogram_visible: self.spectrogram_visible,
+            cent_meter_visible: self.cent_meter_visible,
+            key_select_visible: self.key_select_visible,
+            partials_visible: self.partials_visible,
+            tuning_mode: self.tuning_mode.clone(),
+            in_measurement_mode: self.in_measurement_mode,
+            capture_button_clicked: self.capture_button_clicked,
         };
 
-        let cent_meter_content = column![
-            row![
-                text("Note").size(14),
-                horizontal_space(),
-                text("Confidence").size(14),
-            ],
-            Space::with_height(5),
-            row![
-                text(note_name).size(24),
-                Space::with_width(10),
-                text(freq_text).size(24),
-                horizontal_space(),
-                container(text(confidence).size(16)).padding([4, 8]),
-            ]
-            .align_y(Alignment::Center),
-            Space::with_height(10),
-            widgets::cent_meter::CentMeter::new(smoothed_cents).view()
-        ]
-        .spacing(5);
-        
-        let panel = container(
-            column![
-                text("Cent Meter").size(18),
-                Space::with_height(10),
-                cent_meter_content
-            ]
-            .spacing(5)
-            .padding(15)
-        )
-        .width(Length::Fill)
-        .height(Length::Fixed(180.0));
-
-        Some(panel.into())
-    }
-
-    /// Builds the piano keyboard panel widget.
-    fn view_keyboard_panel(&self) -> Option<Element<'_, Message>> {
-        if !self.key_select_visible {
-            return None;
-        }
-
-        let (detected_key, selected_key) = if let Some(analysis) = &self.last_analysis {
-            let detected_key_index = analysis.note_name.as_ref()
-                .map(|name| tuning::get_key_index_from_name(name));
-            match &self.tuning_mode {
-                TuningMode::Auto => (detected_key_index, None),
-                TuningMode::Manual { key_index, .. } => (detected_key_index, Some(*key_index)),
-            }
-        } else { 
-            (None, None) 
-        };
-        
-        let piano_keyboard = widgets::piano_keyboard::PianoKeyboard::new(detected_key, selected_key);
-
-        let keyboard_content = container(piano_keyboard.view())
-            .width(Length::Fill)
-            .height(Length::Fill);
-        
-        let panel = container(
-            column![
-                text("KEYBOARD Key Select").size(18),
-                Space::with_height(10),
-                keyboard_content
-            ]
-            .spacing(5)
-            .padding(15)
-        )
-        .width(Length::Fill)
-        .height(Length::Fixed(200.0));
-
-        Some(panel.into())
-    }
-
-    /// Builds the partials display panel widget.
-    fn view_partials_panel(&self) -> Option<Element<'_, Message>> {
-        if !self.partials_visible {
-            return None;
-        }
-        
-        let partials_data = self.last_analysis.as_ref()
-            .map(|a| a.partials.clone())
-            .unwrap_or_default();
-
-        let partials_content = container(
-            widgets::partials_display::PartialsDisplay::new(partials_data).view()
-        )
-        .width(Length::Fill)
-        .height(Length::Fill);
-        
-        let panel = container(
-            column![
-                text("Partials").size(18),
-                Space::with_height(10),
-                partials_content
-            ]
-            .spacing(5)
-            .padding(15)
-        )
-        .width(Length::Fill)
-        .height(Length::Fixed(180.0));
-
-        Some(panel.into())
-    }
-
-    /// Builds the right-hand sidebar with settings and controls.
-    fn view_sidebar(&self) -> Element<'_, Message> {
-        container(
-            column![
-                make_settings_section(
-                    "Tools",
-                    vec![
-                        ("Spectrogram", Some(Message::ToggleSpectrogram)),
-                        ("Centmeter", Some(Message::ToggleCentMeter)),
-                        ("Key select", Some(Message::ToggleKeySelect)),
-                        ("Partials", Some(Message::TogglePartials)),
-                        // This button is now disabled as its message is `None`.
-                        ("Partial Measurement", None),
-                    ]
-                ),
-                Space::with_height(20),
-                make_settings_section(
-                    "Systemic change",
-                    vec![
-                        // These buttons are now disabled.
-                        ("Temperament", None),
-                        ("Tuning Standard", None),
-                        ("Inharmonic curve adjustment", None),
-                    ]
-                ),
-                Space::with_height(20),
-                make_settings_section(
-                    "Program",
-                    vec![
-                        // These buttons are now disabled.
-                        ("Sample Buffer adjustment", None),
-                        ("Tuning Profile", None),
-                    ]
-                ),
-            ]
-            .spacing(10)
-            .padding(15)
-        )
-        .width(Length::Fixed(250.0))
-        .height(Length::Fill)
-        .into()
+        create_main_view(&display_data, &(), Message::CaptureMeasurement)
     }
     
     /// Creates a subscription for continuous application updates.
@@ -661,41 +486,24 @@ impl TunerApp {
     }
 }
 
-/// Helper function to create a section of buttons in the sidebar.
-fn make_settings_section<'a>(
-    title: &'a str,
-    items: Vec<(&'a str, Option<Message>)>
-) -> Element<'a, Message> {
-    let title_widget = text(title).size(18);
-    
-    let items_widget = items.into_iter().fold(
-        column![].spacing(8),
-        |col, (label, msg)| {
-            let button = button(text(label).size(14).width(Length::Fill))
-                .padding([6, 10]);
-            
-            // If the message is `None`, no `on_press` handler is attached,
-            // making the button non-interactive.
-            let button_with_action = if let Some(m) = msg {
-                button.on_press(m)
-            } else {
-                button
-            };
-            
-            col.push(button_with_action)
-        }
-    );
 
-    column![
-        title_widget,
-        Space::with_height(10),
-        items_widget
-    ]
-    .spacing(5)
-    .into()
-}
 
 /// Performs a full analysis on a single frame of audio data.
+/// 
+/// This function processes raw audio data through the complete analysis pipeline:
+/// 1. Performs FFT to get frequency spectrum
+/// 2. Detects fundamental frequency using PYIN algorithm
+/// 3. Refines frequency detection using spectrum analysis
+/// 4. Finds nearest musical note and calculates cents deviation
+/// 5. Identifies harmonic partials for inharmonicity analysis
+/// 
+/// # Arguments
+/// * `audio_frame` - Raw audio samples (typically 2048 samples)
+/// * `sample_rate` - Sample rate in Hz (typically 44100 or 48000)
+/// 
+/// # Returns
+/// * `AnalysisResult` - Complete analysis including frequency, confidence, 
+///   cents deviation, note name, spectrogram data, and detected partials
 fn perform_analysis(
     audio_frame: &[f32],
     sample_rate: u32
@@ -721,8 +529,8 @@ fn perform_analysis(
     };
     
     let partials = if let Some(fundamental) = detected_frequency {
-        // Search for up to 10 partials
-        pitch::find_partials(&spectrogram_data, fundamental, sample_rate, 10)
+        // Search for up to 7 partials
+        pitch::find_partials(&spectrogram_data, fundamental, sample_rate, 7)
     } else {
         vec![] // No fundamental, no partials
     };
@@ -735,4 +543,53 @@ fn perform_analysis(
         spectrogram_data,
         partials,
     }
+}
+
+// --- New Profile Save/Load Functions ---
+
+use std::fs::File;
+use std::io::{Read, Write};
+use serde_json;
+
+/// Saves the inharmonicity profile to a JSON file.
+/// 
+/// Serializes the complete inharmonicity profile (including all measured
+/// partials and calculated B values) to a JSON file for persistent storage.
+/// This allows users to save their piano's unique inharmonicity characteristics
+/// and reload them in future tuning sessions.
+/// 
+/// # Arguments
+/// * `profile` - The inharmonicity profile to save
+/// * `path` - File path where the profile should be saved (e.g., "tuning_profile.json")
+/// 
+/// # Returns
+/// * `Ok(())` - Profile saved successfully
+/// * `Err(io::Error)` - File I/O error or JSON serialization error
+fn save_profile(profile: &InharmonicityProfile, path: &str) -> std::io::Result<()> {
+    let json_string = serde_json::to_string_pretty(profile)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let mut file = File::create(path)?;
+    file.write_all(json_string.as_bytes())?;
+    Ok(())
+}
+
+/// Loads an inharmonicity profile from a JSON file.
+/// 
+/// Deserializes a previously saved inharmonicity profile from a JSON file.
+/// This allows users to restore their piano's unique inharmonicity characteristics
+/// from a previous tuning session, maintaining consistency across tuning sessions.
+/// 
+/// # Arguments
+/// * `path` - File path to load the profile from (e.g., "tuning_profile.json")
+/// 
+/// # Returns
+/// * `Ok(InharmonicityProfile)` - Successfully loaded profile
+/// * `Err(io::Error)` - File I/O error or JSON deserialization error
+fn load_profile(path: &str) -> std::io::Result<InharmonicityProfile> {
+    let mut file = File::open(path)?;
+    let mut data = String::new();
+    file.read_to_string(&mut data)?;
+    let profile: InharmonicityProfile = serde_json::from_str(&data)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    Ok(profile)
 }
