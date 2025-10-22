@@ -2,7 +2,7 @@
 
 ![Inharmonicity Interface](images/interface-screenshot.png)
 
-An open source professional-grade piano tuning application built in Rust with real-time audio analysis, spectrogram visualization, and interactive piano keyboard interface. Designed for professional piano tuners with planned support for inharmonicity compensation and advanced tuning algorithms.
+An open source professional-grade piano tuning application built in Rust with real-time audio analysis, spectrogram visualization, and interactive piano keyboard interface. Designed for professional piano tuners with planned support for inharmonicity compensation via advanced tuning algorithms.
 
 ## Features
 
@@ -14,11 +14,15 @@ An open source professional-grade piano tuning application built in Rust with re
 - **Interactive Piano Keyboard**: 88-key piano interface with click-to-select frequency functionality
 - **Cent Meter Confidence**: Probabilistic confidence value for auto-detected notes
 - **Partials Analysis**: Harmonic partial frequency display
+- **Inharmonicity Measurement**: Capture and analyze piano-specific inharmonicity characteristics
+- **Profile Management**: Save and load piano tuning profiles with JSON persistence
 
 ### Planned Features
 
 - **Inharmonicity Compensation**: Professional piano-specific tuning curves
 - **Buffer Size Selection**: Choice between 2048 and 4096 sample buffers
+- **Temperament Selection**: Support for various tuning temperaments
+- **Tuning Standard Options**: A440 and other reference frequencies
 
 ### Technical Features
 
@@ -37,15 +41,21 @@ inharmonicity/
 │   │   ├── audio.rs     # CPAL audio capture and stream management
 │   │   ├── fft.rs       # FFT processing and spectrum analysis
 │   │   ├── pitch.rs     # stateless pYIN pitch detection algorithm
-│   │   └── tuning.rs    # Musical note calculations and cent deviation, inharmonicity curve calculation
+│   │   ├── tuning.rs    # Musical note calculations and cent deviation, inharmonicity curve calculation
+│   │   ├── inharmonicity.rs        # Inharmonicity constant calculation and profile management
+│   │   ├── capture_processing.rs   # Audio frame processing strategies for inharmonicity measurement
+│   │   └── lib.rs       # Core library exports and public API
 │   └── Cargo.toml
 ├── tuner-gui/           # Iced-based GUI application
 │   ├── src/
 │   │   ├── main.rs      # Main application and event handling
-│   │   └── widgets/     # Custom GUI components
-│   │       ├── cent_meter.rs      # Cent deviation meter widget
-│   │       ├── piano_keyboard.rs   # Interactive piano keyboard
-│   │       └── spectrogram.rs      # Frequency spectrum visualization
+│   │   └── ui/          # Modular GUI components and layout
+│   │       ├── mod.rs           # UI module declarations
+│   │       ├── main_display.rs  # Main layout and panel management
+│   │       ├── cent_meter.rs    # Cent deviation meter widget
+│   │       ├── piano_keyboard.rs # Interactive piano keyboard
+│   │       ├── spectrogram.rs   # Frequency spectrum visualization
+│   │       └── partials_display.rs # Harmonic partials display
 │   └── Cargo.toml
 └── Cargo.toml           # Workspace configuration
 ```
@@ -100,6 +110,8 @@ cargo run -p tuner-gui
 - **Audio Device Selection**: Choose input device from GUI
 - **Export Functionality**: Save tuning data and reports
 
+At a much later date, complete piano voicing analysis may be implemented after core tuning functionality is complete.
+
 ## 🎛️ Usage
 
 ### Interface Overview
@@ -111,6 +123,7 @@ The application features a professional layout with:
 3. **Piano Keyboard**: Interactive 88-key piano for manual note selection
 4. **Partials Panel**: Harmonic partial frequency display
 5. **Control Sidebar**: Tool visibility toggles and settings
+6. **Measurement Mode**: Automatic capturing of stable note sustain
 
 ## ⚠️ Known Issues
 

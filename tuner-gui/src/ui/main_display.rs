@@ -5,28 +5,22 @@
 
 use iced::{Element, Length, Alignment};
 use iced::widget::{column, Space, container, row, text, button, horizontal_space};
+use std::time::{Duration, Instant};
+
+/// Local timer state for managing "Done" button display
+use std::sync::Mutex;
+use std::sync::OnceLock;
 
 use super::{spectrogram, cent_meter, piano_keyboard, partials_display};
 
-/// Application state data needed for rendering
-pub struct AppDisplayData {
-    // Audio state
-    pub audio_worker_active: bool,
-    pub last_analysis: Option<crate::AnalysisResult>,
-    pub smoothing_buffer: Vec<f32>,
-    
-    // UI visibility states
-    pub spectrogram_visible: bool,
-    pub cent_meter_visible: bool,
-    pub key_select_visible: bool,
-    pub partials_visible: bool,
-    
-    // Tuning mode
-    pub tuning_mode: crate::TuningMode,
-    
-    // Measurement mode
-    pub in_measurement_mode: bool,
-    pub capture_button_clicked: bool,
+static CAPTURE_DONE_TIMER: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+
+/// Initializes the "Done" timer when capture completes.
+/// This should be called when the capture state changes to Done.
+pub fn initialize_done_timer() {
+    let timer_guard = CAPTURE_DONE_TIMER.get_or_init(|| Mutex::new(None));
+    let mut timer = timer_guard.lock().unwrap();
+    *timer = Some(Instant::now());
 }
 
 /// Configuration for a single button in the settings sidebar
@@ -71,8 +65,7 @@ const SETTINGS_CONFIG: &[(&str, &[ButtonConfig])] = &[
 
 /// Creates the complete main application view
 pub fn create_main_view(
-    data: &AppDisplayData,
-    _settings_config: &(), // No longer needed
+    data: &crate::AppDisplayData,
     capture_message: crate::Message,
 ) -> Element<'static, crate::Message>
 {
@@ -100,7 +93,7 @@ pub fn create_main_view(
     let partials_panel = create_partials_panel(data);
     
     // Create sidebar
-    let sidebar = create_sidebar(data.in_measurement_mode, data.capture_button_clicked, capture_message);
+    let sidebar = create_sidebar(data.capture_state.clone(), capture_message);
 
     // Build top row dynamically based on visibility
     let top_row = match (spectrogram_panel, cent_meter_panel) {
@@ -144,7 +137,7 @@ pub fn create_main_view(
 }
 
 /// Creates the spectrogram panel widget.
-fn create_spectrogram_panel(data: &AppDisplayData) -> Option<Element<'static, crate::Message>>
+fn create_spectrogram_panel(data: &crate::AppDisplayData) -> Option<Element<'static, crate::Message>>
 {
     if !data.spectrogram_visible {
         return None;
@@ -176,7 +169,7 @@ fn create_spectrogram_panel(data: &AppDisplayData) -> Option<Element<'static, cr
 }
 
 /// Creates the cent meter panel
-fn create_cent_meter_panel(data: &AppDisplayData) -> Option<Element<'static, crate::Message>>
+fn create_cent_meter_panel(data: &crate::AppDisplayData) -> Option<Element<'static, crate::Message>>
 {
     if !data.cent_meter_visible {
         return None;
@@ -243,7 +236,7 @@ fn create_cent_meter_panel(data: &AppDisplayData) -> Option<Element<'static, cra
 }
 
 /// Creates the piano keyboard panel
-fn create_keyboard_panel(data: &AppDisplayData) -> Option<Element<'static, crate::Message>>
+fn create_keyboard_panel(data: &crate::AppDisplayData) -> Option<Element<'static, crate::Message>>
 {
     if !data.key_select_visible {
         return None;
@@ -282,7 +275,7 @@ fn create_keyboard_panel(data: &AppDisplayData) -> Option<Element<'static, crate
 }
 
 /// Creates the partials display panel
-fn create_partials_panel(data: &AppDisplayData) -> Option<Element<'static, crate::Message>>
+fn create_partials_panel(data: &crate::AppDisplayData) -> Option<Element<'static, crate::Message>>
 {
     if !data.partials_visible {
         return None;
@@ -322,15 +315,13 @@ fn create_partials_panel(data: &AppDisplayData) -> Option<Element<'static, crate
 /// capture button for recording partial measurements.
 /// 
 /// # Arguments
-/// * `in_measurement_mode` - Whether the application is in measurement mode
-/// * `capture_button_clicked` - Current state of the capture button
+/// * `capture_state` - Current capture state (Off, Armed, Done)
 /// * `capture_message` - Message to send when capture button is pressed
 /// 
 /// # Returns
 /// * `Element` - Complete sidebar widget with all controls and sections
 fn create_sidebar(
-    in_measurement_mode: bool,
-    capture_button_clicked: bool,
+    capture_state: crate::CaptureState,
     capture_message: crate::Message,
 ) -> Element<'static, crate::Message>
 {
@@ -338,12 +329,13 @@ fn create_sidebar(
     
     // Add all settings sections
     for (title, buttons) in SETTINGS_CONFIG {
+        let in_measurement_mode = capture_state != crate::CaptureState::Off;
         sections = sections.push(make_settings_section(title, buttons, in_measurement_mode));
     }
     
     // Add capture button if in measurement mode
-    if in_measurement_mode {
-        sections = sections.push(make_capture_button(capture_button_clicked, capture_message));
+    if capture_state != crate::CaptureState::Off {
+        sections = sections.push(make_capture_button(capture_state, capture_message));
     }
     
     container(sections.padding(15))
@@ -413,28 +405,61 @@ fn make_button(
 /// Creates a large Capture button for measurement mode.
 /// 
 /// Generates a special large capture button that appears only in measurement mode.
-/// The button changes color based on its state: gold when ready to capture,
-/// red when actively capturing. This provides clear visual feedback for the
-/// measurement process and makes the capture action prominent and easy to use.
+/// The button changes appearance based on its state:
+/// - Off: Gray button with "Off" text
+/// - Armed: Gold button with "Capture" text  
+/// - Done: Green button with "Done" text (shows for 3 seconds)
+/// This provides clear visual feedback for the measurement process.
 /// 
 /// # Arguments
-/// * `capture_button_clicked` - Whether the capture button is currently active
+/// * `capture_state` - Current capture state (Off, Armed, Done)
 /// * `capture_message` - Message to send when the button is pressed
 /// 
 /// # Returns
 /// * `Element` - Large, prominently styled capture button
 fn make_capture_button(
-    capture_button_clicked: bool,
+    capture_state: crate::CaptureState,
     capture_message: crate::Message,
 ) -> Element<'static, crate::Message> 
 {
-    let color = if capture_button_clicked {
-        iced::Color::from_rgb(0.8, 0.2, 0.2) // Red when clicked
-    } else {
-        iced::Color::from_rgb(1.0, 0.84, 0.0) // Gold when not clicked
+    // Handle timer logic for "Done" state display
+    let should_show_done = {
+        let timer_guard = CAPTURE_DONE_TIMER.get_or_init(|| Mutex::new(None));
+        let mut timer = timer_guard.lock().unwrap();
+        
+        // Check if we should show "Done" based on timer
+        if let Some(start_time) = *timer {
+            let elapsed = start_time.elapsed();
+            if elapsed < Duration::from_secs(1) {
+                // Still within 2 seconds - show "Done"
+                true
+            } else {
+                // Timer expired - clear timer and don't show "Done"
+                *timer = None;
+                false
+            }
+        } else {
+            // No timer set - don't show "Done"
+            false
+        }
     };
     
-    button(text("Capture").size(18).width(Length::Fill))
+    let (text_label, color, message) = if should_show_done {
+        ("Done", iced::Color::from_rgb(0.2, 0.8, 0.2), capture_message) // Green
+    } else {
+        // Show normal button behavior based on actual state
+        match capture_state {
+            crate::CaptureState::Off => ("Off", iced::Color::from_rgb(0.5, 0.5, 0.5), capture_message), // Gray
+            crate::CaptureState::Armed => ("Off", iced::Color::from_rgb(0.5, 0.5, 0.5), capture_message), // Gray - ready to capture
+            crate::CaptureState::Capturing => ("Capturing", iced::Color::from_rgb(1.0, 0.84, 0.0), capture_message), // Gold
+            crate::CaptureState::Done => {
+                // This should not happen if main.rs logic is correct
+                ("Off", iced::Color::from_rgb(0.5, 0.5, 0.5), capture_message)
+            }
+        }
+    };
+    
+    button(text(text_label).size(18).width(Length::Fill))
         .padding([12, 20])
         .style(move |_theme, _status| {
             use iced::widget::button;
@@ -444,7 +469,7 @@ fn make_capture_button(
                 ..button::Style::default()
             }
         })
-        .on_press(capture_message)
+        .on_press(message)
         .into()
 }
 
