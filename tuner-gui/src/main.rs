@@ -21,14 +21,16 @@ use std::collections::VecDeque;
 use std::thread::{self, JoinHandle};
 use tuner_core::{
     audio, fft, pitch, tuning, AnalysisResult,
-    inharmonicity::{InharmonicityProfile, KeyMeasurement, Partial}
+    inharmonicity::InharmonicityProfile,
+    capture_processing::{self, ProcessingOperation}
 };
-use ui::main_display::{create_main_view, AppDisplayData};
+use ui::main_display::create_main_view;
 
 // Audio processing constants
 const SMOOTHING_FACTOR: usize = 5;  // Number of samples for cent smoothing
 const AMPLITUDE_THRESHOLD: f32 = 0.01;  // Minimum amplitude for pitch detection
-
+const STABILITY_TARGET: usize = 20; // Number of stable frames required for capture
+const STABILITY_CONFIDENCE_THRESHOLD: f32 = 0.9; // Confidence threshold for stability
 
 
 /// Main entry point for the Inharmonicity application.
@@ -58,7 +60,7 @@ pub enum Message {
     
     // --- Messages for Inharmonicity Measurement & Profile ---
     ToggleMeasurementMode,     // Toggle the partial measurement mode
-    CaptureMeasurement,        // Capture the current note's partials
+    CaptureButtonClicked,      // Capture button was clicked (behavior depends on current state)
     SaveProfile,               // Save the current inharmonicity profile
     LoadProfile,               // Load an inharmonicity profile from file
     // ----------------------------------------------
@@ -88,7 +90,7 @@ pub enum Message {
 /// Determines whether the application is in automatic pitch detection mode
 /// or manual key selection mode.
 #[derive(Debug, Clone, PartialEq)]
-enum TuningMode {
+pub enum TuningMode {
     /// Automatic pitch detection mode - detects any note being played
     Auto,
     /// Manual mode - user has selected a specific piano key to tune
@@ -97,6 +99,39 @@ enum TuningMode {
         note_name: String,    // Note name (e.g., "A4", "C#3")
         target_freq: f32,     // Target frequency in Hz
     },
+}
+
+/// State for the stability-gated capture system.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CaptureState {
+    Off,        // Not capturing
+    Armed,      // Ready to capture (button shows "Off")
+    Capturing,  // Actively capturing (button shows "Capturing")
+    Done,       // Capture is complete, data is being processed
+}
+
+
+/// UI-specific data needed for rendering the interface.
+/// 
+/// This struct contains only the data that the UI components need
+#[derive(Debug, Clone)]
+pub struct AppDisplayData {
+    // Audio state
+    pub audio_worker_active: bool,
+    pub last_analysis: Option<AnalysisResult>,
+    pub smoothing_buffer: Vec<f32>,
+    
+    // UI visibility states
+    pub spectrogram_visible: bool,
+    pub cent_meter_visible: bool,
+    pub key_select_visible: bool,
+    pub partials_visible: bool,
+    
+    // Tuning mode
+    pub tuning_mode: TuningMode,
+    
+    // Capture state
+    pub capture_state: CaptureState,
 }
 
 /// Main application state for the Inharmonicity piano tuner.
@@ -110,22 +145,13 @@ struct TunerApp {
     analysis_receiver: Option<Receiver<AnalysisResult>>,  // Channel to receive analysis results
     analysis_sender: Option<Sender<AnalysisResult>>,      // Channel to send analysis results
     
-    // Current analysis state
-    last_analysis: Option<AnalysisResult>,                // Most recent audio analysis
-    tuning_mode: TuningMode,                             // Current tuning mode
-    smoothing_buffer: VecDeque<f32>,                      // Buffer for cent smoothing
-    
     // --- New Inharmonicity State ---
-    in_measurement_mode: bool,
-    capture_button_clicked: bool,  // Track if capture button has been clicked
+    stability_buffer: VecDeque<AnalysisResult>, // Buffer for checking note stability
     inharmonicity_profile: InharmonicityProfile,
     // ---------------------------------
     
-    // UI visibility states
-    spectrogram_visible: bool,    // Show/hide spectrogram panel
-    cent_meter_visible: bool,     // Show/hide cent meter panel
-    key_select_visible: bool,     // Show/hide piano keyboard
-    partials_visible: bool,       // Show/hide partials panel
+    // Single source of truth for all display data
+    display_data: AppDisplayData,
 }
 
 /// Audio worker thread management structure.
@@ -154,19 +180,22 @@ impl Default for TunerApp {
             audio_worker: None,
             analysis_receiver: Some(analysis_rx),
             analysis_sender: Some(analysis_tx),
-            last_analysis: None,
-            smoothing_buffer: VecDeque::with_capacity(SMOOTHING_FACTOR),
-            tuning_mode: TuningMode::Auto,
             // --- Initialize new state ---
-            in_measurement_mode: false,
-            capture_button_clicked: false,
+            stability_buffer: VecDeque::with_capacity(STABILITY_TARGET),
             inharmonicity_profile: InharmonicityProfile::default(),
             // ----------------------------
-            // Initialize all tools as visible by default
-            spectrogram_visible: true,
-            cent_meter_visible: true,
-            key_select_visible: true,
-            partials_visible: true,
+            // Initialize display data
+            display_data: AppDisplayData {
+                audio_worker_active: false, // Will be set to true after audio starts
+                last_analysis: None,
+                smoothing_buffer: Vec::new(),
+                spectrogram_visible: true,
+                cent_meter_visible: true,
+                key_select_visible: true,
+                partials_visible: true,
+                tuning_mode: TuningMode::Auto,
+                capture_state: CaptureState::Off,
+            },
         };
         
         eprintln!("[MAIN] Starting audio processing...");
@@ -262,6 +291,8 @@ impl TunerApp {
                 shutdown_tx,
                 thread_handle: Some(thread_handle),
             });
+        // Update the display data to reflect that audio is active
+        self.display_data.audio_worker_active = true;
         }
     }
 
@@ -304,75 +335,71 @@ impl TunerApp {
             }
             Message::KeySelected(key_index) => {
                 // Check if the same key is already selected - if so, switch to auto mode
-                if let TuningMode::Manual { key_index: current_key, .. } = &self.tuning_mode {
+                if let TuningMode::Manual { key_index: current_key, .. } = &self.display_data.tuning_mode {
                     if *current_key == key_index {
                         // Same key clicked again - switch to auto mode
-                        self.tuning_mode = TuningMode::Auto;
-                        self.smoothing_buffer.clear();
+                        self.display_data.tuning_mode = TuningMode::Auto;
+                        self.display_data.smoothing_buffer.clear();
                         return;
                     }
                 }
                 
                 // Different key or not in manual mode - switch to manual mode with new key
                 let (note_name, target_freq) = tuning::find_nearest_note_by_index(key_index);
-                self.tuning_mode = TuningMode::Manual {
+                self.display_data.tuning_mode = TuningMode::Manual {
                     key_index,
                     note_name,
                     target_freq,
                 };
-                self.smoothing_buffer.clear();
+                self.display_data.smoothing_buffer.clear();
             }
             Message::SwitchToAutoMode => {
-                self.tuning_mode = TuningMode::Auto;
-                self.smoothing_buffer.clear();
+                self.display_data.tuning_mode = TuningMode::Auto;
+                self.display_data.smoothing_buffer.clear();
             }
             Message::ToggleMeasurementMode => {
-                self.in_measurement_mode = !self.in_measurement_mode;
-                self.capture_button_clicked = false; // Reset capture button state
-                eprintln!("[MAIN] Measurement mode set to: {}", self.in_measurement_mode);
-            }
-            Message::CaptureMeasurement => {
-                if !self.in_measurement_mode { return; }
-                
-                // Toggle capture button state
-                self.capture_button_clicked = !self.capture_button_clicked;
-                
-                if self.capture_button_clicked {
-                    // Only capture when button is being activated (not deactivated)
-                    if let Some(analysis) = &self.last_analysis {
-                        if let (Some(note_name), Some(freq)) = (&analysis.note_name, analysis.detected_frequency) {
-                            let key_index = tuning::get_key_index_from_name(note_name);
-
-                            // Create the fundamental partial (n=1)
-                            let mut all_partials = vec![Partial { number: 1, frequency: freq }];
-                            
-                            // Create the overtone partials (n=2, 3, 4...)
-                            let overtone_partials = analysis.partials.iter().enumerate()
-                                .map(|(i, &freq)| Partial {
-                                    number: (i + 2) as u32, // find_partials starts at the 2nd partial
-                                    frequency: freq,
-                                });
-                            all_partials.extend(overtone_partials);
-                            
-                            let mut measurement = KeyMeasurement {
-                                key_index,
-                                partials: all_partials,
-                                calculated_b: None,
-                            };
-                            
-                            // Calculate the 'B' value immediately
-                            measurement.calculate_b_value();
-                            
-                            eprintln!("[MAIN] Captured measurement for {}: B={:?}", note_name, measurement.calculated_b);
-                            
-                            // Store it in the profile
-                            self.inharmonicity_profile.measurements.insert(key_index, measurement);
-                        } else {
-                            eprintln!("[MAIN] Capture failed: No stable note detected.");
-                        }
+                // This toggles the measurement mode on/off
+                self.display_data.capture_state = match self.display_data.capture_state {
+                    CaptureState::Off => {
+                        eprintln!("[MAIN] Measurement mode ON - starting in Armed state");
+                        CaptureState::Armed  // Start in Armed state (ready to capture)
                     }
-                } else {
-                    eprintln!("[MAIN] Capture ended.");
+                    CaptureState::Armed => {
+                        eprintln!("[MAIN] Measurement mode OFF");
+                        self.stability_buffer.clear();
+                        CaptureState::Off
+                    }
+                    CaptureState::Capturing => {
+                        eprintln!("[MAIN] Measurement mode OFF (from Capturing)");
+                        self.stability_buffer.clear();
+                        CaptureState::Off
+                    }
+                    CaptureState::Done => {
+                        // If it's done, clicking again resets it
+                        eprintln!("[MAIN] Measurement mode OFF (from Done)");
+                        CaptureState::Off
+                    }
+                };
+            }
+            Message::CaptureButtonClicked => {
+                // This handles the capture button click behavior
+                match self.display_data.capture_state {
+                    CaptureState::Armed => {
+                        eprintln!("[MAIN] Capture button clicked - starting capture");
+                        self.display_data.capture_state = CaptureState::Capturing;
+                    }
+                    CaptureState::Capturing => {
+                        eprintln!("[MAIN] Capture button clicked - stopping capture");
+                        self.display_data.capture_state = CaptureState::Armed;
+                    }
+                    CaptureState::Done => {
+                        eprintln!("[MAIN] Capture button clicked - resetting to Off");
+                        self.display_data.capture_state = CaptureState::Off;
+                    }
+                    CaptureState::Off => {
+                        eprintln!("[MAIN] Capture button clicked - but not in measurement mode");
+                        // Do nothing - button shouldn't be visible in Off state
+                    }
                 }
             }
             Message::SaveProfile => {
@@ -408,65 +435,115 @@ impl TunerApp {
                 // Placeholder for tuning profile settings
             }
             Message::ToggleSpectrogram => {
-                eprintln!("[MAIN] Toggling spectrogram visibility: {} -> {}", self.spectrogram_visible, !self.spectrogram_visible);
-                self.spectrogram_visible = !self.spectrogram_visible;
+                eprintln!("[MAIN] Toggling spectrogram visibility: {} -> {}", self.display_data.spectrogram_visible, !self.display_data.spectrogram_visible);
+                self.display_data.spectrogram_visible = !self.display_data.spectrogram_visible;
             }
             Message::ToggleCentMeter => {
-                eprintln!("[MAIN] Toggling cent meter visibility: {} -> {}", self.cent_meter_visible, !self.cent_meter_visible);
-                self.cent_meter_visible = !self.cent_meter_visible;
+                eprintln!("[MAIN] Toggling cent meter visibility: {} -> {}", self.display_data.cent_meter_visible, !self.display_data.cent_meter_visible);
+                self.display_data.cent_meter_visible = !self.display_data.cent_meter_visible;
             }
             Message::ToggleKeySelect => {
-                eprintln!("[MAIN] Toggling key select visibility: {} -> {}", self.key_select_visible, !self.key_select_visible);
-                self.key_select_visible = !self.key_select_visible;
+                eprintln!("[MAIN] Toggling key select visibility: {} -> {}", self.display_data.key_select_visible, !self.display_data.key_select_visible);
+                self.display_data.key_select_visible = !self.display_data.key_select_visible;
             }
             Message::TogglePartials => {
-                eprintln!("[MAIN] Toggling partials visibility: {} -> {}", self.partials_visible, !self.partials_visible);
-                self.partials_visible = !self.partials_visible;
+                eprintln!("[MAIN] Toggling partials visibility: {} -> {}", self.display_data.partials_visible, !self.display_data.partials_visible);
+                self.display_data.partials_visible = !self.display_data.partials_visible;
             }
             Message::Tick => {
                 // Continuous update - poll for audio data
                 if let Some(receiver) = &self.analysis_receiver {
+                    // --- REFACTORED: Delegate result processing ---
+                    // Collect all results first to avoid borrowing conflicts
+                    let mut results = Vec::new();
                     while let Ok(result) = receiver.try_recv() {
-                        let cents_for_smoothing = match self.tuning_mode {
-                            TuningMode::Auto => result.cents_deviation,
-                            TuningMode::Manual { target_freq, .. } => result
-                                .detected_frequency
-                                .map(|freq| tuning::calculate_cents_deviation(freq, target_freq)),
-                        };
-                        if let Some(cents) = cents_for_smoothing {
-                            self.smoothing_buffer.push_back(cents);
-                            if self.smoothing_buffer.len() > SMOOTHING_FACTOR {
-                                self.smoothing_buffer.pop_front();
-                            }
-                        } else {
-                            self.smoothing_buffer.clear();
-                        }
-                        self.last_analysis = Some(result);
+                        results.push(result);
                     }
+                    // Process all collected results
+                    for result in results {
+                        self.process_analysis_result(result);
+                    }
+                    // ---------------------------------------------
+                }
+
+                // --- State reset after capture processing ---
+                if self.display_data.capture_state == CaptureState::Done {
+                    // Reset state after capture is processed
+                    eprintln!("[MAIN] Capture complete. Resetting state to Armed.");
+                    self.display_data.capture_state = CaptureState::Armed;
                 }
             }
         }
     }
+
+    // --- ADDED: New helper function to process analysis results ---
+    /// Processes a single AnalysisResult received from the audio thread.
+    ///
+    /// This function runs on the GUI thread and updates the application state
+    /// based on the new analysis data. It handles:
+    /// - Updating the stability buffer for capture
+    /// - Triggering the capture process when stable
+    /// - Updating the cent smoothing buffer
+    /// - Storing the latest analysis result
+    fn process_analysis_result(&mut self, result: AnalysisResult) {
+        // --- Stability-Gated Capture Logic ---
+        if self.display_data.capture_state == CaptureState::Capturing {
+            self.stability_buffer.push_back(result.clone()); // Clone for stability check
+
+            if self.stability_buffer.len() > STABILITY_TARGET {
+                self.stability_buffer.pop_front();
+            }
+
+            if self.stability_buffer.len() == STABILITY_TARGET {
+                if check_stability(&self.stability_buffer) {
+                    eprintln!("[MAIN] STABILITY DETECTED! Capturing...");
+                    self.display_data.capture_state = CaptureState::Done;
+                    // Convert stability buffer to Vec and process it
+                    let stability_data: Vec<AnalysisResult> = self.stability_buffer.drain(..).collect();
+                    // Call the processing function with the stability buffer using default operation
+                    if let Some(measurement) = capture_processing::process(stability_data, ProcessingOperation::BestConfidence) {
+                        // Store the measurement in the profile
+                        self.inharmonicity_profile
+                            .measurements
+                            .insert(measurement.key_index, measurement);
+                    }
+                    // Initialize the "Done" timer for visual feedback
+                    ui::main_display::initialize_done_timer();
+                }
+            }
+        }
+        // --- End Capture Logic ---
+
+        // --- Smoothing Buffer Logic ---
+        let cents_for_smoothing = match self.display_data.tuning_mode {
+            TuningMode::Auto => result.cents_deviation,
+            TuningMode::Manual { target_freq, .. } => result
+                .detected_frequency
+                .map(|freq| tuning::calculate_cents_deviation(freq, target_freq)),
+        };
+        if let Some(cents) = cents_for_smoothing {
+            self.display_data.smoothing_buffer.push(cents);
+            if self.display_data.smoothing_buffer.len() > SMOOTHING_FACTOR {
+                self.display_data.smoothing_buffer.remove(0);
+            }
+        } else {
+            self.display_data.smoothing_buffer.clear();
+        }
+        
+        // --- Store Last Analysis ---
+        self.display_data.last_analysis = Some(result); // Move the original result
+    }
+    // ----------------------------------------------------------------
 
     /// Renders the main application interface.
     /// 
     /// Delegates all UI rendering to the main_display module,
     /// keeping this function focused on application logic only.
     fn view(&self) -> Element<'_, Message> {
-        let display_data = AppDisplayData {
-            audio_worker_active: self.audio_worker.is_some(),
-            last_analysis: self.last_analysis.clone(),
-            smoothing_buffer: self.smoothing_buffer.iter().cloned().collect(),
-            spectrogram_visible: self.spectrogram_visible,
-            cent_meter_visible: self.cent_meter_visible,
-            key_select_visible: self.key_select_visible,
-            partials_visible: self.partials_visible,
-            tuning_mode: self.tuning_mode.clone(),
-            in_measurement_mode: self.in_measurement_mode,
-            capture_button_clicked: self.capture_button_clicked,
-        };
-
-        create_main_view(&display_data, &(), Message::CaptureMeasurement)
+        create_main_view(
+            &self.display_data, 
+            Message::CaptureButtonClicked
+        )
     }
     
     /// Creates a subscription for continuous application updates.
@@ -543,6 +620,37 @@ fn perform_analysis(
         spectrogram_data,
         partials,
     }
+}
+
+/// Checks if all AnalysisResult frames in the buffer are "stable."
+///
+/// Stability is defined as:
+/// 1. The buffer is not empty.
+/// 2. All frames have a `note_name` that is `Some` and is the *same* note.
+/// 3. All frames have a `confidence` that is `Some` and is above the `STABILITY_CONFIDENCE_THRESHOLD`.
+fn check_stability(buffer: &VecDeque<AnalysisResult>) -> bool {
+    if buffer.is_empty() {
+        return false;
+    }
+
+    // Get the note name from the first frame. If it's None, it's not stable.
+    let first_note = match &buffer[0].note_name {
+        Some(n) => n,
+        None => return false,
+    };
+
+    // Use `iter().all()` to efficiently check every frame against the criteria.
+    buffer.iter().all(|frame| {
+        // 1. Check confidence
+        let high_confidence = frame
+            .confidence
+            .map_or(false, |c| c > STABILITY_CONFIDENCE_THRESHOLD);
+
+        // 2. Check for matching note name
+        let matching_note = frame.note_name.as_ref().map_or(false, |n| n == first_note);
+
+        high_confidence && matching_note
+    })
 }
 
 // --- New Profile Save/Load Functions ---
