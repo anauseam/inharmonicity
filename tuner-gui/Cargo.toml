@@ -8,16 +8,19 @@ edition = "2024"
 tuner-core = { path = "../tuner-core" }
 
 # Iced is a popular choice for GUIs in Rust
-iced = { version = "0.13.1", features = ["canvas", "tokio", "advanced"] }
-cpal = { workspace = true }
+iced = { version = "0.14.0", features = ["canvas", "tokio", "advanced"] }
+
 
 
 # For running audio on a separate thread and communicating
-crossbeam-channel = "0.5.15"
+cpal = { workspace = true }
+ringbuf = { workspace = true }
+crossbeam-channel = { workspace = true }
+
 
 # For profile saving and loading
 serde = { workspace = true }
 serde_json = { workspace = true }
 
-anyhow = "1.0.100" # For easier error handling
+anyhow = "1.0.102" # For easier error handling
 

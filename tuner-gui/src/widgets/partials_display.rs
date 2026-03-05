@@ -4,8 +4,7 @@
 //! It dynamically lists the frequency of each detected partial using a Canvas,
 //! consistent with other widgets in the application.
 
-use iced::widget::canvas::{self, Frame, Geometry, Text};
-use iced::widget::container;
+use iced::widget::canvas::{self, Canvas, Frame, Geometry, Text};
 use iced::{Element, Point, Rectangle, Renderer, Theme};
 
 /// Represents the state and view logic for the partials display panel.
@@ -24,16 +23,11 @@ impl PartialsDisplay {
     }
 
     /// Creates the view element for the partials display.
-    /// 
-    /// This method consumes the PartialsDisplay instance to create an Iced Element
-    /// that can be embedded in the GUI layout.
-    pub fn view(self) -> Element<'static, super::super::Message> {
-        container(
-            canvas::Canvas::new(self)
-                .width(iced::Length::Fill)
-                .height(iced::Length::Fill),
-        )
-        .into()
+    pub fn view(self) -> Element<'static, crate::Message> {
+        Canvas::new(self)
+            .width(iced::Length::Fill)
+            .height(iced::Length::Fill)
+            .into()
     }
 }
 
@@ -59,8 +53,8 @@ impl<Message> canvas::Program<Message> for PartialsDisplay {
                 position: frame.center(),
                 color: text_color,
                 size: 14.0.into(),
-                horizontal_alignment: iced::alignment::Horizontal::Center,
-                vertical_alignment: iced::alignment::Vertical::Center,
+                align_x: iced::alignment::Horizontal::Center.into(),
+                align_y: iced::alignment::Vertical::Center.into(),
                 ..Text::default()
             };
             frame.fill_text(placeholder);
@@ -71,7 +65,8 @@ impl<Message> canvas::Program<Message> for PartialsDisplay {
             let padding: f32 = 15.0;
 
             // Draw each partial's information
-            for (i, &freq) in self.partials.iter().enumerate().take(8) { // Limit to 8 to fit
+            for (i, &freq) in self.partials.iter().enumerate().take(8) {
+                // Limit to 8 to fit
                 let y = start_y + (i as f32 * line_height);
 
                 // Draw "Partial X" on the left
@@ -80,8 +75,8 @@ impl<Message> canvas::Program<Message> for PartialsDisplay {
                     position: Point::new(padding, y),
                     color: text_color,
                     size: 14.0.into(),
-                    horizontal_alignment: iced::alignment::Horizontal::Left,
-                    vertical_alignment: iced::alignment::Vertical::Top,
+                    align_x: iced::alignment::Horizontal::Left.into(),
+                    align_y: iced::alignment::Vertical::Top.into(),
                     ..Text::default()
                 };
                 frame.fill_text(partial_label);
@@ -92,8 +87,8 @@ impl<Message> canvas::Program<Message> for PartialsDisplay {
                     position: Point::new(bounds.width - padding, y),
                     color: text_color,
                     size: 14.0.into(),
-                    horizontal_alignment: iced::alignment::Horizontal::Right,
-                    vertical_alignment: iced::alignment::Vertical::Top,
+                    align_x: iced::alignment::Horizontal::Right.into(),
+                    align_y: iced::alignment::Vertical::Top.into(),
                     ..Text::default()
                 };
                 frame.fill_text(freq_label);
@@ -103,4 +98,3 @@ impl<Message> canvas::Program<Message> for PartialsDisplay {
         vec![frame.into_geometry()]
     }
 }
-

@@ -4,6 +4,14 @@
 
 An open source professional-grade piano tuning application built in Rust with real-time audio analysis, spectrogram visualization, and interactive piano keyboard interface. Designed for professional piano tuners with planned support for inharmonicity compensation via advanced tuning algorithms.
 
+> [!TIP]
+> **Graphics Issues? Check Your Vulkan Drivers**
+>
+> This application uses `iced` with the `wgpu` backend (Vulkan on Linux). If you experience
+> invisible widgets, flickering, or blank panels, the most common cause is stale or
+> incompatible Vulkan drivers. Ensure your GPU drivers are fully up-to-date before
+> reporting rendering bugs.
+
 ## Features
 
 ### Core Functionality
@@ -47,14 +55,23 @@ inharmonicity/
 │   │   └── lib.rs       # Core library exports and public API
 │   └── Cargo.toml
 ├── tuner-gui/           # Iced-based GUI application
+│   ├── examples/        # Standalone GUI tests and visual sandboxes
+│   │   ├── shared/mod.rs         # Shared audio testing utility
+│   │   ├── dashboard_test.rs     # Composite widget area integration test
+│   │   ├── spectrogram_test.rs   # Isolated spectrogram widget test
+│   │   └── cent_meter_test.rs    # Isolated cent meter widget test
 │   ├── src/
-│   │   ├── main.rs      # Main application and event handling
-│   │   └── ui/          # Modular GUI components and layout
-│   │       ├── mod.rs           # UI module declarations
-│   │       ├── main_display.rs  # Main layout and panel management
-│   │       ├── cent_meter.rs    # Cent deviation meter widget
+│   │   ├── main.rs      # Binary entry point
+│   │   ├── lib.rs       # Crate configuration
+│   │   ├── app.rs       # Main application state and audio integration
+│   │   ├── views.rs     # Views module declaration
+│   │   ├── views/       # Layouts orchestrating multiple components
+│   │   │   └── main_view.rs      # Main composed layout (widgets + sidebar)
+│   │   ├── widgets.rs   # Widgets module declaration
+│   │   └── widgets/     # Independent UI drawing components
+│   │       ├── cent_meter.rs     # Cent deviation meter widget
 │   │       ├── piano_keyboard.rs # Interactive piano keyboard
-│   │       ├── spectrogram.rs   # Frequency spectrum visualization
+│   │       ├── spectrogram.rs    # Frequency spectrum visualization
 │   │       └── partials_display.rs # Harmonic partials display
 │   └── Cargo.toml
 └── Cargo.toml           # Workspace configuration
@@ -63,9 +80,10 @@ inharmonicity/
 ### Threading Model
 
 - **GUI Thread**: Main Iced application thread handling user interface
-- **Audio Thread**: Dedicated thread for audio capture and analysis
-- **Communication**: Crossbeam channels for thread-safe data exchange
-- **Real-time Processing**: ~46ms update intervals for smooth visualization
+- **Audio Thread (System)**: Real-time system audio lock-free extraction from capture device
+- **Audio Processing Thread**: Dedicated worker polling audio data and running expensive DSP operations
+- **Communication**: Lock-free asynchronous `ringbuf` transfers from audio to processing threads; standard `crossbeam` channels transfer `AnalysisResult` data back to the GUI
+- **Real-time Processing**: Fast 5ms buffer polling loop providing fluid ~46ms GUI update intervals
 
 ## 🚀 Getting Started
 
@@ -91,7 +109,7 @@ cargo run -p tuner-gui
 
 ### Dependencies
 
-- **Iced 0.13.1**: Modern Rust GUI framework with canvas support
+- **Iced 0.14.0**: Modern Rust GUI framework with canvas support
 - **CPAL 0.16.0**: Cross-platform audio library
 - **RustFFT 6.4.1**: High-performance FFT implementation
 - **Crossbeam-channel 0.5.15**: Lock-free concurrent data structures
@@ -125,16 +143,6 @@ The application features a professional layout with:
 5. **Control Sidebar**: Tool visibility toggles and settings
 6. **Measurement Mode**: Automatic capturing of stable note sustain
 
-## ⚠️ Known Issues
-
-### Segfault on Exit (Linux Graphics Driver Issue)
-
-**Issue**: The application segfaults when the window is closed on Linux systems.
-
-**Root Cause**: This is a **known issue with the graphics driver cleanup chain**, specifically in the EGL/Wayland/OpenGL cleanup sequence. The segfault occurs in the graphics driver cleanup, not in the application code itself.
-
-**Status**: This is a system-level graphics driver issue, not a bug in the application. The application functions correctly for its intended purpose.
-
 ## 📝 License
 
 This project is licensed under the terms specified in the LICENSE file.
@@ -156,7 +164,3 @@ For technical support or bug reports, please include:
 - Graphics driver information
 - Audio system details (ALSA/PulseAudio)
 - Complete error logs if applicable
-
----
-
-**Note**: The segfault on exit is a known graphics driver issue and does not affect the core functionality of the application. The tuning tools work perfectly during runtime.

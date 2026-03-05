@@ -1,10 +1,10 @@
 //! # Piano Keyboard Widget
-//! 
+//!
 //! This module provides an interactive 88-key piano keyboard widget
 //! for piano tuning applications. It displays a visual representation
 //! of the piano keyboard with clickable keys and visual feedback
 //! for detected and selected notes.
-//! 
+//!
 //! ## Features
 //! - 88-key piano keyboard visualization
 //! - Interactive key selection
@@ -12,9 +12,8 @@
 //! - Professional piano appearance
 //! - Click-to-select functionality
 
-use iced::widget::canvas::{self, event, Event, Fill, Geometry, Path, Stroke};
-use iced::widget::container;
-use iced::{mouse, Color, Element, Point, Rectangle, Renderer, Size, Theme};
+use iced::widget::canvas::{self, Canvas, Event, Fill, Geometry, Path, Stroke};
+use iced::{Color, Element, Point, Rectangle, Renderer, Size, Theme, mouse};
 
 /// Number of white keys on an 88-key piano.
 const WHITE_KEY_COUNT: usize = 52;
@@ -28,7 +27,7 @@ const IS_BLACK: [bool; 12] = [
 ];
 
 /// Interactive piano keyboard widget for note selection and visualization.
-/// 
+///
 /// This widget displays a full 88-key piano keyboard with visual feedback
 /// for detected notes and user-selected keys. It supports click-to-select
 /// functionality for manual tuning mode.
@@ -42,7 +41,7 @@ pub struct PianoKeyboard {
 
 impl PianoKeyboard {
     /// Creates a new piano keyboard widget.
-    /// 
+    ///
     /// # Arguments
     /// * `detected_key_index` - Currently detected key from audio analysis (0-87)
     /// * `selected_key_index` - User-selected key from mouse clicks (0-87)
@@ -53,29 +52,16 @@ impl PianoKeyboard {
         }
     }
 
-    /// Creates the view element for the piano keyboard.
-    /// 
-    /// This method consumes the PianoKeyboard instance to create an Iced Element
-    /// that can be embedded in the GUI layout.
-    pub fn view(self) -> Element<'static, super::super::Message> {
-        container(
-            canvas::Canvas::new(self)
-                .width(iced::Length::Fill)
-                .height(iced::Length::Fixed(120.0)),
-        )
-        .into()
-    }
-
     /// Determines which piano key was clicked based on mouse position.
-    /// 
+    ///
     /// Calculates the key index (0-87) from a mouse click position on the keyboard.
     /// Handles both white and black keys, with black keys taking priority since
     /// they are drawn on top. Returns the key index if a valid key was clicked.
-    /// 
+    ///
     /// # Arguments
     /// * `bounds` - Size of the keyboard widget
     /// * `pos` - Mouse click position within the keyboard bounds
-    /// 
+    ///
     /// # Returns
     /// * `Some(u8)` - Key index (0-87) if a key was clicked
     /// * `None` - If click was outside any key area
@@ -118,32 +104,42 @@ impl PianoKeyboard {
         }
         None
     }
+
+    /// Creates the view element for the piano keyboard.
+    ///
+    /// This method consumes the PianoKeyboard instance to create an Iced Element
+    /// that can be embedded in the GUI layout.
+    pub fn view(self) -> Element<'static, crate::Message> {
+        Canvas::new(self)
+            .width(iced::Length::Fill)
+            .height(iced::Length::Fixed(120.0))
+            .into()
+    }
 }
 
 impl<Message> canvas::Program<Message> for PianoKeyboard
 where
-    Message: From<super::super::Message>,
+    Message: From<crate::Message>,
 {
     type State = ();
 
     fn update(
         &self,
         _state: &mut Self::State,
-        event: Event,
+        event: &Event,
         bounds: Rectangle,
         cursor: mouse::Cursor,
-    ) -> (event::Status, Option<Message>) {
+    ) -> Option<iced::widget::canvas::Action<Message>> {
         if let Some(position) = cursor.position_in(bounds) {
             if let Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) = event {
                 if let Some(key_index) = self.key_index_from_pos(bounds.size(), position) {
-                    return (
-                        event::Status::Captured,
-                        Some(super::super::Message::KeySelected(key_index).into()),
-                    );
+                    return Some(iced::widget::canvas::Action::publish(
+                        crate::Message::KeySelected(key_index).into(),
+                    ));
                 }
             }
         }
-        (event::Status::Ignored, None)
+        None
     }
 
     fn draw(
