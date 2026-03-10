@@ -2,7 +2,11 @@
 use crossbeam_channel::{Receiver, unbounded};
 use ringbuf::traits::{Consumer, Observer, Split};
 use std::thread;
-use tuner_core::{AnalysisResult, audio, fft, pitch, tuning};
+use tuner_core::{
+    AnalysisResult,
+    algorithms::{fft, pitch, tuning},
+    audio,
+};
 
 /// Starts a background audio thread that captures microphone input,
 /// processes it through the entire FFT and pitch detection pipeline,
@@ -26,6 +30,12 @@ pub fn start_audio_feed() -> Receiver<AnalysisResult> {
         let mut audio_frame = Vec::with_capacity(audio::BUFFER_SIZE);
         let amplitude_threshold = 0.01;
 
+        let mut planner = rustfft::FftPlanner::new();
+        let fft_instance = planner.plan_fft_forward(audio::BUFFER_SIZE);
+        let mut complex_buffer =
+            vec![rustfft::num_complex::Complex { re: 0.0, im: 0.0 }; audio::BUFFER_SIZE];
+        let mut time_buffer = vec![0.0; audio::BUFFER_SIZE / 2];
+
         loop {
             if consumer.occupied_len() >= audio::BUFFER_SIZE {
                 audio_frame.clear();
@@ -33,12 +43,16 @@ pub fn start_audio_feed() -> Receiver<AnalysisResult> {
                 consumer.pop_slice(&mut audio_frame);
 
                 // Replicate the main app's analysis pipeline
-                let complex_spectrum = fft::perform_fft(&audio_frame);
-                let spectrogram_data = fft::spectrum_to_magnitudes(&complex_spectrum);
+                fft::perform_fft(&audio_frame, &mut complex_buffer, &fft_instance);
+                let spectrogram_data = fft::spectrum_to_magnitudes(&complex_buffer);
 
                 let (detected_frequency, confidence) = if let Some((freq, conf)) =
-                    pitch::detect_pitch_pyin(&audio_frame, sample_rate, amplitude_threshold)
-                {
+                    pitch::detect_pitch_pyin(
+                        &audio_frame,
+                        sample_rate,
+                        amplitude_threshold,
+                        &mut time_buffer,
+                    ) {
                     let refined_freq =
                         pitch::refine_from_spectrum(&spectrogram_data, freq, sample_rate);
                     (refined_freq, Some(conf))

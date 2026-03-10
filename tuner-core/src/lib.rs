@@ -5,12 +5,14 @@
 //! and inharmonicity calculations. It is completely headless
 //! and contains no GUI code.
 
+pub mod algorithms;
 pub mod audio;
 pub mod capture_processing;
-pub mod fft;
+pub mod engine;
+pub mod gatekeeper;
 pub mod inharmonicity;
-pub mod pitch;
-pub mod tuning;
+pub mod pipeline;
+pub mod worker;
 
 /// Represents the result of a single audio analysis frame.
 // This derive is necessary for the struct to be used in the `CustomEvent` enum.

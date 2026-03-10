@@ -330,7 +330,11 @@ fn create_keyboard_panel(
         .last_analysis
         .as_ref()
         .and_then(|analysis| analysis.note_name.as_ref())
-        .and_then(|name| Some(tuner_core::tuning::get_key_index_from_name(name)));
+        .and_then(|name| {
+            Some(tuner_core::algorithms::tuning::get_key_index_from_name(
+                name,
+            ))
+        });
 
     let selected_key_index = match &data.tuning_mode {
         crate::app::TuningMode::Manual { key_index, .. } => Some(*key_index),
