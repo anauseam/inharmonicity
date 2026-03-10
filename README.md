@@ -77,13 +77,48 @@ inharmonicity/
 └── Cargo.toml           # Workspace configuration
 ```
 
+### Global Data Structures & Memory Management
+
+To maintain real-time performance without relying on OS priority elevation, the system completely avoids dynamic heap allocation (`std::thread::spawn`, `Vec::push`, etc.) during runtime by using pre-allocated, lock-free structures:
+
+- **The Elastic Ring Buffer:** A massive lock-free circular buffer (e.g., 16,384 samples) connecting Thread 1 and Thread 2. It acts as an elastic shock absorber; if the OS briefly suspends the processing thread, the audio stream can still safely dump samples into the buffer without dropping data.
+- **Lock-Free Object Pool:** A pre-allocated pool of fixed-size arrays (each large enough to hold 1.5 seconds of audio at 44,100 Hz). If capture mode is enabled, Thread 2 borrows an array to record a stable note and passes the reference to the background worker, which returns it to the pool when finished.
+
 ### Threading Model
 
-- **GUI Thread**: Main Iced application thread handling user interface
-- **Audio Thread (System)**: Real-time system audio lock-free extraction from capture device
-- **Audio Processing Thread**: Dedicated worker polling audio data and running expensive DSP operations
-- **Communication**: Lock-free asynchronous `ringbuf` transfers from audio to processing threads; standard `crossbeam` channels transfer `AnalysisResult` data back to the GUI
-- **Real-time Processing**: Fast 5ms buffer polling loop providing fluid ~46ms GUI update intervals
+#### Thread 1: The Audio Stream (The Harvester)
+
+- **Role:** High-speed hardware ingestor.
+- **Action:** Continuously captures raw audio from the microphone at 44,100 Hz. It immediately pushes all incoming samples directly into the Elastic Ring Buffer.
+- **Rule:** This thread performs zero math, zero allocations, and does no analysis. Its only job is to guarantee pristine data throughput.
+
+#### Thread 2: The Audio Processing Pipeline (The Brains)
+
+This thread constantly consumes data from the Elastic Ring Buffer and executes a deterministic DSP pipeline to calculate the fundamental frequency ($f_0$).
+
+- **The Gatekeeper (Signal Validator & 4-State Logic):** An always-running traffic cop monitoring the $f_0$ stream. It outputs a discrete `SignalState` to the UI, holding the last reliable note for 1.5 seconds to prevent visual flickering. When "Capture Mode" is enabled, it utilizes 4-state logic to control the 1.5-second capture window:
+  - *State 1 & 2 (Attack/Transient):* Uses Complex Spectral Difference (CSD) to detect the broadband noise of the hammer strike, instituting a hard delay to ignore the chaotic transient.
+  - *State 3 (Stability Gating):* Uses the NINOS2 (Normalized Identification of Note Onset based on Spectral Sparsity) metric to monitor the signal. Because NINOS2 measures structural spectral sparsity, it completely ignores the volume swells caused by unison beating, successfully identifying the "Golden Window" of pure harmonic decay.
+  - *State 4 (Timeout):* Caps the capture at 1.5 seconds to prevent flat-lining pitch drift, closing the gate, recycling the buffer, and dispatching the payload to Thread 3.
+- **The Scout:** Applies a Hann or Hamming window to a 2048-sample buffer to eliminate spectral leakage, then runs a Real FFT to find an accurate rough frequency neighborhood.
+- **The Router & Dual Engines:**
+  - *Bass Engine (< 150 Hz):* Instructs the ring buffer to pull an 8192-sample window (necessary for long bass wavelengths). It applies an anti-aliasing filter, decimates the audio, and runs the pYIN algorithm. The Hidden Markov Model within pYIN effectively prevents the octave errors that plague stiff, copper-wound bass strings.
+  - *Treble Engine (> 150 Hz):* Uses the standard 2048-sample window. It features two toggleable modes. For professional use, it seeds a Digital Phase-Locked Loop (DPLL) with the Scout's frequency, using a Proportional-Integral filter to lock tightly onto the string's phase. For educational use, it utilizes a Quadratic Interpolated FFT (QIFFT) to demonstrate highly accurate frequency-domain sub-bin peak detection.
+- **Output:** Pushes the sub-cent accurate $f_0$ float to the UI thread via a lock-free channel.
+
+#### Thread 3: The Background Worker (The Heavy Lifter)
+
+- **Role:** A single detached worker thread pre-allocated at application launch.
+- **Action:** When the Gatekeeper conditionally triggers a capture, the sleeping worker receives the 1.5-second audio array from the Object Pool. It offers two toggleable algorithms for calculating the inharmonicity coefficient ($B$):
+  - *Professional Mode:* Runs the Median-Adjustive Trajectories (MAT) algorithm. MAT uses extremely narrow frequency bands to iteratively adjust its trajectory, finding the true inharmonic partials with extreme computational efficiency and precision.
+  - *Educational Mode:* Runs an Inharmonic Comb Filter (ICF), which sweeps a grid of values to align the "teeth" of a comb filter with the stretched partials, providing a highly intuitive visual representation of piano stiffness.
+- **Output:** Sends the $B$ coefficient to the UI thread and recycles the audio array back into the Object Pool.
+
+#### Thread 4: The UI Thread (The Visual Renderer)
+
+- **Role:** The graphical interface operating at 60 FPS.
+- **Action:** Consumes the high-speed stream of $f_0$ floats from Thread 2 to drive the instantaneous tuning visualizer (strobe, cents-deviation, or dial).
+- **Background Duty:** When it receives a new $B$ coefficient from Thread 3, it applies a Bayesian moving average to prevent measurement jitter. It then recalculates the 88-key Railsback tuning curve in the background, smoothly adjusting the target pitches for the user.
 
 ## 🚀 Getting Started
 

@@ -1,11 +1,12 @@
+//! [DEPRECATED - Slated for REMOVAL]
 //! # Capture Processing Module
 //!
 //! Handles the processing of captured audio analysis frames for inharmonicity measurement.
 //! This module provides different processing strategies for analyzing stable audio frames.
 
 use crate::{
+    algorithms::tuning,
     inharmonicity::{KeyMeasurement, Partial},
-    tuning,
 };
 
 /// Different processing operations that can be performed on captured frames
@@ -14,7 +15,7 @@ pub enum ProcessingOperation {
     /// Find the frame with the highest confidence (default strategy)
     BestConfidence,
     /// Average all frames (future implementation)
-    Average
+    Average,
 }
 
 /// Processes captured frames using the specified operation strategy.
@@ -31,7 +32,10 @@ pub enum ProcessingOperation {
 ///
 /// # Returns
 /// * `Option<KeyMeasurement>` - The processed measurement if successful, None otherwise
-pub fn process(buffer: Vec<crate::AnalysisResult>, operation: ProcessingOperation) -> Option<KeyMeasurement> {
+pub fn process(
+    buffer: Vec<crate::AnalysisResult>,
+    operation: ProcessingOperation,
+) -> Option<KeyMeasurement> {
     match operation {
         ProcessingOperation::BestConfidence => process_best_confidence(buffer),
         ProcessingOperation::Average => {
@@ -49,15 +53,13 @@ pub fn process(buffer: Vec<crate::AnalysisResult>, operation: ProcessingOperatio
 /// 3. Calculates the 'B' value for the measurement
 fn process_best_confidence(buffer: Vec<crate::AnalysisResult>) -> Option<KeyMeasurement> {
     // 1. Find the frame with the highest confidence
-    let best_frame = buffer
-        .iter()
-        .max_by(|a, b| {
-            let conf_a = a.confidence.unwrap_or(0.0);
-            let conf_b = b.confidence.unwrap_or(0.0);
-            conf_a
-                .partial_cmp(&conf_b)
-                .unwrap_or(std::cmp::Ordering::Less)
-        });
+    let best_frame = buffer.iter().max_by(|a, b| {
+        let conf_a = a.confidence.unwrap_or(0.0);
+        let conf_b = b.confidence.unwrap_or(0.0);
+        conf_a
+            .partial_cmp(&conf_b)
+            .unwrap_or(std::cmp::Ordering::Less)
+    });
 
     if let Some(best_frame) = best_frame {
         // 2. Use this frame to perform the capture logic
@@ -73,14 +75,15 @@ fn process_best_confidence(buffer: Vec<crate::AnalysisResult>) -> Option<KeyMeas
             }];
 
             // Create the overtone partials (n=2, 3, 4...)
-            let overtone_partials = best_frame
-                .partials
-                .iter()
-                .enumerate()
-                .map(|(i, &freq)| Partial {
-                    number: (i + 2) as u32, // find_partials starts at the 2nd partial
-                    frequency: freq,
-                });
+            let overtone_partials =
+                best_frame
+                    .partials
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &freq)| Partial {
+                        number: (i + 2) as u32, // find_partials starts at the 2nd partial
+                        frequency: freq,
+                    });
             all_partials.extend(overtone_partials);
 
             // 3. Create and 4. Calculate 'B' value

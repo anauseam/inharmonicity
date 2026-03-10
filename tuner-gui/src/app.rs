@@ -18,11 +18,11 @@ use ringbuf::traits::{Consumer, Observer, Split};
 use std::collections::VecDeque;
 use std::thread::{self, JoinHandle};
 use tuner_core::{
-    AnalysisResult, audio,
+    AnalysisResult,
+    algorithms::{fft, pitch, tuning},
+    audio,
     capture_processing::{self, ProcessingOperation},
-    fft,
     inharmonicity::InharmonicityProfile,
-    pitch, tuning,
 };
 
 // Audio processing constants
@@ -263,6 +263,11 @@ impl TunerApp {
                 std::thread::sleep(std::time::Duration::from_millis(100));
 
                 let mut audio_frame = Vec::with_capacity(audio::BUFFER_SIZE);
+                let mut planner = rustfft::FftPlanner::new();
+                let fft_instance = planner.plan_fft_forward(audio::BUFFER_SIZE);
+                let mut complex_buffer =
+                    vec![rustfft::num_complex::Complex { re: 0.0, im: 0.0 }; audio::BUFFER_SIZE];
+                let mut yin_buffer = vec![0.0; audio::BUFFER_SIZE / 2];
 
                 loop {
                     // 1. Check for shutdown signal non-blocking
@@ -280,22 +285,31 @@ impl TunerApp {
                         audio_frame.resize(audio::BUFFER_SIZE, 0.0);
                         consumer.pop_slice(&mut audio_frame);
                         // Add error handling for analysis
-                        let result = match std::panic::catch_unwind(|| {
-                            perform_analysis(&audio_frame, sample_rate)
-                        }) {
-                            Ok(result) => result,
-                            Err(_) => {
-                                eprintln!("[AUDIO-THREAD] Analysis panicked, using default result");
-                                AnalysisResult {
-                                    detected_frequency: None,
-                                    confidence: None,
-                                    cents_deviation: None,
-                                    note_name: None,
-                                    spectrogram_data: vec![],
-                                    partials: vec![],
+                        let result =
+                            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                perform_analysis(
+                                    &audio_frame,
+                                    sample_rate,
+                                    &mut complex_buffer,
+                                    &mut yin_buffer,
+                                    &fft_instance,
+                                )
+                            })) {
+                                Ok(result) => result,
+                                Err(_) => {
+                                    eprintln!(
+                                        "[AUDIO-THREAD] Analysis panicked, using default result"
+                                    );
+                                    AnalysisResult {
+                                        detected_frequency: None,
+                                        confidence: None,
+                                        cents_deviation: None,
+                                        note_name: None,
+                                        spectrogram_data: vec![],
+                                        partials: vec![],
+                                    }
                                 }
-                            }
-                        };
+                            };
 
                         if analysis_tx.send(result).is_err() {
                             eprintln!("[AUDIO-THREAD] Failed to send analysis result");
@@ -638,13 +652,19 @@ impl TunerApp {
 /// # Returns
 /// * `AnalysisResult` - Complete analysis including frequency, confidence,
 ///   cents deviation, note name, spectrogram data, and detected partials
-fn perform_analysis(audio_frame: &[f32], sample_rate: u32) -> AnalysisResult {
-    let complex_spectrum = fft::perform_fft(audio_frame);
-    let spectrogram_data = fft::spectrum_to_magnitudes(&complex_spectrum);
+fn perform_analysis(
+    audio_frame: &[f32],
+    sample_rate: u32,
+    complex_buffer: &mut [rustfft::num_complex::Complex<f32>],
+    yin_buffer: &mut [f32],
+    fft_instance: &std::sync::Arc<dyn rustfft::Fft<f32>>,
+) -> AnalysisResult {
+    fft::perform_fft(audio_frame, complex_buffer, fft_instance);
+    let spectrogram_data = fft::spectrum_to_magnitudes(complex_buffer);
 
     // --- Unpack the frequency and confidence ---
     let (detected_frequency, confidence) = if let Some((freq, conf)) =
-        pitch::detect_pitch_pyin(audio_frame, sample_rate, AMPLITUDE_THRESHOLD)
+        pitch::detect_pitch_pyin(audio_frame, sample_rate, AMPLITUDE_THRESHOLD, yin_buffer)
     {
         let refined_freq = pitch::refine_from_spectrum(&spectrogram_data, freq, sample_rate);
         (refined_freq, Some(conf))
