@@ -265,9 +265,12 @@ impl TunerApp {
                 let mut audio_frame = Vec::with_capacity(audio::BUFFER_SIZE);
                 let mut planner = rustfft::FftPlanner::new();
                 let fft_instance = planner.plan_fft_forward(audio::BUFFER_SIZE);
-                let mut complex_buffer =
-                    vec![rustfft::num_complex::Complex { re: 0.0, im: 0.0 }; audio::BUFFER_SIZE];
                 let mut yin_buffer = vec![0.0; audio::BUFFER_SIZE / 2];
+
+                // Initialize Gatekeeper for realtime testing
+                let audio_pool = std::sync::Arc::new(crossbeam_queue::ArrayQueue::new(4));
+                let mut gatekeeper = tuner_core::gatekeeper::Gatekeeper::new(audio_pool);
+                let mut test_frame = tuner_core::pipeline::ProcessingFrame::new();
 
                 loop {
                     // 1. Check for shutdown signal non-blocking
@@ -284,13 +287,17 @@ impl TunerApp {
                         // Pop exactly BUFFER_SIZE samples from the ring buffer
                         audio_frame.resize(audio::BUFFER_SIZE, 0.0);
                         consumer.pop_slice(&mut audio_frame);
+
+                        // Feed samples to Gatekeeper's testing frame
+                        test_frame.audio_buffer[..audio::BUFFER_SIZE].copy_from_slice(&audio_frame);
+
                         // Add error handling for analysis
                         let result =
                             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 perform_analysis(
                                     &audio_frame,
                                     sample_rate,
-                                    &mut complex_buffer,
+                                    &mut test_frame.frequency_buffer[..],
                                     &mut yin_buffer,
                                     &fft_instance,
                                 )
@@ -310,6 +317,19 @@ impl TunerApp {
                                     }
                                 }
                             };
+
+                        // Inject Gatekeeper Test Hook
+                        let prev_state = gatekeeper.current_state.clone();
+                        gatekeeper.process_frame(&test_frame);
+                        if gatekeeper.current_state != prev_state {
+                            eprintln!(
+                                "[GATEKEEPER] Transition: {:?} -> {:?} (CSD Dly: {}, Stable Cnt: {})",
+                                prev_state,
+                                gatekeeper.current_state,
+                                gatekeeper.transient_delay_counter,
+                                gatekeeper.stable_counter
+                            );
+                        }
 
                         if analysis_tx.send(result).is_err() {
                             eprintln!("[AUDIO-THREAD] Failed to send analysis result");
@@ -656,7 +676,7 @@ fn perform_analysis(
     audio_frame: &[f32],
     sample_rate: u32,
     complex_buffer: &mut [rustfft::num_complex::Complex<f32>],
-    yin_buffer: &mut [f32],
+    time_buffer: &mut [f32],
     fft_instance: &std::sync::Arc<dyn rustfft::Fft<f32>>,
 ) -> AnalysisResult {
     fft::perform_fft(audio_frame, complex_buffer, fft_instance);
@@ -664,7 +684,7 @@ fn perform_analysis(
 
     // --- Unpack the frequency and confidence ---
     let (detected_frequency, confidence) = if let Some((freq, conf)) =
-        pitch::detect_pitch_pyin(audio_frame, sample_rate, AMPLITUDE_THRESHOLD, yin_buffer)
+        pitch::detect_pitch_pyin(audio_frame, sample_rate, AMPLITUDE_THRESHOLD, time_buffer)
     {
         let refined_freq = pitch::refine_from_spectrum(&spectrogram_data, freq, sample_rate);
         (refined_freq, Some(conf))

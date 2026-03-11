@@ -96,10 +96,12 @@ To maintain real-time performance without relying on OS priority elevation, the 
 
 This thread constantly consumes data from the Elastic Ring Buffer and executes a deterministic DSP pipeline to calculate the fundamental frequency ($f_0$).
 
-- **The Gatekeeper (Signal Validator & 4-State Logic):** An always-running traffic cop monitoring the $f_0$ stream. It outputs a discrete `SignalState` to the UI, holding the last reliable note for 1.5 seconds to prevent visual flickering. When "Capture Mode" is enabled, it utilizes 4-state logic to control the 1.5-second capture window:
-  - *State 1 & 2 (Attack/Transient):* Uses Complex Spectral Difference (CSD) to detect the broadband noise of the hammer strike, instituting a hard delay to ignore the chaotic transient.
-  - *State 3 (Stability Gating):* Uses the NINOS2 (Normalized Identification of Note Onset based on Spectral Sparsity) metric to monitor the signal. Because NINOS2 measures structural spectral sparsity, it completely ignores the volume swells caused by unison beating, successfully identifying the "Golden Window" of pure harmonic decay.
-  - *State 4 (Timeout):* Caps the capture at 1.5 seconds to prevent flat-lining pitch drift, closing the gate, recycling the buffer, and dispatching the payload to Thread 3.
+- **The Gatekeeper (Signal Validator & 5-State Logic):** An always-running traffic cop monitoring the $f_0$ stream. It outputs a discrete `SignalState` to the UI, holding the last reliable note for 1.5 seconds to prevent visual flickering. When "Capture Mode" is enabled, it utilizes a perfect 5-stage state machine to control the 1.5-second capture window:
+  - *State 0 (IDLE / Silence Gating):* Uses a dynamic RMS baseline with Exponential Moving Average (EMA) to completely ignore background room noise and momentary unison beating volume dips. Bypasses heavy DSP.
+  - *State 1 (ATTACK):* Uses Complex Spectral Difference (CSD) to detect the massive positive derivative spike of the hammer strike.
+  - *State 2 (TRANSIENT):* Institutes a hard delay waiting for the chaotic broadband noise of the strike to physically decay.
+  - *State 3 (HARMONIC DECAY):* Uses the NINOS2 (Normalized Identification of Note Onset based on Spectral Sparsity) metric to monitor the signal. It ignores volume swells and identifies the "Golden Window" of pure, stable harmonic decay for capture.
+  - *State 4 (RELEASE):* Caps the capture at 1.5 seconds to prevent flat-lining pitch drift, closing the gate, recycling the buffer, dispatching the payload to Thread 3, and immediately resets to State 0.
 - **The Scout:** Applies a Hann or Hamming window to a 2048-sample buffer to eliminate spectral leakage, then runs a Real FFT to find an accurate rough frequency neighborhood.
 - **The Router & Dual Engines:**
   - *Bass Engine (< 150 Hz):* Instructs the ring buffer to pull an 8192-sample window (necessary for long bass wavelengths). It applies an anti-aliasing filter, decimates the audio, and runs the pYIN algorithm. The Hidden Markov Model within pYIN effectively prevents the octave errors that plague stiff, copper-wound bass strings.
