@@ -3,122 +3,63 @@
 //! This module contains the main display components and layout logic
 //! for the Inharmonicity piano tuning application.
 
+use crate::utils::view_utils::{
+    ButtonConfig, ButtonType, make_capture_button, make_sidebar_section,
+};
+use crate::widgets::{cent_meter, partials_display, piano_keyboard, spectrogram};
 use iced::widget::{Space, button, column, container, row, text};
 use iced::{Alignment, Element, Fill, Length};
-use std::time::{Duration, Instant};
 
-/// Local timer state for managing "Done" button display
-use std::sync::Mutex;
-use std::sync::OnceLock;
+const TOOLS_CONFIG: [ButtonConfig; 5] = [
+    ButtonConfig {
+        label: "Spectrogram",
+        message: Some(crate::Message::ToggleSpectrogram),
+        button_type: ButtonType::Standard,
+    },
+    ButtonConfig {
+        label: "Centmeter",
+        message: Some(crate::Message::ToggleCentMeter),
+        button_type: ButtonType::Standard,
+    },
+    ButtonConfig {
+        label: "Key select",
+        message: Some(crate::Message::ToggleKeySelect),
+        button_type: ButtonType::Standard,
+    },
+    ButtonConfig {
+        label: "Partials",
+        message: Some(crate::Message::TogglePartials),
+        button_type: ButtonType::Standard,
+    },
+    // ButtonConfig {
+    //     label: "Inharmonicity Graph",
+    //     message: Some(crate::Message::ToggleInharmonicityGraph),
+    //     button_type: ButtonType::Standard,
+    // },
+    ButtonConfig {
+        label: "Measurement Mode",
+        message: Some(crate::Message::ToggleMeasurementMode),
+        button_type: ButtonType::MeasurementMode,
+    },
+];
 
-use crate::widgets::{cent_meter, partials_display, piano_keyboard, spectrogram};
+const PROGRAM_CONFIG: [ButtonConfig; 2] = [
+    ButtonConfig {
+        label: "Save Profile",
+        message: Some(crate::Message::SaveProfile),
+        button_type: ButtonType::Standard,
+    },
+    ButtonConfig {
+        label: "Load Profile",
+        message: Some(crate::Message::LoadProfile),
+        button_type: ButtonType::Standard,
+    },
+];
 
-static CAPTURE_DONE_TIMER: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
-
-/// Initializes the "Done" timer when capture completes.
-/// This should be called when the capture state changes to Done.
-pub fn initialize_done_timer() {
-    let timer_guard = CAPTURE_DONE_TIMER.get_or_init(|| Mutex::new(None));
-    let mut timer = timer_guard.lock().unwrap();
-    *timer = Some(Instant::now());
-}
-
-/// Configuration for a single button in the settings sidebar
-#[derive(Debug, Clone)]
-struct ButtonConfig {
-    label: &'static str,
-    message: Option<crate::Message>,
-    button_type: ButtonType,
-}
-
-/// Different types of buttons with their styling requirements
-#[derive(Debug, Clone)]
-enum ButtonType {
-    /// Standard button with no special styling
-    Standard,
-    /// Measurement mode button that changes color when active
-    MeasurementMode,
-    /// Disabled button (no interaction)
-    Disabled,
-}
-
-/// Static settings configuration - no need for a function
-const SETTINGS_CONFIG: &[(&str, &[ButtonConfig])] = &[
-    (
-        "Tools",
-        &[
-            ButtonConfig {
-                label: "Spectrogram",
-                message: Some(crate::Message::ToggleSpectrogram),
-                button_type: ButtonType::Standard,
-            },
-            ButtonConfig {
-                label: "Centmeter",
-                message: Some(crate::Message::ToggleCentMeter),
-                button_type: ButtonType::Standard,
-            },
-            ButtonConfig {
-                label: "Key select",
-                message: Some(crate::Message::ToggleKeySelect),
-                button_type: ButtonType::Standard,
-            },
-            ButtonConfig {
-                label: "Partials",
-                message: Some(crate::Message::TogglePartials),
-                button_type: ButtonType::Standard,
-            },
-            // ButtonConfig {
-            //     label: "Inharmonicity Graph",
-            //     message: Some(crate::Message::ToggleInharmonicityGraph),
-            //     button_type: ButtonType::Standard,
-            // },
-            ButtonConfig {
-                label: "Measurement Mode",
-                message: Some(crate::Message::ToggleMeasurementMode),
-                button_type: ButtonType::MeasurementMode,
-            },
-        ],
-    ),
-    (
-        "Systemic change",
-        &[
-            ButtonConfig {
-                label: "Temperament",
-                message: None,
-                button_type: ButtonType::Disabled,
-            },
-            ButtonConfig {
-                label: "Tuning Standard",
-                message: None,
-                button_type: ButtonType::Disabled,
-            },
-            ButtonConfig {
-                label: "Inharmonic curve adjustment",
-                message: None,
-                button_type: ButtonType::Disabled,
-            },
-        ],
-    ),
-    (
-        "Program",
-        &[
-            ButtonConfig {
-                label: "Sample Buffer adjustment",
-                message: None,
-                button_type: ButtonType::Disabled,
-            },
-            ButtonConfig {
-                label: "Save Profile",
-                message: Some(crate::Message::SaveProfile),
-                button_type: ButtonType::Standard,
-            },
-            ButtonConfig {
-                label: "Load Profile",
-                message: Some(crate::Message::LoadProfile),
-                button_type: ButtonType::Standard,
-            },
-        ],
-    ),
+/// Static main sidebar configuration
+const MAIN_SIDEBAR_CONFIG: [(&str, &[ButtonConfig]); 2] = [
+    ("Tools", TOOLS_CONFIG.as_slice()),
+    ("Program", PROGRAM_CONFIG.as_slice()),
 ];
 
 /// Creates the complete main application view
@@ -444,10 +385,28 @@ fn create_sidebar(
 ) -> Element<'static, crate::Message> {
     let mut sections = column![].spacing(10);
 
+    // Add Settings button at the top
+    let settings_button = button(text("Settings").size(16).width(Fill))
+        .padding([10, 15])
+        .style(|_theme, _status| {
+            use iced::widget::button;
+            button::Style {
+                background: Some(iced::Background::Color(iced::Color::from_rgb(
+                    0.5, 1.0, 0.83,
+                ))), // Aquamarine
+                text_color: iced::Color::BLACK,
+                ..button::Style::default()
+            }
+        })
+        .on_press(crate::Message::ToggleSettingsView);
+
+    sections = sections.push(settings_button);
+    sections = sections.push(Space::new().height(10));
+
     // Add all settings sections
-    for (title, buttons) in SETTINGS_CONFIG {
+    for (title, buttons) in MAIN_SIDEBAR_CONFIG {
         let in_measurement_mode = capture_state != crate::app::CaptureState::Off;
-        sections = sections.push(make_settings_section(title, buttons, in_measurement_mode));
+        sections = sections.push(make_sidebar_section(title, buttons, in_measurement_mode));
     }
 
     // Add capture button if in measurement mode
@@ -461,170 +420,4 @@ fn create_sidebar(
         .into()
 }
 
-/// Creates a button based on configuration and application state.
-///
-/// Generates a styled button widget based on the provided configuration.
-/// Applies different visual styles based on button type (Standard, MeasurementMode, Disabled)
-/// and current application state. Measurement mode buttons change color when active,
-/// while disabled buttons are grayed out and non-interactive.
-///
-/// # Arguments
-/// * `config` - Button configuration containing label, message, and type
-/// * `in_measurement_mode` - Whether the application is in measurement mode
-///
-/// # Returns
-/// * `Element` - Styled button widget with appropriate message handler
-fn make_button(
-    config: &ButtonConfig,
-    in_measurement_mode: bool,
-) -> Element<'static, crate::Message> {
-    let mut button = button(text(config.label).size(14).width(Fill)).padding([6, 10]);
-
-    // Apply styling based on button type and state
-    match config.button_type {
-        ButtonType::Standard => {
-            // No special styling needed
-        }
-        ButtonType::MeasurementMode => {
-            if in_measurement_mode {
-                button = button.style(|_theme, _status| {
-                    use iced::widget::button;
-                    button::Style {
-                        background: Some(iced::Background::Color(iced::Color::from_rgb(
-                            0.8, 0.2, 0.2,
-                        ))), // Red background
-                        text_color: iced::Color::WHITE,
-                        ..button::Style::default()
-                    }
-                });
-            }
-        }
-        ButtonType::Disabled => {
-            button = button.style(|_theme, _status| {
-                use iced::widget::button;
-                button::Style {
-                    background: Some(iced::Background::Color(iced::Color::from_rgb(
-                        0.3, 0.3, 0.3,
-                    ))), // Gray background
-                    text_color: iced::Color::from_rgb(0.6, 0.6, 0.6), // Gray text
-                    ..button::Style::default()
-                }
-            });
-        }
-    }
-
-    // Add message handler if available
-    if let Some(message) = &config.message {
-        button.on_press(message.clone()).into()
-    } else {
-        button.into()
-    }
-}
-
-/// Creates a large Capture button for measurement mode.
-///
-/// Generates a special large capture button that appears only in measurement mode.
-/// The button changes appearance based on its state:
-/// - Off: Gray button with "Off" text
-/// - Armed: Gold button with "Capture" text  
-/// - Done: Green button with "Done" text (shows for 3 seconds)
-/// This provides clear visual feedback for the measurement process.
-///
-/// # Arguments
-/// * `capture_state` - Current capture state (Off, Armed, Done)
-/// * `capture_message` - Message to send when the button is pressed
-///
-/// # Returns
-/// * `Element` - Large, prominently styled capture button
-fn make_capture_button(
-    capture_state: crate::app::CaptureState,
-    capture_message: crate::Message,
-) -> Element<'static, crate::Message> {
-    // Handle timer logic for "Done" state display
-    let should_show_done = {
-        let timer_guard = CAPTURE_DONE_TIMER.get_or_init(|| Mutex::new(None));
-        let mut timer = timer_guard.lock().unwrap();
-
-        // Check if we should show "Done" based on timer
-        if let Some(start_time) = *timer {
-            let elapsed = start_time.elapsed();
-            if elapsed < Duration::from_secs(1) {
-                // Still within 1 second - show "Done"
-                true
-            } else {
-                // Timer expired - clear timer and don't show "Done"
-                *timer = None;
-                false
-            }
-        } else {
-            // No timer set - don't show "Done"
-            false
-        }
-    };
-
-    let (text_label, color, _pulsing) = if should_show_done {
-        ("Done", iced::Color::from_rgb(0.2, 0.8, 0.2), false) // Green
-    } else {
-        // Show normal button behavior based on actual state
-        match capture_state {
-            // When off, display "Off" and slightly dim the button.
-            crate::app::CaptureState::Off => ("Off", iced::Color::from_rgb(0.5, 0.5, 0.5), false),
-            // When armed, display Armed and use a neutral or slightly distinct color...
-            crate::app::CaptureState::Armed => {
-                ("Armed", iced::Color::from_rgb(0.8, 0.6, 0.2), false)
-            } // Orange-ish
-            // When actively capturing (waiting for stability), indicate progress.
-            crate::app::CaptureState::Capturing => {
-                ("Capturing...", iced::Color::from_rgb(0.8, 0.2, 0.2), true)
-            } // Red and pulsing
-            // When done, show confirmed status. (A timer elsewhere resets this to Armed).
-            crate::app::CaptureState::Done => {
-                ("Done!", iced::Color::from_rgb(0.2, 0.8, 0.2), false)
-            } // Green
-        }
-    };
-
-    button(text(text_label).size(18).width(Fill))
-        .padding([12, 20])
-        .style(move |_theme, _status| {
-            use iced::widget::button;
-            button::Style {
-                background: Some(iced::Background::Color(color)),
-                text_color: iced::Color::WHITE,
-                ..button::Style::default()
-            }
-        })
-        .on_press(capture_message)
-        .into()
-}
-
-/// Creates a settings section with title and buttons.
-///
-/// Builds a grouped section of the settings sidebar with a title and
-/// a vertical list of buttons. Each section represents a logical grouping
-/// of related controls (e.g., "Tools", "Systemic change", "Program").
-/// The buttons within each section are styled according to their type
-/// and the current application state.
-///
-/// # Arguments
-/// * `title` - Section title (e.g., "Tools", "Program")
-/// * `buttons` - Array of button configurations for this section
-/// * `in_measurement_mode` - Whether the application is in measurement mode
-///
-/// # Returns
-/// * `Element` - Complete settings section with title and button list
-fn make_settings_section(
-    title: &'static str,
-    buttons: &[ButtonConfig],
-    in_measurement_mode: bool,
-) -> Element<'static, crate::Message> {
-    let title_widget = text(title).size(18);
-
-    let items_widget = buttons.iter().fold(column![].spacing(8), |col, config| {
-        col.push(make_button(config, in_measurement_mode))
-    });
-
-    column![title_widget, Space::new().height(10), items_widget]
-        .spacing(5)
-        .into()
-}
+// End of file
