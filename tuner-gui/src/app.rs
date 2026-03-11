@@ -10,7 +10,8 @@
 //! - **Communication**: Crossbeam channels for thread-safe data exchange
 //! - **Updates**: 60 FPS continuous updates via subscription system
 
-use crate::views::main_view::create_main_view;
+use crate::utils::view_utils::initialize_done_timer;
+use crate::views::{main_view::create_main_view, settings_view::create_settings_view};
 use cpal::traits::StreamTrait;
 use crossbeam_channel::{Receiver, Sender};
 use iced::{self, Element, Subscription, Theme};
@@ -87,6 +88,9 @@ pub enum Message {
     TogglePartials,    // Show/hide partials panel
     // ToggleInharmonicityGraph, // Show/hide inharmonicity graph
 
+    // Toggle main view versus settings view
+    ToggleSettingsView,
+
     // Continuous update message
     Tick, // Timer tick for real-time updates
 }
@@ -132,6 +136,9 @@ pub struct AppDisplayData {
     pub key_select_visible: bool,
     pub partials_visible: bool,
     // pub inharmonicity_graph_visible: bool,
+
+    // View state
+    pub settings_view_visible: bool,
 
     // Tuning mode
     pub tuning_mode: TuningMode,
@@ -199,6 +206,7 @@ impl Default for TunerApp {
                 key_select_visible: true,
                 partials_visible: true,
                 // inharmonicity_graph_visible: true,
+                settings_view_visible: false,
                 tuning_mode: TuningMode::Auto,
                 capture_state: CaptureState::Off,
             },
@@ -523,6 +531,7 @@ impl TunerApp {
                 );
                 self.display_data.partials_visible = !self.display_data.partials_visible;
             }
+
             // Message::ToggleInharmonicityGraph => {
             //     eprintln!(
             //         "[MAIN] Toggling inharmonicity graph visibility: {} -> {}",
@@ -532,6 +541,14 @@ impl TunerApp {
             //     self.display_data.inharmonicity_graph_visible =
             //         !self.display_data.inharmonicity_graph_visible;
             // }
+            Message::ToggleSettingsView => {
+                eprintln!(
+                    "[MAIN] Toggling settings view visibility: {} -> {}",
+                    self.display_data.settings_view_visible,
+                    !self.display_data.settings_view_visible
+                );
+                self.display_data.settings_view_visible = !self.display_data.settings_view_visible;
+            }
             Message::Tick => {
                 // Continuous update - poll for audio data
                 if let Some(receiver) = &self.analysis_receiver {
@@ -594,7 +611,7 @@ impl TunerApp {
                             .insert(measurement.key_index, measurement);
                     }
                     // Initialize the "Done" timer for visual feedback
-                    crate::views::main_view::initialize_done_timer();
+                    initialize_done_timer();
                 }
             }
         }
@@ -626,11 +643,15 @@ impl TunerApp {
     /// Delegates all UI rendering to the main_display module,
     /// keeping this function focused on application logic only.
     pub fn view(&self) -> Element<'_, Message> {
-        create_main_view(
-            &self.display_data,
-            &self.inharmonicity_profile,
-            Message::CaptureButtonClicked,
-        )
+        if self.display_data.settings_view_visible {
+            create_settings_view(&self.display_data)
+        } else {
+            create_main_view(
+                &self.display_data,
+                &self.inharmonicity_profile,
+                Message::CaptureButtonClicked,
+            )
+        }
     }
 
     /// Creates a subscription for continuous application updates.
