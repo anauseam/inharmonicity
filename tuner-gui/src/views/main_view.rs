@@ -143,7 +143,7 @@ pub fn create_main_view(
     let sidebar = create_sidebar(data.capture_state.clone(), capture_message);
 
     // Assemble the final layout
-    let main_content = row![widget_area, Space::new().width(10), sidebar,]
+    let main_content = row![sidebar, Space::new().width(10), widget_area,]
         .align_y(Alignment::Start)
         .padding(20);
 
