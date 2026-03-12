@@ -44,45 +44,114 @@ An open source professional-grade piano tuning application built in Rust with re
 
 ```text
 inharmonicity/
-├── tuner-core/          # Audio processing and analysis engine
+├── tuner-core/                     # Headless audio processing & analysis (no GUI code)
 │   ├── src/
-│   │   ├── audio.rs     # CPAL audio capture and stream management
-│   │   ├── fft.rs       # FFT processing and spectrum analysis
-│   │   ├── pitch.rs     # stateless pYIN pitch detection algorithm
-│   │   ├── tuning.rs    # Musical note calculations and cent deviation, inharmonicity curve calculation
-│   │   ├── inharmonicity.rs        # Inharmonicity constant calculation and profile management
-│   │   ├── capture_processing.rs   # Audio frame processing strategies for inharmonicity measurement
-│   │   └── lib.rs       # Core library exports and public API
+│   │   ├── algorithms/             # Stateless DSP building blocks
+│   │   │   ├── fft.rs              # FFT windowing and spectrum analysis
+│   │   │   ├── pitch.rs            # pYIN pitch detection
+│   │   │   ├── power.rs            # RMS, EMA, CSD, NINOS2 calculations
+│   │   │   └── tuning.rs           # Note mapping, cent deviation, inharmonicity curves
+│   │   ├── pipeline.rs             # AudioPipeline mediator, shared state types, memory pools
+│   │   ├── engine.rs               # F0 Engine — Scout / Bass / Treble DSP (wireframe)
+│   │   ├── gatekeeper.rs           # 5-state signal validator (DSP, no shared state)
+│   │   ├── worker.rs               # Background worker manager for heavy offline DSP (wireframe)
+│   │   ├── audio.rs                # CPAL audio capture and stream management
+│   │   ├── inharmonicity.rs        # Inharmonicity constant calculation and profiles
+│   │   ├── capture_processing.rs   # Legacy frame processing (deprecated — see migration note)
+│   │   └── lib.rs                  # Crate root and AnalysisResult definition
 │   └── Cargo.toml
-├── tuner-gui/           # Iced-based GUI application
-│   ├── examples/        # Standalone GUI tests and visual sandboxes
-│   │   ├── shared/mod.rs         # Shared audio testing utility
-│   │   ├── dashboard_test.rs     # Composite widget area integration test
-│   │   ├── spectrogram_test.rs   # Isolated spectrogram widget test
-│   │   └── cent_meter_test.rs    # Isolated cent meter widget test
+├── tuner-gui/                      # Iced-based GUI frontend
+│   ├── examples/                   # Standalone visual sandboxes
+│   │   ├── shared/mod.rs           # Shared audio testing utility
+│   │   ├── dashboard_test.rs       # Composite widget area integration test
+│   │   ├── spectrogram_test.rs     # Isolated spectrogram widget test
+│   │   └── cent_meter_test.rs      # Isolated cent meter widget test
 │   ├── src/
-│   │   ├── main.rs      # Binary entry point
-│   │   ├── lib.rs       # Crate configuration
-│   │   ├── app.rs       # Main application state and audio integration
-│   │   ├── views.rs     # Views module declaration
-│   │   ├── views/       # Layouts orchestrating multiple components
-│   │   │   └── main_view.rs      # Main composed layout (widgets + sidebar)
-│   │   ├── widgets.rs   # Widgets module declaration
-│   │   └── widgets/     # Independent UI drawing components
-│   │       ├── cent_meter.rs     # Cent deviation meter widget
-│   │       ├── piano_keyboard.rs # Interactive piano keyboard
-│   │       ├── spectrogram.rs    # Frequency spectrum visualization
-│   │       └── partials_display.rs # Harmonic partials display
+│   │   ├── main.rs                 # Binary entry point
+│   │   ├── lib.rs                  # Crate configuration
+│   │   ├── app.rs                  # Application state, audio thread, message loop
+│   │   ├── views/                  # Layouts orchestrating multiple components
+│   │   │   ├── main_view.rs        # Main composed layout (widgets + sidebar)
+│   │   │   └── settings_view.rs    # Settings layout (noise floor, envelope viewer)
+│   │   ├── widgets/                # Independent UI drawing components
+│   │   │   ├── cent_meter.rs       # Cent deviation meter
+│   │   │   ├── envelope.rs         # RMS envelope viewer (time-domain)
+│   │   │   ├── partials_display.rs # Harmonic partials display
+│   │   │   ├── piano_keyboard.rs   # Interactive 88-key piano
+│   │   │   └── spectrogram.rs      # Frequency spectrum visualization
+│   │   └── utils/                  # Shared UI helpers (sidebar, timers)
 │   └── Cargo.toml
-└── Cargo.toml           # Workspace configuration
+└── Cargo.toml                      # Workspace configuration
 ```
+
+### The AudioPipeline (Mediator Pattern)
+
+The `tuner-core` crate is designed to be **frontend-agnostic**. Any GUI (Iced, egui, WASM, etc.) can consume it through the `AudioPipeline` — the single entry point that orchestrates all DSP components and manages cross-thread shared state.
+
+```text
+AudioPipeline::new()  →  (AudioPipeline, PipelineHandle)
+        │                         │
+        ▼                         ▼
+    Audio Thread              Frontend Thread
+    ┌─────────────────┐       ┌──────────────┐
+    │ Engine (F0 DSP) │       │ config       │ ← read/write (silence threshold, etc.)
+    │       ↓         │       │ runtime      │ ← read-only  (current RMS EMA, etc.)
+    │ Gatekeeper      │       └──────────────┘
+    │   (5-state SM)  │              ↑
+    │       ↓         │              │ polls via Arc<Mutex<...>>
+    │ SharedState ────────────────────
+    │       ↓ capture trigger
+    │ AudioPool ──────────┐
+    └─────────────────┘   │
+                          ▼
+                    Worker Thread(s)
+                    ┌──────────────────┐
+                    │ MAT / ICF        │ ← heavy offline DSP
+                    │ (B coefficient)  │
+                    └────────┬─────────┘
+                             │ returns buffer
+                             ▼
+                         AudioPool (recycled)
+```
+
+This follows the **Split / Handle pattern** (the same convention used by `crossbeam_channel`, `ringbuf::split()`, `std::thread::spawn`):
+
+- **`AudioPipeline`** is moved to the audio thread. It owns the pure DSP components (`Engine`, `Gatekeeper`) and is the **only** thing that touches `Arc<Mutex<...>>` shared state. After calling each DSP component's `process_frame()`, the pipeline reads their public fields and syncs observations to shared state.
+- **`PipelineHandle`** is kept by the frontend. It provides `Arc<Mutex<...>>` handles for:
+  - `config` — reading and writing configuration values (e.g., silence threshold)
+  - `runtime` — polling runtime observations (e.g., smoothed RMS for the Envelope Viewer)
+
+A frontend contributor just calls `AudioPipeline::new()`, gets a `PipelineHandle`, and never needs to know about Gatekeeper internals, EMA calculations, or lock management.
+
+The pipeline also manages the **`WorkerManager`** (`worker.rs`), which owns a single dedicated background thread for computationally expensive offline DSP. When the Gatekeeper's 5-state machine triggers a capture (State 4: RELEASE), the pipeline dispatches a 1.5-second audio buffer from the `AudioPool` to the worker thread. The worker runs heavy algorithms (MAT or ICF) to calculate the inharmonicity coefficient ($B$), sends the result to the frontend, and recycles the buffer back to the pool. A single thread is sufficient because captures are infrequent (one stable note at a time) and the algorithms are fast enough to complete before the next capture could arrive.
+
+> [!IMPORTANT]
+> **Migration Status**
+>
+> The unified `AudioPipeline` system is partially implemented:
+>
+> | Component | Status |
+> | --- | --- |
+> | `pipeline.rs` — AudioPipeline mediator + shared state | ✅ Implemented |
+> | `gatekeeper.rs` — 5-state signal validator (pure DSP) | ✅ Implemented |
+> | `engine.rs` — F0 Engine (Scout / Bass / Treble) | ⬜ Wireframe |
+> | `worker.rs` — Background worker (single thread) | ⬜ Wireframe |
+> | Pipeline fully encapsulates all output | ⬜ In progress |
+>
+> **Currently**, `app.rs` still calls algorithm functions directly (FFT, YIN, tuning)
+> and uses the legacy `capture_processing` module. The `AudioPipeline` is live for
+> Gatekeeper orchestration and shared state (RMS / threshold), while the `Engine`
+> and `Worker` are scaffolded for future integration. As the migration completes,
+> `app.rs` will reduce to a thin `pipeline.process_frame()` call with zero
+> knowledge of DSP internals.
 
 ### Global Data Structures & Memory Management
 
 To maintain real-time performance without relying on OS priority elevation, the system completely avoids dynamic heap allocation (`std::thread::spawn`, `Vec::push`, etc.) during runtime by using pre-allocated, lock-free structures:
 
 - **The Elastic Ring Buffer:** A massive lock-free circular buffer (e.g., 16,384 samples) connecting Thread 1 and Thread 2. It acts as an elastic shock absorber; if the OS briefly suspends the processing thread, the audio stream can still safely dump samples into the buffer without dropping data.
-- **Lock-Free Object Pool:** A pre-allocated pool of fixed-size arrays (each large enough to hold 1.5 seconds of audio at 44,100 Hz). If capture mode is enabled, Thread 2 borrows an array to record a stable note and passes the reference to the background worker, which returns it to the pool when finished.
+- **Lock-Free Object Pool (`AudioPool`):** A pre-allocated pool of fixed-size arrays (each large enough to hold 1.5 seconds of audio at 44,100 Hz). If capture mode is enabled, Thread 2 borrows an array to record a stable note and passes the reference to the background worker, which returns it to the pool when finished.
+- **`ProcessingFrame`:** Thread-local scratch buffers (audio, time-domain, frequency-domain) for zero-allocation per-frame DSP.
 
 ### Threading Model
 
@@ -94,7 +163,7 @@ To maintain real-time performance without relying on OS priority elevation, the 
 
 #### Thread 2: The Audio Processing Pipeline (The Brains)
 
-This thread constantly consumes data from the Elastic Ring Buffer and executes a deterministic DSP pipeline to calculate the fundamental frequency ($f_0$).
+This thread constantly consumes data from the Elastic Ring Buffer and executes a deterministic DSP pipeline via `AudioPipeline.process_frame()` to calculate the fundamental frequency ($f_0$).
 
 - **The Gatekeeper (Signal Validator & 5-State Logic):** An always-running traffic cop monitoring the $f_0$ stream. It outputs a discrete `SignalState` to the UI, holding the last reliable note for 1.5 seconds to prevent visual flickering. When "Capture Mode" is enabled, it utilizes a perfect 5-stage state machine to control the 1.5-second capture window:
   - *State 0 (IDLE / Silence Gating):* Uses a dynamic RMS baseline with Exponential Moving Average (EMA) to completely ignore background room noise and momentary unison beating volume dips. Bypasses heavy DSP.
@@ -119,7 +188,7 @@ This thread constantly consumes data from the Elastic Ring Buffer and executes a
 #### Thread 4: The UI Thread (The Visual Renderer)
 
 - **Role:** The graphical interface operating at 60 FPS.
-- **Action:** Consumes the high-speed stream of $f_0$ floats from Thread 2 to drive the instantaneous tuning visualizer (strobe, cents-deviation, or dial).
+- **Action:** Consumes the high-speed stream of $f_0$ floats from Thread 2 to drive the instantaneous tuning visualizer (strobe, cents-deviation, or dial). Polls the `PipelineHandle` for runtime observations (e.g., RMS envelope) and reads/writes configuration (e.g., silence threshold) via `Arc<Mutex<...>>`.
 - **Background Duty:** When it receives a new $B$ coefficient from Thread 3, it applies a Bayesian moving average to prevent measurement jitter. It then recalculates the 88-key Railsback tuning curve in the background, smoothly adjusting the target pitches for the user.
 
 ## 🚀 Getting Started

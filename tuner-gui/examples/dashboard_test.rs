@@ -52,6 +52,12 @@ impl DashboardTest {
             cent_meter_visible: true,
             key_select_visible: true,
             partials_visible: true,
+            settings_view_visible: false,
+            settings_data: tuner_gui::app::SettingsDisplayData {
+                rms_history: std::collections::VecDeque::new(),
+                current_silence_threshold: 0.005,
+                noise_floor_adjustment_visible: false,
+            },
             tuning_mode: TuningMode::Auto,
             capture_state: CaptureState::Off,
         };

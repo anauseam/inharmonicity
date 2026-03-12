@@ -1,11 +1,33 @@
 //! # Audio Processing Pipeline
 //!
-//! This module defines the lock-free memory structures and object pools required
-//! for real-time audio processing. It eliminates dynamic heap allocations on the
-//! audio thread during continuous processing.
+//! This module defines the lock-free memory structures, shared state types,
+//! and the `AudioPipeline` orchestrator for real-time audio processing.
+//!
+//! ## Architecture
+//!
+//! The pipeline follows the **Split / Handle pattern**:
+//!
+//! - [`AudioPipeline`] is moved to the audio thread. It owns the pure DSP
+//!   components ([`Gatekeeper`]) and coordinates them, syncing observations
+//!   to shared state after each frame.
+//!
+//! - [`PipelineHandle`] is kept by the frontend (GUI, WASM, etc.). It provides
+//!   read/write access to the shared state via `Arc<Mutex<...>>`.
+//!
+//! ```text
+//! AudioPipeline::new() -> (AudioPipeline, PipelineHandle)
+//!       │                         │
+//!       ▼                         ▼
+//!   Audio Thread              GUI Thread
+//! ```
 
 use crossbeam_queue::ArrayQueue;
 use rustfft::num_complex::Complex;
+use std::sync::{Arc, Mutex};
+
+use crate::gatekeeper::Gatekeeper;
+
+// ─── Memory Infrastructure ───────────────────────────────────────────────────
 
 /// A lock-free Object Pool for 2-second audio captures.
 ///
@@ -43,6 +65,154 @@ impl ProcessingFrame {
             audio_buffer: [0.0; 8192],
             time_buffer: [0.0; 8192],
             frequency_buffer: [Complex { re: 0.0, im: 0.0 }; 2048],
+        }
+    }
+}
+
+// ─── Shared State Types ──────────────────────────────────────────────────────
+
+/// Startup/UI-editable configuration. The audio thread reads only.
+///
+/// These values are initialized at application startup (e.g., via noise floor
+/// calibration) and can be adjusted by the user through the Settings UI.
+/// The audio/processing thread reads them each frame to gate its behavior.
+#[derive(Debug, Clone)]
+pub struct ConfigState {
+    /// Minimum RMS amplitude required to exit the `Silence` state.
+    pub silence_threshold: f32,
+    /// Multiplier applied to the calculated ambient noise to set the silence threshold.
+    pub noise_safety_multiplier: f32,
+}
+
+impl Default for ConfigState {
+    fn default() -> Self {
+        Self {
+            silence_threshold: 0.005,
+            noise_safety_multiplier: 2.0,
+        }
+    }
+}
+
+/// Audio-thread-owned observations. The UI reads only.
+///
+/// These values are updated by the pipeline after each frame.
+/// The UI polls them (e.g., at 60 FPS during `Message::Tick`) to drive
+/// visualizations like the Envelope Viewer.
+#[derive(Debug, Clone)]
+pub struct RuntimeState {
+    /// The current smoothed RMS amplitude (Exponential Moving Average).
+    pub current_rms_ema: f32,
+}
+
+impl Default for RuntimeState {
+    fn default() -> Self {
+        Self {
+            current_rms_ema: 0.0,
+        }
+    }
+}
+
+/// Thread-safe handle to `ConfigState`. Frontend writes, audio thread reads.
+pub type SharedConfigState = Arc<Mutex<ConfigState>>;
+
+/// Thread-safe handle to `RuntimeState`. Audio thread writes, frontend reads.
+pub type SharedRuntimeState = Arc<Mutex<RuntimeState>>;
+
+// ─── AudioPipeline (Mediator) ────────────────────────────────────────────────
+
+/// The orchestrator that coordinates all DSP components on the audio thread.
+///
+/// `AudioPipeline` owns the pure DSP components (like [`Gatekeeper`]) and
+/// is the **only** thing that touches `Arc<Mutex<...>>` shared state.
+/// After each frame, it reads the DSP components' public fields and syncs
+/// the relevant observations to shared state for the frontend to poll.
+///
+/// Created via [`AudioPipeline::new()`], which returns both the pipeline
+/// (moved to the audio thread) and a [`PipelineHandle`] (kept by the frontend).
+pub struct AudioPipeline {
+    /// The Gatekeeper — pure DSP, evaluates signal stability.
+    pub gatekeeper: Gatekeeper,
+
+    // Shared state bridges (pipeline ↔ frontend)
+    shared_config: SharedConfigState,
+    shared_runtime: SharedRuntimeState,
+
+    // Memory infrastructure
+    #[allow(dead_code)] // To be utilized upon full implementation
+    audio_pool: Arc<AudioPool>,
+}
+
+/// Frontend-side handle to the pipeline's shared state.
+///
+/// Returned by [`AudioPipeline::new()`] and kept by the frontend (GUI, WASM, etc.).
+/// Provides `Arc<Mutex<...>>` handles for polling runtime observations and
+/// editing configuration values.
+#[derive(Debug)]
+pub struct PipelineHandle {
+    /// Shared configuration state — the frontend can **read and write** this
+    /// (e.g., to adjust the silence threshold from the Settings UI).
+    pub config: SharedConfigState,
+
+    /// Shared runtime state — the frontend can **read** this
+    /// (e.g., to poll the current RMS for the Envelope Viewer).
+    pub runtime: SharedRuntimeState,
+}
+
+impl Default for PipelineHandle {
+    fn default() -> Self {
+        Self {
+            config: Arc::new(Mutex::new(ConfigState::default())),
+            runtime: Arc::new(Mutex::new(RuntimeState::default())),
+        }
+    }
+}
+
+impl AudioPipeline {
+    /// Creates a new AudioPipeline and its corresponding [`PipelineHandle`].
+    ///
+    /// This follows the **Split / Handle pattern**: the `AudioPipeline` is moved
+    /// to the audio thread, and the `PipelineHandle` is kept by the frontend.
+    ///
+    /// # Returns
+    /// A tuple of `(AudioPipeline, PipelineHandle)`.
+    pub fn new() -> (Self, PipelineHandle) {
+        let audio_pool = Arc::new(ArrayQueue::new(4));
+        let shared_config = Arc::new(Mutex::new(ConfigState::default()));
+        let shared_runtime = Arc::new(Mutex::new(RuntimeState::default()));
+
+        let gatekeeper = Gatekeeper::new(Arc::clone(&audio_pool));
+
+        let pipeline = Self {
+            gatekeeper,
+            shared_config: Arc::clone(&shared_config),
+            shared_runtime: Arc::clone(&shared_runtime),
+            audio_pool,
+        };
+
+        let handle = PipelineHandle {
+            config: shared_config,
+            runtime: shared_runtime,
+        };
+
+        (pipeline, handle)
+    }
+
+    /// Processes a single audio frame through the full DSP pipeline.
+    ///
+    /// 1. Delegates to the Gatekeeper for signal stability evaluation (pure DSP).
+    /// 2. Syncs the Gatekeeper's observable state to shared memory for the frontend.
+    pub fn process_frame(&mut self, frame: &ProcessingFrame) {
+        // 1. Pure DSP — Gatekeeper evaluates signal stability
+        self.gatekeeper.process_frame(frame);
+
+        // 2. Sync observations to shared state for the frontend
+        if let Ok(mut runtime) = self.shared_runtime.try_lock() {
+            runtime.current_rms_ema = self.gatekeeper.current_rms_ema;
+        }
+
+        // Sync calibrated threshold if it changed
+        if let Ok(mut config) = self.shared_config.try_lock() {
+            config.silence_threshold = self.gatekeeper.config.silence_threshold;
         }
     }
 }

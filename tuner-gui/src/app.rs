@@ -24,7 +24,9 @@ use tuner_core::{
     audio,
     capture_processing::{self, ProcessingOperation},
     inharmonicity::InharmonicityProfile,
+    pipeline::PipelineHandle,
 };
+use crate::widgets::envelope::ENVELOPE_HISTORY_LENGTH;
 
 // Audio processing constants
 const SMOOTHING_FACTOR: usize = 5; // Number of samples for cent smoothing
@@ -88,8 +90,9 @@ pub enum Message {
     TogglePartials,    // Show/hide partials panel
     // ToggleInharmonicityGraph, // Show/hide inharmonicity graph
 
-    // Toggle main view versus settings view
-    ToggleSettingsView,
+    // Settings view toggles
+    ToggleSettingsView,          // Toggle main view versus settings view
+    ToggleNoiseFloorAdjustment,  // Show/hide noise floor envelope viewer
 
     // Continuous update message
     Tick, // Timer tick for real-time updates
@@ -120,6 +123,17 @@ pub enum CaptureState {
     Done,      // Capture is complete, data is being processed
 }
 
+/// Settings-view-specific display data.
+#[derive(Debug, Clone)]
+pub struct SettingsDisplayData {
+    /// Rolling history of smoothed RMS values for the Envelope Viewer.
+    pub rms_history: VecDeque<f32>,
+    /// Current silence threshold (read from shared ConfigState).
+    pub current_silence_threshold: f32,
+    /// Whether the Noise Floor Adjustment panel is visible.
+    pub noise_floor_adjustment_visible: bool,
+}
+
 /// UI-specific data needed for rendering the interface.
 ///
 /// This struct contains only the data that the UI components need
@@ -139,6 +153,9 @@ pub struct AppDisplayData {
 
     // View state
     pub settings_view_visible: bool,
+
+    // Settings view data
+    pub settings_data: SettingsDisplayData,
 
     // Tuning mode
     pub tuning_mode: TuningMode,
@@ -162,6 +179,9 @@ pub struct TunerApp {
     stability_buffer: VecDeque<AnalysisResult>, // Buffer for checking note stability
     inharmonicity_profile: InharmonicityProfile,
     // ---------------------------------
+
+    // Frontend handle to the AudioPipeline's shared state
+    pipeline_handle: PipelineHandle,
 
     // Single source of truth for all display data
     pub display_data: AppDisplayData,
@@ -188,6 +208,7 @@ impl Default for TunerApp {
     fn default() -> Self {
         eprintln!("[MAIN] Creating TunerApp...");
         let (analysis_tx, analysis_rx) = crossbeam_channel::unbounded();
+
         let mut app = Self {
             audio_worker: None,
             analysis_receiver: Some(analysis_rx),
@@ -196,6 +217,7 @@ impl Default for TunerApp {
             stability_buffer: VecDeque::with_capacity(STABILITY_TARGET),
             inharmonicity_profile: InharmonicityProfile::default(),
             // ----------------------------
+            pipeline_handle: PipelineHandle::default(),
             // Initialize display data
             display_data: AppDisplayData {
                 audio_worker_active: false, // Will be set to true after audio starts
@@ -207,6 +229,11 @@ impl Default for TunerApp {
                 partials_visible: true,
                 // inharmonicity_graph_visible: true,
                 settings_view_visible: false,
+                settings_data: SettingsDisplayData {
+                    rms_history: VecDeque::with_capacity(ENVELOPE_HISTORY_LENGTH),
+                    current_silence_threshold: 0.005,
+                    noise_floor_adjustment_visible: false,
+                },
                 tuning_mode: TuningMode::Auto,
                 capture_state: CaptureState::Off,
             },
@@ -242,15 +269,16 @@ impl TunerApp {
 
         if let Some(analysis_tx) = self.analysis_sender.take() {
             let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded(1);
+
+            // Take ownership of the pipeline to move it into the audio thread
+            // The PipelineHandle stays on the GUI side for shared state polling
+            let (pipeline, new_handle) = tuner_core::pipeline::AudioPipeline::new();
+            self.pipeline_handle = new_handle;
+
             let thread_handle = thread::spawn(move || {
                 eprintln!("[AUDIO-THREAD] Starting audio thread...");
 
                 // --- RINGBUF MIGRATION ---
-                // We create a lock-free ring buffer here.
-                // 8 * BUFFER_SIZE = 16,384 samples (~371ms at 44.1kHz).
-                // This is the "properly sized buffer" mentioned in audio.rs!
-                // It ensures the real-time CPAL thread has plenty of room to push samples
-                // even if this processing thread hits a small latency spike.
                 let rb = ringbuf::HeapRb::<f32>::new(audio::BUFFER_SIZE * 8);
                 let (producer, mut consumer) = rb.split();
 
@@ -267,7 +295,6 @@ impl TunerApp {
                 };
 
                 eprintln!("[AUDIO-THREAD] Entering audio processing loop...");
-                // Add a small delay to let GUI initialize
                 std::thread::sleep(std::time::Duration::from_millis(100));
 
                 let mut audio_frame = Vec::with_capacity(audio::BUFFER_SIZE);
@@ -275,9 +302,8 @@ impl TunerApp {
                 let fft_instance = planner.plan_fft_forward(audio::BUFFER_SIZE);
                 let mut yin_buffer = vec![0.0; audio::BUFFER_SIZE / 2];
 
-                // Initialize Gatekeeper for realtime testing
-                let audio_pool = std::sync::Arc::new(crossbeam_queue::ArrayQueue::new(4));
-                let mut gatekeeper = tuner_core::gatekeeper::Gatekeeper::new(audio_pool);
+                // The AudioPipeline owns the Gatekeeper and shared state sync
+                let mut pipeline = pipeline;
                 let mut test_frame = tuner_core::pipeline::ProcessingFrame::new();
 
                 loop {
@@ -288,15 +314,12 @@ impl TunerApp {
                     }
 
                     // 2. Lock-free Ringbuf Polling
-                    // We need BUFFER_SIZE samples to run an analysis frame.
                     if consumer.occupied_len() >= audio::BUFFER_SIZE {
                         audio_frame.clear();
-
-                        // Pop exactly BUFFER_SIZE samples from the ring buffer
                         audio_frame.resize(audio::BUFFER_SIZE, 0.0);
                         consumer.pop_slice(&mut audio_frame);
 
-                        // Feed samples to Gatekeeper's testing frame
+                        // Feed samples to the processing frame
                         test_frame.audio_buffer[..audio::BUFFER_SIZE].copy_from_slice(&audio_frame);
 
                         // Add error handling for analysis
@@ -326,16 +349,16 @@ impl TunerApp {
                                 }
                             };
 
-                        // Inject Gatekeeper Test Hook
-                        let prev_state = gatekeeper.current_state.clone();
-                        gatekeeper.process_frame(&test_frame);
-                        if gatekeeper.current_state != prev_state {
+                        // Run the full pipeline (Gatekeeper + shared state sync)
+                        let prev_state = pipeline.gatekeeper.current_state.clone();
+                        pipeline.process_frame(&test_frame);
+                        if pipeline.gatekeeper.current_state != prev_state {
                             eprintln!(
                                 "[GATEKEEPER] Transition: {:?} -> {:?} (CSD Dly: {}, Stable Cnt: {})",
                                 prev_state,
-                                gatekeeper.current_state,
-                                gatekeeper.transient_delay_counter,
-                                gatekeeper.stable_counter
+                                pipeline.gatekeeper.current_state,
+                                pipeline.gatekeeper.transient_delay_counter,
+                                pipeline.gatekeeper.stable_counter
                             );
                         }
 
@@ -344,18 +367,14 @@ impl TunerApp {
                             break;
                         }
                     } else {
-                        // We don't have enough samples yet.
-                        // Sleep briefly so we don't pin the CPU at 100% while polling.
                         std::thread::sleep(std::time::Duration::from_millis(5));
                     }
                 }
 
                 eprintln!("[AUDIO-THREAD] Stopping stream and exiting...");
-                // Properly stop the stream before dropping it
                 if let Err(e) = stream.pause() {
                     eprintln!("[AUDIO-THREAD] Error pausing stream: {}", e);
                 }
-                // Give the stream a moment to fully stop
                 std::thread::sleep(std::time::Duration::from_millis(50));
                 drop(stream);
                 eprintln!("[AUDIO-THREAD] Audio thread finished");
@@ -549,6 +568,10 @@ impl TunerApp {
                 );
                 self.display_data.settings_view_visible = !self.display_data.settings_view_visible;
             }
+            Message::ToggleNoiseFloorAdjustment => {
+                self.display_data.settings_data.noise_floor_adjustment_visible =
+                    !self.display_data.settings_data.noise_floor_adjustment_visible;
+            }
             Message::Tick => {
                 // Continuous update - poll for audio data
                 if let Some(receiver) = &self.analysis_receiver {
@@ -563,6 +586,23 @@ impl TunerApp {
                         self.process_analysis_result(result);
                     }
                     // ---------------------------------------------
+                }
+
+                // Poll shared state for settings view (only when visible)
+                if self.display_data.settings_view_visible
+                    && self.display_data.settings_data.noise_floor_adjustment_visible
+                {
+                    if let Ok(runtime) = self.pipeline_handle.runtime.lock() {
+                        let history = &mut self.display_data.settings_data.rms_history;
+                        history.push_back(runtime.current_rms_ema);
+                        if history.len() > ENVELOPE_HISTORY_LENGTH {
+                            history.pop_front();
+                        }
+                    }
+                    if let Ok(config) = self.pipeline_handle.config.lock() {
+                        self.display_data.settings_data.current_silence_threshold =
+                            config.silence_threshold;
+                    }
                 }
 
                 // State reset after capture processing
