@@ -1,16 +1,32 @@
-//! # Gatekeeper Module
+//! # Gatekeeper — 5-State Signal Validator (Pure DSP)
 //!
-//! Provides the primary stability evaluation logic for the continuous incoming
-//! audio analysis stream. The Gatekeeper operates continuously alongside the
-//! fundamental frequency (`f0`) engine, serving two primary functions:
+//! The Gatekeeper is the "traffic cop" of the audio pipeline. It evaluates every
+//! incoming [`ProcessingFrame`] against a sequence of stability heuristics and
+//! outputs a discrete [`SignalState`] (`Silence`, `Unstable`, or `Stable`) that
+//! downstream consumers (GUI, capture logic) observe.
 //!
-//! 1. **Signal Validation**: Emits a continuous, filtered status output (e.g.,
-//!    `Stable`, `Unstable`, or `Silence`) to downstream consumers (such
-//!    as the graphical interface).
-//! 2. **Pool Dispatch Authorization**: Conditionally regulates the allocation and
-//!    dispatch of high-capacity memory buffers from the `AudioPool` to the Thread 3
-//!    `WorkerPool` when `capture_mode` is enabled and a target frequency attains
-//!    defined stability metrics.
+//! ## Pure DSP — No Shared State
+//!
+//! The Gatekeeper has **zero knowledge** of `Arc`, `Mutex`, or the GUI. It exposes
+//! its observations through `pub` fields (e.g., `current_rms_ema`, `current_state`).
+//! The [`AudioPipeline`](crate::pipeline::AudioPipeline) reads these fields after
+//! each frame and syncs them to shared state on behalf of the frontend.
+//!
+//! ## 5-State Capture Logic
+//!
+//! | State | Name | Metric | Purpose |
+//! |---|---|---|---|
+//! | 0 | IDLE | RMS + EMA | Silence gating — ignore background noise |
+//! | 1 | ATTACK | CSD | Detect the hammer strike transient |
+//! | 2 | TRANSIENT | Counter | Hard delay for broadband noise to decay |
+//! | 3 | HARMONIC DECAY | NINOS2 | Identify the "Golden Window" of stable harmonics |
+//! | 4 | RELEASE | Counter | Cap capture at 1.5s, dispatch to Worker, reset |
+//!
+//! ## Noise Floor Calibration
+//!
+//! On startup (or after [`Gatekeeper::reset_noise_floor`]), the Gatekeeper spends
+//! `noise_calibration_frames` (~2 seconds) measuring the room's ambient noise.
+//! It then sets `silence_threshold = avg_noise × noise_safety_multiplier`.
 
 use crate::algorithms::power::{calculate_csd, calculate_ema, calculate_ninos2, calculate_rms};
 use crate::pipeline::{AudioPool, ProcessingFrame};
@@ -58,19 +74,29 @@ impl Default for GatekeeperConfig {
     }
 }
 
-/// Represents the discrete evaluation state of the realtime audio stream.
+/// The Gatekeeper's output — a discrete evaluation of the audio stream.
+///
+/// The GUI observes this value (via the pipeline's shared state) to drive
+/// visual feedback (e.g., "listening…", "note detected", silence indicator).
 #[derive(Debug, Clone, PartialEq)]
 pub enum SignalState {
     /// The stream contains a clear, steady fundamental frequency.
+    /// The NINOS2 metric has exceeded the stability threshold for
+    /// `required_stable_frames` consecutive frames.
     Stable,
     /// The stream contains audio energy but lacks a clear fundamental frequency
-    /// (e.g., attack transient, noise, inharmonic sounds).
+    /// (e.g., hammer strike transient, broadband noise, inharmonic sounds).
+    /// This covers States 1 (ATTACK) and 2 (TRANSIENT) of the state machine.
     Unstable,
-    /// The stream falls below the configured noise floor amplitude threshold.
+    /// The EMA-smoothed RMS falls below `silence_threshold`.
+    /// No DSP beyond RMS is performed in this state (bypasses CSD, NINOS2).
     Silence,
 }
 
-/// Regulates stream state emissions and authorizes computational captures using a 5-state state machine.
+/// The 5-state signal validator. Pure DSP — no shared state awareness.
+///
+/// See the [module-level docs](crate::gatekeeper) for the full state machine
+/// description and the role of each metric.
 pub struct Gatekeeper {
     pub capture_mode_enabled: bool,
     #[allow(dead_code)] // To be utilized upon full implementation
@@ -100,7 +126,15 @@ pub struct Gatekeeper {
 }
 
 impl Gatekeeper {
-    /// Instantiates a new Gatekeeper bound to the provided AudioPool.
+    /// Creates a new Gatekeeper bound to the provided [`AudioPool`].
+    ///
+    /// All counters and EMA state are zeroed. The Gatekeeper starts in
+    /// [`SignalState::Silence`] and will enter the noise calibration phase
+    /// for the first `noise_calibration_frames` frames.
+    ///
+    /// # Arguments
+    /// * `audio_pool` — Shared reference to the lock-free object pool
+    ///   (used for buffer dispatch in State 4).
     pub fn new(audio_pool: Arc<AudioPool>) -> Self {
         Self {
             audio_pool,
@@ -118,8 +152,12 @@ impl Gatekeeper {
         }
     }
 
-    /// Resets the baseline noise floor calibration, forcing the Gatekeeper to listen to
-    /// the room's ambient noise for `config.noise_calibration_frames` before processing frames normally.
+    /// Resets the noise floor calibration, forcing the Gatekeeper to re-listen
+    /// to the room's ambient noise for `config.noise_calibration_frames` before
+    /// resuming normal processing.
+    ///
+    /// This is called when the user triggers a manual noise floor recalibration
+    /// from the Settings UI.
     pub fn reset_noise_floor(&mut self) {
         self.noise_calibration_counter = 0;
         self.noise_calibration_sum = 0.0;
@@ -127,14 +165,19 @@ impl Gatekeeper {
         self.current_state = SignalState::Silence;
     }
 
-    /// Evaluates a single `ProcessingFrame` against stability heuristics.
+    /// Evaluates a single [`ProcessingFrame`] through the 5-state machine.
     ///
-    /// The 5-State Capture Logic:
-    /// State 0: IDLE (Silence / Noise Floor Gating).
-    /// State 1: ATTACK (Transient spike).
-    /// State 2: TRANSIENT (Waiting for broadband noise to decay).
-    /// State 3: HARMONIC DECAY (NINOS2 Stability gating / Golden Window).
-    /// State 4: RELEASE (Hard timeout capture & dispatch).
+    /// This is the main entry point called by [`AudioPipeline::process_frame()`].
+    /// After this returns, the pipeline reads `self.current_state` and
+    /// `self.current_rms_ema` and syncs them to shared state.
+    ///
+    /// ## State Machine Flow
+    ///
+    /// 1. **RMS + EMA** — compute smoothed amplitude
+    /// 2. **Noise calibration** — if still calibrating, accumulate and return
+    /// 3. **Silence gate** — if below threshold, emit `Silence` and reset
+    /// 4. **CSD transient detection** — States 1 & 2
+    /// 5. **NINOS2 stability + capture** — States 3 & 4
     pub fn process_frame(&mut self, frame: &ProcessingFrame) {
         // State 0: Calculate RMS amplitude for Silence fallback
         let rms = calculate_rms(&frame.audio_buffer[..]);
@@ -165,8 +208,16 @@ impl Gatekeeper {
         self.process_stability_and_capture(current_spectrum);
     }
 
-    /// Handles the dynamic noise floor calibration phase.
-    /// Returns `true` if the Gatekeeper is actively calibrating and should skip further processing.
+    /// Handles the dynamic noise floor calibration phase (startup / reset).
+    ///
+    /// During calibration, the Gatekeeper accumulates EMA-smoothed RMS values
+    /// for `noise_calibration_frames` frames. Once complete, it computes:
+    ///
+    /// `silence_threshold = avg_noise × noise_safety_multiplier`
+    ///
+    /// # Returns
+    /// `true` if we are still calibrating and the main `process_frame` should
+    /// skip all further processing for this frame.
     fn process_noise_calibration(&mut self, smoothed_rms: f32) -> bool {
         if self.noise_calibration_counter >= self.config.noise_calibration_frames {
             return false;
@@ -180,6 +231,7 @@ impl Gatekeeper {
             let avg_noise =
                 self.noise_calibration_sum / (self.config.noise_calibration_frames as f32);
             self.config.silence_threshold = avg_noise * self.config.noise_safety_multiplier;
+
             eprintln!(
                 "[GATEKEEPER] Noise floor calibrated. Ambient RMS EMA: {:.5}, Threshold set to: {:.5}",
                 avg_noise, self.config.silence_threshold
@@ -191,8 +243,18 @@ impl Gatekeeper {
         true
     }
 
-    /// Calculates CSD to detect transients (hammer strikes) and manage the bypass delay.
-    /// Returns `true` if a transient is detected or if we are waiting for a transient tail to die down.
+    /// Detects transient events (States 1 & 2) using Complex Spectral Difference.
+    ///
+    /// **State 1 (ATTACK):** If CSD exceeds `csd_transient_threshold`, a hammer
+    /// strike is declared. The transient delay counter is armed.
+    ///
+    /// **State 2 (TRANSIENT):** While the delay counter is nonzero, the Gatekeeper
+    /// waits for the broadband strike noise to physically decay.
+    ///
+    /// Also updates `prev_spectrum` for the next frame's CSD calculation.
+    ///
+    /// # Returns
+    /// `true` if a transient was detected or we are still in the bypass delay.
     fn process_transient_detection(
         &mut self,
         current_spectrum: &[rustfft::num_complex::Complex<f32>],
@@ -227,7 +289,15 @@ impl Gatekeeper {
         false
     }
 
-    /// Evaluates signal stability (NINOS2) and manages the capture phase.
+    /// Evaluates spectral stability (State 3) and manages audio capture (State 4).
+    ///
+    /// **State 3 (HARMONIC DECAY):** The NINOS2 sparsity metric must exceed
+    /// `ninos2_stability_threshold` for `required_stable_frames` consecutive
+    /// frames before the signal is declared [`Stable`](SignalState::Stable).
+    ///
+    /// **State 4 (RELEASE):** Once stable and `capture_mode_enabled`, the
+    /// Gatekeeper counts frames up to `capture_max_frames` (~1.5s), then
+    /// dispatches the buffer to the Worker and resets.
     fn process_stability_and_capture(
         &mut self,
         current_spectrum: &[rustfft::num_complex::Complex<f32>],
@@ -262,6 +332,10 @@ impl Gatekeeper {
         }
     }
 
+    /// Resets all capture-related state machine counters.
+    ///
+    /// Called when transitioning back to Silence, after a capture completes,
+    /// or during noise floor calibration.
     fn reset_capture_state(&mut self) {
         self.transient_delay_counter = 0;
         self.stable_counter = 0;

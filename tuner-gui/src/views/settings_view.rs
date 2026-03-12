@@ -2,8 +2,9 @@ use iced::widget::{Space, button, column, container, row, text};
 use iced::{Alignment, Element, Fill, Length};
 
 use crate::utils::view_utils::{ButtonConfig, ButtonType, make_sidebar_section};
+use crate::widgets::envelope;
 
-const SYSTEMIC_CONFIG: [ButtonConfig; 3] = [
+const TONAL_CONFIG: [ButtonConfig; 3] = [
     ButtonConfig {
         label: "Temperament",
         message: None,
@@ -21,9 +22,14 @@ const SYSTEMIC_CONFIG: [ButtonConfig; 3] = [
     },
 ];
 
-const PROGRAM_CONFIG: [ButtonConfig; 1] = [
+const PROGRAM_CONFIG: [ButtonConfig; 2] = [
     ButtonConfig {
-        label: "Sample Buffer adjustment",
+        label: "Noise Floor Adjustment",
+        message: Some(crate::Message::ToggleNoiseFloorAdjustment),
+        button_type: ButtonType::Standard,
+    },
+    ButtonConfig {
+        label: "Sample Buffer Adjustment",
         message: None,
         button_type: ButtonType::Disabled,
     },
@@ -31,8 +37,8 @@ const PROGRAM_CONFIG: [ButtonConfig; 1] = [
 
 /// Static settings sidebar configuration
 const SETTINGS_SIDEBAR_CONFIG: [(&str, &[ButtonConfig]); 2] = [
-    ("Systemic change", SYSTEMIC_CONFIG.as_slice()),
-    ("Program", PROGRAM_CONFIG.as_slice()),
+    ("Tonal adjustments", TONAL_CONFIG.as_slice()),
+    ("Program adjustments", PROGRAM_CONFIG.as_slice()),
 ];
 
 pub fn create_settings_view(data: &crate::app::AppDisplayData) -> Element<'static, crate::Message> {
@@ -47,10 +53,38 @@ pub fn create_settings_view(data: &crate::app::AppDisplayData) -> Element<'stati
     }
 
     let title = text("Settings").size(28);
-    let placeholder = text("Settings controls will go here.").size(18);
+
+    // Build main panel content based on which sub-view is active
+    let main_panel_content: Element<'static, crate::Message> =
+        if data.settings_data.noise_floor_adjustment_visible {
+            let rms_data: Vec<f32> = data.settings_data.rms_history.iter().copied().collect();
+            let threshold = data.settings_data.current_silence_threshold;
+
+            let envelope_content: Element<'static, crate::Message> =
+                container(envelope::EnvelopeViewer::new(rms_data, threshold).view())
+                    .width(Fill)
+                    .height(Fill)
+                    .into();
+
+            container(
+                column![
+                    text("Noise Floor Adjustment").size(18),
+                    Space::new().height(10),
+                    envelope_content
+                ]
+                .width(Fill)
+                .spacing(5)
+                .padding(15),
+            )
+            .width(Fill)
+            .height(Length::Fixed(250.0))
+            .into()
+        } else {
+            text("Select a setting to adjust.").size(18).into()
+        };
 
     let main_panel = container(
-        column![title, Space::new().height(20), placeholder]
+        column![title, Space::new().height(20), main_panel_content]
             .width(Fill)
             .spacing(10),
     )
@@ -76,9 +110,9 @@ fn create_settings_sidebar(data: &crate::app::AppDisplayData) -> Element<'static
             use iced::widget::button;
             button::Style {
                 background: Some(iced::Background::Color(iced::Color::from_rgb(
-                    0.5, 1.0, 0.83,
-                ))), // Aquamarine
-                text_color: iced::Color::BLACK,
+                    0.325, 0.278, 0.388,
+                ))), // purple
+                text_color: iced::Color::WHITE,
                 ..button::Style::default()
             }
         })

@@ -392,9 +392,10 @@ fn create_sidebar(
             use iced::widget::button;
             button::Style {
                 background: Some(iced::Background::Color(iced::Color::from_rgb(
-                    0.5, 1.0, 0.83,
-                ))), // Aquamarine
-                text_color: iced::Color::BLACK,
+                    //0.38, 0.294, 0.502,
+                    0.427, 0.298, 0.612,
+                ))), // purple
+                text_color: iced::Color::WHITE,
                 ..button::Style::default()
             }
         })
