@@ -7,7 +7,6 @@
 //! ## Features
 //! - High-performance FFT using RustFFT
 //! - Hann windowing for reduced spectral leakage
-//! - DC offset removal for accurate analysis
 //! - Optimized for real-time processing
 
 use crate::audio::BUFFER_SIZE;
@@ -18,9 +17,11 @@ use std::sync::Arc;
 ///
 /// This is the primary FFT function for the application. It processes
 /// the input signal directly into the provided frequency buffer through:
-/// 1. DC offset removal
-/// 2. Hann windowing
-/// 3. Forward FFT transformation
+/// 1. Hann windowing
+/// 2. Forward FFT transformation
+///
+/// DC offset removal is handled upstream by the audio stream's `dc_block` filter,
+/// so all samples arriving here are already zero-mean.
 ///
 /// # Arguments
 /// * `signal` - Input audio signal (must be exactly BUFFER_SIZE samples)
@@ -38,19 +39,11 @@ pub fn perform_fft(
         panic!("Input frame size and frequency buffer must be at least BUFFER_SIZE");
     }
 
-    let len = signal.len();
-    let sum: f32 = signal.iter().sum();
-    let avg = sum / len as f32;
-    let n_minus_1 = (len - 1) as f32;
+    let n_minus_1 = (signal.len() - 1) as f32;
 
     for (i, (&sample, complex)) in signal.iter().zip(frequency_buffer.iter_mut()).enumerate() {
-        let centered = if avg.abs() > 1e-6 {
-            sample - avg
-        } else {
-            sample
-        };
         let multiplier = 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / n_minus_1).cos());
-        complex.re = centered * multiplier;
+        complex.re = sample * multiplier;
         complex.im = 0.0;
     }
 

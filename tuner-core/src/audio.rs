@@ -2,12 +2,13 @@
 //!
 //! This module handles real-time audio capture using CPAL (Cross-Platform Audio Library).
 //! It provides functions for setting up audio streams, selecting appropriate devices,
-//! and streaming audio data to the analysis pipeline.
+//! and streaming clean, DC-free audio data to the analysis pipeline.
 //!
 //! ## Features
 //! - Automatic audio device selection
 //! - Configurable sample rates and formats
 //! - Real-time audio streaming with buffering
+//! - Always-on DC offset removal
 //! - Error handling and device fallback
 
 use anyhow::{Result, anyhow};
@@ -21,12 +22,21 @@ use ringbuf::traits::Producer;
 /// Larger buffers provide more frequency resolution but increase latency.
 pub const BUFFER_SIZE: usize = 2048;
 
+/// DC blocking filter coefficient.
+///
+/// α = 0.995 → ~3.5 Hz cutoff at 44.1 kHz — well below A0 (27.5 Hz).
+const DC_BLOCK_ALPHA: f32 = 0.995;
+
 /// Starts audio capture from the default input device.
 ///
 /// This function:
 /// 1. Selects the default audio input device
 /// 2. Configures the audio stream for optimal piano tuning
 /// 3. Sets up a callback to stream audio data to the analysis pipeline
+///
+/// Every sample passes through a DC blocking high-pass filter
+/// (y[n] = x[n] - x[n-1] + α·y[n-1]) before entering the ring buffer,
+/// removing hardware-dependent DC offset regardless of device or driver.
 ///
 /// # Arguments
 /// * `mut producer` - Lock-free ring buffer producer for streaming audio data to the analysis thread
@@ -43,7 +53,6 @@ pub const BUFFER_SIZE: usize = 2048;
 pub fn start_audio_capture(
     mut producer: impl Producer<Item = f32> + Send + 'static,
 ) -> Result<(cpal::Stream, u32)> {
-    // ... (device and config selection code is the same)
     let host = cpal::default_host();
     let device = host
         .default_input_device()
@@ -65,14 +74,22 @@ pub fn start_audio_capture(
 
     let err_fn = |err| eprintln!("An error occurred on the audio stream: {}", err);
 
+    // DC blocking filter state — captured by the closure below.
+    let mut dc_prev_x: f32 = 0.0;
+    let mut dc_prev_y: f32 = 0.0;
+
     let stream = device.build_input_stream(
         &config,
         move |data: &[f32], _: &cpal::InputCallbackInfo| {
-            // Push slice of floats lock-free into the ring buffer
-            let _pushed = producer.push_slice(data);
-            // In a real-time audio thread, if the buffer is full (PushError),
-            // we have no choice but to drop samples since we cannot block.
-            // A properly sized buffer like ours (e.g. 8x or 16x BUFFER_SIZE) avoids this.
+            for &sample in data {
+                let filtered = dc_block(sample, &mut dc_prev_x, &mut dc_prev_y);
+
+                // Push filtered sample lock-free into the ring buffer.
+                // If the buffer is full, we drop the sample — we cannot block
+                // in a real-time audio callback. A properly sized buffer
+                // (e.g. 8x or 16x BUFFER_SIZE) makes this extremely rare.
+                let _ = producer.try_push(filtered);
+            }
         },
         err_fn,
         None,
@@ -81,6 +98,20 @@ pub fn start_audio_capture(
     stream.play()?;
 
     Ok((stream, sample_rate_val))
+}
+
+/// Applies one step of the DC blocking high-pass IIR filter.
+///
+/// Removes hardware-dependent DC offset from a single sample.
+/// `prev_x` and `prev_y` are the filter's persistent state and must be
+/// initialized to `0.0` before the first call.
+///
+/// Transfer function: `y[n] = x[n] - x[n-1] + α·y[n-1]`
+pub(crate) fn dc_block(sample: f32, prev_x: &mut f32, prev_y: &mut f32) -> f32 {
+    let y = sample - *prev_x + DC_BLOCK_ALPHA * *prev_y;
+    *prev_x = sample;
+    *prev_y = y;
+    y
 }
 
 /// Finds the best supported audio configuration for the target sample rate.
