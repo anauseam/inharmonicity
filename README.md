@@ -35,6 +35,7 @@ An open source professional-grade piano tuning application built in Rust with re
 ### Technical Features
 
 - **High-Performance Audio Processing**: FFT-based frequency analysis with YIN pitch detection and spectrum refinement
+- **DC Offset Removal**: Always-on single-pole high-pass IIR filter in the audio stream callback removes hardware-dependent DC bias, ensuring device- and platform-agnostic operation
 - **Thread-Safe Architecture**: Dedicated audio processing thread with crossbeam channels
 - **Real-time Updates**: Continuous GUI updates with audio analysis
 
@@ -55,7 +56,7 @@ inharmonicity/
 │   │   ├── engine.rs               # F0 Engine — Scout / Bass / Treble DSP (wireframe)
 │   │   ├── gatekeeper.rs           # 5-state signal validator (DSP, no shared state)
 │   │   ├── worker.rs               # Background worker manager for heavy offline DSP (wireframe)
-│   │   ├── audio.rs                # CPAL audio capture and stream management
+│   │   ├── audio.rs                # CPAL audio capture, stream management, DC blocking
 │   │   ├── inharmonicity.rs        # Inharmonicity constant calculation and profiles
 │   │   ├── capture_processing.rs   # Legacy frame processing (deprecated — see migration note)
 │   │   └── lib.rs                  # Crate root and AnalysisResult definition
@@ -157,9 +158,9 @@ To maintain real-time performance without relying on OS priority elevation, the 
 
 #### Thread 1: The Audio Stream (The Harvester)
 
-- **Role:** High-speed hardware ingestor.
-- **Action:** Continuously captures raw audio from the microphone at 44,100 Hz. It immediately pushes all incoming samples directly into the Elastic Ring Buffer.
-- **Rule:** This thread performs zero math, zero allocations, and does no analysis. Its only job is to guarantee pristine data throughput.
+- **Role:** High-speed hardware ingestor and signal conditioner.
+- **Action:** Continuously captures raw audio from the microphone at 44,100 Hz. Each sample passes through a `DcBlocker` (single-pole high-pass IIR, α = 0.995, ~3.5 Hz cutoff) to remove hardware-dependent DC offset, then is pushed into the Elastic Ring Buffer. This guarantees every downstream consumer sees a zero-mean signal regardless of microphone, audio interface, or OS driver.
+- **Rule:** This thread performs zero allocations and no analysis. The DC blocker is the only computation — one multiply and two additions per sample — and is classified as signal *conditioning*, not signal analysis. Its job is to guarantee pristine, zero-mean data throughput.
 
 #### Thread 2: The Audio Processing Pipeline (The Brains)
 

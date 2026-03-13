@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::algorithms::power::{calculate_ema, calculate_rms};
-use crate::audio::{BUFFER_SIZE, find_supported_config};
+use crate::audio::{BUFFER_SIZE, dc_block, find_supported_config};
 
 /// Default number of calibration frames (~2 seconds at 44.1 kHz / 2048 samples).
 pub const DEFAULT_CALIBRATION_FRAMES: usize = 43;
@@ -33,6 +33,13 @@ pub const DEFAULT_CALIBRATION_FRAMES: usize = 43;
 /// Default multiplier applied to the measured ambient noise.
 /// Require the signal to be 2× louder than the room's background noise.
 pub const DEFAULT_NOISE_MULTIPLIER: f32 = 1.0;
+
+/// Number of frames to discard at stream open before measuring.
+///
+/// When a CPAL stream is first opened, the audio driver's AGC and the
+/// hardware ADC need time to stabilize. Dropping these frames prevents
+/// the warm-up transient from inflating the measured noise floor.
+const WARMUP_FRAMES: usize = 10;
 
 /// EMA smoothing factor used during calibration (same as the Gatekeeper's).
 const CALIBRATION_EMA_ALPHA: f32 = 0.1;
@@ -96,10 +103,16 @@ pub fn calibrate_noise_floor(
 
     let err_fn = |err| eprintln!("[CALIBRATION] Audio stream error: {}", err);
 
+    // DC blocking filter state — same filter as the main audio stream.
+    let mut dc_prev_x: f32 = 0.0;
+    let mut dc_prev_y: f32 = 0.0;
+
     let stream = device.build_input_stream(
         &stream_config,
         move |data: &[f32], _: &cpal::InputCallbackInfo| {
-            let _ = producer.push_slice(data);
+            for &sample in data {
+                let _ = producer.try_push(dc_block(sample, &mut dc_prev_x, &mut dc_prev_y));
+            }
         },
         err_fn,
         None,
@@ -107,8 +120,20 @@ pub fn calibrate_noise_floor(
 
     stream.play()?;
 
-    // ── Collect frames and compute RMS ───────────────────────────────────
+    // ── Warm-up: discard initial frames so the driver/hardware can settle ──
     let mut frame_buffer = vec![0.0f32; BUFFER_SIZE];
+    let mut warmup_done: usize = 0;
+
+    while warmup_done < WARMUP_FRAMES {
+        if consumer.occupied_len() >= BUFFER_SIZE {
+            consumer.pop_slice(&mut frame_buffer);
+            warmup_done += 1;
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    // ── Collect frames and compute RMS ───────────────────────────────────
     let mut ema: f32 = 0.0;
     let mut rms_sum: f32 = 0.0;
     let mut frames_collected: usize = 0;
