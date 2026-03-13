@@ -12,21 +12,24 @@
 
 use crate::utils::view_utils::initialize_done_timer;
 use crate::views::{main_view::create_main_view, settings_view::create_settings_view};
+use crate::widgets::envelope::ENVELOPE_HISTORY_LENGTH;
 use cpal::traits::StreamTrait;
 use crossbeam_channel::{Receiver, Sender};
 use iced::{self, Element, Subscription, Theme};
 use ringbuf::traits::{Consumer, Observer, Split};
 use std::collections::VecDeque;
 use std::thread::{self, JoinHandle};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tuner_core::{
     AnalysisResult,
     algorithms::{fft, pitch, tuning},
     audio,
+    calibration::{self, CalibrationResult},
     capture_processing::{self, ProcessingOperation},
     inharmonicity::InharmonicityProfile,
     pipeline::PipelineHandle,
 };
-use crate::widgets::envelope::ENVELOPE_HISTORY_LENGTH;
 
 // Audio processing constants
 const SMOOTHING_FACTOR: usize = 5; // Number of samples for cent smoothing
@@ -91,8 +94,11 @@ pub enum Message {
     // ToggleInharmonicityGraph, // Show/hide inharmonicity graph
 
     // Settings view toggles
-    ToggleSettingsView,          // Toggle main view versus settings view
-    ToggleNoiseFloorAdjustment,  // Show/hide noise floor envelope viewer
+    ToggleSettingsView,           // Toggle main view versus settings view
+    ToggleNoiseFloorAdjustment,   // Show/hide noise floor envelope viewer
+    SilenceThresholdChanged(f32), // User dragged the silence threshold slider
+    RecalibrateNoiseFloor,        // User clicked the recalibrate button
+    CalibrationComplete(Result<CalibrationResult, String>), // Calibration finished
 
     // Continuous update message
     Tick, // Timer tick for real-time updates
@@ -130,6 +136,8 @@ pub struct SettingsDisplayData {
     pub rms_history: VecDeque<f32>,
     /// Current silence threshold (read from shared ConfigState).
     pub current_silence_threshold: f32,
+    /// Whether noise-floor calibration has completed at least once.
+    pub calibration_complete: bool,
     /// Whether the Noise Floor Adjustment panel is visible.
     pub noise_floor_adjustment_visible: bool,
 }
@@ -143,6 +151,11 @@ pub struct AppDisplayData {
     pub audio_worker_active: bool,
     pub last_analysis: Option<AnalysisResult>,
     pub smoothing_buffer: Vec<f32>,
+
+    // Calibration state
+    pub is_calibrating: bool,
+    pub calibration_progress: usize,
+    pub calibration_total: usize,
 
     // UI visibility states
     pub spectrogram_visible: bool,
@@ -185,6 +198,9 @@ pub struct TunerApp {
 
     // Single source of truth for all display data
     pub display_data: AppDisplayData,
+
+    // Calibration progress counter (shared with the calibration task)
+    calibration_progress: Arc<AtomicUsize>,
 }
 
 /// Audio worker thread management structure.
@@ -200,29 +216,27 @@ struct AudioWorker {
 impl Default for TunerApp {
     /// Creates a new TunerApp instance with default settings.
     ///
-    /// Initializes the application with:
-    /// - Crossbeam channels for audio data communication
-    /// - All tool panels visible by default
-    /// - Automatic tuning mode
-    /// - Audio processing thread started
+    /// Initializes the application state but does NOT start audio processing.
+    /// Audio processing starts after calibration completes (see `CalibrationComplete`).
     fn default() -> Self {
         eprintln!("[MAIN] Creating TunerApp...");
         let (analysis_tx, analysis_rx) = crossbeam_channel::unbounded();
 
-        let mut app = Self {
+        Self {
             audio_worker: None,
             analysis_receiver: Some(analysis_rx),
             analysis_sender: Some(analysis_tx),
-            // --- Initialize new state ---
             stability_buffer: VecDeque::with_capacity(STABILITY_TARGET),
             inharmonicity_profile: InharmonicityProfile::default(),
-            // ----------------------------
             pipeline_handle: PipelineHandle::default(),
-            // Initialize display data
+            calibration_progress: Arc::new(AtomicUsize::new(0)),
             display_data: AppDisplayData {
-                audio_worker_active: false, // Will be set to true after audio starts
+                audio_worker_active: false,
                 last_analysis: None,
                 smoothing_buffer: Vec::new(),
+                is_calibrating: true,
+                calibration_progress: 0,
+                calibration_total: calibration::DEFAULT_CALIBRATION_FRAMES,
                 spectrogram_visible: true,
                 cent_meter_visible: true,
                 key_select_visible: true,
@@ -232,23 +246,33 @@ impl Default for TunerApp {
                 settings_data: SettingsDisplayData {
                     rms_history: VecDeque::with_capacity(ENVELOPE_HISTORY_LENGTH),
                     current_silence_threshold: 0.005,
+                    calibration_complete: false,
                     noise_floor_adjustment_visible: false,
                 },
                 tuning_mode: TuningMode::Auto,
                 capture_state: CaptureState::Off,
             },
-        };
-
-        eprintln!("[MAIN] Starting audio processing...");
-        app.start_audio_processing();
-        eprintln!("[MAIN] TunerApp created successfully with audio enabled");
-        app
+        }
     }
 }
 
 impl TunerApp {
+    /// Creates the app and kicks off noise-floor calibration via `Task::perform`.
+    /// Audio processing starts only after `CalibrationComplete` arrives.
     pub fn new() -> (Self, iced::Task<Message>) {
-        (Self::default(), iced::Task::none())
+        let app = Self::default();
+        let progress = Arc::clone(&app.calibration_progress);
+        let calibration_task = iced::Task::perform(
+            async move {
+                calibration::calibrate_noise_floor(
+                    calibration::DEFAULT_NOISE_MULTIPLIER,
+                    calibration::DEFAULT_CALIBRATION_FRAMES,
+                    progress,
+                )
+            },
+            |result| Message::CalibrationComplete(result.map_err(|e| e.to_string())),
+        );
+        (app, calibration_task)
     }
     /// Starts the dedicated audio processing thread.
     ///
@@ -267,18 +291,33 @@ impl TunerApp {
             return;
         }
 
-        if let Some(analysis_tx) = self.analysis_sender.take() {
-            let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded(1);
+        // Create fresh channels each time (previous ones were consumed by the old thread)
+        let (analysis_tx, analysis_rx) = crossbeam_channel::unbounded();
+        self.analysis_receiver = Some(analysis_rx);
 
-            // Take ownership of the pipeline to move it into the audio thread
-            // The PipelineHandle stays on the GUI side for shared state polling
-            let (pipeline, new_handle) = tuner_core::pipeline::AudioPipeline::new();
-            self.pipeline_handle = new_handle;
+        let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded(1);
+
+        // Take ownership of the pipeline to move it into the audio thread
+        // The PipelineHandle stays on the GUI side for shared state polling
+        let (pipeline, new_handle) = tuner_core::pipeline::AudioPipeline::new();
+
+        // Write the current threshold to the new pipeline's config
+        // (since AudioPipeline::new() creates fresh defaults)
+        if let Ok(mut config) = new_handle.config.lock() {
+            config.silence_threshold = self.display_data.settings_data.current_silence_threshold;
+        }
+
+        self.pipeline_handle = new_handle;
 
             let thread_handle = thread::spawn(move || {
                 eprintln!("[AUDIO-THREAD] Starting audio thread...");
 
-                // --- RINGBUF MIGRATION ---
+                // --- RINGBUF ---
+                // We create a lock-free ring buffer here.
+                // 8 * BUFFER_SIZE = 16,384 samples (~371ms at 44.1kHz).
+                // This is the "properly sized buffer" mentioned in audio.rs!
+                // It ensures the real-time CPAL thread has plenty of room to push samples
+                // even if this processing thread hits a small latency spike.
                 let rb = ringbuf::HeapRb::<f32>::new(audio::BUFFER_SIZE * 8);
                 let (producer, mut consumer) = rb.split();
 
@@ -295,6 +334,7 @@ impl TunerApp {
                 };
 
                 eprintln!("[AUDIO-THREAD] Entering audio processing loop...");
+                // Add a small delay to let GUI initialize
                 std::thread::sleep(std::time::Duration::from_millis(100));
 
                 let mut audio_frame = Vec::with_capacity(audio::BUFFER_SIZE);
@@ -314,8 +354,11 @@ impl TunerApp {
                     }
 
                     // 2. Lock-free Ringbuf Polling
+                    // We need BUFFER_SIZE samples to run an analysis frame.
                     if consumer.occupied_len() >= audio::BUFFER_SIZE {
                         audio_frame.clear();
+
+                        // Pop exactly BUFFER_SIZE samples from the ring buffer
                         audio_frame.resize(audio::BUFFER_SIZE, 0.0);
                         consumer.pop_slice(&mut audio_frame);
 
@@ -367,14 +410,18 @@ impl TunerApp {
                             break;
                         }
                     } else {
+                        // We don't have enough samples yet.
+                        // Sleep briefly so we don't pin the CPU at 100% while polling.
                         std::thread::sleep(std::time::Duration::from_millis(5));
                     }
                 }
 
                 eprintln!("[AUDIO-THREAD] Stopping stream and exiting...");
+                // Properly stop the stream before dropping it
                 if let Err(e) = stream.pause() {
                     eprintln!("[AUDIO-THREAD] Error pausing stream: {}", e);
                 }
+                // Give the stream a moment to fully stop
                 std::thread::sleep(std::time::Duration::from_millis(50));
                 drop(stream);
                 eprintln!("[AUDIO-THREAD] Audio thread finished");
@@ -385,7 +432,6 @@ impl TunerApp {
             });
             // Update the display data to reflect that audio is active
             self.display_data.audio_worker_active = true;
-        }
     }
 
     /// Handles application state updates based on incoming messages.
@@ -569,10 +615,89 @@ impl TunerApp {
                 self.display_data.settings_view_visible = !self.display_data.settings_view_visible;
             }
             Message::ToggleNoiseFloorAdjustment => {
-                self.display_data.settings_data.noise_floor_adjustment_visible =
-                    !self.display_data.settings_data.noise_floor_adjustment_visible;
+                self.display_data
+                    .settings_data
+                    .noise_floor_adjustment_visible = !self
+                    .display_data
+                    .settings_data
+                    .noise_floor_adjustment_visible;
+            }
+            Message::SilenceThresholdChanged(value) => {
+                // Write to shared config so the audio thread picks it up immediately
+                if let Ok(mut config) = self.pipeline_handle.config.lock() {
+                    config.silence_threshold = value;
+                }
+                // Update local display data for immediate UI feedback
+                self.display_data.settings_data.current_silence_threshold = value;
+            }
+            Message::CalibrationComplete(result) => {
+                self.display_data.is_calibrating = false;
+                match result {
+                    Ok(cal) => {
+                        eprintln!(
+                            "[MAIN] Calibration complete. Baseline: {:.6}, Threshold: {:.6}",
+                            cal.baseline, cal.threshold
+                        );
+                        // Write calibrated values to shared config
+                        if let Ok(mut config) = self.pipeline_handle.config.lock() {
+                            config.silence_threshold = cal.threshold;
+                        }
+                        // Update display data
+                        self.display_data.settings_data.current_silence_threshold = cal.threshold;
+                        self.display_data.settings_data.calibration_complete = true;
+
+                        // Now start the audio processing thread
+                        self.start_audio_processing();
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[MAIN] Calibration failed: {}. Starting audio with defaults.",
+                            e
+                        );
+                        // Start audio anyway with default threshold
+                        self.display_data.settings_data.calibration_complete = true;
+                        self.start_audio_processing();
+                    }
+                }
+            }
+            Message::RecalibrateNoiseFloor => {
+                eprintln!("[MAIN] Recalibration requested — stopping audio thread...");
+                // Stop the audio worker
+                if let Some(mut worker) = self.audio_worker.take() {
+                    let _ = worker.shutdown_tx.send(());
+                    if let Some(handle) = worker.thread_handle.take() {
+                        let _ = handle.join();
+                    }
+                }
+                self.display_data.audio_worker_active = false;
+                self.display_data.settings_data.calibration_complete = false;
+
+                // Set calibrating state and reset progress counter
+                self.display_data.is_calibrating = true;
+                self.display_data.calibration_progress = 0;
+                self.calibration_progress.store(0, Ordering::Relaxed);
+
+                let progress = Arc::clone(&self.calibration_progress);
+
+                // Kick off recalibration
+                return iced::Task::perform(
+                    async move {
+                        calibration::calibrate_noise_floor(
+                            calibration::DEFAULT_NOISE_MULTIPLIER,
+                            calibration::DEFAULT_CALIBRATION_FRAMES,
+                            progress,
+                        )
+                    },
+                    |result| Message::CalibrationComplete(result.map_err(|e| e.to_string())),
+                );
             }
             Message::Tick => {
+                // Poll calibration progress (atomic, lock-free)
+                if self.display_data.is_calibrating {
+                    self.display_data.calibration_progress =
+                        self.calibration_progress.load(Ordering::Relaxed);
+                }
+
                 // Continuous update - poll for audio data
                 if let Some(receiver) = &self.analysis_receiver {
                     // --- REFACTORED: Delegate result processing ---
@@ -590,7 +715,10 @@ impl TunerApp {
 
                 // Poll shared state for settings view (only when visible)
                 if self.display_data.settings_view_visible
-                    && self.display_data.settings_data.noise_floor_adjustment_visible
+                    && self
+                        .display_data
+                        .settings_data
+                        .noise_floor_adjustment_visible
                 {
                     if let Ok(runtime) = self.pipeline_handle.runtime.lock() {
                         let history = &mut self.display_data.settings_data.rms_history;

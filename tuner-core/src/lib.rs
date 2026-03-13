@@ -29,6 +29,8 @@
 pub mod algorithms;
 /// CPAL audio capture, device selection, and real-time streaming.
 pub mod audio;
+/// Standalone noise-floor calibration (opens its own temporary CPAL stream).
+pub mod calibration;
 /// Legacy capture frame processing (deprecated — to be replaced by `pipeline` + `worker`).
 pub mod capture_processing;
 /// F0 Engine — Scout, Bass, and Treble frequency detection (wireframe).

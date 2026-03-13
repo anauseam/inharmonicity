@@ -98,7 +98,7 @@ pub fn start_audio_capture(
 /// # Returns
 /// * `Some(config)` - Best matching configuration
 /// * `None` - No suitable configuration found
-fn find_supported_config(
+pub(crate) fn find_supported_config(
     configs: Vec<SupportedStreamConfigRange>,
     target_rate: u32,
 ) -> Option<SupportedStreamConfigRange> {

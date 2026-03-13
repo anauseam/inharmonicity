@@ -68,9 +68,17 @@ pub fn create_main_view(
     _profile: &tuner_core::inharmonicity::InharmonicityProfile,
     capture_message: crate::Message,
 ) -> Element<'static, crate::Message> {
-    // Show shutdown message if audio worker is not active
+    // Show calibrating/shutdown message if audio worker is not active
     if !data.audio_worker_active {
-        return container(text("Shutting down...").size(40))
+        let message = if data.is_calibrating {
+            format!(
+                "Calibrating… {}/{}",
+                data.calibration_progress, data.calibration_total
+            )
+        } else {
+            "Shutting down...".to_string()
+        };
+        return container(text(message).size(40))
             .width(Fill)
             .height(Fill)
             .center_x(Fill)

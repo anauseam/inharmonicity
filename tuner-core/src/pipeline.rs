@@ -80,15 +80,12 @@ impl ProcessingFrame {
 pub struct ConfigState {
     /// Minimum RMS amplitude required to exit the `Silence` state.
     pub silence_threshold: f32,
-    /// Multiplier applied to the calculated ambient noise to set the silence threshold.
-    pub noise_safety_multiplier: f32,
 }
 
 impl Default for ConfigState {
     fn default() -> Self {
         Self {
             silence_threshold: 0.005,
-            noise_safety_multiplier: 2.0,
         }
     }
 }
@@ -199,20 +196,21 @@ impl AudioPipeline {
 
     /// Processes a single audio frame through the full DSP pipeline.
     ///
-    /// 1. Delegates to the Gatekeeper for signal stability evaluation (pure DSP).
-    /// 2. Syncs the Gatekeeper's observable state to shared memory for the frontend.
+    /// 1. Reads the GUI-set silence threshold from shared config into the Gatekeeper.
+    /// 2. Delegates to the Gatekeeper for signal stability evaluation (pure DSP).
+    /// 3. Syncs runtime observations to shared state for the frontend.
     pub fn process_frame(&mut self, frame: &ProcessingFrame) {
-        // 1. Pure DSP — Gatekeeper evaluates signal stability
-        self.gatekeeper.process_frame(frame);
-
-        // 2. Sync observations to shared state for the frontend
-        if let Ok(mut runtime) = self.shared_runtime.try_lock() {
-            runtime.current_rms_ema = self.gatekeeper.current_rms_ema;
+        // 1. Read GUI-set silence threshold into the Gatekeeper
+        if let Ok(config) = self.shared_config.try_lock() {
+            self.gatekeeper.config.silence_threshold = config.silence_threshold;
         }
 
-        // Sync calibrated threshold if it changed
-        if let Ok(mut config) = self.shared_config.try_lock() {
-            config.silence_threshold = self.gatekeeper.config.silence_threshold;
+        // 2. Pure DSP — Gatekeeper evaluates signal stability
+        self.gatekeeper.process_frame(frame);
+
+        // 3. Sync runtime observations to shared state for the frontend
+        if let Ok(mut runtime) = self.shared_runtime.try_lock() {
+            runtime.current_rms_ema = self.gatekeeper.current_rms_ema;
         }
     }
 }

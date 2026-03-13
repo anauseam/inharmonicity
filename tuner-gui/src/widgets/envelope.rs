@@ -9,8 +9,8 @@
 //! - Horizontal silence threshold marker
 //! - Dynamic Y-axis scaling
 
-use iced::widget::canvas::{self, Canvas, Geometry, path};
-use iced::{Color, Element, Fill, Point, Rectangle, Renderer, Theme, mouse};
+use iced::widget::canvas::{self, Canvas, Geometry, Text, path};
+use iced::{Color, Element, Fill, Point, Rectangle, Renderer, Theme, alignment, mouse};
 
 /// Maximum number of RMS history samples to display.
 /// At 60 FPS this represents approximately 2 seconds of history.
@@ -75,19 +75,10 @@ impl<Message> canvas::Program<Message> for EnvelopeViewer {
                 return;
             }
 
-            // Dynamic Y-axis scaling: use the max of either the history peak
-            // or the silence threshold (whichever is larger) to ensure the
-            // threshold line is always visible. Add 20% headroom.
-            let history_max = self
-                .rms_history
-                .iter()
-                .fold(0.0f32, |max, &val| val.max(max));
-            let y_max = history_max.max(self.silence_threshold) * 1.2;
-
-            // Avoid division by zero for completely silent signals
-            if y_max <= 0.0 {
-                return;
-            }
+            // Fixed Y-axis: anchored at 0.5 to match the slider's absolute range.
+            // Both RMS and threshold lines represent true values — moving the slider
+            // visibly moves the red line independently of the green RMS line.
+            let y_max = 0.5_f32;
 
             let len = self.rms_history.len();
             let x_step = bounds.width / (ENVELOPE_HISTORY_LENGTH as f32 - 1.0).max(1.0);
@@ -133,6 +124,73 @@ impl<Message> canvas::Program<Message> for EnvelopeViewer {
                     .with_color(Color::from_rgba8(0xE7, 0x4C, 0x3C, 0.8)) // red, slightly transparent
                     .with_width(1.5),
             );
+
+            // Draw grid lines (horizontal)
+            let grid_color = Color::from_rgba8(0x44, 0x44, 0x66, 0.3);
+            for i in 1..4 {
+                let y = bounds.height * (i as f32 / 4.0);
+                let grid_line = canvas::Path::line(Point::new(0.0, y), Point::new(bounds.width, y));
+                frame.stroke(
+                    &grid_line,
+                    canvas::Stroke::default()
+                        .with_color(grid_color)
+                        .with_width(1.0),
+                );
+            }
+
+            // Draw grid lines (vertical)
+            for i in 1..4 {
+                let x = bounds.width * (i as f32 / 4.0);
+                let grid_line =
+                    canvas::Path::line(Point::new(x, 0.0), Point::new(x, bounds.height));
+                frame.stroke(
+                    &grid_line,
+                    canvas::Stroke::default()
+                        .with_color(grid_color)
+                        .with_width(1.0),
+                );
+            }
+
+            // Draw Text Labels
+            let label_color = Color::from_rgba8(0xBD, 0xC3, 0xC7, 0.6);
+            for i in 1..4 {
+                let value = y_max * (1.0 - i as f32 / 4.0);
+                let y = bounds.height * (i as f32 / 4.0);
+                let label = Text {
+                    content: format!("{:.3}", value),
+                    position: Point::new(4.0, y + 2.0),
+                    color: label_color,
+                    align_x: alignment::Horizontal::Left.into(),
+                    align_y: alignment::Vertical::Top.into(),
+                    size: iced::Pixels(10.0),
+                    ..Default::default()
+                };
+                frame.fill_text(label);
+            }
+
+            // Current RMS value (latest sample)
+            if let Some(&latest_rms) = self.rms_history.last() {
+                let rms_text = Text {
+                    content: format!("RMS {:.4}", latest_rms),
+                    position: Point::new(bounds.width - 5.0, 5.0),
+                    color: Color::from_rgb8(0x2E, 0xCC, 0x71), // Match envelope color
+                    align_x: alignment::Horizontal::Right.into(),
+                    align_y: alignment::Vertical::Top.into(),
+                    ..Default::default()
+                };
+                frame.fill_text(rms_text);
+            }
+
+            // Silence threshold value
+            let threshold_text = Text {
+                content: format!("Threshold: {:.4}", self.silence_threshold),
+                position: Point::new(5.0, threshold_y - 5.0),
+                color: Color::from_rgba8(0xE7, 0x4C, 0x3C, 0.9), // Match threshold color
+                align_x: alignment::Horizontal::Left.into(),
+                align_y: alignment::Vertical::Bottom.into(),
+                ..Default::default()
+            };
+            frame.fill_text(threshold_text);
         });
 
         vec![geometry]
