@@ -1,4 +1,4 @@
-use iced::widget::{Space, button, column, container, row, text};
+use iced::widget::{Space, button, column, container, row, slider, text};
 use iced::{Alignment, Element, Fill, Length};
 
 use crate::utils::view_utils::{ButtonConfig, ButtonType, make_sidebar_section};
@@ -42,8 +42,8 @@ const SETTINGS_SIDEBAR_CONFIG: [(&str, &[ButtonConfig]); 2] = [
 ];
 
 pub fn create_settings_view(data: &crate::app::AppDisplayData) -> Element<'static, crate::Message> {
-    // Show shutdown message if audio worker is not active
-    if !data.audio_worker_active {
+    // Show calibrating/shutdown message if audio worker is not active AND not in settings recalibration
+    if !data.audio_worker_active && !data.is_calibrating {
         return container(text("Shutting down...").size(40))
             .width(Fill)
             .height(Fill)
@@ -66,18 +66,49 @@ pub fn create_settings_view(data: &crate::app::AppDisplayData) -> Element<'stati
                     .height(Fill)
                     .into();
 
+            // Fixed range: covers all realistic noise floors regardless of device.
+            // Calibration sets the initial position; the range never shifts.
+            let slider_min = 0.001_f32;
+            let slider_max = 0.5_f32;
+            let slider_step = 0.0001_f32;
+            let calibration_complete = data.settings_data.calibration_complete;
+
+            let controls: Element<'static, crate::Message> = if calibration_complete {
+                column![
+                    row![
+                        text("Silence Threshold: ").size(14),
+                        slider(slider_min..=slider_max, threshold, crate::Message::SilenceThresholdChanged)
+                            .step(slider_step)
+                            .width(Fill),
+                        text(format!("{:.5}", threshold)).size(14),
+                    ]
+                    .spacing(10)
+                    .align_y(Alignment::Center),
+                    Space::new().height(5),
+                    button(text("Recalibrate Noise Floor").size(14))
+                        .on_press(crate::Message::RecalibrateNoiseFloor)
+                        .padding([8, 16]),
+                ]
+                .spacing(5)
+                .into()
+            } else {
+                text("Calibrating…").size(16).into()
+            };
+
             container(
                 column![
                     text("Noise Floor Adjustment").size(18),
                     Space::new().height(10),
-                    envelope_content
+                    envelope_content,
+                    Space::new().height(10),
+                    controls,
                 ]
                 .width(Fill)
                 .spacing(5)
                 .padding(15),
             )
             .width(Fill)
-            .height(Length::Fixed(250.0))
+            .height(Length::Fixed(340.0))
             .into()
         } else {
             text("Select a setting to adjust.").size(18).into()
