@@ -47,17 +47,21 @@ An open source professional-grade piano tuning application built in Rust with re
 inharmonicity/
 ├── tuner-core/                     # Headless audio processing & analysis (no GUI code)
 │   ├── src/
-│   │   ├── algorithms/             # Stateless DSP building blocks
-│   │   │   ├── fft.rs              # FFT windowing and spectrum analysis
-│   │   │   ├── pitch.rs            # pYIN pitch detection
-│   │   │   ├── power.rs            # RMS, EMA, CSD, NINOS2 calculations
-│   │   │   └── tuning.rs           # Note mapping, cent deviation, inharmonicity curves
+│   │   ├── algorithms/             # Stateless DSP building blocks (spectral, pitch, metrics, tuning)
+│   │   │   ├── spectral.rs         # FFT, windowing, and spectrum magnitude extraction
+│   │   │   ├── pitch.rs            # YIN / pYIN pitch detection and spectrum refinement
+│   │   │   ├── dpyin.rs            # Decimated pYIN — bass register pitch detection
+│   │   │   ├── scout.rs            # Rough frequency neighborhood detection
+│   │   │   ├── metrics.rs          # RMS, EMA, CSD, NINOS2 signal metrics
+│   │   │   ├── tuning.rs           # Cent deviation, inharmonicity-compensated frequencies
+│   │   │   └── inharmonicity.rs    # B-coefficient calculation (deprecated, pending replacement)
+│   │   ├── models.rs               # Domain data types: Note, Partial, KeyMeasurement, profiles
 │   │   ├── pipeline.rs             # AudioPipeline mediator, shared state types, memory pools
 │   │   ├── engine.rs               # F0 Engine — Scout / Bass / Treble DSP (wireframe)
 │   │   ├── gatekeeper.rs           # 5-state signal validator (DSP, no shared state)
 │   │   ├── worker.rs               # Background worker manager for heavy offline DSP (wireframe)
 │   │   ├── audio.rs                # CPAL audio capture, stream management, DC blocking
-│   │   ├── inharmonicity.rs        # Inharmonicity constant calculation and profiles
+│   │   ├── calibration.rs          # Standalone noise-floor calibration
 │   │   ├── capture_processing.rs   # Legacy frame processing (deprecated — see migration note)
 │   │   └── lib.rs                  # Crate root and AnalysisResult definition
 │   └── Cargo.toml
@@ -138,6 +142,7 @@ The pipeline also manages the **`WorkerManager`** (`worker.rs`), which owns a si
 > | `engine.rs` — F0 Engine (Scout / Bass / Treble) | ⬜ Wireframe |
 > | `worker.rs` — Background worker (single thread) | ⬜ Wireframe |
 > | Pipeline fully encapsulates all output | ⬜ In progress |
+> | STFT overlap — Hamming window → 50% COLA w/ Hann | ⬜ Planned (post-migration) |
 >
 > **Currently**, `app.rs` still calls algorithm functions directly (FFT, YIN, tuning)
 > and uses the legacy `capture_processing` module. The `AudioPipeline` is live for
@@ -145,6 +150,32 @@ The pipeline also manages the **`WorkerManager`** (`worker.rs`), which owns a si
 > and `Worker` are scaffolded for future integration. As the migration completes,
 > `app.rs` will reduce to a thin `pipeline.process_frame()` call with zero
 > knowledge of DSP internals.
+
+> [!NOTE]
+> **Planned: COLA STFT Architecture**
+>
+> The pipeline currently processes **non-overlapping** 2048-sample frames. Because
+> frame boundaries are asynchronous to real piano strikes, the original Hann window
+> (which tapers to exactly 0.0 at both edges) created transient detection dead zones:
+> a hammer strike landing on a frame boundary would be attenuated to silence in both
+> adjacent frames, preventing the CSD algorithm from tripping.
+>
+> **Immediate mitigation (current):** The Hann window is replaced with a **Hamming**
+> window (`0.54 − 0.46·cos(…)`), which maintains an 8% amplitude pedestal at the
+> edges. This ensures boundary transients retain enough broadband energy to breach
+> the CSD threshold, while its −43 dB sidelobe floor provides sufficient spectral
+> clarity for partial interpolation at 0% overlap.
+>
+> **Target architecture (post-migration):** Once `app.rs` is fully migrated to
+> `AudioPipeline.process_frame()`, the frame geometry will be upgraded to a
+> **50% overlap COLA** design (1024-sample hop, circular FIFO ring buffer). This
+> satisfies the Constant Overlap-Add property with a Hann window, mathematically
+> guaranteeing that every sample is analyzed at full window amplitude in at least
+> one frame — eliminating temporal blind spots entirely. The Hann window's
+> −18 dB/octave sidelobe roll-off also provides superior noise floor suppression
+> over Hamming's −6 dB/octave for resolving high-order inharmonic partials. The
+> FFT rate doubles (~21.5 → ~43 frames/sec), adding roughly 1 ms of CPU time per
+> second of audio — a negligible cost on modern hardware.
 
 ### Global Data Structures & Memory Management
 
@@ -172,7 +203,7 @@ This thread constantly consumes data from the Elastic Ring Buffer and executes a
   - *State 2 (TRANSIENT):* Institutes a hard delay waiting for the chaotic broadband noise of the strike to physically decay.
   - *State 3 (HARMONIC DECAY):* Uses the NINOS2 (Normalized Identification of Note Onset based on Spectral Sparsity) metric to monitor the signal. It ignores volume swells and identifies the "Golden Window" of pure, stable harmonic decay for capture.
   - *State 4 (RELEASE):* Caps the capture at 1.5 seconds to prevent flat-lining pitch drift, closing the gate, recycling the buffer, dispatching the payload to Thread 3, and immediately resets to State 0.
-- **The Scout:** Applies a Hann or Hamming window to a 2048-sample buffer to eliminate spectral leakage, then runs a Real FFT to find an accurate rough frequency neighborhood.
+- **The Scout:** Applies a **Hamming** window to a 2048-sample buffer to eliminate spectral leakage, then runs a Real FFT to find an accurate rough frequency neighborhood. The Hamming window is the correct choice for the current non-overlapping frame geometry (see COLA migration note above). Once 50% overlap is implemented, this will switch to a Hann window to satisfy the COLA constraint.
 - **The Router & Dual Engines:**
   - *Bass Engine (< 150 Hz):* Instructs the ring buffer to pull an 8192-sample window (necessary for long bass wavelengths). It applies an anti-aliasing filter, decimates the audio, and runs the pYIN algorithm. The Hidden Markov Model within pYIN effectively prevents the octave errors that plague stiff, copper-wound bass strings.
   - *Treble Engine (> 150 Hz):* Uses the standard 2048-sample window. It features two toggleable modes. For professional use, it seeds a Digital Phase-Locked Loop (DPLL) with the Scout's frequency, using a Proportional-Integral filter to lock tightly onto the string's phase. For educational use, it utilizes a Quadratic Interpolated FFT (QIFFT) to demonstrate highly accurate frequency-domain sub-bin peak detection.

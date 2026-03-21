@@ -24,7 +24,7 @@ use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::algorithms::power::{calculate_ema, calculate_rms};
+use crate::algorithms::metrics::{calculate_ema, calculate_rms};
 use crate::audio::{BUFFER_SIZE, dc_block, find_supported_config};
 
 /// Default number of calibration frames (~2 seconds at 44.1 kHz / 2048 samples).

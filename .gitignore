@@ -26,3 +26,6 @@ README.html
 
 # Generated JSON files
 tuning_profile.json
+
+# AI-related files
+.agents/

@@ -65,7 +65,7 @@ const MAIN_SIDEBAR_CONFIG: [(&str, &[ButtonConfig]); 2] = [
 /// Creates the complete main application view
 pub fn create_main_view(
     data: &crate::app::AppDisplayData,
-    _profile: &tuner_core::inharmonicity::InharmonicityProfile,
+    _profile: &tuner_core::models::InharmonicityProfile,
     capture_message: crate::Message,
 ) -> Element<'static, crate::Message> {
     // Show calibrating/shutdown message if audio worker is not active
@@ -280,7 +280,7 @@ fn create_keyboard_panel(
         .as_ref()
         .and_then(|analysis| analysis.note_name.as_ref())
         .and_then(|name| {
-            Some(tuner_core::algorithms::tuning::get_key_index_from_name(
+            Some(tuner_core::models::get_key_index_from_name(
                 name,
             ))
         });

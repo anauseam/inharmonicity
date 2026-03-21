@@ -57,7 +57,7 @@ impl KeyboardView {
                 while let Ok(result) = self.channel_rx.try_recv() {
                     self.detected_key_index = result
                         .note_name
-                        .map(|name| tuner_core::algorithms::tuning::get_key_index_from_name(&name));
+                        .map(|name| tuner_core::models::get_key_index_from_name(&name));
                 }
             }
             LocalMessage::KeyClicked(idx) => {

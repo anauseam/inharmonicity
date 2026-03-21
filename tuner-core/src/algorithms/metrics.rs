@@ -48,7 +48,7 @@ pub fn calculate_rms(buffer: &[f32]) -> f32 {
 /// The updated EMA value.
 ///
 /// # Formula
-/// $$\text{EMA}_t = \alpha \cdot x_t + (1 - \alpha) \cdot \text{EMA}_{t-1}$$
+/// $$\text{EMA}_{\ell} = \alpha \cdot x_{\ell} + (1 - \alpha) \cdot \text{EMA}_{\ell-1}$$
 pub fn calculate_ema(current_val: f32, previous_ema: f32, alpha: f32) -> f32 {
     if previous_ema == 0.0 {
         current_val

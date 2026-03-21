@@ -23,11 +23,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tuner_core::{
     AnalysisResult,
-    algorithms::{fft, pitch, tuning},
+    algorithms::{pitch, tuning},
     audio,
     calibration::{self, CalibrationResult},
     capture_processing::{self, ProcessingOperation},
-    inharmonicity::InharmonicityProfile,
+    models::InharmonicityProfile,
     pipeline::PipelineHandle,
 };
 
@@ -283,6 +283,7 @@ impl TunerApp {
     ///
     /// The audio thread runs independently and sends analysis results
     /// back to the GUI thread via the analysis channel.
+    #[allow(unreachable_code)]
     fn start_audio_processing(&mut self) {
         // Prevent headless tests from hanging indefinitely while trying to initialize physical audio hardware
         #[cfg(test)]
@@ -338,9 +339,9 @@ impl TunerApp {
                 std::thread::sleep(std::time::Duration::from_millis(100));
 
                 let mut audio_frame = Vec::with_capacity(audio::BUFFER_SIZE);
-                let mut planner = rustfft::FftPlanner::new();
+                let mut planner = realfft::RealFftPlanner::<f32>::new();
                 let fft_instance = planner.plan_fft_forward(audio::BUFFER_SIZE);
-                let mut yin_buffer = vec![0.0; audio::BUFFER_SIZE / 2];
+                let mut time_buffer = vec![0.0; audio::BUFFER_SIZE];
 
                 // The AudioPipeline owns the Gatekeeper and shared state sync
                 let mut pipeline = pipeline;
@@ -372,7 +373,7 @@ impl TunerApp {
                                     &audio_frame,
                                     sample_rate,
                                     &mut test_frame.frequency_buffer[..],
-                                    &mut yin_buffer,
+                                    &mut time_buffer,
                                     &fft_instance,
                                 )
                             })) {
@@ -482,7 +483,7 @@ impl TunerApp {
                 }
 
                 // Different key or not in manual mode - switch to manual mode with new key
-                let (note_name, target_freq) = tuning::find_nearest_note_by_index(key_index);
+                let (note_name, target_freq) = tuner_core::models::find_nearest_note_by_index(key_index);
                 self.display_data.tuning_mode = TuningMode::Manual {
                     key_index,
                     note_name,
@@ -866,10 +867,10 @@ fn perform_analysis(
     sample_rate: u32,
     complex_buffer: &mut [rustfft::num_complex::Complex<f32>],
     time_buffer: &mut [f32],
-    fft_instance: &std::sync::Arc<dyn rustfft::Fft<f32>>,
+    fft_instance: &std::sync::Arc<dyn realfft::RealToComplex<f32>>,
 ) -> AnalysisResult {
-    fft::perform_fft(audio_frame, complex_buffer, fft_instance);
-    let spectrogram_data = fft::spectrum_to_magnitudes(complex_buffer);
+    tuner_core::algorithms::spectral::perform_fft(audio_frame, time_buffer, complex_buffer, fft_instance);
+    let spectrogram_data = tuner_core::algorithms::spectral::spectrum_to_magnitudes(complex_buffer);
 
     // --- Unpack the frequency and confidence ---
     let (detected_frequency, confidence) = if let Some((freq, conf)) =
@@ -882,7 +883,7 @@ fn perform_analysis(
     };
 
     let (cents_deviation, note_name) = if let Some(freq) = detected_frequency {
-        let (name, target_freq) = tuning::find_nearest_note(freq);
+        let (name, target_freq) = tuner_core::models::find_nearest_note(freq);
         let deviation = tuning::calculate_cents_deviation(freq, target_freq);
         (Some(deviation), Some(name))
     } else {

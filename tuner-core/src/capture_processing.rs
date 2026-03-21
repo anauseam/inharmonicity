@@ -5,8 +5,8 @@
 //! This module provides different processing strategies for analyzing stable audio frames.
 
 use crate::{
-    algorithms::tuning,
-    inharmonicity::{KeyMeasurement, Partial},
+    algorithms::inharmonicity::calculate_b_value,
+    models::{KeyMeasurement, Partial, get_key_index_from_name},
 };
 
 /// Different processing operations that can be performed on captured frames
@@ -66,7 +66,7 @@ fn process_best_confidence(buffer: Vec<crate::AnalysisResult>) -> Option<KeyMeas
         if let (Some(note_name), Some(freq)) =
             (&best_frame.note_name, best_frame.detected_frequency)
         {
-            let key_index = tuning::get_key_index_from_name(note_name);
+            let key_index = get_key_index_from_name(note_name);
 
             // Create the fundamental partial (n=1)
             let mut all_partials = vec![Partial {
@@ -92,7 +92,7 @@ fn process_best_confidence(buffer: Vec<crate::AnalysisResult>) -> Option<KeyMeas
                 partials: all_partials,
                 calculated_b: None,
             };
-            measurement.calculate_b_value();
+            calculate_b_value(&mut measurement);
 
             eprintln!(
                 "[CAPTURE] Processed measurement for {}: B={:?}",

@@ -106,7 +106,7 @@ pub fn detect_pitch_pyin(
 
 /// Calculates the core YIN cumulative mean normalized difference function.
 /// This is the heart of both YIN and pYIN and is reused.
-fn yin_difference(signal: &[f32], frame_size: usize, yin_buffer: &mut [f32]) {
+pub(crate) fn yin_difference(signal: &[f32], frame_size: usize, yin_buffer: &mut [f32]) {
     // Step 1 & 2: Difference function and squared difference
     for tau in 1..(frame_size / 2) {
         let mut diff = 0.0;
@@ -338,7 +338,7 @@ pub fn refine_from_spectrum(
 /// # Returns
 /// * `Some(offset)` - The calculated offset, which can be added to the center index.
 /// * `None` - If the points form a straight line (denominator is zero).
-fn parabolic_interpolation_offset(y_left: f32, y_center: f32, y_right: f32) -> Option<f32> {
+pub(crate) fn parabolic_interpolation_offset(y_left: f32, y_center: f32, y_right: f32) -> Option<f32> {
     let denominator = y_left - 2.0 * y_center + y_right;
 
     if denominator.abs() < 1e-6 {

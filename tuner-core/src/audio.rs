@@ -22,6 +22,9 @@ use ringbuf::traits::Producer;
 /// Larger buffers provide more frequency resolution but increase latency.
 pub const BUFFER_SIZE: usize = 2048;
 
+/// The target sample rate for the application in Hz.
+pub const SAMPLE_RATE: u32 = 44100;
+
 /// DC blocking filter coefficient.
 ///
 /// α = 0.995 → ~3.5 Hz cutoff at 44.1 kHz — well below A0 (27.5 Hz).
@@ -61,11 +64,10 @@ pub fn start_audio_capture(
     println!("Using audio input device: {:?}", device.description()?);
 
     let configs = device.supported_input_configs()?.collect::<Vec<_>>();
-    let supported_config = find_supported_config(configs, 44100)
+    let supported_config = find_supported_config(configs, SAMPLE_RATE)
         .ok_or_else(|| anyhow!("No suitable f32 input format found"))?;
 
-    let sample_rate = 44100;
-    let config = supported_config.with_sample_rate(sample_rate);
+    let config = supported_config.with_sample_rate(SAMPLE_RATE);
 
     let sample_rate_val = config.sample_rate();
     let config: cpal::StreamConfig = config.into();
