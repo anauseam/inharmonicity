@@ -1,17 +1,22 @@
 //! # Algorithms — Stateless DSP Building Blocks
 //!
-//! This module re-exports the four core algorithm submodules used throughout
-//! the tuner pipeline. All functions in these modules are **stateless** —
-//! they take input buffers and return computed values with no side effects.
+//! Pure, stateless math organized by primary output. All functions take input
+//! buffers and return computed values with no side effects.
 //!
-//! | Submodule | Purpose |
-//! |---|---|
-//! | [`fft`] | Forward FFT, Hann windowing, spectrum magnitude extraction |
-//! | [`pitch`] | YIN and pYIN pitch detection with parabolic interpolation |
-//! | [`power`] | RMS, EMA, CSD, and NINOS2 — power and spectral metrics |
-//! | [`tuning`] | 88-key note mapping, cent deviation, frequency lookup |
+//! | Submodule | Domain | Returns |
+//! |---|---|---|
+//! | [`spectral`] | Time ↔ frequency transforms | Complex spectra, magnitude vectors |
+//! | [`pitch`] | YIN / pYIN pitch detection | Frequency (Hz), confidence |
+//! | [`dpyin`] | Decimated pYIN (bass register) | Frequency (Hz), confidence |
+//! | [`scout`] | Rough frequency neighborhood | Frequency (Hz) |
+//! | [`metrics`] | Signal property measurement | RMS, EMA, CSD, NINOS2 scalars |
+//! | [`tuning`] | Tuning math | Cent deviations, compensated frequencies |
+//! | [`inharmonicity`] | B-coefficient calculation | B coefficient (deprecated) |
 
-pub mod fft;
+pub mod dpyin;
+pub mod inharmonicity;
+pub mod spectral;
 pub mod pitch;
-pub mod power;
+pub mod metrics;
 pub mod tuning;
+pub mod scout;

@@ -48,6 +48,9 @@ impl DashboardTest {
             audio_worker_active: true,
             last_analysis: None,
             smoothing_buffer: Vec::new(),
+            is_calibrating: false,
+            calibration_progress: 0,
+            calibration_total: 100,
             spectrogram_visible: true,
             cent_meter_visible: true,
             key_select_visible: true,
@@ -56,6 +59,7 @@ impl DashboardTest {
             settings_data: tuner_gui::app::SettingsDisplayData {
                 rms_history: std::collections::VecDeque::new(),
                 current_silence_threshold: 0.005,
+                calibration_complete: true,
                 noise_floor_adjustment_visible: false,
             },
             tuning_mode: TuningMode::Auto,

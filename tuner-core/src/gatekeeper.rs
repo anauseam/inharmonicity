@@ -28,7 +28,7 @@
 //! set by the standalone [`calibration`](crate::calibration) module or the GUI slider.
 //! The Gatekeeper has no knowledge of how the threshold was computed.
 
-use crate::algorithms::power::{calculate_csd, calculate_ema, calculate_ninos2, calculate_rms};
+use crate::algorithms::metrics::{calculate_csd, calculate_ema, calculate_ninos2, calculate_rms};
 use crate::pipeline::{AudioPool, ProcessingFrame};
 use std::sync::Arc;
 

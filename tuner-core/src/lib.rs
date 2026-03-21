@@ -16,16 +16,16 @@
 //!
 //! | Module | Purpose |
 //! |---|---|
-//! | [`algorithms`] | Stateless DSP building blocks (FFT, pitch, power, tuning) |
+//! | [`algorithms`] | Stateless DSP building blocks (spectral, pitch, metrics, tuning) |
+//! | [`models`] | Domain data types, lookup tables, and serializable structures |
 //! | [`audio`] | CPAL audio capture and stream management |
 //! | [`pipeline`] | AudioPipeline mediator, shared state types, memory pools |
 //! | [`engine`] | F0 Engine — Scout / Bass / Treble DSP (wireframe) |
 //! | [`gatekeeper`] | 5-state signal validator (pure DSP, no shared state) |
 //! | [`worker`] | Background worker for heavy offline DSP (wireframe) |
-//! | [`inharmonicity`] | Inharmonicity constant (B) calculation and profiles |
 //! | [`capture_processing`] | Legacy frame processing (deprecated) |
 
-/// Stateless DSP building blocks: FFT, pitch detection, power metrics, and tuning math.
+/// Stateless DSP building blocks: spectral transforms, pitch detection, signal metrics, and tuning math.
 pub mod algorithms;
 /// CPAL audio capture, device selection, and real-time streaming.
 pub mod audio;
@@ -37,8 +37,8 @@ pub mod capture_processing;
 pub mod engine;
 /// 5-state signal validator (pure DSP). Evaluates RMS, CSD, and NINOS2 for stability gating.
 pub mod gatekeeper;
-/// Inharmonicity constant (B) calculation, partial measurements, and piano profiles.
-pub mod inharmonicity;
+/// Domain data types, lookup tables, and serializable structures.
+pub mod models;
 /// AudioPipeline mediator: orchestrates DSP components, owns shared state, memory pools.
 pub mod pipeline;
 /// Background worker manager for heavy offline DSP (MAT / ICF).
