@@ -87,6 +87,56 @@ pub fn calculate_csd(
     sum_sq
 }
 
+/// Calculates the Normalized Half-Wave Rectified Spectral Flux (NHWRSF).
+///
+/// This measures the increase in transient energy between two frames by summing
+/// the positive magnitude differences across a specific frequency band (roughly 50Hz to 10kHz),
+/// then normalizing it against the total signal energy of the current frame.
+///
+/// # Arguments
+/// * `current_spectrum` — The complex frequency spectrum of the current frame.
+/// * `prev_spectrum_mags` — Mutable slice of the previous frame's magnitudes.
+///   This is updated in-place to prime it for the next frame.
+///
+/// # Returns
+/// A normalized, dimensionless float representing the transient flux.
+pub fn calculate_nhwrsf(
+    current_spectrum: &[rustfft::num_complex::Complex<f32>],
+    prev_spectrum_mags: &mut [f32],
+) -> f32 {
+    // 2048-window FFT at 44100 Hz = ~21.533 Hz per bin.
+    const START_BIN: usize = 2;   // ~43 Hz
+    const END_BIN: usize = 464;   // ~9991 Hz
+
+    let mut total_flux = 0.0;
+    let mut current_energy = 0.0;
+    
+    // Ensure we don't panic if buffers are small for some reason
+    let limit = current_spectrum.len()
+        .min(prev_spectrum_mags.len())
+        .min(END_BIN + 1);
+        
+    let start = START_BIN.min(limit);
+
+    for k in start..limit {
+        let c = current_spectrum[k];
+        let mag = (c.re * c.re + c.im * c.im).sqrt();
+        
+        current_energy += mag;
+
+        let diff = mag - prev_spectrum_mags[k];
+        if diff > 0.0 {
+            total_flux += diff;
+        }
+
+        // Buffer maintenance for the next frame
+        prev_spectrum_mags[k] = mag;
+    }
+
+    // Secure against division-by-zero
+    total_flux / (current_energy + 1e-6)
+}
+
 /// Normalized Identification of Note Onset based on Spectral Sparsity (NINOS2).
 ///
 /// NINOS2 quantifies how "peaky" (tonal) vs. "flat" (noisy) a spectrum is.
