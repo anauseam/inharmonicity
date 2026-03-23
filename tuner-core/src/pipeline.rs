@@ -81,12 +81,15 @@ impl ProcessingFrame {
 pub struct ConfigState {
     /// Minimum RMS amplitude required to exit the `Silence` state.
     pub silence_threshold: f32,
+    /// NHWRSF threshold required to declare a new transient note event.
+    pub nhwrsf_threshold: f32,
 }
 
 impl Default for ConfigState {
     fn default() -> Self {
         Self {
             silence_threshold: 0.005,
+            nhwrsf_threshold: 0.5,
         }
     }
 }
@@ -100,12 +103,15 @@ impl Default for ConfigState {
 pub struct RuntimeState {
     /// The current smoothed RMS amplitude (Exponential Moving Average).
     pub current_rms_ema: f32,
+    /// The current signal flux
+    pub current_nhwrsf: f32,
 }
 
 impl Default for RuntimeState {
     fn default() -> Self {
         Self {
             current_rms_ema: 0.0,
+            current_nhwrsf: 0.0,
         }
     }
 }
@@ -205,9 +211,10 @@ impl AudioPipeline {
     /// 2. Delegates to the Gatekeeper for signal stability evaluation (pure DSP).
     /// 3. Syncs runtime observations to shared state for the frontend.
     pub fn process_frame(&mut self, frame: &mut ProcessingFrame, amplitude_threshold: f32) -> Option<(f32, Option<f32>)> {
-        // 1. Read GUI-set silence threshold into the Gatekeeper
+        // 1. Read GUI-set configs into the Gatekeeper
         if let Ok(config) = self.shared_config.try_lock() {
             self.gatekeeper.config.silence_threshold = config.silence_threshold;
+            self.gatekeeper.config.nhwrsf_threshold = config.nhwrsf_threshold;
         }
 
         // 2. Pure DSP — Gatekeeper evaluates signal stability
@@ -216,6 +223,7 @@ impl AudioPipeline {
         // 3. Sync runtime observations to shared state for the frontend
         if let Ok(mut runtime) = self.shared_runtime.try_lock() {
             runtime.current_rms_ema = self.gatekeeper.current_rms_ema;
+            runtime.current_nhwrsf = self.gatekeeper.current_nhwrsf;
         }
 
         // 4. Run the Engine to extract fundamental frequency

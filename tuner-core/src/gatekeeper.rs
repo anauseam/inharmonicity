@@ -28,7 +28,7 @@
 //! set by the standalone [`calibration`](crate::calibration) module or the GUI slider.
 //! The Gatekeeper has no knowledge of how the threshold was computed.
 
-use crate::algorithms::metrics::{calculate_csd, calculate_ema, calculate_ninos2, calculate_rms};
+use crate::algorithms::metrics::{calculate_nhwrsf, calculate_ema, calculate_ninos2, calculate_rms};
 use crate::pipeline::{AudioPool, ProcessingFrame};
 use std::sync::Arc;
 
@@ -41,8 +41,8 @@ pub struct GatekeeperConfig {
     pub silence_threshold: f32,
     /// The smoothing factor for the Root Mean Square (RMS) Exponential Moving Average (EMA). 0.0 is infinite smoothing, 1.0 is instantaneous.
     pub rms_ema_alpha: f32,
-    /// The threshold for Complex Spectral Difference (CSD) above which we declare a transient
-    pub csd_transient_threshold: f32,
+    /// The threshold for Normalized Half-Wave Rectified Spectral Flux (NHWRSF) above which we declare a transient
+    pub nhwrsf_threshold: f32,
     /// How many frames to hard-wait after a CSD transient is detected (e.g., 10 frames ≈ 464ms)
     pub transient_delay_frames: usize,
     /// The NINOS2 sparsity threshold above which the signal is considered harmonically stable
@@ -60,7 +60,7 @@ impl Default for GatekeeperConfig {
         Self {
             silence_threshold: 0.005, // Default until overwritten by calibration or GUI
             rms_ema_alpha: 0.1, // Strong smoothing to ride through momentary unison beating dips
-            csd_transient_threshold: 15.0, // Arbitrary starting threshold
+            nhwrsf_threshold: 0.5, // Arbitrary starting threshold
             transient_delay_frames: 10, // Hard bypass delay after transient (~464ms)
             ninos2_stability_threshold: 10.0, // Scale 1 (white noise) to N (pure tone)
             required_stable_frames: 4, // (~185ms)
@@ -104,7 +104,9 @@ pub struct Gatekeeper {
     // Internal DSP State memory
     // Pre-allocated array matching the size of ProcessingFrame.frequency_buffer (2048)
     // to prevent dynamic heap allocation on the audio hot-path.
-    prev_spectrum: [rustfft::num_complex::Complex<f32>; 2048],
+    prev_spectrum: [f32; 2048],
+
+    pub current_nhwrsf: f32,
 
     // State machine counters
     pub transient_delay_counter: usize,
@@ -134,7 +136,8 @@ impl Gatekeeper {
             capture_mode_enabled: false,
             config: GatekeeperConfig::default(),
             current_state: SignalState::Silence,
-            prev_spectrum: [rustfft::num_complex::Complex { re: 0.0, im: 0.0 }; 2048],
+            prev_spectrum: [0.0; 2048],
+            current_nhwrsf: 0.0,
             transient_delay_counter: 0,
             stable_counter: 0,
             capture_counter: 0,
@@ -183,9 +186,9 @@ impl Gatekeeper {
     }
 
 
-    /// Detects transient events (States 1 & 2) using Complex Spectral Difference.
+    /// Detects transient events (States 1 & 2) using NHWRSF.
     ///
-    /// **State 1 (ATTACK):** If CSD exceeds `csd_transient_threshold`, a hammer
+    /// **State 1 (ATTACK):** If NHWRSF exceeds `nhwrsf_threshold`, a hammer
     /// strike is declared. The transient delay counter is armed.
     ///
     /// **State 2 (TRANSIENT):** While the delay counter is nonzero, the Gatekeeper
@@ -199,21 +202,17 @@ impl Gatekeeper {
         &mut self,
         current_spectrum: &[rustfft::num_complex::Complex<f32>],
     ) -> bool {
-        // We only calculate CSD up to the size of the current spectrum to avoid out-of-bounds
-        // if for some reason the buffer is smaller than our 2048 array.
-        let csd = calculate_csd(
-            &self.prev_spectrum[..current_spectrum.len()],
+        let nhwrsf = calculate_nhwrsf(
             current_spectrum,
+            &mut self.prev_spectrum[..],
         );
+        self.current_nhwrsf = nhwrsf;
 
-        // Update history (zero-allocation copy)
-        self.prev_spectrum[..current_spectrum.len()].copy_from_slice(current_spectrum);
-
-        // Reset the onset flag by default; it only fires true on the exact frame the CSD triggers
+        // Reset the onset flag by default; it only fires true on the exact frame the transient triggers
         self.is_new_onset = false;
 
         // State 1: ATTACK
-        if csd > self.config.csd_transient_threshold {
+        if nhwrsf > self.config.nhwrsf_threshold {
             // Hammer strike detected
             self.transient_delay_counter = self.config.transient_delay_frames;
             self.stable_counter = 0;
