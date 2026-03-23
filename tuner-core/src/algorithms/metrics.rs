@@ -124,3 +124,43 @@ pub fn calculate_ninos2(spectrum: &[rustfft::num_complex::Complex<f32>]) -> f32 
     // For white noise, it approaches 1.
     (sum_mag_sq * spectrum.len() as f32) / (sum_mag * sum_mag)
 }
+
+/// Evaluates the Band Energy Ratio to determine if the audio frame is
+/// predominantly a bass register note (< 300 Hz) or treble register.
+///
+/// Instead of attempting to locate an exact fundamental frequency via spectral
+/// peaks (which fails for low bass notes due to FFT resolution and the missing
+/// fundamental), this calculates what fraction of the total acoustic energy
+/// lives in the lower frequency band.
+///
+/// # Returns
+/// A ratio `0.0..=1.0` representing the low-band energy fraction.
+pub fn evaluate_band_energy_ratio(spectrum: &[rustfft::num_complex::Complex<f32>]) -> f32 {
+    // 2048-sample FFT at 44100 Hz = ~21.53 Hz per bin.
+    const LOW_BAND_BINS: usize = 14;   // Up to ~301.4 Hz
+    const TOTAL_BAND_BINS: usize = 200; // Up to ~4306.6 Hz
+
+    let limit = spectrum.len().min(TOTAL_BAND_BINS);
+    if limit == 0 {
+        return 0.0;
+    }
+
+    let mut low_band_energy = 0.0;
+    let mut total_energy = 0.0;
+
+    // Start at bin 1 to ignore DC offset (bin 0)
+    for (k, complex) in spectrum.iter().enumerate().take(limit).skip(1) {
+        let power = complex.re * complex.re + complex.im * complex.im;
+        if k <= LOW_BAND_BINS {
+            low_band_energy += power;
+        }
+        total_energy += power;
+    }
+
+    // Guard against division by zero (pure digital silence)
+    if total_energy <= f32::EPSILON {
+        return 0.0;
+    }
+
+    low_band_energy / total_energy
+}

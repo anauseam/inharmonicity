@@ -19,4 +19,3 @@ pub mod spectral;
 pub mod pitch;
 pub mod metrics;
 pub mod tuning;
-pub mod scout;
