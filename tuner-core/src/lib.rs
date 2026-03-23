@@ -64,3 +64,8 @@ pub struct AnalysisResult {
     /// Frequencies of detected harmonic partials (2nd, 3rd, … overtones).
     pub partials: Vec<f32>,
 }
+
+#[cfg(test)]
+mod tests {
+    mod audio_tests;
+}

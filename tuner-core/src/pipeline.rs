@@ -25,7 +25,8 @@ use crossbeam_queue::ArrayQueue;
 use rustfft::num_complex::Complex;
 use std::sync::{Arc, Mutex};
 
-use crate::gatekeeper::Gatekeeper;
+use crate::engine::Engine;
+use crate::gatekeeper::{Gatekeeper, SignalState};
 
 // ─── Memory Infrastructure ───────────────────────────────────────────────────
 
@@ -129,6 +130,8 @@ pub type SharedRuntimeState = Arc<Mutex<RuntimeState>>;
 pub struct AudioPipeline {
     /// The Gatekeeper — pure DSP, evaluates signal stability.
     pub gatekeeper: Gatekeeper,
+    /// The Engine — F0 detection chain
+    pub engine: Engine,
 
     // Shared state bridges (pipeline ↔ frontend)
     shared_config: SharedConfigState,
@@ -178,9 +181,11 @@ impl AudioPipeline {
         let shared_runtime = Arc::new(Mutex::new(RuntimeState::default()));
 
         let gatekeeper = Gatekeeper::new(Arc::clone(&audio_pool));
+        let engine = Engine::new(44100);
 
         let pipeline = Self {
             gatekeeper,
+            engine,
             shared_config: Arc::clone(&shared_config),
             shared_runtime: Arc::clone(&shared_runtime),
             audio_pool,
@@ -199,7 +204,7 @@ impl AudioPipeline {
     /// 1. Reads the GUI-set silence threshold from shared config into the Gatekeeper.
     /// 2. Delegates to the Gatekeeper for signal stability evaluation (pure DSP).
     /// 3. Syncs runtime observations to shared state for the frontend.
-    pub fn process_frame(&mut self, frame: &ProcessingFrame) {
+    pub fn process_frame(&mut self, frame: &mut ProcessingFrame, amplitude_threshold: f32) -> Option<(f32, Option<f32>)> {
         // 1. Read GUI-set silence threshold into the Gatekeeper
         if let Ok(config) = self.shared_config.try_lock() {
             self.gatekeeper.config.silence_threshold = config.silence_threshold;
@@ -212,5 +217,11 @@ impl AudioPipeline {
         if let Ok(mut runtime) = self.shared_runtime.try_lock() {
             runtime.current_rms_ema = self.gatekeeper.current_rms_ema;
         }
+
+        // 4. Run the Engine to extract fundamental frequency
+        let is_silence = self.gatekeeper.current_state == SignalState::Silence;
+        let is_new_onset = self.gatekeeper.is_new_onset;
+
+        self.engine.process(frame, amplitude_threshold, is_silence, is_new_onset)
     }
 }

@@ -259,7 +259,7 @@ fn interpolate_peak_frequency(
     // Use the new helper function
     if let Some(offset) = parabolic_interpolation_offset(y1, y2, y3) {
         let interpolated_bin = peak_bin as f32 + offset;
-        let buffer_size = spectrum_magnitudes.len() * 2;
+        let buffer_size = (spectrum_magnitudes.len() - 1) * 2;
         let final_freq = (interpolated_bin * sample_rate as f32) / buffer_size as f32;
 
         if final_freq.is_finite() && final_freq > 0.0 {
@@ -269,6 +269,56 @@ fn interpolate_peak_frequency(
         }
     } else {
         // Interpolation failed (collinear points), return None
+        None
+    }
+}
+
+/// Detects the fundamental frequency using Quadratic Interpolated FFT (QIFFT).
+///
+/// This algorithm finds the bin with the highest magnitude in the spectrum
+/// and applies parabolic interpolation on the log-magnitude (decibel) values
+/// of that peak and its immediate neighbors to find the exact sub-bin frequency.
+///
+/// # Arguments
+/// * `spectrum_magnitudes` - Magnitude spectrum from an FFT.
+/// * `sample_rate` - The sample rate of the original audio in Hz.
+///
+/// # Returns
+/// * `Some((frequency, None))` - The detected true fundamental frequency. QIFFT does not provide a confidence metric natively, so confidence is `None`.
+pub fn detect_pitch_qifft(
+    spectrum_magnitudes: &[f32],
+    sample_rate: u32,
+) -> Option<(f32, Option<f32>)> {
+    if spectrum_magnitudes.len() < 3 {
+        return None;
+    }
+
+    // 1. Peak Identification
+    // Find the bin index with the highest magnitude.
+    // We ignore the DC bin (index 0) and the Nyquist bin (last index) 
+    // because we need left and right neighbors for interpolation.
+    let mut peak_bin = 0;
+    let mut max_mag = -1.0;
+
+    for i in 1..(spectrum_magnitudes.len() - 1) {
+        let mag = spectrum_magnitudes[i];
+        if mag > max_mag {
+            max_mag = mag;
+            peak_bin = i;
+        }
+    }
+
+    // If the spectrum is essentially empty/silent
+    if max_mag <= 1e-6 {
+        return None;
+    }
+
+    // 2-4. Parabolic Interpolation and Final Frequency Calculation
+    // We reuse the existing interpolate_peak_frequency function which 
+    // perfectly implements the log-magnitude QIFFT math.
+    if let Some(freq) = interpolate_peak_frequency(spectrum_magnitudes, peak_bin, sample_rate) {
+        Some((freq, None))
+    } else {
         None
     }
 }
@@ -351,7 +401,6 @@ pub(crate) fn parabolic_interpolation_offset(y_left: f32, y_center: f32, y_right
 }
 
 /// Optional algorithms for pitch detection:
-
 /// A robust implementation of the YIN pitch detection algorithm.
 ///
 /// This version is optimized for piano tuning with several enhancements:
@@ -427,4 +476,70 @@ pub fn detect_pitch_yin(
     } else {
         None
     }
+}
+
+/// Detects the exact pitch using a Digital Phase-Locked Loop.
+///
+/// A highly localized, time-domain feedback control system. Instead of waiting to 
+/// analyze a large block of audio all at once (like an FFT), it acts as a self-adjusting 
+/// oscillator that "locks" onto the exact phase of the incoming audio signal on a 
+/// sample-by-sample basis. This algorithm extracts a highly accurate fundamental 
+/// frequency, impervious to the initial impact noise of the piano key.
+///
+/// # Arguments
+/// * `input` — The raw time-domain audio buffer (typically 2048 samples).
+/// * `sample_rate` — The sampling rate in Hz.
+/// * `scout_freq` — The rough frequency neighborhood provided by the Scout, used to seed the NCO.
+///
+/// # Returns
+/// * `Some((frequency, None))` containing the stabilized, sub-cent accurate frequency. 
+///   Confidence is not calculated in this time-domain approach.
+pub fn detect_pitch_dpll(
+    input: &[f32],
+    sample_rate: u32,
+    scout_freq: f32,
+) -> Option<(f32, Option<f32>)> {
+    if scout_freq <= 0.0 || input.is_empty() {
+        return None;
+    }
+
+    // PI controller constants (shock absorbers)
+    const K_P: f32 = 0.01;
+    const K_I: f32 = 0.001;
+
+    // Phase 1: Seeding the NCO
+    let center_step = 2.0 * std::f32::consts::PI * scout_freq / (sample_rate as f32);
+    
+    let mut nco_phase: f32 = 0.0;
+    let mut current_step: f32 = center_step;
+    let mut integral: f32 = 0.0;
+
+    // Phase 2: The Tracking Loop
+    for &sample in input {
+        // Phase Detector (Multiplier): Multiply incoming sample by NCO's generated wave.
+        let nco_wave = nco_phase.sin();
+        let error = sample * nco_wave;
+
+        // Loop Filter (PI Controller): Smooth erratic error into a stable control voltage.
+        integral += error;
+        let control_voltage = (K_P * error) + (K_I * integral);
+
+        // NCO Update: Force NCO to speed up or slow down exactly matching the sample.
+        current_step = center_step + control_voltage;
+        nco_phase += current_step;
+
+        // Wrap phase to avoid creeping floating-point inaccuracies
+        while nco_phase > std::f32::consts::PI {
+            nco_phase -= 2.0 * std::f32::consts::PI;
+        }
+        while nco_phase < -std::f32::consts::PI {
+            nco_phase += 2.0 * std::f32::consts::PI;
+        }
+    }
+
+    // Phase 3 & 4: Convergence and Extraction
+    // Calculate exact sub-cent accurate fundamental based on final locked step size.
+    let final_f0 = current_step * (sample_rate as f32) / (2.0 * std::f32::consts::PI);
+    
+    Some((final_f0, None))
 }

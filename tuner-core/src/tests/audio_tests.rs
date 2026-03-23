@@ -1,14 +1,15 @@
 // tuner-core/src/tests/audio_tests.rs
-use crate::fft;
+use crate::algorithms::{pitch, dpyin, spectral, metrics};
+use rustfft::num_complex::Complex;
+use realfft::RealFftPlanner;
 use std::f32::consts::PI;
 
 /// Generates a perfect sine wave signal
-fn generate_sine(frequency: f32, sample_rate: usize, duration_sec: f32) -> Vec<f32> {
-    let num_samples = (sample_rate as f32 * duration_sec) as usize;
-    (0..num_samples)
+fn generate_sine_wave(freq: f32, sample_rate: u32, length: usize) -> Vec<f32> {
+    (0..length)
         .map(|i| {
             let t = i as f32 / sample_rate as f32;
-            (2.0 * PI * frequency * t).sin()
+            (t * freq * 2.0 * PI).sin()
         })
         .collect()
 }
@@ -18,19 +19,19 @@ fn test_fft_magnitude_calculation() {
     let sample_rate = 44100;
     let target_freq = 440.0; // A4
 
-    // Generate exactly BUFFER_SIZE samples of a pure A4 tone
     let buffer_size = crate::audio::BUFFER_SIZE;
-    let duration = buffer_size as f32 / sample_rate as f32;
-    let signal = generate_sine(target_freq, sample_rate, duration);
+    let audio = generate_sine_wave(target_freq, sample_rate as u32, buffer_size);
 
-    // Process FFT
-    let spectrum = fft::perform_fft(&signal);
-    let magnitudes = fft::spectrum_to_magnitudes(&spectrum);
+    let mut planner = RealFftPlanner::<f32>::new();
+    let r2c = planner.plan_fft_forward(buffer_size);
+    let mut time_buffer = vec![0.0; buffer_size];
+    let mut freq_buffer = vec![Complex { re: 0.0, im: 0.0 }; buffer_size / 2 + 1];
 
-    // Ensure output array has exactly 1024 bins (BUFFER_SIZE / 2)
+    spectral::perform_fft(&audio, &mut time_buffer, &mut freq_buffer, &r2c);
+    let magnitudes = spectral::spectrum_to_magnitudes(&freq_buffer);
+
     assert_eq!(magnitudes.len(), buffer_size / 2);
 
-    // Find highest peak
     let mut peak_idx = 0;
     let mut peak_mag: f32 = 0.0;
 
@@ -43,11 +44,9 @@ fn test_fft_magnitude_calculation() {
 
     let detected_freq = peak_idx as f32 * sample_rate as f32 / buffer_size as f32;
 
-    // Verify peak magnitude is not negative, NaN, or infinite
     assert!(peak_mag.is_finite());
     assert!(peak_mag > 0.0);
 
-    // The peak bin frequency should be within half a bin resolution for accuracy, but we check 1 bin just in case
     let bin_resolution = sample_rate as f32 / buffer_size as f32;
     assert!(
         (detected_freq - target_freq).abs() <= bin_resolution,
@@ -56,4 +55,53 @@ fn test_fft_magnitude_calculation() {
         bin_resolution,
         target_freq
     );
+}
+
+#[test]
+fn test_qifft_core() {
+    let audio = generate_sine_wave(440.0, 44100, 2048);
+    let mut planner = RealFftPlanner::<f32>::new();
+    let r2c = planner.plan_fft_forward(2048);
+    
+    let mut time_buffer = vec![0.0; 2048];
+    let mut freq_buffer = vec![Complex { re: 0.0, im: 0.0 }; 1025];
+    
+    spectral::perform_fft(&audio, &mut time_buffer, &mut freq_buffer, &r2c);
+    let magnitudes = spectral::spectrum_to_magnitudes(&freq_buffer);
+    
+    let (freq, _conf) = pitch::detect_pitch_qifft(&magnitudes, 44100).unwrap();
+    assert!((freq - 440.0).abs() < 1.0, "Expected ~440.0, got {}", freq);
+}
+
+#[test]
+fn test_dpyin_core() {
+    let audio = generate_sine_wave(110.0, 44100, 8192);
+    let mut scratch = vec![0.0; 8192];
+    
+    let result = dpyin::detect_pitch_dpyin(
+        &audio, 44100, 0.0, &mut scratch, None
+    );
+    let (freq, _conf) = result.expect("DPYIN failed to detect pitch");
+    assert!((freq - 110.0).abs() < 2.0, "Expected ~110.0, got {}", freq);
+}
+
+#[test]
+fn test_band_energy_routing() {
+    let mut planner = RealFftPlanner::<f32>::new();
+    let r2c = planner.plan_fft_forward(2048);
+
+    // Bass note C2 (65.4 Hz)
+    let bass_audio = generate_sine_wave(65.4, 44100, 2048);
+    let mut time_buffer = vec![0.0; 2048];
+    let mut freq_buffer = vec![Complex { re: 0.0, im: 0.0 }; 1025];
+    
+    spectral::perform_fft(&bass_audio, &mut time_buffer, &mut freq_buffer, &r2c);
+    let bass_ratio = metrics::evaluate_band_energy_ratio(&freq_buffer);
+    assert!(bass_ratio > 0.25, "Bass ratio too low: {}", bass_ratio);
+    
+    // Treble note C6 (1046.5 Hz)
+    let treble_audio = generate_sine_wave(1046.5, 44100, 2048);
+    spectral::perform_fft(&treble_audio, &mut time_buffer, &mut freq_buffer, &r2c);
+    let treble_ratio = metrics::evaluate_band_energy_ratio(&freq_buffer);
+    assert!(treble_ratio < 0.15, "Treble ratio too high: {}", treble_ratio);
 }

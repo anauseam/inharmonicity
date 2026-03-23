@@ -156,13 +156,12 @@ struct PitchCandidate {
 fn beta_thresholds() -> [f32; NUM_THRESHOLDS] {
     let mut thresholds = [0.0_f32; NUM_THRESHOLDS];
     let alpha = 2.0_f64;
-    let beta = 18.0_f64;
+    let beta = 10.0_f64;
 
     for i in 0..NUM_THRESHOLDS {
-        // Evenly spaced quantiles from the CDF of Beta(2, 18).
-        // Using the CDF approximation: F(x) = I_x(alpha, beta).
-        // For Beta(2,18): F(x) = 1 - (1-x)^18 * (1 + 18x)
-        // We invert this numerically with a simple bisection.
+        // Evenly spaced quantiles from the CDF of Beta(2, 10).
+        // Relaxed from Beta(2,18) to spread thresholds more evenly,
+        // giving inharmonic bass string troughs a fairer confidence score.
         let target = (i as f64 + 0.5) / NUM_THRESHOLDS as f64;
         thresholds[i] = invert_beta_cdf(target, alpha, beta) as f32;
     }
@@ -177,9 +176,9 @@ fn beta_thresholds() -> [f32; NUM_THRESHOLDS] {
 /// Actually for Beta(a,b) with integer params, we use the expansion.
 /// For a=2, b=18: I_x(2,18) = 1 - (1-x)^19 * [1 + 19*x / ... ]
 /// Simpler: use numerical bisection on the Beta CDF which is straightforward.
-fn beta_cdf(x: f64, _alpha: f64, _beta: f64) -> f64 {
-    // For Beta(2, 18), the CDF has a closed form:
-    // I_x(2, 18) = 1 - (1-x)^18 * (1 + 18*x)
+fn beta_cdf(x: f64, _alpha: f64, beta: f64) -> f64 {
+    // For Beta(2, b), the CDF has a closed form:
+    // I_x(2, b) = 1 - (1-x)^b * (1 + b*x)
     // This comes from the incomplete beta function with integer parameters.
     if x <= 0.0 {
         return 0.0;
@@ -188,7 +187,8 @@ fn beta_cdf(x: f64, _alpha: f64, _beta: f64) -> f64 {
         return 1.0;
     }
     let one_minus_x = 1.0 - x;
-    1.0 - one_minus_x.powi(18) * (1.0 + 18.0 * x)
+    let b = beta as i32;
+    1.0 - one_minus_x.powi(b) * (1.0 + beta * x)
 }
 
 /// Inverts the Beta CDF via bisection to find the threshold value for a given quantile.
@@ -334,6 +334,7 @@ pub fn detect_pitch_dpyin(
     sample_rate: u32,
     amplitude_threshold: f32,
     scratch: &mut [f32],
+    prev_lag: Option<f32>,
 ) -> Option<(f32, Option<f32>)> {
     let input_len = 8192;
     assert!(
@@ -386,16 +387,18 @@ pub fn detect_pitch_dpyin(
     }
 
     // --- Phase 4: Viterbi Selection ---
-    // For the initial implementation we have no previous frame state,
-    // so prev_lag is None. This will be enhanced when the Engine gains
-    // persistent state across frames.
-    let winner_idx = viterbi_select(&candidates, candidate_count, None)?;
+    // Use the previous frame's winning lag (if available) so the Viterbi
+    // transition penalty can stabilize tracking across frames.
+    let winner_idx = viterbi_select(&candidates, candidate_count, prev_lag)?;
     let winner = &candidates[winner_idx];
 
     // Convert winning lag → frequency using the decimated sample rate
     let frequency = DECIMATED_SAMPLE_RATE / winner.lag;
 
-    if frequency.is_finite() && frequency > 20.0 && frequency < 150.0 {
+    // Accept up to 300 Hz — the scout already decided this is a bass note,
+    // so DPYIN shouldn't second-guess it with a tight cap. This prevents
+    // borderline notes (e.g., D#3 at 155 Hz) from being silently discarded.
+    if frequency.is_finite() && frequency > 20.0 && frequency < 300.0 {
         // Confidence derived from emission probability
         let confidence = Some(winner.probability);
         Some((frequency, confidence))

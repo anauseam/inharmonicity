@@ -114,6 +114,9 @@ pub struct Gatekeeper {
 
     // EMA State
     pub current_rms_ema: f32,
+
+    // Expose transient detection state for routing engine
+    pub is_new_onset: bool,
 }
 
 impl Gatekeeper {
@@ -137,6 +140,7 @@ impl Gatekeeper {
             capture_counter: 0,
             is_capturing: false,
             current_rms_ema: 0.0,
+            is_new_onset: false,
         }
     }
 
@@ -162,6 +166,7 @@ impl Gatekeeper {
 
         if smoothed_rms < self.config.silence_threshold {
             self.current_state = SignalState::Silence;
+            self.is_new_onset = false;
             self.reset_capture_state();
             return;
         }
@@ -204,12 +209,16 @@ impl Gatekeeper {
         // Update history (zero-allocation copy)
         self.prev_spectrum[..current_spectrum.len()].copy_from_slice(current_spectrum);
 
+        // Reset the onset flag by default; it only fires true on the exact frame the CSD triggers
+        self.is_new_onset = false;
+
         // State 1: ATTACK
         if csd > self.config.csd_transient_threshold {
             // Hammer strike detected
             self.transient_delay_counter = self.config.transient_delay_frames;
             self.stable_counter = 0;
             self.current_state = SignalState::Unstable;
+            self.is_new_onset = true;
             return true;
         }
 

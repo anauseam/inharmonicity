@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tuner_core::{
     AnalysisResult,
-    algorithms::{pitch, tuning},
+    algorithms::tuning,
     audio,
     calibration::{self, CalibrationResult},
     capture_processing::{self, ProcessingOperation},
@@ -345,6 +345,7 @@ impl TunerApp {
 
                 // The AudioPipeline owns the Gatekeeper and shared state sync
                 let mut pipeline = pipeline;
+                pipeline.engine.sample_rate = sample_rate;
                 let mut test_frame = tuner_core::pipeline::ProcessingFrame::new();
 
                 loop {
@@ -366,36 +367,42 @@ impl TunerApp {
                         // Feed samples to the processing frame
                         test_frame.audio_buffer[..audio::BUFFER_SIZE].copy_from_slice(&audio_frame);
 
-                        // Add error handling for analysis
-                        let result =
-                            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                perform_analysis(
-                                    &audio_frame,
-                                    sample_rate,
-                                    &mut test_frame.frequency_buffer[..],
-                                    &mut time_buffer,
-                                    &fft_instance,
-                                )
-                            })) {
-                                Ok(result) => result,
-                                Err(_) => {
-                                    eprintln!(
-                                        "[AUDIO-THREAD] Analysis panicked, using default result"
-                                    );
-                                    AnalysisResult {
-                                        detected_frequency: None,
-                                        confidence: None,
-                                        cents_deviation: None,
-                                        note_name: None,
-                                        spectrogram_data: vec![],
-                                        partials: vec![],
-                                    }
-                                }
-                            };
+                        // Perform FFT to populate frequency_buffer before pipeline processes it
+                        // (Gatekeeper uses the spectrum for CSD and NINOS2, and Engine uses it for Treble finding)
+                        tuner_core::algorithms::spectral::perform_fft(
+                            &audio_frame,
+                            &mut time_buffer,
+                            &mut test_frame.frequency_buffer[..],
+                            &fft_instance,
+                        );
 
-                        // Run the full pipeline (Gatekeeper + shared state sync)
+                        // Run the full pipeline (Gatekeeper + Engine + shared state sync)
                         let prev_state = pipeline.gatekeeper.current_state.clone();
-                        pipeline.process_frame(&test_frame);
+                        let engine_result = pipeline.process_frame(&mut test_frame, AMPLITUDE_THRESHOLD);
+                        
+                        let spectrogram_data = tuner_core::algorithms::spectral::spectrum_to_magnitudes(&test_frame.frequency_buffer[..]);
+
+                        let (detected_frequency, confidence) = match engine_result {
+                            Option::Some((freq, conf)) => (Some(freq), conf),
+                            Option::None => (None, None),
+                        };
+
+                        let (cents_deviation, note_name) = if let Some(freq) = detected_frequency {
+                            let (name, target_freq) = tuner_core::models::find_nearest_note(freq);
+                            let deviation = tuning::calculate_cents_deviation(freq, target_freq);
+                            (Some(deviation), Some(name))
+                        } else {
+                            (None, None)
+                        };
+
+                        let result = AnalysisResult {
+                            detected_frequency,
+                            confidence,
+                            cents_deviation,
+                            note_name,
+                            spectrogram_data,
+                            partials: vec![],
+                        };
                         if pipeline.gatekeeper.current_state != prev_state {
                             eprintln!(
                                 "[GATEKEEPER] Transition: {:?} -> {:?} (CSD Dly: {}, Stable Cnt: {})",
@@ -846,66 +853,7 @@ impl TunerApp {
     }
 }
 
-/// Performs a full analysis on a single frame of audio data.
-///
-/// This function processes raw audio data through the complete analysis pipeline:
-/// 1. Performs FFT to get frequency spectrum
-/// 2. Detects fundamental frequency using PYIN algorithm
-/// 3. Refines frequency detection using spectrum analysis
-/// 4. Finds nearest musical note and calculates cents deviation
-/// 5. Identifies harmonic partials for inharmonicity analysis
-///
-/// # Arguments
-/// * `audio_frame` - Raw audio samples (typically 2048 samples)
-/// * `sample_rate` - Sample rate in Hz (typically 44100 or 48000)
-///
-/// # Returns
-/// * `AnalysisResult` - Complete analysis including frequency, confidence,
-///   cents deviation, note name, spectrogram data, and detected partials
-fn perform_analysis(
-    audio_frame: &[f32],
-    sample_rate: u32,
-    complex_buffer: &mut [rustfft::num_complex::Complex<f32>],
-    time_buffer: &mut [f32],
-    fft_instance: &std::sync::Arc<dyn realfft::RealToComplex<f32>>,
-) -> AnalysisResult {
-    tuner_core::algorithms::spectral::perform_fft(audio_frame, time_buffer, complex_buffer, fft_instance);
-    let spectrogram_data = tuner_core::algorithms::spectral::spectrum_to_magnitudes(complex_buffer);
 
-    // --- Unpack the frequency and confidence ---
-    let (detected_frequency, confidence) = if let Some((freq, conf)) =
-        pitch::detect_pitch_pyin(audio_frame, sample_rate, AMPLITUDE_THRESHOLD, time_buffer)
-    {
-        let refined_freq = pitch::refine_from_spectrum(&spectrogram_data, freq, sample_rate);
-        (refined_freq, Some(conf))
-    } else {
-        (None, None)
-    };
-
-    let (cents_deviation, note_name) = if let Some(freq) = detected_frequency {
-        let (name, target_freq) = tuner_core::models::find_nearest_note(freq);
-        let deviation = tuning::calculate_cents_deviation(freq, target_freq);
-        (Some(deviation), Some(name))
-    } else {
-        (None, None)
-    };
-
-    let partials = if let Some(fundamental) = detected_frequency {
-        // Search for up to 7 partials
-        pitch::find_partials(&spectrogram_data, fundamental, sample_rate, 7)
-    } else {
-        vec![] // No fundamental, no partials
-    };
-
-    AnalysisResult {
-        detected_frequency,
-        confidence,
-        cents_deviation,
-        note_name,
-        spectrogram_data,
-        partials,
-    }
-}
 
 /// Checks if all AnalysisResult frames in the buffer are "stable."
 ///
