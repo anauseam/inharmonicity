@@ -14,7 +14,7 @@
 use anyhow::{Result, anyhow};
 use cpal::SupportedStreamConfigRange;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use ringbuf::traits::Producer;
+use ringbuf::{HeapRb, traits::{Producer, Split}};
 
 /// Audio buffer size for processing frames.
 ///
@@ -22,8 +22,23 @@ use ringbuf::traits::Producer;
 /// Larger buffers provide more frequency resolution but increase latency.
 pub const BUFFER_SIZE: usize = 2048;
 
+/// Capacity of the lock-free ring buffer between the CPAL capture thread and
+/// the analysis thread, in samples.
+///
+/// 8 × BUFFER_SIZE = 16,384 samples (~371 ms at 44.1 kHz).
+/// This headroom ensures the real-time callback never drops samples even if
+/// the analysis thread hits a scheduling spike.
+pub const RING_BUFFER_CAPACITY: usize = BUFFER_SIZE * 8;
+
 /// The target sample rate for the application in Hz.
 pub const SAMPLE_RATE: u32 = 44100;
+
+/// Consumer half of the audio ring buffer.
+///
+/// Returned by [`start_audio_capture`]. The analysis thread holds this end
+/// and pops samples whenever it is ready to process a new frame.
+/// Callers do not need to import `ringbuf` directly.
+pub type AudioConsumer = ringbuf::HeapCons<f32>;
 
 /// DC blocking filter coefficient.
 ///
@@ -33,29 +48,28 @@ const DC_BLOCK_ALPHA: f32 = 0.995;
 /// Starts audio capture from the default input device.
 ///
 /// This function:
-/// 1. Selects the default audio input device
-/// 2. Configures the audio stream for optimal piano tuning
-/// 3. Sets up a callback to stream audio data to the analysis pipeline
+/// 1. Selects the default audio input device.
+/// 2. Configures the audio stream for optimal piano tuning.
+/// 3. Creates a lock-free ring buffer internally (capacity [`RING_BUFFER_CAPACITY`]).
+/// 4. Sets up a real-time callback to stream audio data to the analysis pipeline.
+///
+/// The producer half is moved into the CPAL real-time callback, which must
+/// remain allocation-free. The consumer half is returned to the caller.
 ///
 /// Every sample passes through a DC blocking high-pass filter
 /// (y[n] = x[n] - x[n-1] + α·y[n-1]) before entering the ring buffer,
 /// removing hardware-dependent DC offset regardless of device or driver.
 ///
-/// # Arguments
-/// * `mut producer` - Lock-free ring buffer producer for streaming audio data to the analysis thread
-///
 /// # Returns
-/// * `Ok((stream, sample_rate))` - Audio stream handle and sample rate
-/// * `Err(e)` - Error if audio setup fails
+/// * `Ok((stream, consumer, sample_rate))` — Stream handle, ring buffer consumer,
+///   and the negotiated sample rate.
+/// * `Err(e)` — Error if audio setup fails.
 ///
 /// # Audio Configuration
 /// - Sample Rate: 44.1 kHz (CD quality)
 /// - Format: 32-bit float
 /// - Channels: Mono (1 channel)
-/// - Buffer Size: 2048 samples (~46ms at 44.1kHz)
-pub fn start_audio_capture(
-    mut producer: impl Producer<Item = f32> + Send + 'static,
-) -> Result<(cpal::Stream, u32)> {
+pub fn start_audio_capture() -> Result<(cpal::Stream, AudioConsumer, u32)> {
     let host = cpal::default_host();
     let device = host
         .default_input_device()
@@ -76,6 +90,11 @@ pub fn start_audio_capture(
 
     let err_fn = |err| eprintln!("An error occurred on the audio stream: {}", err);
 
+    // Create the lock-free ring buffer. The producer moves into the CPAL callback
+    // (real-time thread); the consumer is returned to the analysis thread.
+    let rb = HeapRb::<f32>::new(RING_BUFFER_CAPACITY);
+    let (mut producer, consumer) = rb.split();
+
     // DC blocking filter state — captured by the closure below.
     let mut dc_prev_x: f32 = 0.0;
     let mut dc_prev_y: f32 = 0.0;
@@ -87,9 +106,8 @@ pub fn start_audio_capture(
                 let filtered = dc_block(sample, &mut dc_prev_x, &mut dc_prev_y);
 
                 // Push filtered sample lock-free into the ring buffer.
-                // If the buffer is full, we drop the sample — we cannot block
-                // in a real-time audio callback. A properly sized buffer
-                // (e.g. 8x or 16x BUFFER_SIZE) makes this extremely rare.
+                // If the buffer is full, drop the sample — we cannot block
+                // in a real-time audio callback.
                 let _ = producer.try_push(filtered);
             }
         },
@@ -99,7 +117,7 @@ pub fn start_audio_capture(
 
     stream.play()?;
 
-    Ok((stream, sample_rate_val))
+    Ok((stream, consumer, sample_rate_val))
 }
 
 /// Applies one step of the DC blocking high-pass IIR filter.

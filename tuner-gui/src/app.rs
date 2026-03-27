@@ -16,7 +16,7 @@ use crate::widgets::envelope::ENVELOPE_HISTORY_LENGTH;
 use cpal::traits::StreamTrait;
 use crossbeam_channel::{Receiver, Sender};
 use iced::{self, Element, Subscription, Theme};
-use ringbuf::traits::{Consumer, Observer, Split};
+use ringbuf::traits::{Consumer, Observer};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -316,17 +316,8 @@ impl TunerApp {
         let thread_handle = thread::spawn(move || {
             eprintln!("[AUDIO-THREAD] Starting audio thread...");
 
-            // --- RINGBUF ---
-            // We create a lock-free ring buffer here.
-            // 8 * BUFFER_SIZE = 16,384 samples (~371ms at 44.1kHz).
-            // This is the "properly sized buffer" mentioned in audio.rs!
-            // It ensures the real-time CPAL thread has plenty of room to push samples
-            // even if this processing thread hits a small latency spike.
-            let rb = ringbuf::HeapRb::<f32>::new(audio::BUFFER_SIZE * 8);
-            let (producer, mut consumer) = rb.split();
-
             eprintln!("[AUDIO-THREAD] Attempting to start audio capture...");
-            let (stream, sample_rate) = match audio::start_audio_capture(producer) {
+            let (stream, mut consumer, sample_rate) = match audio::start_audio_capture() {
                 Ok(tuple) => {
                     eprintln!("[AUDIO-THREAD] Audio capture started successfully");
                     tuple

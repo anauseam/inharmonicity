@@ -1,6 +1,6 @@
 //! Shared testing utilities for visual examples
 use crossbeam_channel::{Receiver, unbounded};
-use ringbuf::traits::{Consumer, Observer, Split};
+use ringbuf::traits::{Consumer, Observer};
 use std::thread;
 use tuner_core::{
     AnalysisResult,
@@ -15,20 +15,17 @@ pub fn start_audio_feed() -> Receiver<AnalysisResult> {
     let (tx, rx) = unbounded();
 
     thread::spawn(move || {
-        let rb = ringbuf::HeapRb::<f32>::new(audio::BUFFER_SIZE * 8);
-        let (producer, mut consumer) = rb.split();
+        let mut audio_frame = Vec::with_capacity(audio::BUFFER_SIZE);
+        let amplitude_threshold = 0.01;
 
-        // Start CPAL audio capture
-        let (_stream, sample_rate) = match audio::start_audio_capture(producer) {
+        // Start CPAL audio capture — ring buffer is created internally
+        let (_stream, mut consumer, sample_rate) = match audio::start_audio_capture() {
             Ok(tuple) => tuple,
             Err(e) => {
                 eprintln!("Failed to start audio feed for test: {}", e);
                 return;
             }
         };
-
-        let mut audio_frame = Vec::with_capacity(audio::BUFFER_SIZE);
-        let amplitude_threshold = 0.01;
 
         let mut planner = realfft::RealFftPlanner::<f32>::new();
         let fft_instance = planner.plan_fft_forward(audio::BUFFER_SIZE);
