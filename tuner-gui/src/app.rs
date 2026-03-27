@@ -18,14 +18,14 @@ use crossbeam_channel::{Receiver, Sender};
 use iced::{self, Element, Subscription, Theme};
 use ringbuf::traits::{Consumer, Observer, Split};
 use std::collections::VecDeque;
-use std::thread::{self, JoinHandle};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread::{self, JoinHandle};
 use tuner_core::{
     AnalysisResult,
     algorithms::tuning,
     audio,
-    calibration::{self, CalibrationResult},
+    calibration::{self, NoiseFloorResult},
     capture_processing::{self, ProcessingOperation},
     models::InharmonicityProfile,
     pipeline::PipelineHandle,
@@ -33,7 +33,6 @@ use tuner_core::{
 
 // Audio processing constants
 const SMOOTHING_FACTOR: usize = 5; // Number of samples for cent smoothing
-const AMPLITUDE_THRESHOLD: f32 = 0.01; // Minimum amplitude for pitch detection
 const STABILITY_TARGET: usize = 20; // Number of stable frames required for capture
 const STABILITY_CONFIDENCE_THRESHOLD: f32 = 0.9; // Confidence threshold for stability
 
@@ -98,7 +97,7 @@ pub enum Message {
     ToggleNoiseFloorAdjustment,   // Show/hide noise floor envelope viewer
     SilenceThresholdChanged(f32), // User dragged the silence threshold slider
     RecalibrateNoiseFloor,        // User clicked the recalibrate button
-    CalibrationComplete(Result<CalibrationResult, String>), // Calibration finished
+    CalibrationComplete(Result<NoiseFloorResult, String>), // Calibration finished
 
     // Continuous update message
     Tick, // Timer tick for real-time updates
@@ -140,6 +139,9 @@ pub struct SettingsDisplayData {
     pub calibration_complete: bool,
     /// Whether the Noise Floor Adjustment panel is visible.
     pub noise_floor_adjustment_visible: bool,
+    /// Peak NHWRSF observed during the last noise-floor calibration ($N_{max}$).
+    /// Used as the lower bound of the transient threshold slider in the wizard.
+    pub nhwrsf_noise_floor: f32,
 }
 
 /// UI-specific data needed for rendering the interface.
@@ -248,6 +250,7 @@ impl Default for TunerApp {
                     current_silence_threshold: 0.005,
                     calibration_complete: false,
                     noise_floor_adjustment_visible: false,
+                    nhwrsf_noise_floor: 0.0,
                 },
                 tuning_mode: TuningMode::Auto,
                 capture_state: CaptureState::Off,
@@ -310,136 +313,138 @@ impl TunerApp {
 
         self.pipeline_handle = new_handle;
 
-            let thread_handle = thread::spawn(move || {
-                eprintln!("[AUDIO-THREAD] Starting audio thread...");
+        let thread_handle = thread::spawn(move || {
+            eprintln!("[AUDIO-THREAD] Starting audio thread...");
 
-                // --- RINGBUF ---
-                // We create a lock-free ring buffer here.
-                // 8 * BUFFER_SIZE = 16,384 samples (~371ms at 44.1kHz).
-                // This is the "properly sized buffer" mentioned in audio.rs!
-                // It ensures the real-time CPAL thread has plenty of room to push samples
-                // even if this processing thread hits a small latency spike.
-                let rb = ringbuf::HeapRb::<f32>::new(audio::BUFFER_SIZE * 8);
-                let (producer, mut consumer) = rb.split();
+            // --- RINGBUF ---
+            // We create a lock-free ring buffer here.
+            // 8 * BUFFER_SIZE = 16,384 samples (~371ms at 44.1kHz).
+            // This is the "properly sized buffer" mentioned in audio.rs!
+            // It ensures the real-time CPAL thread has plenty of room to push samples
+            // even if this processing thread hits a small latency spike.
+            let rb = ringbuf::HeapRb::<f32>::new(audio::BUFFER_SIZE * 8);
+            let (producer, mut consumer) = rb.split();
 
-                eprintln!("[AUDIO-THREAD] Attempting to start audio capture...");
-                let (stream, sample_rate) = match audio::start_audio_capture(producer) {
-                    Ok(tuple) => {
-                        eprintln!("[AUDIO-THREAD] Audio capture started successfully");
-                        tuple
+            eprintln!("[AUDIO-THREAD] Attempting to start audio capture...");
+            let (stream, sample_rate) = match audio::start_audio_capture(producer) {
+                Ok(tuple) => {
+                    eprintln!("[AUDIO-THREAD] Audio capture started successfully");
+                    tuple
+                }
+                Err(e) => {
+                    eprintln!("[AUDIO-THREAD] Fatal Error starting audio: {}", e);
+                    return;
+                }
+            };
+
+            eprintln!("[AUDIO-THREAD] Entering audio processing loop...");
+            // Add a small delay to let GUI initialize
+            std::thread::sleep(std::time::Duration::from_millis(100));
+
+            let mut audio_frame = Vec::with_capacity(audio::BUFFER_SIZE);
+            let mut planner = realfft::RealFftPlanner::<f32>::new();
+            let fft_instance = planner.plan_fft_forward(audio::BUFFER_SIZE);
+            let mut time_buffer = vec![0.0; audio::BUFFER_SIZE];
+
+            // The AudioPipeline owns the Gatekeeper and shared state sync
+            let mut pipeline = pipeline;
+            pipeline.engine.sample_rate = sample_rate;
+            let mut test_frame = tuner_core::pipeline::ProcessingFrame::new();
+
+            loop {
+                // 1. Check for shutdown signal non-blocking
+                if let Ok(_) = shutdown_rx.try_recv() {
+                    eprintln!("[AUDIO-THREAD] Received shutdown signal");
+                    break;
+                }
+
+                // 2. Lock-free Ringbuf Polling
+                // We need BUFFER_SIZE samples to run an analysis frame.
+                if consumer.occupied_len() >= audio::BUFFER_SIZE {
+                    audio_frame.clear();
+
+                    // Pop exactly BUFFER_SIZE samples from the ring buffer
+                    audio_frame.resize(audio::BUFFER_SIZE, 0.0);
+                    consumer.pop_slice(&mut audio_frame);
+
+                    // Feed samples to the processing frame
+                    test_frame.audio_buffer[..audio::BUFFER_SIZE].copy_from_slice(&audio_frame);
+
+                    // Perform FFT to populate frequency_buffer before pipeline processes it
+                    // (Gatekeeper uses the spectrum for CSD and NINOS2, and Engine uses it for Treble finding)
+                    tuner_core::algorithms::spectral::perform_fft(
+                        &audio_frame,
+                        &mut time_buffer,
+                        &mut test_frame.frequency_buffer[..],
+                        &fft_instance,
+                    );
+
+                    // Run the full pipeline (Gatekeeper + Engine + shared state sync)
+                    let prev_state = pipeline.gatekeeper.current_state.clone();
+                    let engine_result = pipeline.process_frame(&mut test_frame);
+
+                    let spectrogram_data = tuner_core::algorithms::spectral::spectrum_to_magnitudes(
+                        &test_frame.frequency_buffer[..],
+                    );
+
+                    let (detected_frequency, confidence) = match engine_result {
+                        Option::Some((freq, conf)) => (Some(freq), conf),
+                        Option::None => (None, None),
+                    };
+
+                    let (cents_deviation, note_name) = if let Some(freq) = detected_frequency {
+                        let (name, target_freq) = tuner_core::models::find_nearest_note(freq);
+                        let deviation = tuning::calculate_cents_deviation(freq, target_freq);
+                        (Some(deviation), Some(name))
+                    } else {
+                        (None, None)
+                    };
+
+                    let result = AnalysisResult {
+                        detected_frequency,
+                        confidence,
+                        cents_deviation,
+                        note_name,
+                        spectrogram_data,
+                        partials: vec![],
+                    };
+                    if pipeline.gatekeeper.current_state != prev_state {
+                        eprintln!(
+                            "[GATEKEEPER] Transition: {:?} -> {:?} (CSD Dly: {}, Stable Cnt: {})",
+                            prev_state,
+                            pipeline.gatekeeper.current_state,
+                            pipeline.gatekeeper.transient_delay_counter,
+                            pipeline.gatekeeper.stable_counter
+                        );
                     }
-                    Err(e) => {
-                        eprintln!("[AUDIO-THREAD] Fatal Error starting audio: {}", e);
-                        return;
-                    }
-                };
 
-                eprintln!("[AUDIO-THREAD] Entering audio processing loop...");
-                // Add a small delay to let GUI initialize
-                std::thread::sleep(std::time::Duration::from_millis(100));
-
-                let mut audio_frame = Vec::with_capacity(audio::BUFFER_SIZE);
-                let mut planner = realfft::RealFftPlanner::<f32>::new();
-                let fft_instance = planner.plan_fft_forward(audio::BUFFER_SIZE);
-                let mut time_buffer = vec![0.0; audio::BUFFER_SIZE];
-
-                // The AudioPipeline owns the Gatekeeper and shared state sync
-                let mut pipeline = pipeline;
-                pipeline.engine.sample_rate = sample_rate;
-                let mut test_frame = tuner_core::pipeline::ProcessingFrame::new();
-
-                loop {
-                    // 1. Check for shutdown signal non-blocking
-                    if let Ok(_) = shutdown_rx.try_recv() {
-                        eprintln!("[AUDIO-THREAD] Received shutdown signal");
+                    if analysis_tx.send(result).is_err() {
+                        eprintln!("[AUDIO-THREAD] Failed to send analysis result");
                         break;
                     }
-
-                    // 2. Lock-free Ringbuf Polling
-                    // We need BUFFER_SIZE samples to run an analysis frame.
-                    if consumer.occupied_len() >= audio::BUFFER_SIZE {
-                        audio_frame.clear();
-
-                        // Pop exactly BUFFER_SIZE samples from the ring buffer
-                        audio_frame.resize(audio::BUFFER_SIZE, 0.0);
-                        consumer.pop_slice(&mut audio_frame);
-
-                        // Feed samples to the processing frame
-                        test_frame.audio_buffer[..audio::BUFFER_SIZE].copy_from_slice(&audio_frame);
-
-                        // Perform FFT to populate frequency_buffer before pipeline processes it
-                        // (Gatekeeper uses the spectrum for CSD and NINOS2, and Engine uses it for Treble finding)
-                        tuner_core::algorithms::spectral::perform_fft(
-                            &audio_frame,
-                            &mut time_buffer,
-                            &mut test_frame.frequency_buffer[..],
-                            &fft_instance,
-                        );
-
-                        // Run the full pipeline (Gatekeeper + Engine + shared state sync)
-                        let prev_state = pipeline.gatekeeper.current_state.clone();
-                        let engine_result = pipeline.process_frame(&mut test_frame, AMPLITUDE_THRESHOLD);
-                        
-                        let spectrogram_data = tuner_core::algorithms::spectral::spectrum_to_magnitudes(&test_frame.frequency_buffer[..]);
-
-                        let (detected_frequency, confidence) = match engine_result {
-                            Option::Some((freq, conf)) => (Some(freq), conf),
-                            Option::None => (None, None),
-                        };
-
-                        let (cents_deviation, note_name) = if let Some(freq) = detected_frequency {
-                            let (name, target_freq) = tuner_core::models::find_nearest_note(freq);
-                            let deviation = tuning::calculate_cents_deviation(freq, target_freq);
-                            (Some(deviation), Some(name))
-                        } else {
-                            (None, None)
-                        };
-
-                        let result = AnalysisResult {
-                            detected_frequency,
-                            confidence,
-                            cents_deviation,
-                            note_name,
-                            spectrogram_data,
-                            partials: vec![],
-                        };
-                        if pipeline.gatekeeper.current_state != prev_state {
-                            eprintln!(
-                                "[GATEKEEPER] Transition: {:?} -> {:?} (CSD Dly: {}, Stable Cnt: {})",
-                                prev_state,
-                                pipeline.gatekeeper.current_state,
-                                pipeline.gatekeeper.transient_delay_counter,
-                                pipeline.gatekeeper.stable_counter
-                            );
-                        }
-
-                        if analysis_tx.send(result).is_err() {
-                            eprintln!("[AUDIO-THREAD] Failed to send analysis result");
-                            break;
-                        }
-                    } else {
-                        // We don't have enough samples yet.
-                        // Sleep briefly so we don't pin the CPU at 100% while polling.
-                        std::thread::sleep(std::time::Duration::from_millis(5));
-                    }
+                } else {
+                    // We don't have enough samples yet.
+                    // Sleep briefly so we don't pin the CPU at 100% while polling.
+                    std::thread::sleep(std::time::Duration::from_millis(5));
                 }
+            }
 
-                eprintln!("[AUDIO-THREAD] Stopping stream and exiting...");
-                // Properly stop the stream before dropping it
-                if let Err(e) = stream.pause() {
-                    eprintln!("[AUDIO-THREAD] Error pausing stream: {}", e);
-                }
-                // Give the stream a moment to fully stop
-                std::thread::sleep(std::time::Duration::from_millis(50));
-                drop(stream);
-                eprintln!("[AUDIO-THREAD] Audio thread finished");
-            });
-            self.audio_worker = Some(AudioWorker {
-                shutdown_tx,
-                thread_handle: Some(thread_handle),
-            });
-            // Update the display data to reflect that audio is active
-            self.display_data.audio_worker_active = true;
+            eprintln!("[AUDIO-THREAD] Stopping stream and exiting...");
+            // Properly stop the stream before dropping it
+            if let Err(e) = stream.pause() {
+                eprintln!("[AUDIO-THREAD] Error pausing stream: {}", e);
+            }
+            // Give the stream a moment to fully stop
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            drop(stream);
+            eprintln!("[AUDIO-THREAD] Audio thread finished");
+        });
+        self.audio_worker = Some(AudioWorker {
+            shutdown_tx,
+            thread_handle: Some(thread_handle),
+        });
+        // Update the display data to reflect that audio is active
+        self.display_data.audio_worker_active = true;
     }
 
     /// Handles application state updates based on incoming messages.
@@ -490,7 +495,8 @@ impl TunerApp {
                 }
 
                 // Different key or not in manual mode - switch to manual mode with new key
-                let (note_name, target_freq) = tuner_core::models::find_nearest_note_by_index(key_index);
+                let (note_name, target_freq) =
+                    tuner_core::models::find_nearest_note_by_index(key_index);
                 self.display_data.tuning_mode = TuningMode::Manual {
                     key_index,
                     note_name,
@@ -643,15 +649,17 @@ impl TunerApp {
                 match result {
                     Ok(cal) => {
                         eprintln!(
-                            "[MAIN] Calibration complete. Baseline: {:.6}, Threshold: {:.6}",
-                            cal.baseline, cal.threshold
+                            "[MAIN] Calibration complete. RMS baseline: {:.6}, threshold: {:.6}, N_max NHWRSF: {:.4}",
+                            cal.rms_baseline, cal.rms_threshold, cal.noise_floor_peak
                         );
                         // Write calibrated values to shared config
                         if let Ok(mut config) = self.pipeline_handle.config.lock() {
-                            config.silence_threshold = cal.threshold;
+                            config.silence_threshold = cal.rms_threshold;
                         }
                         // Update display data
-                        self.display_data.settings_data.current_silence_threshold = cal.threshold;
+                        self.display_data.settings_data.current_silence_threshold =
+                            cal.rms_threshold;
+                        self.display_data.settings_data.nhwrsf_noise_floor = cal.noise_floor_peak;
                         self.display_data.settings_data.calibration_complete = true;
 
                         // Now start the audio processing thread
@@ -852,8 +860,6 @@ impl TunerApp {
         Theme::Dark
     }
 }
-
-
 
 /// Checks if all AnalysisResult frames in the buffer are "stable."
 ///

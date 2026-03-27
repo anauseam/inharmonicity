@@ -210,7 +210,7 @@ impl AudioPipeline {
     /// 1. Reads the GUI-set silence threshold from shared config into the Gatekeeper.
     /// 2. Delegates to the Gatekeeper for signal stability evaluation (pure DSP).
     /// 3. Syncs runtime observations to shared state for the frontend.
-    pub fn process_frame(&mut self, frame: &mut ProcessingFrame, amplitude_threshold: f32) -> Option<(f32, Option<f32>)> {
+    pub fn process_frame(&mut self, frame: &mut ProcessingFrame) -> Option<(f32, Option<f32>)> {
         // 1. Read GUI-set configs into the Gatekeeper
         if let Ok(config) = self.shared_config.try_lock() {
             self.gatekeeper.config.silence_threshold = config.silence_threshold;
@@ -230,6 +230,6 @@ impl AudioPipeline {
         let is_silence = self.gatekeeper.current_state == SignalState::Silence;
         let is_new_onset = self.gatekeeper.is_new_onset;
 
-        self.engine.process(frame, amplitude_threshold, is_silence, is_new_onset)
+        self.engine.process(frame, is_silence, is_new_onset)
     }
 }

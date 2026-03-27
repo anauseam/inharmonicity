@@ -61,6 +61,7 @@ impl DashboardTest {
                 current_silence_threshold: 0.005,
                 calibration_complete: true,
                 noise_floor_adjustment_visible: false,
+                nhwrsf_noise_floor: 0.0,
             },
             tuning_mode: TuningMode::Auto,
             capture_state: CaptureState::Off,

@@ -128,7 +128,6 @@ impl Engine {
     pub fn process(
         &mut self,
         frame: &mut ProcessingFrame,
-        amplitude_threshold: f32,
         is_silence: bool,
         is_new_onset: bool,
     ) -> Option<(f32, Option<f32>)> {
@@ -153,7 +152,6 @@ impl Engine {
                         let result = dpyin::detect_pitch_dpyin(
                             &frame.audio_buffer[..],
                             self.sample_rate,
-                            amplitude_threshold,
                             &mut frame.time_buffer[..],
                             self.prev_bass_lag,
                         );
