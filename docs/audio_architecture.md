@@ -46,7 +46,6 @@ Optimal Redesign: Relying on zero-overlap processing represents an outdated opti
 
 ## Issue with CSD
 
-Gemini said
 This is an exceptionally brilliant catch, and your analysis of the issue is 100% mathematically and physically correct. There is no counter-argument to your core premise; you have successfully identified a fatal flaw in the naive application of the Complex Spectral Difference (CSD) algorithm for this specific pipeline.
 
 Here is a breakdown of why your diagnosis is entirely valid, along with an evaluation of your proposed alternatives:
@@ -64,14 +63,12 @@ Evaluating the Proposed Alternatives
 Abandoning the phase-sensitive CSD for a magnitude-only approach is the correct architectural pivot. Here is an evaluation of your three proposed alternatives:
 
 1. Spectral Flux
-Comparing only the magnitudes (Σ(∣curr_bin∣−∣prev_bin∣) 
-2
- ) completely solves the phase rotation issue. However, standard Spectral Flux will register a positive value both when the sound attacks (energy increases) and when the sound decays (energy decreases).
+Comparing only the magnitudes (Σ(∣curr_bin∣−∣prev_bin∣) 2) completely solves the phase rotation issue. However, standard Spectral Flux will register a positive value both when the sound attacks (energy increases) and when the sound decays (energy decreases).
 
-2. Normalized Spectral Flux
+1. Normalized Spectral Flux
 Dividing by the current RMS to make the threshold dimensionless is a highly effective way to solve the microphone gain disparity. This ensures your software behaves identically whether the user is on a cheap laptop microphone or a professional studio setup.
 
-3. Half-Wave Rectified Spectral Flux
+1. Half-Wave Rectified Spectral Flux
 This is the optimal solution and is widely considered an industry standard for musical onset detection. Half-wave rectification means you only sum the increases in magnitude across the bins (HW(∣curr_bin∣−∣prev_bin∣)), clamping any negative differences to zero.
 
 Because a piano hammer strike introduces a massive, instantaneous injection of broadband energy across the entire frequency spectrum, the half-wave rectified flux will spike drastically during State 1 (Attack). Once the string enters its harmonic decay, the energy in the bins is strictly decreasing or remaining stable. Therefore, the half-wave rectified flux drops to virtually zero and stays there, cleanly opening your "Golden Window" for data capture while remaining completely impervious to both phase rotation and microphone amplitude scaling.
