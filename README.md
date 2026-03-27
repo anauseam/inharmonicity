@@ -32,6 +32,13 @@ For a detailed overview of the algorithms used, see the [Anauseam documentation]
 - **Temperament Selection**: Support for various tuning temperaments
 - **Tuning Standard Options**: A440 and other reference frequencies
 
+### Work in Progress
+
+- **COLA Overlapping Frame Pipeline**: Migrating from sequential 2048-sample frames to 50% overlapping Hann-windowed frames via a circular FIFO (`cola` module). Eliminates temporal blind spots at frame boundaries. `AudioPipeline` will fully internalize FIFO/FFT — `tuner-gui` only calls `push_audio(&[f32])`.
+- **TWM Pitch Detection**: Replacing DPYIN and bare QIFFT with Two-Way Mismatch (TWM) as the universal coarse F0 engine for both bass and treble registers. TWM supports targeted mode (user key hint), discovery mode (Scout-bounded), and inharmonicity template stretching.
+- **XQIFFT Sub-Cent Refinement**: Exponentially-weighted QIFFT running after TWM to achieve sub-cent accuracy without additional FFT cost.
+- **Linear Kalman Filter** *(experimental — may not ship)*: Gatekeeper-governed temporal smoothing stage. Engages only during the NINOS2-confirmed Stable phase; bypassed and reset on each new onset. Retention in the final release is undecided.
+
 ## Architecture
 
 ### Project Structure
@@ -40,19 +47,22 @@ For a detailed overview of the algorithms used, see the [Anauseam documentation]
 inharmonicity/
 ├── tuner-core/                     # Headless audio processing & analysis (no GUI code)
 │   ├── src/
-│   │   ├── algorithms/             # Stateless DSP building blocks (spectral, pitch, metrics, tuning)
-│   │   │   ├── spectral.rs         # FFT, windowing, and spectrum magnitude extraction
-│   │   │   ├── pitch.rs            # Pitch detection algorithms (QIFFT, DPLL, etc.)
-│   │   │   ├── dpyin.rs            # Decimated pYIN — bass register pitch detection
-│   │   │   ├── scout.rs            # Rough frequency neighborhood detection
+│   │   ├── algorithms/             # Stateless DSP building blocks
+│   │   │   ├── spectral.rs         # FFT, Hann windowing, spectrum magnitude extraction
+│   │   │   ├── pitch.rs            # XQIFFT (seeded, exponentially-weighted sub-cent refinement)
+│   │   │   ├── twm.rs              # Two-Way Mismatch coarse F0 detection (bass + treble)
+│   │   │   ├── kalman.rs           # Linear Kalman filter for temporal pitch smoothing (experimental)
+│   │   │   ├── dpyin.rs            # Decimated pYIN — legacy bass pitch detection (superseded by TWM)
+│   │   │   ├── scout.rs            # Band Energy Ratio classifier (Bass / Treble routing)
 │   │   │   ├── metrics.rs          # RMS, EMA, CSD, NHWRSF, NINOS2 signal metrics
 │   │   │   ├── tuning.rs           # Cent deviation, inharmonicity-compensated frequencies
 │   │   │   └── inharmonicity.rs    # B-coefficient calculation (pending replacement)
-│   │   ├── models.rs               # Domain data types: Note, Partial, KeyMeasurement, profiles
-│   │   ├── pipeline.rs             # AudioPipeline mediator, shared state types, memory pools
-│   │   ├── engine.rs               # F0 Engine — Scout / Bass / Treble DSP
-│   │   ├── gatekeeper.rs           # 5-state signal validator (DSP, no shared state)
-│   │   ├── worker.rs               # Background worker manager for heavy offline DSP (wireframe)
+│   │   ├── cola.rs                 # CircularFifo — COLA circular FIFO for overlapping frame analysis
+│   │   ├── models.rs               # Domain types: Note, Partial, KeyMeasurement, profiles
+│   │   ├── pipeline.rs             # AudioPipeline mediator — push_audio() public API, shared state
+│   │   ├── engine.rs               # F0 Engine — Scout routing, TWM → XQIFFT → Kalman chain
+│   │   ├── gatekeeper.rs           # 5-state signal validator (DSP only, no shared state)
+│   │   ├── worker.rs               # Background worker for heavy offline DSP (wireframe)
 │   │   ├── audio.rs                # CPAL audio capture, stream management, DC blocking
 │   │   ├── calibration.rs          # Noise-floor & onset calibration
 │   │   ├── capture_processing.rs   # Legacy frame processing (deprecated — see migration note)
@@ -116,8 +126,12 @@ The pipeline also manages the **`WorkerManager`** (`worker.rs`), which owns a si
 > | `gatekeeper.rs` — 5-state signal validator (pure DSP) | ⬜ Testing |
 > | `engine.rs` — F0 Engine (Scout / Bass / Treble) | ⬜ Testing |
 > | `worker.rs` — Background worker (single thread) | ⬜ Wireframe |
+> | `Box<[T]>` buffer migration (ProcessingFrame, Gatekeeper) | ⬜ Planned |
+> | COLA — 50% overlap Hann window, `CircularFifo`, `push_audio()` API | ⬜ Planned |
+> | TWM — coarse F0 for both registers, `RefinementAlgorithm` enum | ⬜ Planned |
+> | XQIFFT — exponentially-weighted seeded sub-cent refinement | ⬜ Planned |
+> | Kalman filter — Gatekeeper-governed temporal smoothing *(experimental)* | ⬜ Planned |
 > | Pipeline fully encapsulates all output | ⬜ In progress |
-> | STFT overlap — Hamming window → 50% COLA w/ Hann | ⬜ Planned (post-migration) |
 >
 > **Currently**, `app.rs` still calls the legacy `capture_processing` module. The `AudioPipeline` is live for
 > Gatekeeper orchestration and shared state (RMS / threshold), while the `Engine`
@@ -153,11 +167,12 @@ The pipeline also manages the **`WorkerManager`** (`worker.rs`), which owns a si
 
 ### Global Data Structures & Memory Management
 
-To maintain real-time performance without relying on OS priority elevation, the core system completely avoids dynamic heap allocation (`std::thread::spawn`, `Vec::push`, etc.) during runtime by using pre-allocated, lock-free structures:
+To maintain real-time performance without relying on OS priority elevation, the core system completely avoids dynamic heap allocation during the audio hot-path by using pre-allocated, lock-free structures:
 
-- **The Elastic Ring Buffer:** A massive lock-free circular buffer (e.g., 16,384 samples) connecting Thread 1 and Thread 2. It acts as an elastic shock absorber; if the OS briefly suspends the processing thread, the audio stream can still safely dump samples into the buffer without dropping data.
-- **Lock-Free Object Pool (`AudioPool`):** A pre-allocated pool of fixed-size arrays (each large enough to hold 1.5 seconds of audio at 44,100 Hz). If capture mode is enabled, Thread 2 borrows an array to record a stable note and passes the reference to the background worker, which returns it to the pool when finished.
-- **`ProcessingFrame`:** Thread-local scratch buffers (audio, time-domain, frequency-domain) for zero-allocation per-frame DSP.
+- **The Elastic Ring Buffer:** A lock-free circular buffer connecting Thread 1 and Thread 2. Acts as an elastic shock absorber — if the OS briefly suspends the processing thread, audio samples continue to accumulate safely without drops.
+- **Lock-Free Object Pool (`AudioPool`):** Pre-allocated pool of `Box<[f32; 66150]>` arrays (1.5 seconds at 44.1 kHz). Thread 2 borrows an array to record a stable note and passes it to the background worker, which recycles it back to the pool when finished.
+- **`ProcessingFrame`:** Thread-local scratch buffers for zero-allocation per-frame DSP. All fields are `Box<[T]>` — allocated once in `AudioPipeline::new()` via `vec![..].into_boxed_slice()`, never resized. This is the project-wide standard for owned DSP state buffers.
+- **`CircularFifo` (COLA):** Owned by `AudioPipeline`. A `Box<[f32]>` ring buffer that accumulates samples and triggers a new FFT + pipeline frame on every 50% hop. Invisible to `tuner-gui` — the GUI only calls `pipeline.push_audio(&[f32])`.
 
 ### Threading Model
 
@@ -210,9 +225,9 @@ This thread constantly consumes data from the Elastic Ring Buffer and executes a
   - *State 4 (RELEASE):* Caps the capture at 1.5 seconds. It closes the gate, recycles the buffer, and dispatches the payload to Thread 3 via an **asynchronous trigger**, allowing the real-time pipeline to immediately reset to State 0 without waiting for the heavy calculation to complete.
 - **The Engine (Scout and Algorithm Router):** A pitch detection chain that operates as an independent state machine, **synchronously reset** by the Gatekeeper's onset pulse but otherwise decoupled from the Gatekeeper's internal transient delays.
   - **The Scout (Band Energy Classifier):** A routing engine that determines if a signal belongs to the Bass or Treble register. Instead of searching for a pitch directly, it calculates the **Band Energy Ratio**—the fraction of total acoustic energy residing below 300 Hz. It employs a **Schmitt trigger** (asymmetric hysteresis) requiring a 3-frame consensus (ratio > 0.25 for Bass, < 0.15 for Treble) before locking the signal into the appropriate detection engine. This prevents routing chatter and robustly handles the "missing fundamental" problem found in low piano strings.
-  - **The Router & Dual Engines:**
-    - *Bass Engine (< 150 Hz):* Instructs the ring buffer to pull an 8192-sample window (necessary for long bass wavelengths). It applies an anti-aliasing filter, decimates the audio, and runs the pYIN algorithm. The Hidden Markov Model within pYIN effectively prevents the octave errors that plague stiff, copper-wound bass strings.
-    - *Treble Engine (> 150 Hz):* Uses the standard 2048-sample window. It features two toggleable modes. ~For professional use, it seeds a Digital Phase-Locked Loop (DPLL) with the Scout's frequency, using a Proportional-Integral filter to lock tightly onto the string's phase~ (currently not implemented). It utilizes a Quadratic Interpolated FFT (QIFFT) to demonstrate accurate frequency-domain sub-bin peak detection.
+  - **The Router — Unified TWM Engine:** Both registers now use **Two-Way Mismatch (TWM)** as the coarse F0 stage. TWM evaluates a set of trial harmonic series against the measured spectral peaks, selecting the trial frequency with the lowest combined mismatch error. The Scout's routing state constrains the search space to the appropriate register, halving the candidate set. If the user has selected a key, TWM evaluates only a microscopic ±50-cent neighborhood around that note — making octave confusion mathematically impossible. TWM also accepts an inharmonicity constant ($B$) from the background worker to stretch its predictive templates to match physical string stiffness.
+  - **XQIFFT Refinement:** Once TWM identifies the correct harmonic bin, an exponentially-weighted QIFFT (XQIFFT) refines the estimate to sub-cent accuracy. The peak and its neighbors are raised to power `p` before parabolic interpolation, sharpening the peak shape and eliminating interpolation bias intrinsic to standard QIFFT — at zero additional FFT cost.
+  - **Kalman Filter** *(experimental)*: During the Gatekeeper's NINOS2-confirmed Stable phase, a discrete linear Kalman filter smooths the XQIFFT output against a constant-velocity motion model. The filter is bypassed during Attack/Transient states and hard-reset on each new onset pulse. Whether this stage ships in the final release is undecided.
 - **Output:** Pushes the sub-cent accurate $f_0$ float to the UI thread via a lock-free channel.
 
 Once the Gatekeeper detects silence, it closes the gate by sending the `is_silence` flag to the Engine to force an immediate state reset and prevent pitch detection from running on background noise.

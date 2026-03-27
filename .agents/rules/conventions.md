@@ -114,9 +114,35 @@ Current contents:
 - Follow **standard Rust conventions**: `snake_case` functions/variables, `CamelCase` types, `SCREAMING_SNAKE_CASE` constants.
 - Use `///` doc comments on all public items. Include `# Arguments`, `# Returns`, and `# Panics` sections where applicable.
 - Prefer `pub(crate)` over `pub` for items not part of the external API.
-- **No heap allocation on the audio hot-path.** Use pre-allocated buffers (`ProcessingFrame`) and fixed-size arrays.
 - Use `#[inline]` only on small, frequently-called functions in tight DSP loops.
 - Prefer `assert!` for programmer errors (wrong buffer sizes) and `Option`/`Result` for runtime conditions (silence, no pitch detected).
+
+## Memory Allocation
+
+This project runs on `std` (Linux, iced, cpal). Follow std-idiomatic allocation patterns —
+not embedded/no-std patterns — for owned DSP state:
+
+| Use case | Idiom | Example |
+|---|---|---|
+| Owned DSP state buffer, fixed size | `Box<[T]>` via `into_boxed_slice()` | `ProcessingFrame`, `CircularFifo` |
+| Compile-time lookup table / const data | `[T; N]` | `beta_thresholds()` in `dpyin.rs` |
+| Object pool items (crossbeam) | `Box<[T; N]>` | `AudioPool` |
+| Algorithms — input/output | `&[T]` / `&mut [T]` slices | All `algorithms/` functions |
+| **Never** on the audio hot-path | `Vec::push`, `Vec::new`, any heap alloc | — |
+
+**The `Box<[T]>` idiom:**
+
+```rust
+// Allocate once at startup — never resize, never reallocate.
+// Box<[T]> is smaller than Vec<T> (16 bytes vs 24) and communicates
+// "fixed capacity" at the type level.
+buffer: vec![0.0_f32; WINDOW_SIZE].into_boxed_slice()
+```
+
+**What this is NOT:** The embedded no-std `[T; N]` const-generic pattern (from `heapless` etc.)
+is not used here. Inline fixed-size arrays are reserved for small stack temporaries and
+lookup tables returned from pure functions, not for large owned state buffers.
+
 
 ---
 
