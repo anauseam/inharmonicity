@@ -79,7 +79,7 @@ fn test_dpyin_core() {
     let mut scratch = vec![0.0; 8192];
     
     let result = dpyin::detect_pitch_dpyin(
-        &audio, 44100, 0.0, &mut scratch, None
+        &audio, 44100, &mut scratch, None
     );
     let (freq, _conf) = result.expect("DPYIN failed to detect pitch");
     assert!((freq - 110.0).abs() < 2.0, "Expected ~110.0, got {}", freq);

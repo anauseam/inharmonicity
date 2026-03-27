@@ -322,9 +322,12 @@ fn viterbi_select(
 /// # Arguments
 /// * `audio_8192` — 8192-sample audio buffer from the ring buffer.
 /// * `sample_rate` — Original sample rate (e.g., 44100 Hz).
-/// * `amplitude_threshold` — Minimum RMS amplitude for pitch detection.
 /// * `scratch` — Mutable scratch buffer (at least 8192 floats). The first 8192
 ///   elements are used for the anti-aliased + decimated signal and YIN working space.
+///
+/// Silence gating is handled upstream by the [`Gatekeeper`](crate::gatekeeper).
+/// This function trusts that the caller has already verified the signal is above
+/// the calibrated silence threshold.
 ///
 /// # Returns
 /// * `Some((frequency, confidence))` — Detected F0 in Hz and optional confidence.
@@ -332,7 +335,6 @@ fn viterbi_select(
 pub fn detect_pitch_dpyin(
     audio_8192: &[f32],
     sample_rate: u32,
-    amplitude_threshold: f32,
     scratch: &mut [f32],
     prev_lag: Option<f32>,
 ) -> Option<(f32, Option<f32>)> {
@@ -345,17 +347,6 @@ pub fn detect_pitch_dpyin(
         scratch.len() >= input_len,
         "DPYIN scratch buffer must be at least 8192 floats"
     );
-
-    // --- Noise Gate ---
-    let rms = (audio_8192[..input_len]
-        .iter()
-        .map(|&s| s * s)
-        .sum::<f32>()
-        / input_len as f32)
-        .sqrt();
-    if rms < amplitude_threshold {
-        return None;
-    }
 
     // --- Phase 1: Anti-aliasing + Decimation ---
     // Copy audio into scratch for in-place filtering

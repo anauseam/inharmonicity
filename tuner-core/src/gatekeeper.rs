@@ -17,7 +17,7 @@
 //! | State | Name | Metric | Purpose |
 //! |---|---|---|---|
 //! | 0 | IDLE | RMS + EMA | Silence gating — ignore background noise |
-//! | 1 | ATTACK | CSD | Detect the hammer strike transient |
+//! | 1 | ATTACK | NHWRSF | Detect the hammer strike transient |
 //! | 2 | TRANSIENT | Counter | Hard delay for broadband noise to decay |
 //! | 3 | HARMONIC DECAY | NINOS2 | Identify the "Golden Window" of stable harmonics |
 //! | 4 | RELEASE | Counter | Cap capture at 1.5s, dispatch to Worker, reset |
@@ -157,7 +157,7 @@ impl Gatekeeper {
     ///
     /// 1. **RMS + EMA** — compute smoothed amplitude
     /// 2. **Silence gate** — if below threshold, emit `Silence` and reset
-    /// 3. **CSD transient detection** — States 1 & 2
+    /// 3. **NHWRSF transient detection** — States 1 & 2
     /// 4. **NINOS2 stability + capture** — States 3 & 4
     pub fn process_frame(&mut self, frame: &ProcessingFrame) {
         // State 0: Calculate RMS amplitude for Silence fallback

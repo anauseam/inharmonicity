@@ -8,7 +8,7 @@
 //! |---|---|---|
 //! | [`calculate_rms`] | Gatekeeper State 0 | Silence gating — below threshold = IDLE |
 //! | [`calculate_ema`] | Gatekeeper State 0 | Smooths RMS to ignore momentary dips |
-//! | [`calculate_csd`] | Gatekeeper States 1–2 | Detects transients (hammer strikes) |
+//! | [`calculate_nhwrsf`] | Gatekeeper States 1–2 | Detects transients (hammer strikes) |
 //! | [`calculate_ninos2`] | Gatekeeper State 3 | Measures spectral sparsity (tonal stability) |
 
 /// Calculates the Root Mean Square (RMS) amplitude of an audio buffer.
