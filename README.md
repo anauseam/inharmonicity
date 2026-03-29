@@ -126,7 +126,7 @@ The pipeline also manages the **`WorkerManager`** (`worker.rs`), which owns a si
 > | `gatekeeper.rs` — 5-state signal validator (pure DSP) | ⬜ Testing |
 > | `engine.rs` — F0 Engine (Scout / Bass / Treble) | ⬜ Testing |
 > | `worker.rs` — Background worker (single thread) | ⬜ Wireframe |
-> | `Box<[T]>` buffer migration (ProcessingFrame, Gatekeeper) | ⬜ Planned |
+> | `Box<[T]>` buffer migration (ProcessingFrame, Gatekeeper) | ✅ Implemented |
 > | COLA — 50% overlap Hann window, `CircularFifo`, `push_audio()` API | ⬜ Planned |
 > | TWM — coarse F0 for both registers, `RefinementAlgorithm` enum | ⬜ Planned |
 > | XQIFFT — exponentially-weighted seeded sub-cent refinement | ⬜ Planned |

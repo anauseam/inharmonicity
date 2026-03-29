@@ -104,7 +104,7 @@ pub struct Gatekeeper {
     // Internal DSP State memory
     // Pre-allocated array matching the size of ProcessingFrame.frequency_buffer (2048)
     // to prevent dynamic heap allocation on the audio hot-path.
-    prev_spectrum: [f32; 2048],
+    prev_spectrum: Box<[f32]>,
 
     pub current_nhwrsf: f32,
 
@@ -136,7 +136,7 @@ impl Gatekeeper {
             capture_mode_enabled: false,
             config: GatekeeperConfig::default(),
             current_state: SignalState::Silence,
-            prev_spectrum: [0.0; 2048],
+            prev_spectrum: vec![0.0; 2048].into_boxed_slice(),
             current_nhwrsf: 0.0,
             transient_delay_counter: 0,
             stable_counter: 0,

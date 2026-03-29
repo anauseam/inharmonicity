@@ -84,7 +84,7 @@ Current contents:
 | Module | Role | Status |
 |---|---|---|
 | `pipeline.rs` | Mediator, shared state types, memory infrastructure | ✅ Implemented |
-| `engine.rs` | F0 detection chain (Scout → Router → Bass/Treble). Owned by `AudioPipeline` | ⬜ Wireframe |
+| `engine.rs` | F0 detection chain (Scout → Router → Bass/Treble). Owned by `AudioPipeline` | ✅ Active |
 | `gatekeeper.rs` | 5-state signal validator. Pure DSP. Owned by `AudioPipeline` | ✅ Implemented |
 | `worker.rs` | Background worker for offline DSP (B coefficient). Communicates via channels | ⬜ Wireframe |
 | `audio.rs` | CPAL audio capture, DC blocking, stream setup. Bootstrap only | ✅ Implemented |

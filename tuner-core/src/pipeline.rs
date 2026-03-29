@@ -47,15 +47,15 @@ pub type AudioPool = ArrayQueue<Box<[f32; 66150]>>;
 pub struct ProcessingFrame {
     /// Holds the raw linear audio samples popped from the Elastic Ring Buffer.
     /// Needs to be up to 8192 samples to support the Bass Engine.
-    pub audio_buffer: [f32; 8192],
+    pub audio_buffer: Box<[f32]>,
 
     /// A generic time-domain working space (e.g., for the YIN difference function).
     /// Size matches the audio_buffer (8192) to accommodate the Bass Engine.
-    pub time_buffer: [f32; 8192],
+    pub time_buffer: Box<[f32]>,
 
     /// A frequency-domain working space for in-place FFT operations.
     /// The Scout and Treble Engines use 2048-sample windows.
-    pub frequency_buffer: [Complex<f32>; 2048],
+    pub frequency_buffer: Box<[Complex<f32>]>,
 }
 
 impl ProcessingFrame {
@@ -63,9 +63,9 @@ impl ProcessingFrame {
     /// This should be called **once** during application startup/thread initialization.
     pub fn new() -> Self {
         Self {
-            audio_buffer: [0.0; 8192],
-            time_buffer: [0.0; 8192],
-            frequency_buffer: [Complex { re: 0.0, im: 0.0 }; 2048],
+            audio_buffer: vec![0.0; 8192].into_boxed_slice(),
+            time_buffer: vec![0.0; 8192].into_boxed_slice(),
+            frequency_buffer: vec![Complex { re: 0.0, im: 0.0 }; 2048].into_boxed_slice(),
         }
     }
 }
