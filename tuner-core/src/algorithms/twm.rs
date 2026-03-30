@@ -39,6 +39,12 @@ pub fn extract_spectral_peaks(
     window_size: usize,
     out: &mut [SpectralPeak],
 ) -> usize {
+    let max_magnitude = magnitudes.iter().cloned().fold(0.0_f32, f32::max);
+    if max_magnitude <= 1e-6 {
+        return 0; // Silence: skip entirely
+    }
+    let dynamic_threshold = (max_magnitude * 0.01_f32).max(1e-5);
+
     let mut count = 0;
     let max_peaks = out.len();
     
@@ -52,7 +58,7 @@ pub fn extract_spectral_peaks(
         let mag_curr = magnitudes[i];
         let mag_next = magnitudes[i + 1];
 
-        if mag_curr > mag_prev && mag_curr > mag_next && mag_curr > 0.01 {
+        if mag_curr > mag_prev && mag_curr > mag_next && mag_curr > dynamic_threshold {
             // Found a peak, apply parabolic interpolation on log-magnitudes
             let y1 = mag_prev.max(1e-6).ln();
             let y2 = mag_curr.max(1e-6).ln();
@@ -87,9 +93,18 @@ pub fn extract_spectral_peaks(
 fn compute_twm_error(candidate_f0: f32, peaks: &[SpectralPeak], _sample_rate: u32, inharmonicity_b: f32) -> f32 {
     let max_peak_freq = peaks.iter().map(|p| p.freq).fold(0.0_f32, f32::max);
     
-    // Check up to the highest measured peak frequency + 1 to cap our harmonic template correctly
-    // Add a minimum of 3 partials to prevent extremely high candidate F0s from gaining an advantage
-    let n_partials = (max_peak_freq / candidate_f0).ceil().max(3.0).min(20.0) as usize;
+    // Dynamically calculate n_partials by generating expected frequencies with inharmonicity
+    // until we exceed the highest measured peak (plus a half-step margin).
+    let mut n_partials = 0;
+    while n_partials < 20 {
+        let n_f32 = (n_partials + 1) as f32;
+        let p_n = candidate_f0 * n_f32 * (1.0 + inharmonicity_b * n_f32 * n_f32).sqrt();
+        if p_n > max_peak_freq + candidate_f0 * 0.5 {
+            break;
+        }
+        n_partials += 1;
+    }
+    let n_partials = n_partials.max(1);
     
     // P -> O
     let mut p_to_o = 0.0;
@@ -102,34 +117,68 @@ fn compute_twm_error(candidate_f0: f32, peaks: &[SpectralPeak], _sample_rate: u3
             .fold(f32::INFINITY, f32::min);
         
         // Normalize distance by expected freq (cents-like scaling)
-        p_to_o += min_dist / p_n; 
+        p_to_o += min_dist / p_n.powf(0.8); 
     }
     p_to_o /= n_partials as f32;
     
-    // O -> P
-    let mut o_to_p = 0.0;
+    // O -> P (split into Set α and Set β)
+    // Set α: peaks >= candidate_f0 (standard normalized penalty)
+    // Set β: peaks < candidate_f0  (Subharmonic Veto — absolute, undiluted penalty)
+
+    let a_max = peaks.iter().map(|p| p.magnitude).fold(0.0_f32, f32::max);
+
+    let mut o_to_p_alpha = 0.0_f32;
+    let mut k_alpha = 0_usize;
+    let mut subharmonic_veto = 0.0_f32; // absolute, un-normalized Set β penalty
+
+    let freq_tolerance = candidate_f0 * 0.25; // quarter-tone margin below F0
+
     for peak in peaks {
-        let mut min_dist = f32::INFINITY;
-        let mut best_p_n = candidate_f0;
-        
-        for n in 1..=n_partials {
-            let n_f32 = n as f32;
-            let p_n = candidate_f0 * n_f32 * (1.0 + inharmonicity_b * n_f32 * n_f32).sqrt();
-            let dist = (peak.freq - p_n).abs();
-            if dist < min_dist {
-                min_dist = dist;
-                best_p_n = p_n;
+        if peak.freq >= candidate_f0 - freq_tolerance {
+            // Set α: standard M&B O->P matching
+            let mut min_dist = f32::INFINITY;
+            let mut best_p_n = candidate_f0;
+            for n in 1..=n_partials {
+                let n_f32 = n as f32;
+                let p_n = candidate_f0 * n_f32 * (1.0 + inharmonicity_b * n_f32 * n_f32).sqrt();
+                let dist = (peak.freq - p_n).abs();
+                if dist < min_dist {
+                    min_dist = dist;
+                    best_p_n = p_n;
+                }
             }
+            o_to_p_alpha += min_dist / best_p_n;
+            k_alpha += 1;
+        } else {
+            // Set β: unexplained sub-fundamental peak — Subharmonic Veto
+            // The penalty is quadratic, smoothly ignoring 4% noise floors (<0.05 error)
+            // but instantly and strictly vetoing >=10% weak piano fundamentals (>0.30 error).
+            let relative_amp = (peak.magnitude / a_max.max(1e-6)).clamp(0.0, 1.0);
+            subharmonic_veto += 30.0 * relative_amp.powi(2);
         }
-        o_to_p += min_dist / best_p_n;
     }
+
+    let o_to_p = if k_alpha > 0 {
+        o_to_p_alpha / k_alpha as f32
+    } else {
+        0.0
+    };
     
-    if !peaks.is_empty() {
-        o_to_p /= peaks.len() as f32;
-    }
-    
-    // Mismatch calculation (γ = 0.5)
-    p_to_o + 0.5 * o_to_p
+    // Dynamic ρ: increases when low-frequency energy is sparse (fundamental fading)
+    // This prevents the O->P penalty from being globally suppressed at end-of-sustain.
+    let low_freq_energy: f32 = peaks.iter()
+        .filter(|p| p.freq < 1000.0)
+        .map(|p| p.magnitude)
+        .sum();
+    let total_energy: f32 = peaks.iter().map(|p| p.magnitude).sum::<f32>().max(1e-6);
+    let low_freq_ratio = (low_freq_energy / total_energy).clamp(0.01, 1.0);
+
+    // ρ base = 0.5 (higher than M&B 0.33 to suit piano)
+    // As fundamentals fade (low_freq_ratio → 0), ρ rises toward 0.9
+    let rho = 0.5_f32 + 0.4 * (1.0 / low_freq_ratio - 1.0).clamp(0.0, 1.0);
+
+    // Total error = normalized P->O  +  dynamic-ρ weighted O->P  +  absolute subharmonic veto
+    p_to_o + rho * o_to_p + subharmonic_veto
 }
 
 /// # Arguments
@@ -145,7 +194,7 @@ pub fn detect_pitch_twm(
     key_hint: Option<f32>,
     inharmonicity_b: Option<f32>,
 ) -> Option<(f32, Option<f32>)> {
-    if peaks.len() < 3 {
+    if peaks.len() < 1 {
         return None;
     }
     
@@ -173,8 +222,8 @@ pub fn detect_pitch_twm(
     } else {
         // Discovery Mode
         let (f_min, f_max): (f32, f32) = match routing_state {
-            RoutingState::LockedBass   => (27.5,  150.0),
-            RoutingState::LockedTreble => (150.0, 4186.0),
+            RoutingState::LockedBass   => (27.5,   400.0),
+            RoutingState::LockedTreble => (130.0, 4186.0),
             RoutingState::Unclassified => (27.5,  4186.0), // fallback only
         };
         

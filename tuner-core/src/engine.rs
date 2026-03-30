@@ -54,7 +54,7 @@ impl Engine {
     /// Creates a new Engine with default algorithms.
     pub fn new(sample_rate: u32) -> Self {
         Self {
-            refinement_algorithm: RefinementAlgorithm::XQIFFT,
+            refinement_algorithm: RefinementAlgorithm::QIFFT,
             sample_rate,
             routing_state: RoutingState::Unclassified,
             consecutive_bass_votes: 0,
@@ -172,12 +172,10 @@ impl Engine {
                     pitch::detect_pitch_dpll(_audio_frame, self.sample_rate, coarse_f0)
                 }
                 RefinementAlgorithm::PVOCODER => None,
-                RefinementAlgorithm::QIFFT => pitch::detect_pitch_qifft_seeded(
-                    &spectrogram_data,
-                    self.sample_rate,
-                    coarse_f0,
-                )
-                .map(|freq| (freq, None)),
+                RefinementAlgorithm::QIFFT => {
+                    pitch::detect_pitch_qifft_seeded(&spectrogram_data, self.sample_rate, coarse_f0)
+                        .map(|freq| (freq, None))
+                }
             }
         } else {
             None
