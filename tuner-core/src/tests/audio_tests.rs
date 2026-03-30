@@ -69,7 +69,7 @@ fn test_qifft_core() {
     spectral::perform_fft(&audio, &mut time_buffer, &mut freq_buffer, &r2c, 2048);
     let magnitudes = spectral::spectrum_to_magnitudes(&freq_buffer, 2048);
     
-    let (freq, _conf) = pitch::detect_pitch_qifft(&magnitudes, 44100).unwrap();
+    let freq = pitch::detect_pitch_qifft(&magnitudes, 44100).unwrap();
     assert!((freq - 440.0).abs() < 1.0, "Expected ~440.0, got {}", freq);
 }
 

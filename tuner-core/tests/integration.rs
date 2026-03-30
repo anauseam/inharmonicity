@@ -11,7 +11,10 @@ fn generate_sine_wave(freq: f32, sample_rate: u32, length: usize) -> Vec<f32> {
     (0..length)
         .map(|i| {
             let t = i as f32 / sample_rate as f32;
-            (t * freq * 2.0 * std::f32::consts::PI).sin() * realistic_amplitude
+            let p1 = (t * freq * 2.0 * std::f32::consts::PI).sin();
+            let p2 = (t * freq * 2.0 * 2.0 * std::f32::consts::PI).sin() * 0.5;
+            let p3 = (t * freq * 3.0 * 2.0 * std::f32::consts::PI).sin() * 0.25;
+            (p1 + p2 + p3) * realistic_amplitude
         })
         .collect()
 }

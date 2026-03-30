@@ -17,11 +17,13 @@ use crate::pipeline::ProcessingFrame;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefinementAlgorithm {
     /// Quadratic Interpolated FFT — frequency-domain sub-bin peak detection.
-    QIFFT,
+    XQIFFT,
     /// Digital Phase-Locked Loop — time-domain phase tracking (future).
     DPLL,
     /// Phase Vocoder - frequency-domain phase angle measurement
     PVOCODER,
+    /// Classical Quadratic Interpolated FFT
+    QIFFT,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -42,6 +44,7 @@ pub struct Engine {
     pub consecutive_treble_votes: usize,
     pub key_hint: Option<f32>,
     pub inharmonicity_b: Option<f32>,
+    pub xqifft_p: f32,
     /// Scratch space for storing detected local maxima when creating candidates for TWM.
     pub peak_scratch: Box<[crate::algorithms::twm::SpectralPeak]>,
 }
@@ -50,14 +53,16 @@ impl Engine {
     /// Creates a new Engine with default algorithms.
     pub fn new(sample_rate: u32) -> Self {
         Self {
-            refinement_algorithm: RefinementAlgorithm::QIFFT,
+            refinement_algorithm: RefinementAlgorithm::XQIFFT,
             sample_rate,
             routing_state: RoutingState::Unclassified,
             consecutive_bass_votes: 0,
             consecutive_treble_votes: 0,
             key_hint: None,
             inharmonicity_b: None,
-            peak_scratch: vec![crate::algorithms::twm::SpectralPeak::default(); 30].into_boxed_slice(),
+            xqifft_p: 0.5,
+            peak_scratch: vec![crate::algorithms::twm::SpectralPeak::default(); 30]
+                .into_boxed_slice(),
         }
     }
 
@@ -82,8 +87,9 @@ impl Engine {
         // If unclassified, use the Band Energy Classifier to lock a routing path.
         if self.routing_state == RoutingState::Unclassified {
             let expected_bins = 2048 / 2 + 1; // 1025 for a 2048-sample FFT
-            let ratio = metrics::evaluate_band_energy_ratio(&frame.frequency_buffer[..expected_bins]);
-            
+            let ratio =
+                metrics::evaluate_band_energy_ratio(&frame.frequency_buffer[..expected_bins]);
+
             // Asymmetric thresholding (Schmitt trigger hysteresis logic)
             if ratio > 0.25 {
                 self.consecutive_bass_votes += 1;
@@ -154,13 +160,23 @@ impl Engine {
 
         if let Some((coarse_f0, _)) = twm_result {
             match self.refinement_algorithm {
-                RefinementAlgorithm::QIFFT => {
-                    pitch::detect_pitch_qifft_seeded(&spectrogram_data, self.sample_rate, coarse_f0)
-                }
+                RefinementAlgorithm::XQIFFT => pitch::detect_pitch_xqifft_seeded(
+                    &spectrogram_data,
+                    self.sample_rate,
+                    coarse_f0,
+                    self.xqifft_p,
+                )
+                .map(|freq| (freq, None)),
                 RefinementAlgorithm::DPLL => {
                     pitch::detect_pitch_dpll(_audio_frame, self.sample_rate, coarse_f0)
                 }
                 RefinementAlgorithm::PVOCODER => None,
+                RefinementAlgorithm::QIFFT => pitch::detect_pitch_qifft_seeded(
+                    &spectrogram_data,
+                    self.sample_rate,
+                    coarse_f0,
+                )
+                .map(|freq| (freq, None)),
             }
         } else {
             None

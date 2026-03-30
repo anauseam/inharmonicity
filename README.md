@@ -34,6 +34,7 @@ For a detailed overview of the algorithms used, see the [Anauseam documentation]
 
 ### Work in Progress
 
+- **XQIFFT Sub-Cent Refinement**: Exponentially-weighted QIFFT running after TWM to achieve sub-cent accuracy without additional FFT cost.
 - **Linear Kalman Filter** *(experimental — may not ship)*: Gatekeeper-governed temporal smoothing stage. Engages only during the NINOS2-confirmed Stable phase; bypassed and reset on each new onset. Retention in the final release is undecided.
 
 ## Architecture
@@ -126,7 +127,7 @@ The pipeline also manages the **`WorkerManager`** (`worker.rs`), which owns a si
 > | `Box<[T]>` buffer migration (ProcessingFrame, Gatekeeper) | ✅ Implemented |
 > | COLA — 50% overlap Hann window, `CircularFifo`, `push_audio()` API | ✅ Implemented |
 > | TWM — coarse F0 for both registers, `RefinementAlgorithm` enum | ✅ Implemented |
-> | XQIFFT — exponentially-weighted seeded sub-cent refinement | ✅ Implemented |
+> | XQIFFT — exponentially-weighted seeded sub-cent refinement | ⬜ Planned |
 > | Kalman filter — Gatekeeper-governed temporal smoothing *(experimental)* | ⬜ Planned |
 > | Pipeline fully encapsulates all output | ⬜ In progress |
 >

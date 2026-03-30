@@ -284,11 +284,11 @@ fn interpolate_peak_frequency(
 /// * `sample_rate` - The sample rate of the original audio in Hz.
 ///
 /// # Returns
-/// * `Some((frequency, None))` - The detected true fundamental frequency. QIFFT does not provide a confidence metric natively, so confidence is `None`.
+/// * `Some(frequency)` - The detected true fundamental frequency.
 pub fn detect_pitch_qifft(
     spectrum_magnitudes: &[f32],
     sample_rate: u32,
-) -> Option<(f32, Option<f32>)> {
+) -> Option<f32> {
     if spectrum_magnitudes.len() < 3 {
         return None;
     }
@@ -316,11 +316,7 @@ pub fn detect_pitch_qifft(
     // 2-4. Parabolic Interpolation and Final Frequency Calculation
     // We reuse the existing interpolate_peak_frequency function which 
     // perfectly implements the log-magnitude QIFFT math.
-    if let Some(freq) = interpolate_peak_frequency(spectrum_magnitudes, peak_bin, sample_rate) {
-        Some((freq, None))
-    } else {
-        None
-    }
+    interpolate_peak_frequency(spectrum_magnitudes, peak_bin, sample_rate)
 }
 
 /// Detects the fundamental frequency using Quadratic Interpolated FFT (QIFFT), seeded by an initial estimate.
@@ -335,12 +331,12 @@ pub fn detect_pitch_qifft(
 /// * `seed_hz` - The approximate fundamental frequency estimate to constrain the peak search.
 ///
 /// # Returns
-/// * `Some((frequency, None))` - The precision-refined true fundamental frequency.
+/// * `Some(frequency)` - The precision-refined true fundamental frequency.
 pub fn detect_pitch_qifft_seeded(
     spectrum_magnitudes: &[f32],
     sample_rate: u32,
     seed_hz: f32,
-) -> Option<(f32, Option<f32>)> {
+) -> Option<f32> {
     if spectrum_magnitudes.len() < 3 || seed_hz <= 0.0 {
         return None;
     }
@@ -377,8 +373,75 @@ pub fn detect_pitch_qifft_seeded(
     }
 
     // Parabolic Interpolation and Final Frequency Calculation
-    if let Some(freq) = interpolate_peak_frequency(spectrum_magnitudes, peak_bin, sample_rate) {
-        Some((freq, None))
+    interpolate_peak_frequency(spectrum_magnitudes, peak_bin, sample_rate)
+}
+
+/// Sub-cent frequency refinement using exponentially-weighted QIFFT.
+///
+/// Raises the magnitude of the seed peak and its neighbors to power `p`
+/// before parabolic interpolation, minimizing interpolation bias for
+/// Hann-windowed spectra.
+///
+/// # Arguments
+/// * `magnitudes` — Linear magnitude spectrum (output of `spectrum_to_magnitudes`).
+/// * `sample_rate` — Audio sample rate in Hz.
+/// * `seed_hz` — Coarse F0 from TWM. Restricts peak search to ±`search_bins` around seed.
+/// * `p` — Exponential weighting factor. Use `2.0` for Hann window, 50% overlap.
+pub fn detect_pitch_xqifft_seeded(
+    magnitudes: &[f32],
+    sample_rate: u32,
+    seed_hz: f32,
+    p: f32,
+) -> Option<f32> {
+    if magnitudes.len() < 3 || seed_hz <= 0.0 {
+        return None;
+    }
+
+    let buffer_size = (magnitudes.len() - 1) * 2;
+    let target_bin = (seed_hz * buffer_size as f32) / sample_rate as f32;
+    
+    // Narrow search window of ±3 bins around the seed frequency estimate
+    let search_radius = 3.0;
+    
+    // Calculate valid bin indices, ignoring DC (0) and Nyquist (len-1) boundaries to allow for interpolation
+    let start_bin = (target_bin - search_radius).max(1.0) as usize;
+    let end_bin = (target_bin + search_radius).min((magnitudes.len() - 2) as f32) as usize;
+    
+    if start_bin >= end_bin {
+        return None; // No valid search area
+    }
+
+    // Find the actual peak bin near the rough estimate
+    let mut peak_bin = 0;
+    let mut max_mag = -1.0;
+
+    for i in start_bin..=end_bin {
+        let mag = magnitudes[i];
+        if mag > max_mag {
+            max_mag = mag;
+            peak_bin = i;
+        }
+    }
+
+    // If the spectrum is essentially empty/silent in this band
+    if max_mag <= 1e-6 || peak_bin == 0 {
+        return None;
+    }
+
+    // XQIFFT: Raise magnitude of the peak and its neighbors to power `p`
+    let m_left = magnitudes[peak_bin - 1].powf(p);
+    let m_peak = magnitudes[peak_bin].powf(p);
+    let m_right = magnitudes[peak_bin + 1].powf(p);
+
+    if let Some(offset) = crate::algorithms::pitch::parabolic_interpolation_offset(m_left, m_peak, m_right) {
+        let interpolated_bin = peak_bin as f32 + offset;
+        let final_freq = (interpolated_bin * sample_rate as f32) / buffer_size as f32;
+
+        if final_freq.is_finite() && final_freq > 0.0 {
+            Some(final_freq)
+        } else {
+            None
+        }
     } else {
         None
     }
