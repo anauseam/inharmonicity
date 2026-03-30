@@ -72,60 +72,6 @@ fn generate_simulated_piano_strike(sample_rate: u32, duration_sec: f32) -> Vec<f
     signal
 }
 
-/// Helper function to modularize pipeline integration testing
-fn verify_pipeline_detection(
-    signal: &[f32], 
-    expected_freq: f32, 
-    expected_states: &[SignalState],
-    mut setup_pipeline: impl FnMut(&mut AudioPipeline, &PipelineHandle)
-) {
-    let (mut pipeline, handle) = AudioPipeline::new();
-    pipeline.gatekeeper.capture_mode_enabled = true;
-    
-    // Allow custom configuration (like thresholds)
-    setup_pipeline(&mut pipeline, &handle);
-    
-    let mut planner = RealFftPlanner::<f32>::new();
-    let r2c = planner.plan_fft_forward(2048);
-    
-    let frame_size = 2048;
-    let num_frames = signal.len() / frame_size;
-    
-    let mut state_history = Vec::new();
-    let mut max_freq: f32 = 0.0;
-    let mut detected = false;
-    
-    for i in 0..num_frames {
-        let mut frame = ProcessingFrame::new();
-        let audio_slice = &signal[i * frame_size..(i + 1) * frame_size];
-        frame.audio_buffer[..frame_size].copy_from_slice(audio_slice);
-        
-        let mut time_buffer = vec![0.0; frame_size];
-        spectral::perform_fft(audio_slice, &mut time_buffer, &mut frame.frequency_buffer[..1025], &r2c, frame_size);
-        
-        if let Some((freq, _)) = pipeline.process_frame(&mut frame) {
-            max_freq = max_freq.max(freq);
-            detected = true;
-        }
-        
-        let current_state = pipeline.gatekeeper.current_state.clone();
-        if state_history.last() != Some(&current_state) {
-            state_history.push(current_state);
-        }
-    }
-    
-    assert!(detected, "Audio pipeline never output a pitch");
-    assert!((max_freq - expected_freq).abs() < 4.0, "Expected pitch ~{}, got {}", expected_freq, max_freq);
-    
-    for expected_state in expected_states {
-        assert!(
-            state_history.contains(expected_state), 
-            "Gatekeeper never identified {:?} phase. History: {:?}", 
-            expected_state, state_history
-        );
-    }
-}
-
 #[test]
 fn test_gatekeeper_integration() {
     let pool = Arc::new(ArrayQueue::new(4));
@@ -177,7 +123,7 @@ fn test_cola_pipeline_integration() {
     let num_hops = signal.len() / hop_size;
     
     let mut detected = false;
-    let mut max_freq = 0.0;
+    let mut max_freq: f32 = 0.0;
     
     for i in 0..num_hops {
         let chunk = &signal[i * hop_size..(i + 1) * hop_size];
