@@ -48,7 +48,7 @@ pub type AudioPool = ArrayQueue<Box<[f32; 66150]>>;
 /// It is meant to be owned by Thread 2 and reused every frame to perform
 /// continuous fundamental frequency ($f_0$) detection without ever calling
 /// `Vec::new()` or `Vec::push()`.
-pub(crate) struct ProcessingFrame {
+pub struct ProcessingFrame {
     /// Holds the raw linear audio samples popped from the Elastic Ring Buffer.
     /// Needs to be up to 8192 samples to support the Bass Engine.
     pub audio_buffer: Box<[f32]>,
@@ -87,6 +87,10 @@ pub struct ConfigState {
     pub silence_threshold: f32,
     /// NHWRSF threshold required to declare a new transient note event.
     pub nhwrsf_threshold: f32,
+    /// Expected frequency hint provided by GUI keys
+    pub key_hint: Option<f32>,
+    /// Pre-calculated base inharmonicity metric
+    pub inharmonicity_b: Option<f32>,
 }
 
 impl Default for ConfigState {
@@ -94,6 +98,8 @@ impl Default for ConfigState {
         Self {
             silence_threshold: 0.005,
             nhwrsf_threshold: 0.5,
+            key_hint: None,
+            inharmonicity_b: None,
         }
     }
 }
@@ -267,10 +273,12 @@ impl AudioPipeline {
 
     /// Internal method to run the DSP pipeline on the populated `processing_frame`.
     fn process_frame_internal(&mut self) -> Option<(f32, Option<f32>)> {
-        // 1. Read GUI-set configs into the Gatekeeper
+        // 1. Read GUI-set configs into the Gatekeeper and Engine
         if let Ok(config) = self.shared_config.try_lock() {
             self.gatekeeper.config.silence_threshold = config.silence_threshold;
             self.gatekeeper.config.nhwrsf_threshold = config.nhwrsf_threshold;
+            self.engine.key_hint = config.key_hint;
+            self.engine.inharmonicity_b = config.inharmonicity_b;
         }
 
         // 2. Pure DSP — Gatekeeper evaluates signal stability

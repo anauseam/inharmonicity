@@ -323,6 +323,67 @@ pub fn detect_pitch_qifft(
     }
 }
 
+/// Detects the fundamental frequency using Quadratic Interpolated FFT (QIFFT), seeded by an initial estimate.
+///
+/// This algorithm finds the bin with the highest magnitude within a narrow search window
+/// centered around the `seed_hz` estimate. It then applies parabolic interpolation on
+/// the log-magnitude values of that peak and its immediate neighbors to find the exact sub-bin frequency.
+///
+/// # Arguments
+/// * `spectrum_magnitudes` - Magnitude spectrum from an FFT.
+/// * `sample_rate` - The sample rate of the original audio in Hz.
+/// * `seed_hz` - The approximate fundamental frequency estimate to constrain the peak search.
+///
+/// # Returns
+/// * `Some((frequency, None))` - The precision-refined true fundamental frequency.
+pub fn detect_pitch_qifft_seeded(
+    spectrum_magnitudes: &[f32],
+    sample_rate: u32,
+    seed_hz: f32,
+) -> Option<(f32, Option<f32>)> {
+    if spectrum_magnitudes.len() < 3 || seed_hz <= 0.0 {
+        return None;
+    }
+
+    let buffer_size = (spectrum_magnitudes.len() - 1) * 2;
+    let target_bin = (seed_hz * buffer_size as f32) / sample_rate as f32;
+    
+    // Narrow search window of ±3 bins around the seed frequency estimate
+    let search_radius = 3.0;
+    
+    // Calculate valid bin indices, ignoring DC (0) and Nyquist (len-1) boundaries to allow for interpolation
+    let start_bin = (target_bin - search_radius).max(1.0) as usize;
+    let end_bin = (target_bin + search_radius).min((spectrum_magnitudes.len() - 2) as f32) as usize;
+    
+    if start_bin >= end_bin {
+        return None; // No valid search area
+    }
+
+    // Find the actual peak bin near the rough estimate
+    let mut peak_bin = 0;
+    let mut max_mag = -1.0;
+
+    for i in start_bin..=end_bin {
+        let mag = spectrum_magnitudes[i];
+        if mag > max_mag {
+            max_mag = mag;
+            peak_bin = i;
+        }
+    }
+
+    // If the spectrum is essentially empty/silent in this band
+    if max_mag <= 1e-6 || peak_bin == 0 {
+        return None;
+    }
+
+    // Parabolic Interpolation and Final Frequency Calculation
+    if let Some(freq) = interpolate_peak_frequency(spectrum_magnitudes, peak_bin, sample_rate) {
+        Some((freq, None))
+    } else {
+        None
+    }
+}
+
 /// Refines a frequency estimate using a pre-computed magnitude spectrum.
 ///
 /// This function improves the accuracy of pitch detection by analyzing

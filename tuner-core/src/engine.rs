@@ -10,25 +10,18 @@
 //! 2. Route to Bass Engine (pYIN) or Treble Engine (QIFFT / DPLL) to extract the exact F0.
 //! 3. Output the resulting F0 and confidence back to the pipeline.
 
-use crate::algorithms::{dpyin, metrics, pitch, spectral};
+use crate::algorithms::{metrics, pitch, spectral};
 use crate::pipeline::ProcessingFrame;
 
-/// Selects the Treble (>= 150 Hz) pitch refinement algorithm.
+/// Selects the refinement pitch detection algorithm (after TWM stage 1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TrebleAlgorithm {
+pub enum RefinementAlgorithm {
     /// Quadratic Interpolated FFT — frequency-domain sub-bin peak detection.
     QIFFT,
     /// Digital Phase-Locked Loop — time-domain phase tracking (future).
     DPLL,
     /// Phase Vocoder - frequency-domain phase angle measurement
     PVOCODER,
-}
-
-/// Selects the Bass (< 150 Hz) pitch detection algorithm.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BassAlgorithm {
-    /// Decimated Probabilistic YIN — robust against octave errors on stiff bass strings.
-    DPYIN,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -42,28 +35,29 @@ pub enum RoutingState {
 ///
 /// Executes the Scout → Router → Bass/Treble detection chain.
 pub struct Engine {
-    pub treble_algorithm: TrebleAlgorithm,
-    pub bass_algorithm: BassAlgorithm,
+    pub refinement_algorithm: RefinementAlgorithm,
     pub sample_rate: u32,
-    /// Previous winning lag from the bass DPYIN algorithm (in the decimated domain).
-    /// Used to give the Viterbi decoder temporal continuity across frames.
-    prev_bass_lag: Option<f32>,
     pub routing_state: RoutingState,
     pub consecutive_bass_votes: usize,
     pub consecutive_treble_votes: usize,
+    pub key_hint: Option<f32>,
+    pub inharmonicity_b: Option<f32>,
+    /// Scratch space for storing detected local maxima when creating candidates for TWM.
+    pub peak_scratch: Box<[crate::algorithms::twm::SpectralPeak]>,
 }
 
 impl Engine {
     /// Creates a new Engine with default algorithms.
     pub fn new(sample_rate: u32) -> Self {
         Self {
-            treble_algorithm: TrebleAlgorithm::QIFFT,
-            bass_algorithm: BassAlgorithm::DPYIN,
+            refinement_algorithm: RefinementAlgorithm::QIFFT,
             sample_rate,
-            prev_bass_lag: None,
             routing_state: RoutingState::Unclassified,
             consecutive_bass_votes: 0,
             consecutive_treble_votes: 0,
+            key_hint: None,
+            inharmonicity_b: None,
+            peak_scratch: vec![crate::algorithms::twm::SpectralPeak::default(); 30].into_boxed_slice(),
         }
     }
 
@@ -83,7 +77,6 @@ impl Engine {
             self.routing_state = RoutingState::Unclassified;
             self.consecutive_bass_votes = 0;
             self.consecutive_treble_votes = 0;
-            self.prev_bass_lag = None;
         }
 
         // If unclassified, use the Band Energy Classifier to lock a routing path.
@@ -144,44 +137,33 @@ impl Engine {
         let frame_size = 2048;
         let _audio_frame = &frame.audio_buffer[..frame_size];
 
-        match self.routing_state {
-            RoutingState::LockedBass => {
-                // Route to Bass Engine — uses full 8192-sample audio buffer for decimation
-                match self.bass_algorithm {
-                    BassAlgorithm::DPYIN => {
-                        let result = dpyin::detect_pitch_dpyin(
-                            &frame.audio_buffer[..],
-                            self.sample_rate,
-                            &mut frame.time_buffer[..],
-                            self.prev_bass_lag,
-                        );
-                        // Store the winning lag for next frame's Viterbi transition penalty.
-                        // Convert frequency back to lag in the decimated domain:
-                        //   lag = decimated_sample_rate / frequency
-                        const DECIMATED_SR: f32 = 44_100.0 / 8.0; // 5512.5 Hz
-                        if let Some((freq, _)) = result {
-                            self.prev_bass_lag = Some(DECIMATED_SR / freq);
-                        }
-                        result
-                    }
+        let peak_count = crate::algorithms::twm::extract_spectral_peaks(
+            &spectrogram_data,
+            self.sample_rate,
+            2048,
+            &mut self.peak_scratch,
+        );
+
+        let twm_result = crate::algorithms::twm::detect_pitch_twm(
+            &self.peak_scratch[..peak_count],
+            self.sample_rate,
+            self.routing_state,
+            self.key_hint,
+            self.inharmonicity_b,
+        );
+
+        if let Some((coarse_f0, _)) = twm_result {
+            match self.refinement_algorithm {
+                RefinementAlgorithm::QIFFT => {
+                    pitch::detect_pitch_qifft_seeded(&spectrogram_data, self.sample_rate, coarse_f0)
                 }
-            }
-            RoutingState::LockedTreble => {
-                // Route to Treble Engine
-                match self.treble_algorithm {
-                    TrebleAlgorithm::QIFFT => {
-                        pitch::detect_pitch_qifft(&spectrogram_data, self.sample_rate)
-                    }
-                    TrebleAlgorithm::DPLL => {
-                        pitch::detect_pitch_dpll(_audio_frame, self.sample_rate, 0.0)
-                    }
-                    TrebleAlgorithm::PVOCODER => {
-                        // PVOCODER is stubbed out for future implementation
-                        None
-                    }
+                RefinementAlgorithm::DPLL => {
+                    pitch::detect_pitch_dpll(_audio_frame, self.sample_rate, coarse_f0)
                 }
+                RefinementAlgorithm::PVOCODER => None,
             }
-            RoutingState::Unclassified => unreachable!(),
+        } else {
+            None
         }
     }
 }
