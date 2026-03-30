@@ -1,15 +1,14 @@
 //! # Pitch Detection Module
 //!
-//! This module implements advanced pitch detection algorithms optimized for piano tuning.
-//! It provides robust frequency detection using the YIN algorithm with enhancements
-//! for musical instrument analysis.
+//! This module implements advanced, precision pitch detection algorithms optimized for piano tuning.
+//! It serves as the primary refinement layer to exact sub-cent precision after a coarse pitch 
+//! neighborhood is established.
 //!
 //! ## Features
-//! - YIN pitch detection algorithm with octave error prevention
-//! - pYIN for enhanced robustness and accuracy
-//! - Noise rejection and clarity checking
-//! - Parabolic interpolation for sub-sample accuracy
-//! - Spectrum refinement for improved precision
+//! - **XQIFFT (Exponential-weighted QIFFT)**: Hann-window bias elimination for sub-cent spectral accuracy
+//! - **QIFFT (Quadratic Interpolated FFT)**: Fast sub-bin parabolic peak resolution
+//! - **DPLL (Digital Phase-Locked Loop)**: High-resolution time-domain phase tracking
+//! - YIN / pYIN: Legacy time-domain auto-correlation algorithms
 
 /// A robust implementation of the pYIN pitch detection algorithm (stateless).
 ///

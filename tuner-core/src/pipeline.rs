@@ -1,15 +1,16 @@
 //! # Audio Processing Pipeline
 //!
 //! This module defines the lock-free memory structures, shared state types,
-//! and the `AudioPipeline` orchestrator for real-time audio processing.
+//! and the `AudioPipeline` orchestrator for real-time continuous audio analysis.
 //!
 //! ## Architecture
 //!
 //! The pipeline follows the **Split / Handle pattern**:
 //!
-//! - [`AudioPipeline`] is moved to the audio thread. It owns the pure DSP
-//!   components ([`Gatekeeper`]) and coordinates them, syncing observations
-//!   to shared state after each frame.
+//! - [`AudioPipeline`] is moved to the audio thread. It owns and mediates all
+//!   internal pure DSP components ([`Gatekeeper`], [`Engine`], and the COLA [`CircularFifo`]).
+//!   It acts as a zero-allocation data sink via `push_audio()`, orchestrating overlapping
+//!   FFT frames transparently.
 //!
 //! - [`PipelineHandle`] is kept by the frontend (GUI, WASM, etc.). It provides
 //!   read/write access to the shared state via `Arc<Mutex<...>>`.

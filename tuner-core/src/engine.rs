@@ -7,8 +7,9 @@
 //! ## Sequence of processing:
 //!
 //! 1. Run the Scout Engine to determine rough frequency neighborhood.
-//! 2. Route to Bass Engine (pYIN) or Treble Engine (QIFFT / DPLL) to extract the exact F0.
-//! 3. Output the resulting F0 and confidence back to the pipeline.
+//! 2. Route candidate frequencies through the Two-Way Mismatch (TWM) algorithm to find coarse F0.
+//! 3. Extract sub-cent accurate F0 by passing the TWM seed bin into XQIFFT (or legacy QIFFT).
+//! 4. Output the resulting F0 and confidence back to the pipeline.
 
 use crate::algorithms::{metrics, pitch, spectral};
 use crate::pipeline::ProcessingFrame;

@@ -1,3 +1,17 @@
+//! # Two-Way Mismatch (TWM) Module
+//!
+//! This module implements the Two-Way Mismatch (TWM) algorithm, serving as the 
+//! coarse fundamental frequency ($f_0$) estimator in the pipeline. By generating 
+//! a theoretical template of harmonic partials and comparing it against measured 
+//! spectral peaks, TWM evaluates both "Predicted-to-Observed" and 
+//! "Observed-to-Predicted" errors to robustly identify the true $f_0$ without 
+//! octave errors.
+//!
+//! ## Features
+//! - Sub-bin accurate spectral peak extraction via fast parabolic interpolation.
+//! - Targeted harmonic template matching with inharmonicity ($B$) coefficient compensation.
+//! - Octave-error immunity across the full piano range (A0 to C8).
+
 use crate::engine::RoutingState;
 
 // Threshold above which a candidate is rejected
