@@ -34,8 +34,6 @@ For a detailed overview of the algorithms used, see the [Anauseam documentation]
 
 ### Work in Progress
 
-- **TWM Pitch Detection**: Replacing DPYIN and bare QIFFT with Two-Way Mismatch (TWM) as the universal coarse F0 engine for both bass and treble registers. TWM supports targeted mode (user key hint), discovery mode (Scout-bounded), and inharmonicity template stretching.
-- **XQIFFT Sub-Cent Refinement**: Exponentially-weighted QIFFT running after TWM to achieve sub-cent accuracy without additional FFT cost.
 - **Linear Kalman Filter** *(experimental — may not ship)*: Gatekeeper-governed temporal smoothing stage. Engages only during the NINOS2-confirmed Stable phase; bypassed and reset on each new onset. Retention in the final release is undecided.
 
 ## Architecture
@@ -122,17 +120,17 @@ The pipeline also manages the **`WorkerManager`** (`worker.rs`), which owns a si
 > | Component | Status |
 > | --- | --- |
 > | `pipeline.rs` — AudioPipeline mediator + shared state | ✅ Implemented |
-> | `gatekeeper.rs` — 5-state signal validator (pure DSP) | ⬜ Testing |
-> | `engine.rs` — F0 Engine (Scout / Bass / Treble) | ⬜ Testing |
+> | `gatekeeper.rs` — 5-state signal validator (pure DSP) | ✅ Implemented |
+> | `engine.rs` — F0 Engine (Scout / TWM / XQIFFT) | ✅ Implemented |
 > | `worker.rs` — Background worker (single thread) | ⬜ Wireframe |
 > | `Box<[T]>` buffer migration (ProcessingFrame, Gatekeeper) | ✅ Implemented |
 > | COLA — 50% overlap Hann window, `CircularFifo`, `push_audio()` API | ✅ Implemented |
-> | TWM — coarse F0 for both registers, `RefinementAlgorithm` enum | ⬜ Planned |
-> | XQIFFT — exponentially-weighted seeded sub-cent refinement | ⬜ Planned |
+> | TWM — coarse F0 for both registers, `RefinementAlgorithm` enum | ✅ Implemented |
+> | XQIFFT — exponentially-weighted seeded sub-cent refinement | ✅ Implemented |
 > | Kalman filter — Gatekeeper-governed temporal smoothing *(experimental)* | ⬜ Planned |
 > | Pipeline fully encapsulates all output | ⬜ In progress |
 >
-> **Currently**, `app.rs` has been successfully migrated to use the overlapping frame pipeline. The `AudioPipeline` serves as the sole frontend-facing DSP orchestrator. The GUI completely ignores pipeline internals such as window size, FFT planning, and zero-allocation frame buffering, communicating purely via `pipeline.push_audio(&[f32])`. The engine and worker remain scouted for upcoming architectural overhauls including TWM Pitch Detection implementation.
+> **Currently**, `app.rs` has been successfully migrated to use the overlapping frame pipeline. The `AudioPipeline` serves as the sole frontend-facing DSP orchestrator. The GUI completely ignores pipeline internals such as window size, FFT planning, and zero-allocation frame buffering, communicating purely via `pipeline.push_audio(&[f32])`. The engine actively routes pitch detection through the newly implemented Two-Way Mismatch (TWM) algorithm, which accurately seeds the XQIFFT refinement stage across both bass and treble registers without octave errors.
 >
 > [!NOTE]
 > **Implemented: COLA STFT Architecture**
