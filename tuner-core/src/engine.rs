@@ -139,7 +139,7 @@ impl Engine {
         // We only use the first half of the frequency buffer (up to Nyquist)
         let expected_bins = 2048 / 2 + 1; // 1025 for a 2048-sample FFT
         let spectrogram_data =
-            spectral::spectrum_to_magnitudes(&frame.frequency_buffer[..expected_bins]);
+            spectral::spectrum_to_magnitudes(&frame.frequency_buffer[..expected_bins], 2048);
 
         let frame_size = 2048;
         let _audio_frame = &frame.audio_buffer[..frame_size];

@@ -34,7 +34,6 @@ For a detailed overview of the algorithms used, see the [Anauseam documentation]
 
 ### Work in Progress
 
-- **COLA Overlapping Frame Pipeline**: Migrating from sequential 2048-sample frames to 50% overlapping Hann-windowed frames via a circular FIFO (`cola` module). Eliminates temporal blind spots at frame boundaries. `AudioPipeline` will fully internalize FIFO/FFT — `tuner-gui` only calls `push_audio(&[f32])`.
 - **TWM Pitch Detection**: Replacing DPYIN and bare QIFFT with Two-Way Mismatch (TWM) as the universal coarse F0 engine for both bass and treble registers. TWM supports targeted mode (user key hint), discovery mode (Scout-bounded), and inharmonicity template stretching.
 - **XQIFFT Sub-Cent Refinement**: Exponentially-weighted QIFFT running after TWM to achieve sub-cent accuracy without additional FFT cost.
 - **Linear Kalman Filter** *(experimental — may not ship)*: Gatekeeper-governed temporal smoothing stage. Engages only during the NINOS2-confirmed Stable phase; bypassed and reset on each new onset. Retention in the final release is undecided.
@@ -127,43 +126,20 @@ The pipeline also manages the **`WorkerManager`** (`worker.rs`), which owns a si
 > | `engine.rs` — F0 Engine (Scout / Bass / Treble) | ⬜ Testing |
 > | `worker.rs` — Background worker (single thread) | ⬜ Wireframe |
 > | `Box<[T]>` buffer migration (ProcessingFrame, Gatekeeper) | ✅ Implemented |
-> | COLA — 50% overlap Hann window, `CircularFifo`, `push_audio()` API | ⬜ Planned |
+> | COLA — 50% overlap Hann window, `CircularFifo`, `push_audio()` API | ✅ Implemented |
 > | TWM — coarse F0 for both registers, `RefinementAlgorithm` enum | ⬜ Planned |
 > | XQIFFT — exponentially-weighted seeded sub-cent refinement | ⬜ Planned |
 > | Kalman filter — Gatekeeper-governed temporal smoothing *(experimental)* | ⬜ Planned |
 > | Pipeline fully encapsulates all output | ⬜ In progress |
 >
-> **Currently**, `app.rs` still calls the legacy `capture_processing` module. The `AudioPipeline` is live for
-> Gatekeeper orchestration and shared state (RMS / threshold), while the `Engine`
-> and `Worker` are scaffolded for future integration. As the migration completes,
-> `app.rs` will reduce to a thin `pipeline.process_frame()` call with zero
-> knowledge of DSP internals.
+> **Currently**, `app.rs` has been successfully migrated to use the overlapping frame pipeline. The `AudioPipeline` serves as the sole frontend-facing DSP orchestrator. The GUI completely ignores pipeline internals such as window size, FFT planning, and zero-allocation frame buffering, communicating purely via `pipeline.push_audio(&[f32])`. The engine and worker remain scouted for upcoming architectural overhauls including TWM Pitch Detection implementation.
 >
 > [!NOTE]
-> **Planned: COLA STFT Architecture**
+> **Implemented: COLA STFT Architecture**
 >
-> The pipeline currently processes **non-overlapping** 2048-sample frames. Because
-> frame boundaries are asynchronous to real piano strikes, the original Hann window
-> (which tapers to exactly 0.0 at both edges) created transient detection dead zones:
-> a hammer strike landing on a frame boundary would be attenuated to silence in both
-> adjacent frames, preventing the CSD algorithm from tripping.
+> Historically, the pipeline processed **non-overlapping** frames which led to temporal blind spots, causing a hammer strike landing on a frame boundary to be attenuated to silence.
 >
-> **Immediate mitigation (current):** The Hann window is replaced with a **Hamming**
-> window (`0.54 − 0.46·cos(…)`), which maintains an 8% amplitude pedestal at the
-> edges. This ensures boundary transients retain enough broadband energy to breach
-> the CSD threshold, while its −43 dB sidelobe floor provides sufficient spectral
-> clarity for partial interpolation at 0% overlap.
->
-> **Target architecture (post-migration):** Once `app.rs` is fully migrated to
-> `AudioPipeline.process_frame()`, the frame geometry will be upgraded to a
-> **50% overlap COLA** design (1024-sample hop, circular FIFO ring buffer). This
-> satisfies the Constant Overlap-Add property with a Hann window, mathematically
-> guaranteeing that every sample is analyzed at full window amplitude in at least
-> one frame — eliminating temporal blind spots entirely. The Hann window's
-> −18 dB/octave sidelobe roll-off also provides superior noise floor suppression
-> over Hamming's −6 dB/octave for resolving high-order inharmonic partials. The
-> FFT rate doubles (~21.5 → ~43 frames/sec), adding roughly 1 ms of CPU time per
-> second of audio — a negligible cost on modern hardware.
+> The pipeline is now upgraded to a **50% overlap COLA** (Constant Overlap-Add) design using an allocation-free circular FIFO ring buffer. By utilizing a Hann window over these 50% overlapping frames, it is mathematically guaranteed that every sample is analyzed at full window amplitude in at least one frame — eliminating temporal blind spots entirely. The Hann window's −18 dB/octave sidelobe roll-off provides superior noise floor suppression for resolving high-order inharmonic partials without any boundary anomalies.
 
 ### Global Data Structures & Memory Management
 
