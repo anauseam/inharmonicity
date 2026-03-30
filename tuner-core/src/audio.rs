@@ -16,19 +16,21 @@ use cpal::SupportedStreamConfigRange;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use ringbuf::{HeapRb, traits::{Producer, Split}};
 
-/// Audio buffer size for processing frames.
-///
-/// This constant defines the number of samples per audio frame.
-/// Larger buffers provide more frequency resolution but increase latency.
-pub const BUFFER_SIZE: usize = 2048;
+/// The standard analysis window size (samples).
+/// Used by the Gatekeeper, Scout, and all Engine paths.
+pub const WINDOW_SIZE: usize = 2048;
+
+/// Hop size for overlapping frame analysis (50% overlap of WINDOW_SIZE).
+/// Each hop triggers a new FFT + pipeline frame.
+pub const HOP_SIZE: usize = WINDOW_SIZE / 2; // 1024 samples
 
 /// Capacity of the lock-free ring buffer between the CPAL capture thread and
 /// the analysis thread, in samples.
 ///
-/// 8 × BUFFER_SIZE = 16,384 samples (~371 ms at 44.1 kHz).
+/// 8 × WINDOW_SIZE = 16,384 samples (~371 ms at 44.1 kHz).
 /// This headroom ensures the real-time callback never drops samples even if
 /// the analysis thread hits a scheduling spike.
-pub const RING_BUFFER_CAPACITY: usize = BUFFER_SIZE * 8;
+pub const RING_BUFFER_CAPACITY: usize = WINDOW_SIZE * 8;
 
 /// The target sample rate for the application in Hz.
 pub const SAMPLE_RATE: u32 = 44100;

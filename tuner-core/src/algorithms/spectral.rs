@@ -9,7 +9,6 @@
 //! - Hamming windowing for zero-overlap transient preservation
 //! - Optimized for real-time processing
 
-use crate::audio::BUFFER_SIZE;
 use realfft::RealToComplex;
 use rustfft::num_complex::Complex;
 use std::sync::Arc;
@@ -27,10 +26,10 @@ use std::sync::Arc;
 /// so all samples arriving here are already zero-mean.
 ///
 /// # Arguments
-/// * `signal` - Input audio signal (must be exactly BUFFER_SIZE samples, e.g., 2048)
-/// * `time_buffer` - Pre-allocated mutable scratch space (must be at least BUFFER_SIZE).
+/// * `signal` - Input audio signal (must be exactly WINDOW_SIZE samples, e.g., 2048)
+/// * `time_buffer` - Pre-allocated mutable scratch space (must be at least WINDOW_SIZE).
 ///   The `realfft` algorithm performs its work in this buffer.
-/// * `frequency_buffer` - Pre-allocated buffer for the FFT output. Must be at least `BUFFER_SIZE / 2 + 1` (e.g., 1025).
+/// * `frequency_buffer` - Pre-allocated buffer for the FFT output. Must be at least `WINDOW_SIZE / 2 + 1` (e.g., 1025).
 /// * `fft_instance` - A pre-planned Real FFT instance from `RealFftPlanner`
 ///
 /// # Panics
@@ -40,29 +39,30 @@ pub fn perform_fft(
     time_buffer: &mut [f32],
     frequency_buffer: &mut [Complex<f32>],
     fft_instance: &Arc<dyn RealToComplex<f32>>,
+    window_size: usize,
 ) {
-    if signal.len() != BUFFER_SIZE || time_buffer.len() < BUFFER_SIZE {
-        panic!("Input frame size and time scratch must be at least BUFFER_SIZE");
+    if signal.len() != window_size || time_buffer.len() < window_size {
+        panic!("Input frame size and time scratch must be at least window_size");
     }
 
     // Real FFT of size N produces N/2 + 1 complex bins (0 to Nyquist)
-    let expected_bins = BUFFER_SIZE / 2 + 1;
+    let expected_bins = window_size / 2 + 1;
     if frequency_buffer.len() < expected_bins {
-        panic!("Frequency buffer must be at least BUFFER_SIZE / 2 + 1 bins long");
+        panic!("Frequency buffer must be at least window_size / 2 + 1 bins long");
     }
 
-    let n_minus_1 = (signal.len() - 1) as f32;
+    let n_minus_1 = (window_size - 1) as f32;
     for (i, (&sample, real_val)) in signal.iter().zip(time_buffer.iter_mut()).enumerate() {
-        // Hamming window: 0.54 - 0.46 * cos(2pi * n / (N-1))
-        // Better than Hann for zero-overlap frames because it doesn't attenuate boundary transients to exactly 0.0
-        let multiplier = 0.54 - 0.46 * (2.0 * std::f32::consts::PI * i as f32 / n_minus_1).cos();
+        // Hann window: 0.5 * (1 - cos(2π * n / (N - 1)))
+        // Satisfies COLA at 50% overlap — no boundary artifacts.
+        let multiplier = 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / n_minus_1).cos());
         *real_val = sample * multiplier;
     }
 
     // The realfft crate modifies the input buffer in-place during calculation
     // and outputs the N/2 + 1 complex bins directly into our frequency_buffer.
     fft_instance
-        .process(time_buffer, &mut frequency_buffer[..expected_bins])
+        .process(&mut time_buffer[..window_size], &mut frequency_buffer[..expected_bins])
         .expect("FFT Process Failed");
 }
 
@@ -82,10 +82,10 @@ pub fn perform_fft(
 ///
 /// # Returns
 /// * `Vec<f32>` - Magnitude spectrum
-pub fn spectrum_to_magnitudes(spectrum: &[Complex<f32>]) -> Vec<f32> {
+pub fn spectrum_to_magnitudes(spectrum: &[Complex<f32>], window_size: usize) -> Vec<f32> {
     spectrum
         .iter()
-        .take(BUFFER_SIZE / 2)
+        .take(window_size / 2)
         .map(|c| c.norm()) // .norm() is sqrt(re^2 + im^2)
         .collect()
 }

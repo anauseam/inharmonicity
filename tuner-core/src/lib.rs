@@ -33,6 +33,8 @@ pub mod audio;
 pub mod calibration;
 /// Legacy capture frame processing (deprecated — to be replaced by `pipeline` + `worker`).
 pub mod capture_processing;
+/// Circular FIFO overlapping analysis sliding window.
+pub mod cola;
 /// F0 Engine — Scout, Bass, and Treble frequency detection (wireframe).
 pub mod engine;
 /// 5-state signal validator (pure DSP). Evaluates RMS, CSD, and NINOS2 for stability gating.
@@ -59,7 +61,7 @@ pub struct AnalysisResult {
     pub cents_deviation: Option<f32>,
     /// Name of the nearest note (e.g., `"A4"`, `"C#3"`).
     pub note_name: Option<String>,
-    /// Magnitude spectrum for the spectrogram visualization (first `BUFFER_SIZE / 2` bins).
+    /// Magnitude spectrum for the spectrogram visualization (first `WINDOW_SIZE / 2` bins).
     pub spectrogram_data: Vec<f32>,
     /// Frequencies of detected harmonic partials (2nd, 3rd, … overtones).
     pub partials: Vec<f32>,

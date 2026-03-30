@@ -36,7 +36,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::algorithms::metrics::{calculate_ema, calculate_nhwrsf, calculate_rms};
-use crate::audio::{BUFFER_SIZE, dc_block, find_supported_config};
+use crate::audio::{WINDOW_SIZE, dc_block, find_supported_config};
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -122,7 +122,7 @@ fn open_calibration_stream() -> Result<(cpal::Stream, impl ringbuf::traits::Cons
     let stream_config: cpal::StreamConfig = config.into();
 
     // Small ring buffer — only needs to hold a few frames of headroom
-    let rb = ringbuf::HeapRb::<f32>::new(BUFFER_SIZE * 4);
+    let rb = ringbuf::HeapRb::<f32>::new(WINDOW_SIZE * 4);
     let (mut producer, consumer) = rb.split();
 
     let err_fn = |err| eprintln!("[CALIBRATION] Audio stream error: {}", err);
@@ -153,7 +153,7 @@ fn drain_warmup(
 ) {
     let mut done = 0;
     while done < WARMUP_FRAMES {
-        if consumer.occupied_len() >= BUFFER_SIZE {
+        if consumer.occupied_len() >= WINDOW_SIZE {
             consumer.pop_slice(frame_buffer);
             done += 1;
         } else {
@@ -194,13 +194,13 @@ pub fn calibrate_noise_floor(
 
     let (stream, mut consumer) = open_calibration_stream()?;
 
-    // FFT setup — RFFT produces BUFFER_SIZE/2 + 1 complex bins
+    // FFT setup — RFFT produces WINDOW_SIZE/2 + 1 complex bins
     let mut planner = RealFftPlanner::<f32>::new();
-    let fft = planner.plan_fft_forward(BUFFER_SIZE);
+    let fft = planner.plan_fft_forward(WINDOW_SIZE);
     let mut freq_buf: Vec<Complex<f32>> = fft.make_output_vec();
     let mut prev_mags = vec![0.0f32; freq_buf.len()];
 
-    let mut frame_buffer = vec![0.0f32; BUFFER_SIZE];
+    let mut frame_buffer = vec![0.0f32; WINDOW_SIZE];
 
     drain_warmup(&mut consumer, &mut frame_buffer);
 
@@ -211,7 +211,7 @@ pub fn calibrate_noise_floor(
     let mut frames_collected: usize = 0;
 
     while frames_collected < num_frames {
-        if consumer.occupied_len() >= BUFFER_SIZE {
+        if consumer.occupied_len() >= WINDOW_SIZE {
             consumer.pop_slice(&mut frame_buffer);
 
             // RMS — silence gate
@@ -297,11 +297,11 @@ pub fn calibrate_minimum_strike(
 
     // FFT setup
     let mut planner = RealFftPlanner::<f32>::new();
-    let fft = planner.plan_fft_forward(BUFFER_SIZE);
+    let fft = planner.plan_fft_forward(WINDOW_SIZE);
     let mut freq_buf: Vec<Complex<f32>> = fft.make_output_vec();
     let mut prev_mags = vec![0.0f32; freq_buf.len()];
 
-    let mut frame_buffer = vec![0.0f32; BUFFER_SIZE];
+    let mut frame_buffer = vec![0.0f32; WINDOW_SIZE];
 
     drain_warmup(&mut consumer, &mut frame_buffer);
 
@@ -311,7 +311,7 @@ pub fn calibrate_minimum_strike(
     let mut frame_index: usize = 0;
 
     while std::time::Instant::now() < deadline {
-        if consumer.occupied_len() >= BUFFER_SIZE {
+        if consumer.occupied_len() >= WINDOW_SIZE {
             consumer.pop_slice(&mut frame_buffer);
 
             // FFT → NHWRSF

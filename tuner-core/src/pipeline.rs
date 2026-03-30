@@ -22,8 +22,12 @@
 //! ```
 
 use crossbeam_queue::ArrayQueue;
+use realfft::RealToComplex;
 use rustfft::num_complex::Complex;
 use std::sync::{Arc, Mutex};
+
+use crate::audio;
+use crate::cola::CircularFifo;
 
 use crate::engine::Engine;
 use crate::gatekeeper::{Gatekeeper, SignalState};
@@ -44,7 +48,7 @@ pub type AudioPool = ArrayQueue<Box<[f32; 66150]>>;
 /// It is meant to be owned by Thread 2 and reused every frame to perform
 /// continuous fundamental frequency ($f_0$) detection without ever calling
 /// `Vec::new()` or `Vec::push()`.
-pub struct ProcessingFrame {
+pub(crate) struct ProcessingFrame {
     /// Holds the raw linear audio samples popped from the Elastic Ring Buffer.
     /// Needs to be up to 8192 samples to support the Bass Engine.
     pub audio_buffer: Box<[f32]>,
@@ -146,6 +150,11 @@ pub struct AudioPipeline {
     // Memory infrastructure
     #[allow(dead_code)] // To be utilized upon full implementation
     audio_pool: Arc<AudioPool>,
+
+    // Internal COLA State
+    cola: CircularFifo,
+    fft_instance: Arc<dyn RealToComplex<f32>>,
+    processing_frame: ProcessingFrame,
 }
 
 /// Frontend-side handle to the pipeline's shared state.
@@ -189,12 +198,18 @@ impl AudioPipeline {
         let gatekeeper = Gatekeeper::new(Arc::clone(&audio_pool));
         let engine = Engine::new(44100);
 
+        let mut planner = realfft::RealFftPlanner::<f32>::new();
+        let fft_instance = planner.plan_fft_forward(crate::audio::WINDOW_SIZE);
+
         let pipeline = Self {
             gatekeeper,
             engine,
             shared_config: Arc::clone(&shared_config),
             shared_runtime: Arc::clone(&shared_runtime),
             audio_pool,
+            cola: CircularFifo::new(audio::WINDOW_SIZE * 4), // Capacity large enough to hold the 8192 points needed for bass F0
+            fft_instance,
+            processing_frame: ProcessingFrame::new(),
         };
 
         let handle = PipelineHandle {
@@ -205,12 +220,53 @@ impl AudioPipeline {
         (pipeline, handle)
     }
 
-    /// Processes a single audio frame through the full DSP pipeline.
-    ///
-    /// 1. Reads the GUI-set silence threshold from shared config into the Gatekeeper.
-    /// 2. Delegates to the Gatekeeper for signal stability evaluation (pure DSP).
-    /// 3. Syncs runtime observations to shared state for the frontend.
-    pub fn process_frame(&mut self, frame: &mut ProcessingFrame) -> Option<(f32, Option<f32>)> {
+    /// Pushes new raw audio samples directly into the internal COLA FIFO.
+    /// Returns `Some` containing the DSP results IF a full hop boundary was reached.
+    pub fn push_audio(
+        &mut self,
+        samples: &[f32],
+    ) -> Option<(Option<(f32, Option<f32>)>, std::vec::Vec<f32>)> {
+        self.cola.push_samples(samples);
+
+        if self.cola.is_hop_ready(crate::audio::HOP_SIZE) {
+            self.consume_cola_hop()
+        } else {
+            None
+        }
+    }
+
+    /// Internal helper that processes a single hop of audio data pulled from the COLA.
+    fn consume_cola_hop(&mut self) -> Option<(Option<(f32, Option<f32>)>, std::vec::Vec<f32>)> {
+        // Read next window of audio out of the sliding queue
+        self.cola.read_window(
+            crate::audio::WINDOW_SIZE,
+            &mut self.processing_frame.audio_buffer[..crate::audio::WINDOW_SIZE],
+        );
+
+        // Populate the frame's frequency buffer in place
+        crate::algorithms::spectral::perform_fft(
+            &self.processing_frame.audio_buffer[..crate::audio::WINDOW_SIZE],
+            &mut self.processing_frame.time_buffer,
+            &mut self.processing_frame.frequency_buffer[..],
+            &self.fft_instance,
+            crate::audio::WINDOW_SIZE,
+        );
+
+        self.cola.acknowledge_hop(crate::audio::HOP_SIZE);
+
+        // Run the rest of the DSP pipeline
+        let engine_result = self.process_frame_internal();
+
+        let spectrogram = crate::algorithms::spectral::spectrum_to_magnitudes(
+            &self.processing_frame.frequency_buffer[..],
+            crate::audio::WINDOW_SIZE,
+        );
+
+        Some((engine_result, spectrogram))
+    }
+
+    /// Internal method to run the DSP pipeline on the populated `processing_frame`.
+    fn process_frame_internal(&mut self) -> Option<(f32, Option<f32>)> {
         // 1. Read GUI-set configs into the Gatekeeper
         if let Ok(config) = self.shared_config.try_lock() {
             self.gatekeeper.config.silence_threshold = config.silence_threshold;
@@ -218,7 +274,7 @@ impl AudioPipeline {
         }
 
         // 2. Pure DSP — Gatekeeper evaluates signal stability
-        self.gatekeeper.process_frame(frame);
+        self.gatekeeper.process_frame(&self.processing_frame);
 
         // 3. Sync runtime observations to shared state for the frontend
         if let Ok(mut runtime) = self.shared_runtime.try_lock() {
@@ -230,6 +286,7 @@ impl AudioPipeline {
         let is_silence = self.gatekeeper.current_state == SignalState::Silence;
         let is_new_onset = self.gatekeeper.is_new_onset;
 
-        self.engine.process(frame, is_silence, is_new_onset)
+        self.engine
+            .process(&mut self.processing_frame, is_silence, is_new_onset)
     }
 }

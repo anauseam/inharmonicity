@@ -332,15 +332,16 @@ impl TunerApp {
             // Add a small delay to let GUI initialize
             std::thread::sleep(std::time::Duration::from_millis(100));
 
-            let mut audio_frame = Vec::with_capacity(audio::BUFFER_SIZE);
-            let mut planner = realfft::RealFftPlanner::<f32>::new();
-            let fft_instance = planner.plan_fft_forward(audio::BUFFER_SIZE);
-            let mut time_buffer = vec![0.0; audio::BUFFER_SIZE];
+            // Fixed-size stack array — no heap allocation.
+            // 512 × f32 = 2 KB, well within stack budget.
+            let mut pop_buf = [0.0_f32; 512];
 
-            // The AudioPipeline owns the Gatekeeper and shared state sync
+            // The AudioPipeline owns the Gatekeeper, FIFO, and shared state sync
             let mut pipeline = pipeline;
             pipeline.engine.sample_rate = sample_rate;
-            let mut test_frame = tuner_core::pipeline::ProcessingFrame::new();
+
+            // Track state for debug logging
+            let mut last_logged_state = pipeline.gatekeeper.current_state.clone();
 
             loop {
                 // 1. Check for shutdown signal non-blocking
@@ -350,33 +351,15 @@ impl TunerApp {
                 }
 
                 // 2. Lock-free Ringbuf Polling
-                // We need BUFFER_SIZE samples to run an analysis frame.
-                if consumer.occupied_len() >= audio::BUFFER_SIZE {
-                    audio_frame.clear();
+                let available = consumer.occupied_len().min(pop_buf.len());
+                if available > 0 {
+                    consumer.pop_slice(&mut pop_buf[..available]);
 
-                    // Pop exactly BUFFER_SIZE samples from the ring buffer
-                    audio_frame.resize(audio::BUFFER_SIZE, 0.0);
-                    consumer.pop_slice(&mut audio_frame);
-
-                    // Feed samples to the processing frame
-                    test_frame.audio_buffer[..audio::BUFFER_SIZE].copy_from_slice(&audio_frame);
-
-                    // Perform FFT to populate frequency_buffer before pipeline processes it
-                    // (Gatekeeper uses the spectrum for CSD and NINOS2, and Engine uses it for Treble finding)
-                    tuner_core::algorithms::spectral::perform_fft(
-                        &audio_frame,
-                        &mut time_buffer,
-                        &mut test_frame.frequency_buffer[..],
-                        &fft_instance,
-                    );
-
-                    // Run the full pipeline (Gatekeeper + Engine + shared state sync)
-                    let prev_state = pipeline.gatekeeper.current_state.clone();
-                    let engine_result = pipeline.process_frame(&mut test_frame);
-
-                    let spectrogram_data = tuner_core::algorithms::spectral::spectrum_to_magnitudes(
-                        &test_frame.frequency_buffer[..],
-                    );
+                    let (engine_result, spectrogram_data) = if let Some(res) = pipeline.push_audio(&pop_buf[..available]) {
+                        res
+                    } else {
+                        continue; // Hop boundary not reached yet
+                    };
 
                     let (detected_frequency, confidence) = match engine_result {
                         Option::Some((freq, conf)) => (Some(freq), conf),
@@ -399,14 +382,16 @@ impl TunerApp {
                         spectrogram_data,
                         partials: vec![],
                     };
-                    if pipeline.gatekeeper.current_state != prev_state {
+
+                    if pipeline.gatekeeper.current_state != last_logged_state {
                         eprintln!(
                             "[GATEKEEPER] Transition: {:?} -> {:?} (CSD Dly: {}, Stable Cnt: {})",
-                            prev_state,
+                            last_logged_state,
                             pipeline.gatekeeper.current_state,
                             pipeline.gatekeeper.transient_delay_counter,
                             pipeline.gatekeeper.stable_counter
                         );
+                        last_logged_state = pipeline.gatekeeper.current_state.clone();
                     }
 
                     if analysis_tx.send(result).is_err() {
@@ -414,9 +399,7 @@ impl TunerApp {
                         break;
                     }
                 } else {
-                    // We don't have enough samples yet.
-                    // Sleep briefly so we don't pin the CPU at 100% while polling.
-                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    std::thread::sleep(std::time::Duration::from_millis(2));
                 }
             }
 
