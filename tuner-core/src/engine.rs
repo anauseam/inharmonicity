@@ -13,6 +13,7 @@
 
 use crate::algorithms::{metrics, pitch, spectral};
 use crate::pipeline::ProcessingFrame;
+use std::sync::Arc;
 
 /// Selects the refinement pitch detection algorithm (after TWM stage 1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,11 +49,16 @@ pub struct Engine {
     pub xqifft_p: f32,
     /// Scratch space for storing detected local maxima when creating candidates for TWM.
     pub peak_scratch: Box<[crate::algorithms::twm::SpectralPeak]>,
+    /// Dedicated FFT instance for generating BASS_WINDOW_SIZE spectrums on bass notes.
+    pub fft_bass_instance: Arc<dyn realfft::RealToComplex<f32>>,
 }
 
 impl Engine {
     /// Creates a new Engine with default algorithms.
     pub fn new(sample_rate: u32) -> Self {
+        let mut planner = realfft::RealFftPlanner::<f32>::new();
+        let fft_bass_instance = planner.plan_fft_forward(crate::audio::BASS_WINDOW_SIZE);
+
         Self {
             refinement_algorithm: RefinementAlgorithm::QIFFT,
             sample_rate,
@@ -64,6 +70,7 @@ impl Engine {
             xqifft_p: 0.5,
             peak_scratch: vec![crate::algorithms::twm::SpectralPeak::default(); 30]
                 .into_boxed_slice(),
+            fft_bass_instance,
         }
     }
 
@@ -135,6 +142,22 @@ impl Engine {
         if !self.update_routing_state(frame, is_silence, is_new_onset) {
             return None;
         }
+
+        // Note: Future Bass TWM expansion will intercept execution here.
+        // If `self.routing_state == RoutingState::LockedBass`, we will run `perform_fft` 
+        // against `frame.audio_buffer[..crate::audio::BASS_WINDOW_SIZE]` using `self.fft_bass_instance` into `frame.bass_frequency_buffer`.
+        /*
+        if self.routing_state == RoutingState::LockedBass {
+            crate::algorithms::spectral::perform_fft(
+                &frame.audio_buffer[..crate::audio::BASS_WINDOW_SIZE],
+                &mut frame.time_buffer[..crate::audio::BASS_WINDOW_SIZE],
+                &mut frame.bass_frequency_buffer[..],
+                &self.fft_bass_instance,
+                crate::audio::BASS_WINDOW_SIZE,
+            );
+            // ... TWM extraction on bass spectrum ...
+        }
+        */
 
         // We only use the first half of the frequency buffer (up to Nyquist)
         let expected_bins = 2048 / 2 + 1; // 1025 for a 2048-sample FFT
