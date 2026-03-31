@@ -34,7 +34,8 @@ For a detailed overview of the algorithms used, see the [Anauseam documentation]
 
 ### Work in Progress
 
-- **Linear Kalman Filter** *(experimental — may not ship)*: Gatekeeper-governed temporal smoothing stage. Engages only during the NINOS2-confirmed Stable phase; bypassed and reset on each new onset. Retention in the final release is undecided.
+- **Two-Way Mismatch (TWM) Integration**: Overhaul of the pitch detection engine to utilize the TWM algorithm for general pitch detection. Still utilizes scout for bass/treble routing, allowing for less complex TWM calculations.  
+- **Linear Kalman Filter** *(experimental — may not ship)*: Gatekeeper-governed temporal smoothing stage. If the engine's pitch detection is deemed unstable, the filter will engage to smooth the pitch detection. Engages only during the NINOS2-confirmed Stable phase; bypassed and reset on each new onset. Retention in the final release is undecided. Will be tested against a either a **Hidden Markov Model (HMM)** or **Viterbi algorithm** since these are more robust for pitch tracking.
 
 ## Architecture
 
@@ -121,23 +122,15 @@ The pipeline also manages the **`WorkerManager`** (`worker.rs`), which owns a si
 > | --- | --- |
 > | `pipeline.rs` — AudioPipeline mediator + shared state | ✅ Implemented |
 > | `gatekeeper.rs` — 5-state signal validator (pure DSP) | ✅ Implemented |
-> | `engine.rs` — F0 Engine (Scout / TWM / XQIFFT) | ✅ Implemented |
+> | `engine.rs` — F0 Engine (Scout / TWM / XQIFFT) | 🟡 testing |
 > | `worker.rs` — Background worker (single thread) | ⬜ Wireframe |
-> | `Box<[T]>` buffer migration (ProcessingFrame, Gatekeeper) | ✅ Implemented |
 > | COLA — 50% overlap Hann window, `CircularFifo`, `push_audio()` API | ✅ Implemented |
-> | TWM — coarse F0 for both registers, `RefinementAlgorithm` enum | ✅ Implemented |
+> | TWM — coarse F0 for both registers, `RefinementAlgorithm` enum | 🟡 Testing |
 > | XQIFFT — exponentially-weighted seeded sub-cent refinement | ✅ Implemented |
 > | Kalman filter — Gatekeeper-governed temporal smoothing *(experimental)* | ⬜ Planned |
-> | Pipeline fully encapsulates all output | ⬜ In progress |
+> | Pipeline fully encapsulates all output | 🟡 In progress |
 >
-> **Currently**, `app.rs` has been successfully migrated to use the overlapping frame pipeline. The `AudioPipeline` serves as the sole frontend-facing DSP orchestrator. The GUI completely ignores pipeline internals such as window size, FFT planning, and zero-allocation frame buffering, communicating purely via `pipeline.push_audio(&[f32])`. The engine actively routes pitch detection through the newly implemented Two-Way Mismatch (TWM) algorithm, which accurately seeds the XQIFFT refinement stage across both bass and treble registers without octave errors.
->
-> [!NOTE]
-> **Implemented: COLA STFT Architecture**
->
-> Historically, the pipeline processed **non-overlapping** frames which led to temporal blind spots, causing a hammer strike landing on a frame boundary to be attenuated to silence.
->
-> The pipeline is now upgraded to a **50% overlap COLA** (Constant Overlap-Add) design using an allocation-free circular FIFO ring buffer. By utilizing a Hann window over these 50% overlapping frames, it is mathematically guaranteed that every sample is analyzed at full window amplitude in at least one frame — eliminating temporal blind spots entirely. The Hann window's −18 dB/octave sidelobe roll-off provides superior noise floor suppression for resolving high-order inharmonic partials without any boundary anomalies.
+> **Currently**, `app.rs` has been successfully migrated to use the overlapping frame pipeline. The `AudioPipeline` serves as the sole frontend-facing DSP orchestrator. The GUI completely ignores pipeline internals such as window size, FFT planning, and zero-allocation frame buffering, communicating purely via `pipeline.push_audio(&[f32])`. The engine actively routes pitch detection through the newly implemented Two-Way Mismatch (TWM) algorithm, which accurately seeds the XQIFFT refinement stage across both bass and treble registers. Testing and refinement are ongoing of the TWM algorithm.
 
 ### Global Data Structures & Memory Management
 
@@ -208,7 +201,7 @@ Once the Gatekeeper detects silence, it closes the gate by sending the `is_silen
 
 #### Thread 3: The Background Worker (Future Implementation)
 
-This is a single detached worker thread pre-allocated at application launch.
+This is a single detached worker thread pre-allocated at application launch. This will replace the old capture_processing module for a dedicated asynchronous implementation.
 
 - **Action:** When the Gatekeeper conditionally triggers a capture, the sleeping worker receives the 1.5-second audio array from the Object Pool. It offers two toggleable algorithms for calculating the inharmonicity coefficient ($B$):
   - *Professional Mode:* Runs the Median-Adjustive Trajectories (MAT) algorithm. MAT uses extremely narrow frequency bands to iteratively adjust its trajectory, finding the true inharmonic partials with extreme computational efficiency and precision.
@@ -239,6 +232,8 @@ cargo build
 cargo run -p tuner-gui
 ```
 
-### License
+### License & Contact
 
 This project is licensed under the terms specified in the LICENSE file.
+
+For questions, suggestions, or collaboration opportunities, please contact [the team](mailto:contact@anauseam.org).
