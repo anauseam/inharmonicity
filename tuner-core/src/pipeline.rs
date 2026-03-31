@@ -27,7 +27,7 @@ use realfft::RealToComplex;
 use rustfft::num_complex::Complex;
 use std::sync::{Arc, Mutex};
 
-use crate::audio;
+use crate::audio::{BASS_WINDOW_SIZE, HOP_SIZE, WINDOW_SIZE};
 use crate::cola::CircularFifo;
 
 use crate::engine::Engine;
@@ -61,6 +61,9 @@ pub struct ProcessingFrame {
     /// A frequency-domain working space for in-place FFT operations.
     /// The Scout and Treble Engines use 2048-sample windows.
     pub frequency_buffer: Box<[Complex<f32>]>,
+
+    /// High-resolution frequency-domain buffer strictly for the 8192-point Bass TWM.
+    pub bass_frequency_buffer: Box<[Complex<f32>]>,
 }
 
 impl ProcessingFrame {
@@ -68,9 +71,11 @@ impl ProcessingFrame {
     /// This should be called **once** during application startup/thread initialization.
     pub fn new() -> Self {
         Self {
-            audio_buffer: vec![0.0; 8192].into_boxed_slice(),
-            time_buffer: vec![0.0; 8192].into_boxed_slice(),
-            frequency_buffer: vec![Complex { re: 0.0, im: 0.0 }; 2048].into_boxed_slice(),
+            audio_buffer: vec![0.0; BASS_WINDOW_SIZE].into_boxed_slice(),
+            time_buffer: vec![0.0; BASS_WINDOW_SIZE].into_boxed_slice(),
+            frequency_buffer: vec![Complex { re: 0.0, im: 0.0 }; WINDOW_SIZE].into_boxed_slice(),
+            bass_frequency_buffer: vec![Complex { re: 0.0, im: 0.0 }; BASS_WINDOW_SIZE]
+                .into_boxed_slice(),
         }
     }
 }
@@ -206,7 +211,7 @@ impl AudioPipeline {
         let engine = Engine::new(44100);
 
         let mut planner = realfft::RealFftPlanner::<f32>::new();
-        let fft_instance = planner.plan_fft_forward(crate::audio::WINDOW_SIZE);
+        let fft_instance = planner.plan_fft_forward(WINDOW_SIZE);
 
         let pipeline = Self {
             gatekeeper,
@@ -214,7 +219,7 @@ impl AudioPipeline {
             shared_config: Arc::clone(&shared_config),
             shared_runtime: Arc::clone(&shared_runtime),
             audio_pool,
-            cola: CircularFifo::new(audio::WINDOW_SIZE * 4), // Capacity large enough to hold the 8192 points needed for bass F0
+            cola: CircularFifo::new(BASS_WINDOW_SIZE),
             fft_instance,
             processing_frame: ProcessingFrame::new(),
         };
@@ -235,7 +240,7 @@ impl AudioPipeline {
     ) -> Option<(Option<(f32, Option<f32>)>, std::vec::Vec<f32>)> {
         self.cola.push_samples(samples);
 
-        if self.cola.is_hop_ready(crate::audio::HOP_SIZE) {
+        if self.cola.is_hop_ready(HOP_SIZE) {
             self.consume_cola_hop()
         } else {
             None
@@ -244,29 +249,31 @@ impl AudioPipeline {
 
     /// Internal helper that processes a single hop of audio data pulled from the COLA.
     fn consume_cola_hop(&mut self) -> Option<(Option<(f32, Option<f32>)>, std::vec::Vec<f32>)> {
-        // Read next window of audio out of the sliding queue
+        // Read the FULL history of audio out of the sliding queue
         self.cola.read_window(
-            crate::audio::WINDOW_SIZE,
-            &mut self.processing_frame.audio_buffer[..crate::audio::WINDOW_SIZE],
+            BASS_WINDOW_SIZE,
+            &mut self.processing_frame.audio_buffer[..BASS_WINDOW_SIZE],
         );
 
-        // Populate the frame's frequency buffer in place
+        // Populate the frame's generic frequency buffer in place
+        // The newest WINDOW_SIZE samples are at the END of the buffer
+        let newest_start = BASS_WINDOW_SIZE - WINDOW_SIZE;
         crate::algorithms::spectral::perform_fft(
-            &self.processing_frame.audio_buffer[..crate::audio::WINDOW_SIZE],
-            &mut self.processing_frame.time_buffer,
+            &self.processing_frame.audio_buffer[newest_start..BASS_WINDOW_SIZE],
+            &mut self.processing_frame.time_buffer[..WINDOW_SIZE],
             &mut self.processing_frame.frequency_buffer[..],
             &self.fft_instance,
-            crate::audio::WINDOW_SIZE,
+            WINDOW_SIZE,
         );
 
-        self.cola.acknowledge_hop(crate::audio::HOP_SIZE);
+        self.cola.acknowledge_hop(HOP_SIZE);
 
         // Run the rest of the DSP pipeline
         let engine_result = self.process_frame_internal();
 
         let spectrogram = crate::algorithms::spectral::spectrum_to_magnitudes(
             &self.processing_frame.frequency_buffer[..],
-            crate::audio::WINDOW_SIZE,
+            WINDOW_SIZE,
         );
 
         Some((engine_result, spectrogram))

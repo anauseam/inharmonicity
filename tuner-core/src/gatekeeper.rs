@@ -28,7 +28,10 @@
 //! set by the standalone [`calibration`](crate::calibration) module or the GUI slider.
 //! The Gatekeeper has no knowledge of how the threshold was computed.
 
-use crate::algorithms::metrics::{calculate_nhwrsf, calculate_ema, calculate_ninos2, calculate_rms};
+use crate::algorithms::metrics::{
+    calculate_ema, calculate_nhwrsf, calculate_ninos2, calculate_rms,
+};
+use crate::audio::WINDOW_SIZE;
 use crate::pipeline::{AudioPool, ProcessingFrame};
 use std::sync::Arc;
 
@@ -161,7 +164,8 @@ impl Gatekeeper {
     /// 4. **NINOS2 stability + capture** — States 3 & 4
     pub fn process_frame(&mut self, frame: &ProcessingFrame) {
         // State 0: Calculate RMS amplitude for Silence fallback
-        let rms = calculate_rms(&frame.audio_buffer[..]);
+        // Slice only the newest WINDOW_SIZE samples from the historical buffer to keep transient detection snappy
+        let rms = calculate_rms(&frame.audio_buffer[frame.audio_buffer.len() - WINDOW_SIZE..]);
 
         // Apply Exponential Moving Average (EMA) to smooth out momentary wave nodes / unison dips
         self.current_rms_ema = calculate_ema(rms, self.current_rms_ema, self.config.rms_ema_alpha);
@@ -185,7 +189,6 @@ impl Gatekeeper {
         self.process_stability_and_capture(current_spectrum);
     }
 
-
     /// Detects transient events (States 1 & 2) using NHWRSF.
     ///
     /// **State 1 (ATTACK):** If NHWRSF exceeds `nhwrsf_threshold`, a hammer
@@ -202,10 +205,7 @@ impl Gatekeeper {
         &mut self,
         current_spectrum: &[rustfft::num_complex::Complex<f32>],
     ) -> bool {
-        let nhwrsf = calculate_nhwrsf(
-            current_spectrum,
-            &mut self.prev_spectrum[..],
-        );
+        let nhwrsf = calculate_nhwrsf(current_spectrum, &mut self.prev_spectrum[..]);
         self.current_nhwrsf = nhwrsf;
 
         // Reset the onset flag by default; it only fires true on the exact frame the transient triggers

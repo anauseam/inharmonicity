@@ -221,16 +221,26 @@ pub fn detect_pitch_twm(
         }
     } else {
         // Discovery Mode
-        let (f_min, f_max): (f32, f32) = match routing_state {
-            RoutingState::LockedBass   => (27.5,   400.0),
-            RoutingState::LockedTreble => (130.0, 4186.0),
-            RoutingState::Unclassified => (27.5,  4186.0), // fallback only
-        };
-        
+        let min_freq: f32;
+        let max_freq: f32;
+        match routing_state {
+            RoutingState::LockedBass => {
+                min_freq = 27.5;
+                max_freq = 400.0;
+            }
+            RoutingState::LockedTreble => {
+                min_freq = 130.0;
+                max_freq = 4186.0;
+            }
+            RoutingState::Unclassified => {
+                min_freq = 27.5;
+                max_freq = 4186.0;
+            }
+        }
         let true_step = 2.0_f32.powf(1.0 / 12.0); // Exactly 1 semitone per step
         
-        let mut current_f0 = f_min;
-        while current_f0 <= f_max && num_candidates < candidates.len() {
+        let mut current_f0 = min_freq;
+        while current_f0 <= max_freq && num_candidates < candidates.len() {
             let error = compute_twm_error(current_f0, peaks, sample_rate, b_val);
             candidates[num_candidates] = TwmCandidate { f0: current_f0, error };
             num_candidates += 1;

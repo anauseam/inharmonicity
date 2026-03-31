@@ -14,11 +14,17 @@
 use anyhow::{Result, anyhow};
 use cpal::SupportedStreamConfigRange;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use ringbuf::{HeapRb, traits::{Producer, Split}};
+use ringbuf::{
+    HeapRb,
+    traits::{Producer, Split},
+};
 
 /// The standard analysis window size (samples).
 /// Used by the Gatekeeper, Scout, and all Engine paths.
 pub const WINDOW_SIZE: usize = 2048;
+
+/// The expanded analysis window size for extracting exact bass fundamental frequencies.
+pub const BASS_WINDOW_SIZE: usize = WINDOW_SIZE * 4; // 8192 samples
 
 /// Hop size for overlapping frame analysis (50% overlap of WINDOW_SIZE).
 /// Each hop triggers a new FFT + pipeline frame.
