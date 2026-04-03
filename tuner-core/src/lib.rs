@@ -18,7 +18,7 @@
 //! |---|---|
 //! | [`algorithms`] | Stateless DSP building blocks (spectral, pitch, metrics, tuning) |
 //! | [`models`] | Domain data types, lookup tables, and serializable structures |
-//! | [`audio`] | CPAL audio capture and stream management |
+//! | [`audio`] | CPAL audio capture, stream management, standalone host extension |
 //! | [`pipeline`] | AudioPipeline mediator, shared state types, memory pools |
 //! | [`engine`] | F0 Engine — Scout / Bass / Treble DSP (wireframe) |
 //! | [`gatekeeper`] | 5-state signal validator (pure DSP, no shared state) |
@@ -27,9 +27,9 @@
 
 /// Stateless DSP building blocks: spectral transforms, pitch detection, signal metrics, and tuning math.
 pub mod algorithms;
-/// CPAL audio capture, device selection, and real-time streaming.
+/// CPAL audio capture, device selection, real-time streaming, and standalone host extension.
 pub mod audio;
-/// Standalone noise-floor calibration (opens its own temporary CPAL stream).
+/// Noise-floor and transient calibration routines (uses [`audio::AudioSource`]).
 pub mod calibration;
 /// Legacy capture frame processing (deprecated — to be replaced by `pipeline` + `worker`).
 pub mod capture_processing;

@@ -1,8 +1,9 @@
 //! # Calibration
 //!
-//! Standalone calibration routines that each open their own temporary CPAL audio
-//! stream, measure a specific signal property, and return a result. These functions
-//! have **no dependency** on [`AudioPipeline`] or the main audio processing thread.
+//! Standalone calibration routines that measure specific signal properties
+//! and return structured results. These functions can either open their own
+//! temporary CPAL audio stream (via [`AudioSource::Default`]) or accept an
+//! externally provided audio consumer (via [`AudioSource::External`]).
 //!
 //! ## Functions
 //!
@@ -15,28 +16,27 @@
 //!
 //! ```text
 //! // Step 1 — run at startup or on recalibrate:
-//! let result = calibrate_noise_floor(1.0, 43, progress_arc)?;
+//! let result = calibrate_noise_floor(AudioSource::Default, 1.0, 43, progress_arc)?;
 //! // result.rms_threshold → ConfigState.silence_threshold
 //! // result.nhwrsf_peak  → N_max (wizard lower bound)
 //!
 //! // Step 2 — run when the user is ready to play a note:
-//! let (result, rx) = calibrate_minimum_strike(result.nhwrsf_peak, 5, progress_arc)?;
+//! let (result, rx) = calibrate_minimum_strike(AudioSource::Default, result.nhwrsf_peak, 5, progress_arc)?;
 //! // Poll rx for StrikeCalibrationEvent::Tick(flux) to drive the seismograph
 //! // StrikeCalibrationEvent::Completed is sent before the function returns
 //! // result.nhwrsf_peak → S_min (wizard upper bound)
 //! ```
 
-use anyhow::{Result, anyhow};
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use anyhow::Result;
 use crossbeam_channel::{Sender, unbounded};
 use realfft::RealFftPlanner;
-use ringbuf::traits::{Consumer, Observer, Producer, Split};
+use ringbuf::traits::{Consumer, Observer};
 use rustfft::num_complex::Complex;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::algorithms::metrics::{calculate_ema, calculate_nhwrsf, calculate_rms};
-use crate::audio::{WINDOW_SIZE, dc_block, find_supported_config};
+use crate::audio::{AudioConsumer, AudioSource, WINDOW_SIZE};
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -56,6 +56,13 @@ pub const DEFAULT_STRIKE_TIMEOUT_SECS: u64 = 5;
 /// hardware ADC need time to stabilize. Dropping these frames prevents
 /// the warm-up transient from inflating the measured values.
 const WARMUP_FRAMES: usize = 10;
+
+/// Ring buffer capacity for calibration streams.
+///
+/// 4 × WINDOW_SIZE = 8,192 samples (~186 ms at 44.1 kHz).
+/// Only needs to hold a few frames of headroom since calibration
+/// processes frames as fast as they arrive.
+const CALIBRATION_RING_CAPACITY: usize = WINDOW_SIZE * 4;
 
 /// EMA smoothing factor used during calibration (same as the Gatekeeper's).
 const CALIBRATION_EMA_ALPHA: f32 = 0.1;
@@ -98,59 +105,34 @@ pub enum StrikeCalibrationEvent {
     Completed(StrikeResult),
 }
 
-// ─── Private Stream Helper ────────────────────────────────────────────────────
+// ─── Private Helpers ─────────────────────────────────────────────────────────
 
-/// Opens a temporary CPAL input stream at 44100 Hz with DC blocking applied.
+/// Resolves an [`AudioSource`] into a concrete consumer for calibration.
 ///
-/// Returns the active `Stream` (keep alive for the duration of calibration)
-/// and a ring buffer `Consumer` to pop audio frames from.
+/// For `AudioSource::Default`, opens a temporary CPAL stream via
+/// [`audio::open_input_stream()`] with a small calibration-sized ring buffer.
+/// For `AudioSource::External`, uses the provided consumer directly.
 ///
-/// # Errors
-/// Returns an error if no input device is available or if the device does not
-/// support 44100 Hz input at the required buffer size.
-fn open_calibration_stream() -> Result<(cpal::Stream, impl ringbuf::traits::Consumer<Item = f32>)> {
-    let host = cpal::default_host();
-    let device = host
-        .default_input_device()
-        .ok_or_else(|| anyhow!("No input device available for calibration"))?;
-
-    let configs = device.supported_input_configs()?.collect::<Vec<_>>();
-    let supported_config = find_supported_config(configs, 44100)
-        .ok_or_else(|| anyhow!("No suitable 44100 Hz audio config found for calibration"))?;
-
-    let config = supported_config.with_sample_rate(44100);
-    let stream_config: cpal::StreamConfig = config.into();
-
-    // Small ring buffer — only needs to hold a few frames of headroom
-    let rb = ringbuf::HeapRb::<f32>::new(WINDOW_SIZE * 4);
-    let (mut producer, consumer) = rb.split();
-
-    let err_fn = |err| eprintln!("[CALIBRATION] Audio stream error: {}", err);
-
-    // DC blocking filter state — same filter as the main audio stream.
-    let mut dc_prev_x: f32 = 0.0;
-    let mut dc_prev_y: f32 = 0.0;
-
-    let stream = device.build_input_stream(
-        &stream_config,
-        move |data: &[f32], _: &cpal::InputCallbackInfo| {
-            for &sample in data {
-                let _ = producer.try_push(dc_block(sample, &mut dc_prev_x, &mut dc_prev_y));
-            }
-        },
-        err_fn,
-        None,
-    )?;
-
-    stream.play()?;
-    Ok((stream, consumer))
+/// # Returns
+/// A tuple of:
+/// - An optional CPAL stream (must be kept alive for the duration of calibration)
+/// - The audio consumer to pop frames from
+fn resolve_source(source: AudioSource) -> Result<(Option<cpal::Stream>, AudioConsumer)> {
+    match source {
+        AudioSource::Default => {
+            let (stream, consumer, _sample_rate) =
+                crate::audio::open_input_stream(CALIBRATION_RING_CAPACITY)?;
+            Ok((Some(stream), consumer))
+        }
+        AudioSource::External {
+            consumer,
+            sample_rate: _,
+        } => Ok((None, consumer)),
+    }
 }
 
 /// Discards `WARMUP_FRAMES` frames from `consumer` to let the hardware/driver settle.
-fn drain_warmup(
-    consumer: &mut impl ringbuf::traits::Consumer<Item = f32>,
-    frame_buffer: &mut [f32],
-) {
+fn drain_warmup(consumer: &mut AudioConsumer, frame_buffer: &mut [f32]) {
     let mut done = 0;
     while done < WARMUP_FRAMES {
         if consumer.occupied_len() >= WINDOW_SIZE {
@@ -166,8 +148,7 @@ fn drain_warmup(
 
 /// Wizard Step 1: Measures the ambient room noise during a period of silence.
 ///
-/// Opens a temporary CPAL stream, discards warm-up frames, then collects
-/// `num_frames` frames to calculate:
+/// Collects `num_frames` frames to calculate:
 /// - The EMA-smoothed RMS average (→ silence gate threshold)
 /// - The peak NHWRSF observed ($N_{max}$ — the noise ceiling for transient detection)
 ///
@@ -175,6 +156,8 @@ fn drain_warmup(
 /// Wrap it in `Task::perform` (or equivalent) on the GUI side.
 ///
 /// # Arguments
+/// * `source` — Where to get audio from. Use [`AudioSource::Default`] for standalone
+///   apps, or [`AudioSource::External`] to feed pre-recorded/routed audio.
 /// * `multiplier` — Safety multiplier applied to the ambient RMS
 ///   (e.g., `1.0` means threshold = ambient RMS exactly)
 /// * `num_frames` — Number of audio frames to collect
@@ -183,6 +166,7 @@ fn drain_warmup(
 /// # Returns
 /// [`NoiseFloorResult`] containing the RMS threshold and $N_{max}$ NHWRSF peak.
 pub fn calibrate_noise_floor(
+    source: AudioSource,
     multiplier: f32,
     num_frames: usize,
     progress: Arc<AtomicUsize>,
@@ -192,7 +176,7 @@ pub fn calibrate_noise_floor(
         num_frames
     );
 
-    let (stream, mut consumer) = open_calibration_stream()?;
+    let (_stream, mut consumer) = resolve_source(source)?;
 
     // FFT setup — RFFT produces WINDOW_SIZE/2 + 1 complex bins
     let mut planner = RealFftPlanner::<f32>::new();
@@ -235,8 +219,6 @@ pub fn calibrate_noise_floor(
         }
     }
 
-    drop(stream);
-
     let rms_baseline = rms_sum / num_frames as f32;
     let rms_threshold = rms_baseline * multiplier;
 
@@ -254,9 +236,9 @@ pub fn calibrate_noise_floor(
 
 /// Wizard Step 2: Captures the NHWRSF peak of the user's softest key strike.
 ///
-/// Opens a temporary CPAL stream and waits up to `timeout_secs` for a transient
-/// event whose NHWRSF value exceeds `noise_ceiling` (the $N_{max}$ from Step 1).
-/// The first qualifying transient is captured and returned as $S_{min}$.
+/// Waits up to `timeout_secs` for a transient event whose NHWRSF value exceeds
+/// `noise_ceiling` (the $N_{max}$ from Step 1). The first qualifying transient
+/// is captured and returned as $S_{min}$.
 ///
 /// Every frame, a [`StrikeCalibrationEvent::Tick`] is sent over the returned
 /// channel so the GUI can update the real-time seismograph. When the transient
@@ -266,6 +248,8 @@ pub fn calibrate_noise_floor(
 /// This is a **blocking** function. Wrap it in `Task::perform` on the GUI side.
 ///
 /// # Arguments
+/// * `source` — Where to get audio from. Use [`AudioSource::Default`] for standalone
+///   apps, or [`AudioSource::External`] for routed/test audio.
 /// * `noise_ceiling` — The $N_{max}$ NHWRSF peak from [`calibrate_noise_floor`].
 ///   A transient is considered valid only when it exceeds this value.
 /// * `timeout_secs` — Maximum seconds to wait for a strike before giving up.
@@ -280,6 +264,7 @@ pub fn calibrate_noise_floor(
 /// Returns an error if the audio stream cannot be opened or if the timeout
 /// expires without a valid transient being detected.
 pub fn calibrate_minimum_strike(
+    source: AudioSource,
     noise_ceiling: f32,
     timeout_secs: u64,
     progress: Arc<AtomicUsize>,
@@ -293,7 +278,7 @@ pub fn calibrate_minimum_strike(
     );
 
     let (tx, rx): (Sender<StrikeCalibrationEvent>, _) = unbounded();
-    let (stream, mut consumer) = open_calibration_stream()?;
+    let (_stream, mut consumer) = resolve_source(source)?;
 
     // FFT setup
     let mut planner = RealFftPlanner::<f32>::new();
@@ -342,10 +327,8 @@ pub fn calibrate_minimum_strike(
         }
     }
 
-    drop(stream);
-
     if !transient_detected {
-        return Err(anyhow!(
+        return Err(anyhow::anyhow!(
             "Strike calibration timed out after {}s. No transient above noise ceiling ({:.4}) was detected.",
             timeout_secs,
             noise_ceiling

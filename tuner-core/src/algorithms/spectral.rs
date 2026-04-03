@@ -77,6 +77,11 @@ pub fn perform_fft(
 /// and for downstream DSP algorithms (e.g., refining pitch estimates with
 /// parabolic interpolation and tracking harmonic partials).
 ///
+/// **Note:** This allocating version is used for the GUI spectrogram (which crosses
+/// thread boundaries via `Vec<f32>`). Once the cross-thread communication structures
+/// are migrated (see `update-communication-structures` workflow), this function will
+/// likely become redundant — replaced entirely by [`spectrum_to_magnitudes_into`].
+///
 /// # Arguments
 /// * `spectrum` - Complex frequency spectrum from the RFFT (1025 bins)
 ///
@@ -88,4 +93,24 @@ pub fn spectrum_to_magnitudes(spectrum: &[Complex<f32>], window_size: usize) -> 
         .take(window_size / 2)
         .map(|c| c.norm()) // .norm() is sqrt(re^2 + im^2)
         .collect()
+}
+
+/// Zero-allocation magnitude extraction — writes directly into a pre-allocated slice.
+///
+/// Use this on the DSP hot path (Engine). The caller provides `out` which must be
+/// at least `window_size / 2` elements. Only that many elements are written.
+///
+/// # Arguments
+/// * `spectrum` — Complex frequency spectrum from the RFFT.
+/// * `window_size` — The FFT window size (2048 or 8192). Determines how many bins to process.
+/// * `out` — Pre-allocated output slice. Must be at least `window_size / 2` elements.
+pub fn spectrum_to_magnitudes_into(
+    spectrum: &[Complex<f32>],
+    window_size: usize,
+    out: &mut [f32],
+) {
+    let count = window_size / 2;
+    for (o, c) in out[..count].iter_mut().zip(spectrum.iter().take(count)) {
+        *o = c.norm();
+    }
 }
