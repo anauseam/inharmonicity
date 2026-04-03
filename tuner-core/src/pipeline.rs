@@ -64,6 +64,11 @@ pub struct ProcessingFrame {
 
     /// High-resolution frequency-domain buffer strictly for the 8192-point Bass TWM.
     pub bass_frequency_buffer: Box<[Complex<f32>]>,
+
+    /// Pre-allocated magnitude scratch buffer for the Engine's TWM + XQIFFT chain.
+    /// Sized to `BASS_WINDOW_SIZE / 2` (4096 elements) to cover both treble (1024) and bass (4096) paths.
+    /// Zero heap allocations on the DSP hot path.
+    pub magnitude_buffer: Box<[f32]>,
 }
 
 impl ProcessingFrame {
@@ -76,6 +81,7 @@ impl ProcessingFrame {
             frequency_buffer: vec![Complex { re: 0.0, im: 0.0 }; WINDOW_SIZE].into_boxed_slice(),
             bass_frequency_buffer: vec![Complex { re: 0.0, im: 0.0 }; BASS_WINDOW_SIZE]
                 .into_boxed_slice(),
+            magnitude_buffer: vec![0.0; BASS_WINDOW_SIZE / 2].into_boxed_slice(),
         }
     }
 }
@@ -174,7 +180,7 @@ pub struct AudioPipeline {
 /// Returned by [`AudioPipeline::new()`] and kept by the frontend (GUI, WASM, etc.).
 /// Provides `Arc<Mutex<...>>` handles for polling runtime observations and
 /// editing configuration values.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PipelineHandle {
     /// Shared configuration state — the frontend can **read and write** this
     /// (e.g., to adjust the silence threshold from the Settings UI).

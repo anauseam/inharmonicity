@@ -132,6 +132,29 @@ pub fn find_nearest_note_by_index(key_index: u8) -> (String, f32) {
     (note.name.clone(), note.frequency)
 }
 
+/// Returns the 88-key piano index (0–87) of the note closest to `freq`.
+///
+/// Unlike [`find_nearest_note()`], this avoids a `String` allocation and is
+/// suitable for use on the DSP hot path or in pipeline output types.
+///
+/// # Arguments
+/// * `freq` - Input frequency in Hz
+///
+/// # Returns
+/// * Piano key index (0 = A0, 87 = C8)
+pub fn find_nearest_note_index(freq: f32) -> u8 {
+    NOTES
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| {
+            let diff_a = (a.frequency - freq).abs();
+            let diff_b = (b.frequency - freq).abs();
+            diff_a.partial_cmp(&diff_b).unwrap()
+        })
+        .map(|(i, _)| i as u8)
+        .unwrap() // Safe: NOTES is never empty.
+}
+
 /// Gets the 88-key piano index from a note name.
 ///
 /// This function converts note names like "A4" or "C#3" to their

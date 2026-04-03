@@ -143,10 +143,7 @@ impl Engine {
             return None;
         }
 
-        // Note: Future Bass TWM expansion will intercept execution here.
-        // If `self.routing_state == RoutingState::LockedBass`, we will run `perform_fft` 
-        // against `frame.audio_buffer[..crate::audio::BASS_WINDOW_SIZE]` using `self.fft_bass_instance` into `frame.bass_frequency_buffer`.
-        /*
+        // ── Step 1: Bass FFT (8192-point) when Scout locks Bass ──────────
         if self.routing_state == RoutingState::LockedBass {
             crate::algorithms::spectral::perform_fft(
                 &frame.audio_buffer[..crate::audio::BASS_WINDOW_SIZE],
@@ -155,37 +152,64 @@ impl Engine {
                 &self.fft_bass_instance,
                 crate::audio::BASS_WINDOW_SIZE,
             );
-            // ... TWM extraction on bass spectrum ...
         }
-        */
 
-        // We only use the first half of the frequency buffer (up to Nyquist)
-        let expected_bins = 2048 / 2 + 1; // 1025 for a 2048-sample FFT
-        let spectrogram_data =
-            spectral::spectrum_to_magnitudes(&frame.frequency_buffer[..expected_bins], 2048);
+        // ── Step 2: Conditional magnitude extraction (zero-alloc) ────────
+        let (active_bins, active_window_size) = match self.routing_state {
+            RoutingState::LockedBass => {
+                let bins = crate::audio::BASS_WINDOW_SIZE / 2;
+                let expected_complex = crate::audio::BASS_WINDOW_SIZE / 2 + 1;
+                spectral::spectrum_to_magnitudes_into(
+                    &frame.bass_frequency_buffer[..expected_complex],
+                    crate::audio::BASS_WINDOW_SIZE,
+                    &mut frame.magnitude_buffer[..bins],
+                );
+                (bins, crate::audio::BASS_WINDOW_SIZE)
+            }
+            _ => {
+                // LockedTreble or Unclassified — standard 2048-point rapid FFT
+                let bins = 2048 / 2;
+                let expected_complex = 2048 / 2 + 1;
+                spectral::spectrum_to_magnitudes_into(
+                    &frame.frequency_buffer[..expected_complex],
+                    2048,
+                    &mut frame.magnitude_buffer[..bins],
+                );
+                (bins, 2048)
+            }
+        };
+        let spectrogram_data = &frame.magnitude_buffer[..active_bins];
 
-        let frame_size = 2048;
-        let _audio_frame = &frame.audio_buffer[..frame_size];
+        // TODO(DPLL): When DPLL refinement is activated, this must use active_window_size.
+        let _audio_frame = &frame.audio_buffer[..2048];
 
+        // ── Step 3: Peak extraction + TWM with dynamic window ────────────
         let peak_count = crate::algorithms::twm::extract_spectral_peaks(
-            &spectrogram_data,
+            spectrogram_data,
             self.sample_rate,
-            2048,
+            active_window_size,
             &mut self.peak_scratch,
         );
+
+        let search_bounds = match self.routing_state {
+            RoutingState::LockedBass   => Some((27.5, 400.0)),
+            RoutingState::LockedTreble => Some((130.0, 4186.0)),
+            RoutingState::Unclassified => Some((27.5, 4186.0)),
+        };
 
         let twm_result = crate::algorithms::twm::detect_pitch_twm(
             &self.peak_scratch[..peak_count],
             self.sample_rate,
-            self.routing_state,
+            search_bounds,
             self.key_hint,
             self.inharmonicity_b,
         );
 
+        // ── Step 4: Sub-cent refinement on the active magnitude buffer ───
         if let Some((coarse_f0, _)) = twm_result {
             match self.refinement_algorithm {
                 RefinementAlgorithm::XQIFFT => pitch::detect_pitch_xqifft_seeded(
-                    &spectrogram_data,
+                    spectrogram_data,
                     self.sample_rate,
                     coarse_f0,
                     self.xqifft_p,
@@ -196,7 +220,7 @@ impl Engine {
                 }
                 RefinementAlgorithm::PVOCODER => None,
                 RefinementAlgorithm::QIFFT => {
-                    pitch::detect_pitch_qifft_seeded(&spectrogram_data, self.sample_rate, coarse_f0)
+                    pitch::detect_pitch_qifft_seeded(spectrogram_data, self.sample_rate, coarse_f0)
                         .map(|freq| (freq, None))
                 }
             }

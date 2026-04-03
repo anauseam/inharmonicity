@@ -6,37 +6,6 @@ An open source professional-grade piano tuning application built in Rust with re
 
 For a detailed overview of the algorithms used, see the [Anauseam documentation](https://docs.anauseam.org/project-docs/inharmonicity-tuner/00_intro).
 
-> [!TIP]
-> **Graphics Issues? Check Your Vulkan Drivers**
->
-> This application uses `iced` with the `wgpu` backend (Vulkan on Linux). If you experience
-> invisible widgets, flickering, or blank panels, the most common cause is stale or
-> incompatible Vulkan drivers. Ensure your GPU drivers are fully up-to-date before
-> reporting rendering bugs.
-
-## Iced 0.14.0 UI
-
-### Features
-
-- **Spectrogram Visualization**: Real-time frequency spectrum display
-- **Cent Meter**: Visual tuning accuracy indicator with color-coded feedback
-- **Interactive Piano Keyboard**: 88-key piano interface with click-to-select frequency functionality
-- **Inharmonicity Measurement**: Capture and analyze piano-specific inharmonicity characteristics
-- **Profile Management**: Save and load piano tuning profiles with JSON persistence
-- **Settings**: Noise floor calibration and envelope viewer
-
-### Planned Features
-
-- **Transient Detection Calibration**: Manual and automatic transient detection calibration
-- **Inharmonicity Compensation**: Professional piano-specific tuning curves
-- **Temperament Selection**: Support for various tuning temperaments
-- **Tuning Standard Options**: A440 and other reference frequencies
-
-### Work in Progress
-
-- **Two-Way Mismatch (TWM) Integration**: Overhaul of the pitch detection engine to utilize the TWM algorithm for general pitch detection. Still utilizes scout for bass/treble routing, allowing for less complex TWM calculations.  
-- **Linear Kalman Filter** *(experimental — may not ship)*: Gatekeeper-governed temporal smoothing stage. If the engine's pitch detection is deemed unstable, the filter will engage to smooth the pitch detection. Engages only during the NINOS2-confirmed Stable phase; bypassed and reset on each new onset. Retention in the final release is undecided. Will be tested against a either a **Hidden Markov Model (HMM)** or **Viterbi algorithm** since these are more robust for pitch tracking.
-
 ## Architecture
 
 ### Project Structure
@@ -122,12 +91,11 @@ The pipeline also manages the **`WorkerManager`** (`worker.rs`), which owns a si
 > | --- | --- |
 > | `pipeline.rs` — AudioPipeline mediator + shared state | ✅ Implemented |
 > | `gatekeeper.rs` — 5-state signal validator (pure DSP) | ✅ Implemented |
-> | `engine.rs` — F0 Engine (Scout / TWM / XQIFFT) | 🟡 testing |
+> | `engine.rs` — F0 Engine (Scout / TWM / XQIFFT) + Dual-FFT Bass path | ✅ Implemented |
 > | `worker.rs` — Background worker (single thread) | ⬜ Wireframe |
-> | COLA — 50% overlap Hann window, `CircularFifo`, `push_audio()` API | ✅ Implemented |
 > | TWM — coarse F0 for both registers, `RefinementAlgorithm` enum | 🟡 Testing |
 > | XQIFFT — exponentially-weighted seeded sub-cent refinement | ✅ Implemented |
-> | Kalman filter — Gatekeeper-governed temporal smoothing *(experimental)* | ⬜ Planned |
+> | Probabilistic Pitch Tracking — pitch estimation smoothing *(experimental)* | ⬜ Planned |
 > | Pipeline fully encapsulates all output | 🟡 In progress |
 >
 > **Currently**, `app.rs` has been successfully migrated to use the overlapping frame pipeline. The `AudioPipeline` serves as the sole frontend-facing DSP orchestrator. The GUI completely ignores pipeline internals such as window size, FFT planning, and zero-allocation frame buffering, communicating purely via `pipeline.push_audio(&[f32])`. The engine actively routes pitch detection through the newly implemented Two-Way Mismatch (TWM) algorithm, which accurately seeds the XQIFFT refinement stage across both bass and treble registers. Testing and refinement are ongoing of the TWM algorithm.
@@ -138,7 +106,7 @@ To maintain real-time performance without relying on OS priority elevation, the 
 
 - **The Elastic Ring Buffer:** A lock-free circular buffer connecting Thread 1 and Thread 2. Acts as an elastic shock absorber — if the OS briefly suspends the processing thread, audio samples continue to accumulate safely without drops.
 - **Lock-Free Object Pool (`AudioPool`):** Pre-allocated pool of `Box<[f32; 66150]>` arrays (1.5 seconds at 44.1 kHz). Thread 2 borrows an array to record a stable note and passes it to the background worker, which recycles it back to the pool when finished.
-- **`ProcessingFrame`:** Thread-local scratch buffers for zero-allocation per-frame DSP. All fields are `Box<[T]>` — allocated once in `AudioPipeline::new()` via `vec![..].into_boxed_slice()`, never resized. This is the project-wide standard for owned DSP state buffers.
+- **`ProcessingFrame`:** Thread-local scratch buffers for zero-allocation per-frame DSP. All fields are `Box<[T]>` — allocated once in `AudioPipeline::new()` via `vec![..].into_boxed_slice()`, never resized. Includes a dedicated `magnitude_buffer` (`Box<[f32]>`, 4096 elements) that the Engine writes into via `spectrum_to_magnitudes_into()` — eliminating per-frame heap allocation from the TWM + XQIFFT chain entirely. This is the project-wide standard for owned DSP state buffers.
 - **`CircularFifo` (COLA):** Owned by `AudioPipeline`. A `Box<[f32]>` ring buffer that accumulates samples and triggers a new FFT + pipeline frame on every 50% hop. Invisible to `tuner-gui` — the GUI only calls `pipeline.push_audio(&[f32])`.
 
 ### Threading Model
@@ -192,9 +160,9 @@ This thread constantly consumes data from the Elastic Ring Buffer and executes a
   - *State 4 (RELEASE):* Caps the capture at 1.5 seconds. It closes the gate, recycles the buffer, and dispatches the payload to Thread 3 via an **asynchronous trigger**, allowing the real-time pipeline to immediately reset to State 0 without waiting for the heavy calculation to complete.
 - **The Engine (Scout and Algorithm Router):** A pitch detection chain that operates as an independent state machine, **synchronously reset** by the Gatekeeper's onset pulse but otherwise decoupled from the Gatekeeper's internal transient delays.
   - **The Scout (Band Energy Classifier):** A routing engine that determines if a signal belongs to the Bass or Treble register. Instead of searching for a pitch directly, it calculates the **Band Energy Ratio**—the fraction of total acoustic energy residing below 300 Hz. It employs a **Schmitt trigger** (asymmetric hysteresis) requiring a 3-frame consensus (ratio > 0.25 for Bass, < 0.15 for Treble) before locking the signal into the appropriate detection engine. This prevents routing chatter and robustly handles the "missing fundamental" problem found in low piano strings.
-  - **The Router — Unified TWM Engine:** Both registers now use **Two-Way Mismatch (TWM)** as the coarse F0 stage. TWM evaluates a set of trial harmonic series against the measured spectral peaks, selecting the trial frequency with the lowest combined mismatch error. The Scout's routing state constrains the search space to the appropriate register, halving the candidate set. If the user has selected a key, TWM evaluates only a microscopic ±50-cent neighborhood around that note — making octave confusion mathematically impossible. TWM also accepts an inharmonicity constant ($B$) from the background worker to stretch its predictive templates to match physical string stiffness.
+  - **The Router — Dual-FFT / Unified TWM Engine:** Both registers now use **Two-Way Mismatch (TWM)** as the coarse F0 stage. When the Scout locks Bass, the Engine executes a dedicated 8192-point FFT (5.38 Hz resolution at 44.1 kHz) against the full COLA history window — instead of the standard 2048-point treble FFT (21.5 Hz resolution). This resolves the dense partial clusters below 100 Hz that a 2048-point FFT cannot distinguish. When the Scout locks Treble, the standard 2048-point rapid FFT is used (46 ms latency). TWM is a pure mathematical function decoupled from engine state — the engine maps its `RoutingState` to explicit `search_bounds: Option<(f32, f32)>` before calling TWM. If the user has selected a key, TWM evaluates only a microscopic ±50-cent neighborhood around that note — making octave confusion mathematically impossible. TWM also accepts an inharmonicity constant ($B$) from the background worker to stretch its predictive templates to match physical string stiffness.
   - **XQIFFT Refinement:** Once TWM identifies the correct harmonic bin, an exponentially-weighted QIFFT (XQIFFT) refines the estimate to sub-cent accuracy. The peak and its neighbors are raised to power `p` before parabolic interpolation, sharpening the peak shape and eliminating interpolation bias intrinsic to standard QIFFT — at zero additional FFT cost.
-  - **Kalman Filter** *(experimental)*: During the Gatekeeper's NINOS2-confirmed Stable phase, a discrete linear Kalman filter smooths the XQIFFT output against a constant-velocity motion model. The filter is bypassed during Attack/Transient states and hard-reset on each new onset pulse. Whether this stage ships in the final release is undecided.
+  - **Kalman Filter** *(experimental)*: During the Gatekeeper's NINOS2-confirmed Stable phase, a discrete linear Kalman filter smooths the XQIFFT output against a constant-velocity motion model. The filter is bypassed during Attack/Transient states and hard-reset on each new onset pulse. Whether this stage ships in the final release is undecided (will be tested with other probabilistic smoothing methods).
 - **Output:** Pushes the sub-cent accurate $f_0$ float to the UI thread via a lock-free channel.
 
 Once the Gatekeeper detects silence, it closes the gate by sending the `is_silence` flag to the Engine to force an immediate state reset and prevent pitch detection from running on background noise.
@@ -215,6 +183,52 @@ This is the graphical interface thread operating at 60 FPS.
 - **Action:** Consumes the high-speed stream of $f_0$ floats from Thread 2 to drive the instantaneous tuning visualizers (strobe, cents-deviation, or dial). Polls the `PipelineHandle` for runtime observations (e.g., RMS envelope) and reads/writes configuration (e.g., silence threshold) via `Arc<Mutex<...>>`.
 
 See [tuner-gui](tuner-gui/README.md) for more information.
+
+## Iced 0.14.0 UI
+
+### Features
+
+- **Spectrogram Visualization**: Real-time frequency spectrum display
+- **Cent Meter**: Visual tuning accuracy indicator with color-coded feedback
+- **Interactive Piano Keyboard**: 88-key piano interface with click-to-select frequency functionality
+- **Inharmonicity Measurement**: Capture and analyze piano-specific inharmonicity characteristics
+- **Profile Management**: Save and load piano tuning profiles with JSON persistence
+- **Settings**: Noise floor calibration and envelope viewer
+
+### Planned Features
+
+- **Transient Detection Calibration**: Manual and automatic transient detection calibration
+- **Inharmonicity Compensation**: Professional piano-specific tuning curves
+- **Temperament Selection**: Support for various tuning temperaments
+- **Tuning Standard Options**: A440 and other reference frequencies
+
+> [!TIP]
+> **Graphics Issues? Check Your Vulkan Drivers**
+>
+> This application uses `iced` with the `wgpu` backend (Vulkan on Linux). If you experience
+> invisible widgets, flickering, or blank panels, the most common cause is stale or
+> incompatible Vulkan drivers. Ensure your GPU drivers are fully up-to-date before
+> reporting rendering bugs.
+
+## Project Work in Progress
+
+### Pipeline-GUI Decoupling Refactor
+
+- Update Cross-Thread Communication Structures to avoid the use of unbounded and mpsc channels.
+- Add a Host/Runner module that calls the CPAL stream and passes the audio data to the pipeline to prevent the GUI thread from spawning and managing the audio stream. This will be optional in case the user wants to use the pipeline without a reliance on CPAL.
+- Finalize `AudioPipeline` return types and public API to be frontend-agnostic. This includes will result in:
+  - The removal or refactor of the `AnalysisResult` struct.
+  - The removal the `capture_processing.rs` module and all related code e.g. stability buffer (Replaced with `Worker.rs` module).
+  - The removal of any instance of the `Tuning.rs` module in `tuner-gui` (integrated to `AudioPipeline` return).
+  - The removal of any instance of the `TuningMode` enum in `tuner-gui` (Migration to `tuner-core`).
+  - File I/O of inharmonicity profiles will likely be moved to `tuner-core`.
+  - Generic use of the `PipelineHandle` in `tuner-gui`.
+
+### Engine TODOs
+
+- **Two-Way Mismatch (TWM) Integration**: Overhaul of the pitch detection engine to utilize the TWM algorithm for general pitch detection. Still utilizes scout for bass/treble routing, allowing for less complex TWM calculations. If TWM proves to be unstable, it will be replaced with a different algorithm.
+- **Probabilistic Pitch Tracking** *(experimental — may not ship)*: If the engine's pitch detection is deemed unstable, probabilistic pitch tracking will be implemented. Either a **Hidden Markov Model (HMM)** or **Viterbi algorithm** will be used after the Engine stage, or a Gatekeeper-governed temporal smoothing stage will trigger a **Linear Kalman Filter** (engages only during the NINOS2-confirmed Stable phase; bypassed and reset on each new onset). Retention in the final release is undecided.
+
 
 ## Getting Started
 

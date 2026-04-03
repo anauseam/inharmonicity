@@ -13,18 +13,15 @@
 use crate::utils::view_utils::initialize_done_timer;
 use crate::views::{main_view::create_main_view, settings_view::create_settings_view};
 use crate::widgets::envelope::ENVELOPE_HISTORY_LENGTH;
-use cpal::traits::StreamTrait;
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::Receiver;
 use iced::{self, Element, Subscription, Theme};
-use ringbuf::traits::{Consumer, Observer};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::thread::{self, JoinHandle};
 use tuner_core::{
     AnalysisResult,
     algorithms::tuning,
-    audio,
+    audio::{self, AudioSource, HostHandle},
     calibration::{self, NoiseFloorResult},
     capture_processing::{self, ProcessingOperation},
     models::InharmonicityProfile,
@@ -185,10 +182,9 @@ pub struct AppDisplayData {
 /// audio processing, analysis results, and UI visibility controls.
 #[derive(Debug)]
 pub struct TunerApp {
-    // Audio processing components
-    audio_worker: Option<AudioWorker>, // Audio thread management
-    analysis_receiver: Option<Receiver<AnalysisResult>>, // Channel to receive analysis results
-    analysis_sender: Option<Sender<AnalysisResult>>, // Channel to send analysis results
+    // Audio processing — managed by tuner_core::audio::HostHandle
+    host_handle: Option<HostHandle>,
+    analysis_receiver: Option<Receiver<AnalysisResult>>,
 
     // --- New Inharmonicity State ---
     stability_buffer: VecDeque<AnalysisResult>, // Buffer for checking note stability
@@ -205,16 +201,6 @@ pub struct TunerApp {
     calibration_progress: Arc<AtomicUsize>,
 }
 
-/// Audio worker thread management structure.
-///
-/// Handles the dedicated audio processing thread and provides
-/// a way to shut it down gracefully.
-#[derive(Debug)]
-struct AudioWorker {
-    shutdown_tx: Sender<()>,               // Channel to send shutdown signal
-    thread_handle: Option<JoinHandle<()>>, // Handle to the audio thread
-}
-
 impl Default for TunerApp {
     /// Creates a new TunerApp instance with default settings.
     ///
@@ -222,12 +208,10 @@ impl Default for TunerApp {
     /// Audio processing starts after calibration completes (see `CalibrationComplete`).
     fn default() -> Self {
         eprintln!("[MAIN] Creating TunerApp...");
-        let (analysis_tx, analysis_rx) = crossbeam_channel::unbounded();
 
         Self {
-            audio_worker: None,
-            analysis_receiver: Some(analysis_rx),
-            analysis_sender: Some(analysis_tx),
+            host_handle: None,
+            analysis_receiver: None,
             stability_buffer: VecDeque::with_capacity(STABILITY_TARGET),
             inharmonicity_profile: InharmonicityProfile::default(),
             pipeline_handle: PipelineHandle::default(),
@@ -268,6 +252,7 @@ impl TunerApp {
         let calibration_task = iced::Task::perform(
             async move {
                 calibration::calibrate_noise_floor(
+                    AudioSource::Default,
                     calibration::DEFAULT_NOISE_MULTIPLIER,
                     calibration::DEFAULT_CALIBRATION_FRAMES,
                     progress,
@@ -277,15 +262,11 @@ impl TunerApp {
         );
         (app, calibration_task)
     }
-    /// Starts the dedicated audio processing thread.
+    /// Starts the dedicated audio processing thread via [`audio::spawn_analysis_thread()`].
     ///
-    /// This function:
-    /// 1. Creates crossbeam channels for audio data communication
-    /// 2. Spawns a dedicated thread for audio capture and analysis
-    /// 3. Sets up the audio worker for graceful shutdown
-    ///
-    /// The audio thread runs independently and sends analysis results
-    /// back to the GUI thread via the analysis channel.
+    /// All audio thread boilerplate (CPAL setup, ring buffer polling, analysis loop)
+    /// is handled by the `tuner-core` host extension. This method simply calls it
+    /// and stores the returned [`HostHandle`].
     #[allow(unreachable_code)]
     fn start_audio_processing(&mut self) {
         // Prevent headless tests from hanging indefinitely while trying to initialize physical audio hardware
@@ -295,130 +276,26 @@ impl TunerApp {
             return;
         }
 
-        // Create fresh channels each time (previous ones were consumed by the old thread)
-        let (analysis_tx, analysis_rx) = crossbeam_channel::unbounded();
-        self.analysis_receiver = Some(analysis_rx);
+        match audio::spawn_analysis_thread(AudioSource::Default) {
+            Ok(handle) => {
+                eprintln!("[AUDIO] Hardware stream active.");
 
-        let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded(1);
+                // Write the current threshold to the new pipeline's config
+                // (since AudioPipeline::new() creates fresh defaults)
+                if let Ok(mut config) = handle.pipeline_handle.config.lock() {
+                    config.silence_threshold =
+                        self.display_data.settings_data.current_silence_threshold;
+                }
 
-        // Take ownership of the pipeline to move it into the audio thread
-        // The PipelineHandle stays on the GUI side for shared state polling
-        let (pipeline, new_handle) = tuner_core::pipeline::AudioPipeline::new();
-
-        // Write the current threshold to the new pipeline's config
-        // (since AudioPipeline::new() creates fresh defaults)
-        if let Ok(mut config) = new_handle.config.lock() {
-            config.silence_threshold = self.display_data.settings_data.current_silence_threshold;
+                self.pipeline_handle = handle.pipeline_handle.clone();
+                self.analysis_receiver = Some(handle.analysis_rx.clone());
+                self.host_handle = Some(handle);
+                self.display_data.audio_worker_active = true;
+            }
+            Err(e) => {
+                eprintln!("[AUDIO ERROR] Could not start hardware: {}", e);
+            }
         }
-
-        self.pipeline_handle = new_handle;
-
-        let thread_handle = thread::spawn(move || {
-            eprintln!("[AUDIO-THREAD] Starting audio thread...");
-
-            eprintln!("[AUDIO-THREAD] Attempting to start audio capture...");
-            let (stream, mut consumer, sample_rate) = match audio::start_audio_capture() {
-                Ok(tuple) => {
-                    eprintln!("[AUDIO-THREAD] Audio capture started successfully");
-                    tuple
-                }
-                Err(e) => {
-                    eprintln!("[AUDIO-THREAD] Fatal Error starting audio: {}", e);
-                    return;
-                }
-            };
-
-            eprintln!("[AUDIO-THREAD] Entering audio processing loop...");
-            // Add a small delay to let GUI initialize
-            std::thread::sleep(std::time::Duration::from_millis(100));
-
-            // Fixed-size stack array — no heap allocation.
-            // 512 × f32 = 2 KB, well within stack budget.
-            let mut pop_buf = [0.0_f32; 512];
-
-            // The AudioPipeline owns the Gatekeeper, FIFO, and shared state sync
-            let mut pipeline = pipeline;
-            pipeline.engine.sample_rate = sample_rate;
-
-            // Track state for debug logging
-            let mut last_logged_state = pipeline.gatekeeper.current_state.clone();
-
-            loop {
-                // 1. Check for shutdown signal non-blocking
-                if let Ok(_) = shutdown_rx.try_recv() {
-                    eprintln!("[AUDIO-THREAD] Received shutdown signal");
-                    break;
-                }
-
-                // 2. Lock-free Ringbuf Polling
-                let available = consumer.occupied_len().min(pop_buf.len());
-                if available > 0 {
-                    consumer.pop_slice(&mut pop_buf[..available]);
-
-                    let (engine_result, spectrogram_data) = if let Some(res) = pipeline.push_audio(&pop_buf[..available]) {
-                        res
-                    } else {
-                        continue; // Hop boundary not reached yet
-                    };
-
-                    let (detected_frequency, confidence) = match engine_result {
-                        Option::Some((freq, conf)) => (Some(freq), conf),
-                        Option::None => (None, None),
-                    };
-
-                    let (cents_deviation, note_name) = if let Some(freq) = detected_frequency {
-                        let (name, target_freq) = tuner_core::models::find_nearest_note(freq);
-                        let deviation = tuning::calculate_cents_deviation(freq, target_freq);
-                        (Some(deviation), Some(name))
-                    } else {
-                        (None, None)
-                    };
-
-                    let result = AnalysisResult {
-                        detected_frequency,
-                        confidence,
-                        cents_deviation,
-                        note_name,
-                        spectrogram_data,
-                        partials: vec![],
-                    };
-
-                    if pipeline.gatekeeper.current_state != last_logged_state {
-                        eprintln!(
-                            "[GATEKEEPER] Transition: {:?} -> {:?} (CSD Dly: {}, Stable Cnt: {})",
-                            last_logged_state,
-                            pipeline.gatekeeper.current_state,
-                            pipeline.gatekeeper.transient_delay_counter,
-                            pipeline.gatekeeper.stable_counter
-                        );
-                        last_logged_state = pipeline.gatekeeper.current_state.clone();
-                    }
-
-                    if analysis_tx.send(result).is_err() {
-                        eprintln!("[AUDIO-THREAD] Failed to send analysis result");
-                        break;
-                    }
-                } else {
-                    std::thread::sleep(std::time::Duration::from_millis(2));
-                }
-            }
-
-            eprintln!("[AUDIO-THREAD] Stopping stream and exiting...");
-            // Properly stop the stream before dropping it
-            if let Err(e) = stream.pause() {
-                eprintln!("[AUDIO-THREAD] Error pausing stream: {}", e);
-            }
-            // Give the stream a moment to fully stop
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            drop(stream);
-            eprintln!("[AUDIO-THREAD] Audio thread finished");
-        });
-        self.audio_worker = Some(AudioWorker {
-            shutdown_tx,
-            thread_handle: Some(thread_handle),
-        });
-        // Update the display data to reflect that audio is active
-        self.display_data.audio_worker_active = true;
     }
 
     /// Handles application state updates based on incoming messages.
@@ -433,22 +310,16 @@ impl TunerApp {
         match message {
             Message::Exit => {
                 eprintln!("[MAIN] Window close requested - starting cleanup...");
-                // Properly shutdown audio worker to prevent CPAL/ALSA segmentation faults.
-                // If we exit forcefully, ALSA may still be executing callbacks when its context
-                // is destroyed, resulting in a segfault. Waiting here guarantees safe tear down.
-                if let Some(mut worker) = self.audio_worker.take() {
-                    eprintln!("[MAIN] Shutting down audio worker...");
-                    let _ = worker.shutdown_tx.send(());
-                    if let Some(handle) = worker.thread_handle.take() {
-                        eprintln!("[MAIN] Waiting for audio thread to finish...");
-                        let _ = handle.join();
-                        eprintln!("[MAIN] Audio thread detached - continuing cleanup");
-                    }
+                // Properly shutdown audio host to prevent CPAL/ALSA segmentation faults.
+                // HostHandle::stop() signals the analysis thread and waits for it to join.
+                if let Some(mut handle) = self.host_handle.take() {
+                    eprintln!("[MAIN] Shutting down audio host...");
+                    handle.stop();
+                    eprintln!("[MAIN] Audio host stopped.");
                 }
                 // Clear channels to prevent segfault
                 eprintln!("[MAIN] Clearing analysis channels...");
                 self.analysis_receiver = None;
-                self.analysis_sender = None;
                 eprintln!("[MAIN] Cleanup completed - forcing clean exit");
                 // Force clean exit to avoid segfault
                 std::process::exit(0);
@@ -652,13 +523,11 @@ impl TunerApp {
             }
             Message::RecalibrateNoiseFloor => {
                 eprintln!("[MAIN] Recalibration requested — stopping audio thread...");
-                // Stop the audio worker
-                if let Some(mut worker) = self.audio_worker.take() {
-                    let _ = worker.shutdown_tx.send(());
-                    if let Some(handle) = worker.thread_handle.take() {
-                        let _ = handle.join();
-                    }
+                // Stop the audio host
+                if let Some(mut handle) = self.host_handle.take() {
+                    handle.stop();
                 }
+                self.analysis_receiver = None;
                 self.display_data.audio_worker_active = false;
                 self.display_data.settings_data.calibration_complete = false;
 
@@ -673,6 +542,7 @@ impl TunerApp {
                 return iced::Task::perform(
                     async move {
                         calibration::calibrate_noise_floor(
+                            AudioSource::Default,
                             calibration::DEFAULT_NOISE_MULTIPLIER,
                             calibration::DEFAULT_CALIBRATION_FRAMES,
                             progress,
@@ -733,7 +603,7 @@ impl TunerApp {
         iced::Task::none()
     }
 
-    // --- ADDED: New helper function to process analysis results ---
+    // --- PLANNED DEPRECATION: Helper function to process analysis results ---
     /// Processes a single AnalysisResult received from the audio thread.
     ///
     /// This function runs on the GUI thread and updates the application state

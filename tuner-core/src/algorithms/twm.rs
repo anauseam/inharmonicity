@@ -12,7 +12,7 @@
 //! - Targeted harmonic template matching with inharmonicity ($B$) coefficient compensation.
 //! - Octave-error immunity across the full piano range (A0 to C8).
 
-use crate::engine::RoutingState;
+
 
 // Threshold above which a candidate is rejected
 const ERROR_CEILING: f32 = 0.25;
@@ -182,15 +182,15 @@ fn compute_twm_error(candidate_f0: f32, peaks: &[SpectralPeak], _sample_rate: u3
 }
 
 /// # Arguments
-/// * `peaks` — Pre-extracted peaks (≥3 required). Use `peak_scratch` from `ProcessingFrame`.
+/// * `peaks` — Pre-extracted peaks (≥1 required). Use `peak_scratch` from `ProcessingFrame`.
 /// * `sample_rate` - Example: 44100
-/// * `routing_state` — Scout lock; constrains candidate range when `key_hint` is None.
+/// * `search_bounds` — Frequency range `(f_min, f_max)` for discovery mode. `None` = full range (27.5–4186 Hz).
 /// * `key_hint` — If Some, targeted mode (±50 cents, ~32 candidates).
 /// * `inharmonicity_b` — If Some, stretch harmonic template to physical string stiffness.
 pub fn detect_pitch_twm(
     peaks: &[SpectralPeak],
     sample_rate: u32,
-    routing_state: RoutingState,
+    search_bounds: Option<(f32, f32)>,
     key_hint: Option<f32>,
     inharmonicity_b: Option<f32>,
 ) -> Option<(f32, Option<f32>)> {
@@ -221,22 +221,7 @@ pub fn detect_pitch_twm(
         }
     } else {
         // Discovery Mode
-        let min_freq: f32;
-        let max_freq: f32;
-        match routing_state {
-            RoutingState::LockedBass => {
-                min_freq = 27.5;
-                max_freq = 400.0;
-            }
-            RoutingState::LockedTreble => {
-                min_freq = 130.0;
-                max_freq = 4186.0;
-            }
-            RoutingState::Unclassified => {
-                min_freq = 27.5;
-                max_freq = 4186.0;
-            }
-        }
+        let (min_freq, max_freq) = search_bounds.unwrap_or((27.5, 4186.0));
         let true_step = 2.0_f32.powf(1.0 / 12.0); // Exactly 1 semitone per step
         
         let mut current_f0 = min_freq;

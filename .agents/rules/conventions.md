@@ -87,8 +87,8 @@ Current contents:
 | `engine.rs` | F0 detection chain (Scout → Router → Bass/Treble). Owned by `AudioPipeline` | ✅ Active |
 | `gatekeeper.rs` | 5-state signal validator. Pure DSP. Owned by `AudioPipeline` | ✅ Implemented |
 | `worker.rs` | Background worker for offline DSP (B coefficient). Communicates via channels | ⬜ Wireframe |
-| `audio.rs` | CPAL audio capture, DC blocking, stream setup. Bootstrap only | ✅ Implemented |
-| `calibration.rs` | Async calibration utilities (noise floor, future calibrations) | ✅ Implemented |
+| `audio.rs` | CPAL audio capture, DC blocking, stream setup, standalone host extension (`AudioSource`, `HostHandle`, `spawn_analysis_thread`) | ✅ Implemented |
+| `calibration.rs` | Async calibration utilities (noise floor, strike). Uses `AudioSource` for stream sourcing | ✅ Implemented |
 | `algorithms/` | Pure stateless DSP math | ✅ Active |
 | `models/` | Domain data types and lookup tables | ✅ Implemented |
 
