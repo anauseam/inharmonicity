@@ -20,15 +20,14 @@
 //! // result.rms_threshold → ConfigState.silence_threshold
 //! // result.nhwrsf_peak  → N_max (wizard lower bound)
 //!
-//! // Step 2 — run when the user is ready to play a note:
-//! let (result, rx) = calibrate_minimum_strike(AudioSource::Default, result.nhwrsf_peak, 5, progress_arc)?;
-//! // Poll rx for StrikeCalibrationEvent::Tick(flux) to drive the seismograph
-//! // StrikeCalibrationEvent::Completed is sent before the function returns
+//! // Step 2 — run when the user is ready
+//! let (tx, rx) = std::sync::mpsc::channel();
+//! let result = calibrate_minimum_strike(AudioSource::Default, noise_peak, 5, progress_arc, tx)?;
+//! // Poll rx for flux values to drive the seismograph
 //! // result.nhwrsf_peak → S_min (wizard upper bound)
 //! ```
 
 use anyhow::Result;
-use crossbeam_channel::{Sender, unbounded};
 use realfft::RealFftPlanner;
 use ringbuf::traits::{Consumer, Observer};
 use rustfft::num_complex::Complex;
@@ -89,20 +88,6 @@ pub struct StrikeResult {
     /// Peak NHWRSF observed during the transient event ($S_{min}$).
     /// This is the upper bound of the transient threshold slider in the wizard.
     pub nhwrsf_peak: f32,
-}
-
-/// Real-time events emitted by [`calibrate_minimum_strike`] over its channel.
-///
-/// The GUI receives these on each tick to drive the seismograph preview
-/// while the user is waiting to play their note.
-#[derive(Debug, Clone)]
-pub enum StrikeCalibrationEvent {
-    /// Emitted every frame with the current NHWRSF flux value.
-    /// Use this to update the real-time seismograph visualizer.
-    Tick(f32),
-    /// Emitted once when a transient spike above `noise_ceiling` is captured.
-    /// The inner value is the peak NHWRSF of the detected strike.
-    Completed(StrikeResult),
 }
 
 // ─── Private Helpers ─────────────────────────────────────────────────────────
@@ -254,11 +239,10 @@ pub fn calibrate_noise_floor(
 ///   A transient is considered valid only when it exceeds this value.
 /// * `timeout_secs` — Maximum seconds to wait for a strike before giving up.
 /// * `progress` — Atomic counter incremented each frame (GUI progress / timeout bar)
+/// * `tick_tx` — Background MPSC channel to send live `f32` flux ticks to the GUI.
 ///
 /// # Returns
-/// A tuple of:
 /// - [`StrikeResult`] containing the peak NHWRSF of the captured strike ($S_{min}$)
-/// - [`crossbeam_channel::Receiver<StrikeCalibrationEvent>`] for live seismograph ticks
 ///
 /// # Errors
 /// Returns an error if the audio stream cannot be opened or if the timeout
@@ -268,16 +252,13 @@ pub fn calibrate_minimum_strike(
     noise_ceiling: f32,
     timeout_secs: u64,
     progress: Arc<AtomicUsize>,
-) -> Result<(
-    StrikeResult,
-    crossbeam_channel::Receiver<StrikeCalibrationEvent>,
-)> {
+    tick_tx: std::sync::mpsc::Sender<f32>,
+) -> Result<StrikeResult> {
     eprintln!(
         "[CALIBRATION] Waiting for softest strike (noise ceiling: {:.4}, timeout: {}s)...",
         noise_ceiling, timeout_secs
     );
 
-    let (tx, rx): (Sender<StrikeCalibrationEvent>, _) = unbounded();
     let (_stream, mut consumer) = resolve_source(source)?;
 
     // FFT setup
@@ -306,7 +287,7 @@ pub fn calibrate_minimum_strike(
             let flux = calculate_nhwrsf(&freq_buf, &mut prev_mags);
 
             // Emit live tick for the seismograph
-            let _ = tx.send(StrikeCalibrationEvent::Tick(flux));
+            let _ = tick_tx.send(flux);
 
             // Detect a valid transient (a spike above the noise ceiling)
             if flux > noise_ceiling && flux > peak_nhwrsf {
@@ -338,13 +319,10 @@ pub fn calibrate_minimum_strike(
     let result = StrikeResult {
         nhwrsf_peak: peak_nhwrsf,
     };
-
-    let _ = tx.send(StrikeCalibrationEvent::Completed(result));
-
     eprintln!(
         "[CALIBRATION] Strike captured. S_min NHWRSF peak: {:.4}",
         peak_nhwrsf
     );
 
-    Ok((result, rx))
+    Ok(result)
 }

@@ -25,15 +25,15 @@
 use anyhow::{Result, anyhow};
 use cpal::SupportedStreamConfigRange;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use crossbeam_channel::{Receiver, Sender};
 use ringbuf::{
     HeapRb,
     traits::{Consumer, Observer, Producer, Split},
 };
+use std::sync::atomic::Ordering;
 use std::thread::{self, JoinHandle};
 
-use crate::AnalysisResult;
 use crate::pipeline::{AudioPipeline, PipelineHandle};
+use crate::FrameOutput;
 
 /// The standard analysis window size (samples).
 /// Used by the Gatekeeper, Scout, and all Engine paths.
@@ -169,20 +169,18 @@ pub enum AudioSource {
 /// which stops the hardware capture. Call [`stop()`](HostHandle::stop) first
 /// to cleanly signal the analysis thread to exit.
 pub struct HostHandle {
-    /// Receive analysis results from the analysis thread.
+    /// Read the freshest per-hop visualization frame from the DSP thread (lossy).
     ///
-    /// Currently uses `crossbeam_channel` — will migrate to `rtrb` + `triple_buffer`
-    /// during the cross-thread communication architecture refactor.
-    pub analysis_rx: Receiver<AnalysisResult>,
+    /// Uses `triple_buffer::Output` — the GUI always reads the most recent frame,
+    /// intermediate frames are silently discarded.
+    /// Wrapped in `Option` so it can be `.take()`'d by the GUI.
+    pub frame_rx: Option<triple_buffer::Output<FrameOutput>>,
 
-    /// Frontend-side handle to the pipeline's shared state.
+    /// Frontend-side handle to the pipeline's shared atomic state.
     ///
-    /// Use this to read `RuntimeState` (RMS, NHWRSF) and write `ConfigState`
-    /// (silence threshold, key hint, etc.).
+    /// Use this to read runtime observations (RMS, NHWRSF) and write
+    /// configuration parameters (silence threshold, key hint, etc.).
     pub pipeline_handle: PipelineHandle,
-
-    /// Send a signal to shut down the analysis thread.
-    shutdown_tx: Sender<()>,
 
     /// Keep the CPAL stream alive for the lifetime of the host.
     /// `None` when using `AudioSource::External`.
@@ -198,7 +196,10 @@ impl HostHandle {
     /// This must be called before dropping the handle to ensure the audio
     /// thread exits cleanly (preventing CPAL/ALSA segfaults on shutdown).
     pub fn stop(&mut self) {
-        let _ = self.shutdown_tx.send(());
+        self.pipeline_handle
+            .atomics
+            .shutdown
+            .store(true, Ordering::Relaxed);
         if let Some(handle) = self.thread_handle.take() {
             eprintln!("[HOST] Waiting for analysis thread to finish...");
             let _ = handle.join();
@@ -241,12 +242,21 @@ impl std::fmt::Debug for HostHandle {
 ///    audio consumer (for [`AudioSource::External`]).
 /// 3. Spawns a dedicated analysis thread that polls the ring buffer consumer
 ///    and calls [`AudioPipeline::push_audio()`].
-/// 4. Returns a [`HostHandle`] with the analysis result receiver, pipeline handle,
-///    and shutdown control.
+/// 4. Returns a [`HostHandle`] with the continuous frame output reader,
+///    pipeline handle, and shutdown control.
 ///
 /// The CPAL callback thread remains **allocation-free** — it only pushes raw
 /// samples into the ring buffer. All DSP work (FFT, Gatekeeper, Engine) runs
 /// on the spawned analysis thread, which is a normal OS thread.
+///
+/// ## Cross-Thread Channels
+///
+/// | Channel | Type | Direction | Semantics |
+/// |---|---|---|---|
+/// | `frame_rx` | `triple_buffer` | DSP → UI | Lossy freshest-frame-only |
+/// | `atomics.config.*` | `AtomicU32` | UI → DSP | Wait-free parameters |
+/// | `atomics.runtime.*` | `AtomicU32` | DSP → UI | Wait-free observations |
+/// | `atomics.shutdown` | `AtomicBool` | UI → DSP | Wait-free shutdown flag |
 ///
 /// # Arguments
 /// * `source` — Where to get audio samples from. Use [`AudioSource::Default`]
@@ -262,10 +272,11 @@ impl std::fmt::Debug for HostHandle {
 ///
 /// let mut handle = spawn_analysis_thread(AudioSource::Default).unwrap();
 ///
-/// // Poll for results on the GUI thread
-/// while let Ok(result) = handle.analysis_rx.try_recv() {
-///     println!("Detected: {:?}", result.detected_frequency);
-/// }
+/// // Read the freshest visualization frame
+/// let frame = handle.frame_rx.read();
+/// println!("RMS: {}", frame.rms_ema);
+///
+
 ///
 /// // Clean shutdown
 /// handle.stop();
@@ -285,10 +296,11 @@ pub fn spawn_analysis_thread(source: AudioSource) -> Result<HostHandle> {
         } => (None, consumer, sample_rate),
     };
 
-    // Crossbeam channels for analysis results and shutdown signaling.
-    // TODO: Migrate to rtrb + triple_buffer per cross-thread communication rules.
-    let (analysis_tx, analysis_rx) = crossbeam_channel::unbounded();
-    let (shutdown_tx, shutdown_rx) = crossbeam_channel::bounded(1);
+    // Triple buffer for continuous per-hop FrameOutput (DSP → UI).
+    let (tri_input, tri_output) = triple_buffer::TripleBuffer::new(&FrameOutput::default()).split();
+
+    // Clone the shared atomics for the analysis thread.
+    let thread_atomics = pipeline_handle.atomics.clone();
 
     let thread_handle = thread::spawn(move || {
         eprintln!("[HOST] Analysis thread started.");
@@ -297,6 +309,7 @@ pub fn spawn_analysis_thread(source: AudioSource) -> Result<HostHandle> {
         pipeline.engine.sample_rate = sample_rate;
 
         let mut consumer = consumer;
+        let mut tri_input = tri_input;
 
         // Fixed-size stack array — no heap allocation.
         // 512 × f32 = 2 KB, well within stack budget.
@@ -309,8 +322,8 @@ pub fn spawn_analysis_thread(source: AudioSource) -> Result<HostHandle> {
         std::thread::sleep(std::time::Duration::from_millis(100));
 
         loop {
-            // 1. Check for shutdown signal (non-blocking)
-            if shutdown_rx.try_recv().is_ok() {
+            // 1. Check for shutdown signal (wait-free atomic read)
+            if thread_atomics.shutdown.load(Ordering::Relaxed) {
                 eprintln!("[HOST] Received shutdown signal.");
                 break;
             }
@@ -320,36 +333,16 @@ pub fn spawn_analysis_thread(source: AudioSource) -> Result<HostHandle> {
             if available > 0 {
                 consumer.pop_slice(&mut pop_buf[..available]);
 
-                let (engine_result, spectrogram_data) =
+                let frame_output =
                     if let Some(res) = pipeline.push_audio(&pop_buf[..available]) {
                         res
                     } else {
                         continue; // Hop boundary not reached yet
                     };
 
-                // Build analysis result
-                let (detected_frequency, confidence) = match engine_result {
-                    Some((freq, conf)) => (Some(freq), conf),
-                    None => (None, None),
-                };
-
-                let (cents_deviation, note_name) = if let Some(freq) = detected_frequency {
-                    let (name, target_freq) = crate::models::find_nearest_note(freq);
-                    let deviation =
-                        crate::algorithms::tuning::calculate_cents_deviation(freq, target_freq);
-                    (Some(deviation), Some(name))
-                } else {
-                    (None, None)
-                };
-
-                let result = AnalysisResult {
-                    detected_frequency,
-                    confidence,
-                    cents_deviation,
-                    note_name,
-                    spectrogram_data,
-                    partials: vec![],
-                };
+                // Write the freshest FrameOutput into the triple buffer (lossy).
+                // The GUI will read only the most recent frame.
+                tri_input.write(frame_output);
 
                 // Log Gatekeeper state transitions
                 if pipeline.gatekeeper.current_state != last_logged_state {
@@ -362,12 +355,6 @@ pub fn spawn_analysis_thread(source: AudioSource) -> Result<HostHandle> {
                     );
                     last_logged_state = pipeline.gatekeeper.current_state.clone();
                 }
-
-                // Send result to the frontend. If the receiver is dropped, exit.
-                if analysis_tx.send(result).is_err() {
-                    eprintln!("[HOST] Analysis receiver dropped — exiting.");
-                    break;
-                }
             } else {
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
@@ -377,9 +364,8 @@ pub fn spawn_analysis_thread(source: AudioSource) -> Result<HostHandle> {
     });
 
     Ok(HostHandle {
-        analysis_rx,
+        frame_rx: Some(tri_output),
         pipeline_handle,
-        shutdown_tx,
         _stream: stream,
         thread_handle: Some(thread_handle),
     })

@@ -16,8 +16,8 @@ description: When working on the tuner-core structure.
 - **`tuner-gui` depends on `tuner-core`, never the reverse.**
 - **Coupling is minimized.** The GUI interacts with `tuner-core` exclusively through:
   1. `AudioPipeline::new()` → `(AudioPipeline, PipelineHandle)` (Split/Handle pattern)
-  2. `PipelineHandle` for reading `RuntimeState` / writing `ConfigState` via `Arc<Mutex<..>>`
-  3. A crossbeam channel for receiving pipeline output
+  2. `PipelineHandle` for reading `RuntimeState` / writing `ConfigState` via atomic primitives
+  3. A `triple_buffer` for receiving the live, continuous `FrameOutput` from the DSP thread
   4. Standalone async utilities like `calibration::calibrate_noise_floor()`
 
 ---
@@ -26,12 +26,12 @@ description: When working on the tuner-core structure.
 
 - **`AudioPipeline` owns all real-time DSP components**: `Gatekeeper`, `Engine`, `AudioPool`.
 - **`PipelineHandle`** is the GUI's only window into shared state.
-- **DSP components are "pure."** `Gatekeeper` and `Engine` have zero knowledge of `Arc`, `Mutex`, shared state, or the GUI. They expose results via `pub` fields. The `AudioPipeline` reads those fields and syncs them to shared state.
+- **DSP components are "pure."** `Gatekeeper` and `Engine` have zero knowledge of `PipelineAtomics`, shared state, or the GUI. They expose results via `pub` fields. The `AudioPipeline` reads those fields and syncs them to shared atomic state.
 - **`process_frame()` is the single DSP entry point:**
-  1. Reads config from shared state into DSP components
+  1. Reads config from shared atomics into DSP components
   2. Runs the Gatekeeper (signal validation)
   3. Runs the Engine (F0 detection) when the Gatekeeper approves the signal
-  4. Syncs observations back to shared state
+  4. Syncs observations back to shared atomics
 
 ---
 
@@ -39,12 +39,12 @@ description: When working on the tuner-core structure.
 
 ### `algorithms/` — Pure, Stateless DSP Math
 
-Every function in `algorithms/` is **stateless**: takes input buffers, returns computed values. No side effects, no `Arc`, `Mutex`, channels, or global mutable state.
+Every function in `algorithms/` is **stateless**: takes input buffers, returns computed values. No side effects, no lock-free channels, atomics, or global mutable state.
 
 Organized by **primary output**:
 
 | Module | Domain | Returns |
-|---|---|---|
+| --- | --- | --- |
 | `pitch.rs` | Pitch detection (YIN/pYIN) | Frequency (Hz), confidence |
 | `dpyin.rs` | Bass pitch detection (standalone, >200 lines) | Frequency (Hz), confidence |
 | `scout.rs` | Rough frequency neighborhood | Frequency (Hz) |
@@ -64,11 +64,12 @@ Non-DSP domain types, lookup tables, and data structures used by the GUI or othe
 Current contents:
 
 | Item | Description |
-|---|---|
+| --- | --- |
 | `Note` | Note name + frequency |
 | `NOTES`, `NOTE_MAP` | 88-key piano lookup tables (lazy statics) |
 | `find_nearest_note()` | Frequency → note name lookup |
 | `find_nearest_note_by_index()` | Key index → note name + frequency |
+| `find_nearest_note_index()` | Frequency → key index (allocation-free) |
 | `get_key_index_from_name()` | Note name → key index |
 | `Partial` | Measured partial (number + frequency) |
 | `KeyMeasurement` | Partials for one key + computed B value |
@@ -82,7 +83,7 @@ Current contents:
 ## Top-Level `tuner-core` Modules
 
 | Module | Role | Status |
-|---|---|---|
+| --- | --- | --- |
 | `pipeline.rs` | Mediator, shared state types, memory infrastructure | ✅ Implemented |
 | `engine.rs` | F0 detection chain (Scout → Router → Bass/Treble). Owned by `AudioPipeline` | ✅ Active |
 | `gatekeeper.rs` | 5-state signal validator. Pure DSP. Owned by `AudioPipeline` | ✅ Implemented |
@@ -103,8 +104,7 @@ Current contents:
 > **[OPEN]** items are unresolved. Do not treat them as settled.
 > Ask the user before making decisions that depend on them.
 
-- **[OPEN] Pipeline output type.** `AnalysisResult` in `lib.rs` is legacy with GUI-specific fields. The pipeline's output type will be determined as Engine integration completes. Do not assume it is the final design.
-- **[OPEN] Overlapped frames.** Currently non-overlapping 2048-sample frames. A 50% COLA design is planned post-migration. Whether this becomes a runtime setting or compile-time architecture choice is undecided.
+- **[OPEN] Pipeline output type.** `FrameOutput` in `lib.rs` is currently the transport mechanism, replacing the old `AnalysisResult` component. However, whether this represents the final output design strategy (e.g. for Bass integration) remains an open design question. Do not assume it is the final design.
 - **[OPEN] `models/` growth pattern.** Whether `models` stays as a single file or becomes a directory with submodules will be decided as more types are added.
 
 ---

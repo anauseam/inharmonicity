@@ -7,25 +7,24 @@
 //! ## Architecture
 //! - **Main Thread**: Iced GUI application with dark theme
 //! - **Audio Thread**: Dedicated thread for real-time audio processing
-//! - **Communication**: Crossbeam channels for thread-safe data exchange
+//! - **Communication**: Wait-free SPSC primitives (rtrb + triple_buffer + atomics)
 //! - **Updates**: 60 FPS continuous updates via subscription system
 
 use crate::utils::view_utils::initialize_done_timer;
 use crate::views::{main_view::create_main_view, settings_view::create_settings_view};
 use crate::widgets::envelope::ENVELOPE_HISTORY_LENGTH;
-use crossbeam_channel::Receiver;
 use iced::{self, Element, Subscription, Theme};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tuner_core::{
-    AnalysisResult,
+    FrameOutput,
     algorithms::tuning,
     audio::{self, AudioSource, HostHandle},
     calibration::{self, NoiseFloorResult},
     capture_processing::{self, ProcessingOperation},
     models::InharmonicityProfile,
-    pipeline::PipelineHandle,
+    pipeline::{PipelineHandle, load_f32, store_f32},
 };
 
 // Audio processing constants
@@ -148,7 +147,16 @@ pub struct SettingsDisplayData {
 pub struct AppDisplayData {
     // Audio state
     pub audio_worker_active: bool,
-    pub last_analysis: Option<AnalysisResult>,
+    /// Most recent visualization frame from the triple buffer.
+    pub last_frame: Option<FrameOutput>,
+    /// Most recent note index from NoteEvent (0–87), or None if no note locked.
+    pub last_note_index: Option<u8>,
+    /// Most recent detected frequency in Hz.
+    pub last_frequency: Option<f32>,
+    /// Most recent detection confidence (0.0–1.0).
+    pub last_confidence: Option<f32>,
+    /// Most recent cents deviation from nearest ET note.
+    pub last_cents: Option<f32>,
     pub smoothing_buffer: Vec<f32>,
 
     // Calibration state
@@ -180,18 +188,20 @@ pub struct AppDisplayData {
 ///
 /// Contains all the state necessary for the GUI application including
 /// audio processing, analysis results, and UI visibility controls.
-#[derive(Debug)]
 pub struct TunerApp {
     // Audio processing — managed by tuner_core::audio::HostHandle
     host_handle: Option<HostHandle>,
-    analysis_receiver: Option<Receiver<AnalysisResult>>,
 
-    // --- New Inharmonicity State ---
-    stability_buffer: VecDeque<AnalysisResult>, // Buffer for checking note stability
+    /// Triple buffer output for continuous visualization frames (lossy, freshest only).
+    frame_rx: Option<triple_buffer::Output<FrameOutput>>,
+
+    // --- Inharmonicity State ---
+    // TODO: Remove when capture_processing.rs is replaced by Worker pipeline.
+    #[allow(deprecated)]
+    stability_buffer: VecDeque<tuner_core::AnalysisResult>,
     inharmonicity_profile: InharmonicityProfile,
-    // ---------------------------------
 
-    // Frontend handle to the AudioPipeline's shared state
+    // Frontend handle to the AudioPipeline's shared atomic state
     pipeline_handle: PipelineHandle,
 
     // Single source of truth for all display data
@@ -199,6 +209,17 @@ pub struct TunerApp {
 
     // Calibration progress counter (shared with the calibration task)
     calibration_progress: Arc<AtomicUsize>,
+}
+
+impl std::fmt::Debug for TunerApp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TunerApp")
+            .field("host_handle", &self.host_handle)
+            .field("has_frame_rx", &self.frame_rx.is_some())
+            .field("pipeline_handle", &self.pipeline_handle)
+            .field("display_data", &self.display_data)
+            .finish()
+    }
 }
 
 impl Default for TunerApp {
@@ -211,14 +232,18 @@ impl Default for TunerApp {
 
         Self {
             host_handle: None,
-            analysis_receiver: None,
+            frame_rx: None,
             stability_buffer: VecDeque::with_capacity(STABILITY_TARGET),
             inharmonicity_profile: InharmonicityProfile::default(),
             pipeline_handle: PipelineHandle::default(),
             calibration_progress: Arc::new(AtomicUsize::new(0)),
             display_data: AppDisplayData {
                 audio_worker_active: false,
-                last_analysis: None,
+                last_frame: None,
+                last_note_index: None,
+                last_frequency: None,
+                last_confidence: None,
+                last_cents: None,
                 smoothing_buffer: Vec::new(),
                 is_calibrating: true,
                 calibration_progress: 0,
@@ -266,7 +291,7 @@ impl TunerApp {
     ///
     /// All audio thread boilerplate (CPAL setup, ring buffer polling, analysis loop)
     /// is handled by the `tuner-core` host extension. This method simply calls it
-    /// and stores the returned [`HostHandle`].
+    /// and stores the returned [`HostHandle`] channels.
     #[allow(unreachable_code)]
     fn start_audio_processing(&mut self) {
         // Prevent headless tests from hanging indefinitely while trying to initialize physical audio hardware
@@ -277,18 +302,18 @@ impl TunerApp {
         }
 
         match audio::spawn_analysis_thread(AudioSource::Default) {
-            Ok(handle) => {
+            Ok(mut handle) => {
                 eprintln!("[AUDIO] Hardware stream active.");
 
                 // Write the current threshold to the new pipeline's config
                 // (since AudioPipeline::new() creates fresh defaults)
-                if let Ok(mut config) = handle.pipeline_handle.config.lock() {
-                    config.silence_threshold =
-                        self.display_data.settings_data.current_silence_threshold;
-                }
+                store_f32(
+                    &handle.pipeline_handle.atomics.config.silence_threshold,
+                    self.display_data.settings_data.current_silence_threshold,
+                );
 
                 self.pipeline_handle = handle.pipeline_handle.clone();
-                self.analysis_receiver = Some(handle.analysis_rx.clone());
+                self.frame_rx = handle.frame_rx.take();
                 self.host_handle = Some(handle);
                 self.display_data.audio_worker_active = true;
             }
@@ -299,29 +324,18 @@ impl TunerApp {
     }
 
     /// Handles application state updates based on incoming messages.
-    ///
-    /// This function processes all user interactions and system events,
-    /// updating the application state accordingly. It handles:
-    /// - Piano key selections and tuning mode changes
-    /// - Tool visibility toggles
-    /// - Audio analysis data processing
-    /// - Application exit requests
     pub fn update(&mut self, message: Message) -> iced::Task<Message> {
         match message {
             Message::Exit => {
                 eprintln!("[MAIN] Window close requested - starting cleanup...");
-                // Properly shutdown audio host to prevent CPAL/ALSA segmentation faults.
-                // HostHandle::stop() signals the analysis thread and waits for it to join.
                 if let Some(mut handle) = self.host_handle.take() {
                     eprintln!("[MAIN] Shutting down audio host...");
                     handle.stop();
                     eprintln!("[MAIN] Audio host stopped.");
                 }
-                // Clear channels to prevent segfault
-                eprintln!("[MAIN] Clearing analysis channels...");
-                self.analysis_receiver = None;
+                eprintln!("[MAIN] Clearing channels...");
+                self.frame_rx = None;
                 eprintln!("[MAIN] Cleanup completed - forcing clean exit");
-                // Force clean exit to avoid segfault
                 std::process::exit(0);
             }
             Message::KeySelected(key_index) => {
@@ -482,10 +496,11 @@ impl TunerApp {
                     .noise_floor_adjustment_visible;
             }
             Message::SilenceThresholdChanged(value) => {
-                // Write to shared config so the audio thread picks it up immediately
-                if let Ok(mut config) = self.pipeline_handle.config.lock() {
-                    config.silence_threshold = value;
-                }
+                // Write to shared atomics so the audio thread picks it up immediately
+                store_f32(
+                    &self.pipeline_handle.atomics.config.silence_threshold,
+                    value,
+                );
                 // Update local display data for immediate UI feedback
                 self.display_data.settings_data.current_silence_threshold = value;
             }
@@ -497,10 +512,11 @@ impl TunerApp {
                             "[MAIN] Calibration complete. RMS baseline: {:.6}, threshold: {:.6}, N_max NHWRSF: {:.4}",
                             cal.rms_baseline, cal.rms_threshold, cal.noise_floor_peak
                         );
-                        // Write calibrated values to shared config
-                        if let Ok(mut config) = self.pipeline_handle.config.lock() {
-                            config.silence_threshold = cal.rms_threshold;
-                        }
+                        // Write calibrated values to shared atomics
+                        store_f32(
+                            &self.pipeline_handle.atomics.config.silence_threshold,
+                            cal.rms_threshold,
+                        );
                         // Update display data
                         self.display_data.settings_data.current_silence_threshold =
                             cal.rms_threshold;
@@ -527,7 +543,7 @@ impl TunerApp {
                 if let Some(mut handle) = self.host_handle.take() {
                     handle.stop();
                 }
-                self.analysis_receiver = None;
+                self.frame_rx = None;
                 self.display_data.audio_worker_active = false;
                 self.display_data.settings_data.calibration_complete = false;
 
@@ -558,39 +574,74 @@ impl TunerApp {
                         self.calibration_progress.load(Ordering::Relaxed);
                 }
 
-                // Continuous update - poll for audio data
-                if let Some(receiver) = &self.analysis_receiver {
-                    // --- REFACTORED: Delegate result processing ---
-                    // Collect all results first to avoid borrowing conflicts
-                    let mut results = Vec::new();
-                    while let Ok(result) = receiver.try_recv() {
-                        results.push(result);
+                // ── Read freshest FrameOutput from triple buffer ──
+                if let Some(ref mut frame_rx) = self.frame_rx {
+                    if frame_rx.update() {
+                        let frame = frame_rx.read().clone();
+                        self.display_data.last_frame = Some(frame.clone());
+
+                        // 1. Independent Decoupling of Scalar Data
+                        // Assign values individually. If one drops out (e.g. confidence),
+                        // we still display the others.
+                        if let Some(freq) = frame.detected_frequency {
+                            self.display_data.last_frequency = Some(freq);
+                        }
+                        if let Some(idx) = frame.note_index {
+                            self.display_data.last_note_index = Some(idx);
+                        }
+                        if let Some(conf) = frame.confidence {
+                            self.display_data.last_confidence = Some(conf);
+                        }
+                        if let Some(cents) = frame.cents_deviation {
+                            self.display_data.last_cents = Some(cents);
+
+                            // Update smoothing buffer
+                            let cents_for_smoothing = match self.display_data.tuning_mode {
+                                TuningMode::Auto => Some(cents),
+                                TuningMode::Manual { target_freq, .. } => {
+                                    if let Some(f) = frame.detected_frequency {
+                                        Some(tuning::calculate_cents_deviation(f, target_freq))
+                                    } else {
+                                        None
+                                    }
+                                }
+                            };
+                            if let Some(c) = cents_for_smoothing {
+                                self.display_data.smoothing_buffer.push(c);
+                                if self.display_data.smoothing_buffer.len() > SMOOTHING_FACTOR {
+                                    self.display_data.smoothing_buffer.remove(0);
+                                }
+                            }
+                        }
+
+                        // If no note data was detected at all (Silence or Unstable routing gap),
+                        // we clear the smoothing buffer, but preserve the last scalar integers
+                        // so the UI floats down instead of abruptly vanishing.
+                        if frame.detected_frequency.is_none() && frame.cents_deviation.is_none() {
+                            self.display_data.smoothing_buffer.clear();
+                        }
+
+                        // 2. Route payload to Legacy Capture System
+                        // TODO: Remove this call when capture_processing is retired.
+                        self.process_legacy_capture(&frame);
                     }
-                    // Process all collected results
-                    for result in results {
-                        self.process_analysis_result(result);
-                    }
-                    // ---------------------------------------------
                 }
 
-                // Poll shared state for settings view (only when visible)
+                // Poll shared atomics for settings view (only when visible)
                 if self.display_data.settings_view_visible
                     && self
                         .display_data
                         .settings_data
                         .noise_floor_adjustment_visible
                 {
-                    if let Ok(runtime) = self.pipeline_handle.runtime.lock() {
-                        let history = &mut self.display_data.settings_data.rms_history;
-                        history.push_back(runtime.current_rms_ema);
-                        if history.len() > ENVELOPE_HISTORY_LENGTH {
-                            history.pop_front();
-                        }
+                    let rms = load_f32(&self.pipeline_handle.atomics.runtime.current_rms_ema);
+                    let history = &mut self.display_data.settings_data.rms_history;
+                    history.push_back(rms);
+                    if history.len() > ENVELOPE_HISTORY_LENGTH {
+                        history.pop_front();
                     }
-                    if let Ok(config) = self.pipeline_handle.config.lock() {
-                        self.display_data.settings_data.current_silence_threshold =
-                            config.silence_threshold;
-                    }
+                    self.display_data.settings_data.current_silence_threshold =
+                        load_f32(&self.pipeline_handle.atomics.config.silence_threshold);
                 }
 
                 // State reset after capture processing
@@ -603,73 +654,59 @@ impl TunerApp {
         iced::Task::none()
     }
 
-    // --- PLANNED DEPRECATION: Helper function to process analysis results ---
-    /// Processes a single AnalysisResult received from the audio thread.
+    /// Legacy stability-gated capture bridge logic.
     ///
-    /// This function runs on the GUI thread and updates the application state
-    /// based on the new analysis data. It handles:
-    /// - Updating the stability buffer for capture
-    /// - Triggering the capture process when stable
-    /// - Updating the cent smoothing buffer
-    /// - Storing the latest analysis result
-    fn process_analysis_result(&mut self, result: AnalysisResult) {
-        // --- Stability-Gated Capture Logic ---
-        if self.display_data.capture_state == CaptureState::Capturing {
-            self.stability_buffer.push_back(result.clone()); // Clone for stability check
+    /// Extracted into its own method to isolate deprecated structures from the
+    /// modern fast-path UI rendering loop above.
+    ///
+    /// TODO: Remove when capture_processing.rs is fully replaced by the new Worker pipeline.
+    fn process_legacy_capture(&mut self, frame: &FrameOutput) {
+        if let (Some(note_index), Some(frequency), Some(confidence), Some(cents_deviation)) = (
+            frame.note_index,
+            frame.detected_frequency,
+            frame.confidence,
+            frame.cents_deviation,
+        ) {
+            // --- Stability-Gated Capture Bridge ---
+            // TODO: Remove when capture_processing.rs is replaced by Worker pipeline.
+            #[allow(deprecated)]
+            if self.display_data.capture_state == CaptureState::Capturing {
+                let (note_name, _) = tuner_core::models::find_nearest_note_by_index(note_index);
 
-            if self.stability_buffer.len() > STABILITY_TARGET {
-                self.stability_buffer.pop_front();
-            }
+                let compat_result = tuner_core::AnalysisResult {
+                    detected_frequency: Some(frequency),
+                    confidence: Some(confidence),
+                    cents_deviation: Some(cents_deviation),
+                    note_name: Some(note_name),
+                };
 
-            if self.stability_buffer.len() == STABILITY_TARGET {
-                if check_stability(&self.stability_buffer) {
-                    eprintln!("[MAIN] STABILITY DETECTED! Capturing...");
-                    self.display_data.capture_state = CaptureState::Done;
-                    // Convert stability buffer to Vec and process it
-                    let stability_data: Vec<AnalysisResult> =
-                        self.stability_buffer.drain(..).collect();
-                    // Call the processing function with the stability buffer using default operation
-                    if let Some(measurement) = capture_processing::process(
-                        stability_data,
-                        ProcessingOperation::BestConfidence,
-                    ) {
-                        // Store the measurement in the profile
-                        self.inharmonicity_profile
-                            .measurements
-                            .insert(measurement.key_index, measurement);
+                self.stability_buffer.push_back(compat_result);
+                if self.stability_buffer.len() > STABILITY_TARGET {
+                    self.stability_buffer.pop_front();
+                }
+
+                if self.stability_buffer.len() == STABILITY_TARGET {
+                    if check_stability(&self.stability_buffer) {
+                        eprintln!("[MAIN] STABILITY DETECTED! Capturing...");
+                        self.display_data.capture_state = CaptureState::Done;
+                        let stability_data: Vec<tuner_core::AnalysisResult> =
+                            self.stability_buffer.drain(..).collect();
+                        if let Some(measurement) = capture_processing::process(
+                            stability_data,
+                            ProcessingOperation::BestConfidence,
+                        ) {
+                            self.inharmonicity_profile
+                                .measurements
+                                .insert(measurement.key_index, measurement);
+                        }
+                        initialize_done_timer();
                     }
-                    // Initialize the "Done" timer for visual feedback
-                    initialize_done_timer();
                 }
             }
         }
-        // --- End Capture Logic ---
-
-        // --- Smoothing Buffer Logic ---
-        let cents_for_smoothing = match self.display_data.tuning_mode {
-            TuningMode::Auto => result.cents_deviation,
-            TuningMode::Manual { target_freq, .. } => result
-                .detected_frequency
-                .map(|freq| tuning::calculate_cents_deviation(freq, target_freq)),
-        };
-        if let Some(cents) = cents_for_smoothing {
-            self.display_data.smoothing_buffer.push(cents);
-            if self.display_data.smoothing_buffer.len() > SMOOTHING_FACTOR {
-                self.display_data.smoothing_buffer.remove(0);
-            }
-        } else {
-            self.display_data.smoothing_buffer.clear();
-        }
-
-        // --- Store Last Analysis ---
-        self.display_data.last_analysis = Some(result); // Move the original result
     }
-    // ----------------------------------------------------------------
 
     /// Renders the main application interface.
-    ///
-    /// Delegates all UI rendering to the main_display module,
-    /// keeping this function focused on application logic only.
     pub fn view(&self) -> Element<'_, Message> {
         if self.display_data.settings_view_visible {
             create_settings_view(&self.display_data)
@@ -697,21 +734,16 @@ impl TunerApp {
     }
 
     /// Returns the application theme.
-    ///
-    /// Currently returns the built-in dark theme for a professional appearance.
-    /// This can be extended to support dynamic theme switching in the future.
     fn theme(&self) -> Theme {
         Theme::Dark
     }
 }
 
-/// Checks if all AnalysisResult frames in the buffer are "stable."
+/// Checks if all frames in the stability buffer have the same note with high confidence.
 ///
-/// Stability is defined as:
-/// 1. The buffer is not empty.
-/// 2. All frames have a `note_name` that is `Some` and is the *same* note.
-/// 3. All frames have a `confidence` that is `Some` and is above the `STABILITY_CONFIDENCE_THRESHOLD`.
-fn check_stability(buffer: &VecDeque<AnalysisResult>) -> bool {
+/// TODO: Remove when capture_processing.rs is replaced by Worker pipeline.
+#[allow(deprecated)]
+fn check_stability(buffer: &VecDeque<tuner_core::AnalysisResult>) -> bool {
     if buffer.is_empty() {
         return false;
     }

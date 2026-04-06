@@ -66,45 +66,24 @@ pub fn perform_fft(
         .expect("FFT Process Failed");
 }
 
-/// Calculates the magnitude vector from a complex spectrum.
+/// Extracts magnitudes from a complex spectrum into a pre-allocated output slice.
 ///
-/// This function extracts the magnitude (amplitude) information from the
-/// complex FFT results. Due to the Nyquist theorem, we only need the first
-/// half of the spectrum (up to the Nyquist frequency).
+/// Computes `sqrt(re² + im²)` for the first `window_size / 2` bins of the RFFT
+/// output and writes them into `out`. This is zero-allocation and safe for the
+/// DSP hot path.
 ///
-/// The resulting magnitudes are fundamental to the audio processing pipeline.
-/// They are used both for visual rendering (e.g., spectrogram displays in the GUI)
-/// and for downstream DSP algorithms (e.g., refining pitch estimates with
-/// parabolic interpolation and tracking harmonic partials).
-///
-/// **Note:** This allocating version is used for the GUI spectrogram (which crosses
-/// thread boundaries via `Vec<f32>`). Once the cross-thread communication structures
-/// are migrated (see `update-communication-structures` workflow), this function will
-/// likely become redundant — replaced entirely by [`spectrum_to_magnitudes_into`].
-///
-/// # Arguments
-/// * `spectrum` - Complex frequency spectrum from the RFFT (1025 bins)
-///
-/// # Returns
-/// * `Vec<f32>` - Magnitude spectrum
-pub fn spectrum_to_magnitudes(spectrum: &[Complex<f32>], window_size: usize) -> Vec<f32> {
-    spectrum
-        .iter()
-        .take(window_size / 2)
-        .map(|c| c.norm()) // .norm() is sqrt(re^2 + im^2)
-        .collect()
-}
-
-/// Zero-allocation magnitude extraction — writes directly into a pre-allocated slice.
-///
-/// Use this on the DSP hot path (Engine). The caller provides `out` which must be
-/// at least `window_size / 2` elements. Only that many elements are written.
+/// The resulting magnitudes are used for spectrogram visualisation (via the
+/// [`FrameOutput`](crate::FrameOutput) triple buffer) and for downstream DSP
+/// (TWM peak picking, XQIFFT refinement).
 ///
 /// # Arguments
 /// * `spectrum` — Complex frequency spectrum from the RFFT.
 /// * `window_size` — The FFT window size (2048 or 8192). Determines how many bins to process.
 /// * `out` — Pre-allocated output slice. Must be at least `window_size / 2` elements.
-pub fn spectrum_to_magnitudes_into(
+///
+/// # Panics
+/// * If `out.len() < window_size / 2`.
+pub fn spectrum_to_magnitudes(
     spectrum: &[Complex<f32>],
     window_size: usize,
     out: &mut [f32],

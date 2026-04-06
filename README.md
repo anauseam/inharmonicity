@@ -73,10 +73,10 @@ AudioPipeline::new()  →  (AudioPipeline, PipelineHandle)
 
 This follows the **Split / Handle pattern** (the same convention used by `crossbeam_channel`, `ringbuf::split()`, `std::thread::spawn`):
 
-- **`AudioPipeline`** is moved to the audio thread. It owns the pure DSP components (`Gatekeeper`, `Engine`) and is the **only** thing that touches `Arc<Mutex<...>>` shared state. After calling each DSP component's `process_frame()`, the pipeline reads their public fields and syncs observations to shared state.
-- **`PipelineHandle`** is kept by the frontend. It provides `Arc<Mutex<...>>` handles for:
-  - `config` — reading and writing configuration values (e.g., silence threshold)
-  - `runtime` — polling runtime observations (e.g., smoothed RMS for the Envelope Viewer)
+- **`AudioPipeline`** is moved to the audio thread. It owns the pure DSP components (`Gatekeeper`, `Engine`) and is the **only** thing that mutates the pipeline's internal state. After calling each DSP component's `process_frame()`, the pipeline reads their public fields and syncs observations to the shared atomic state.
+- **`PipelineHandle`** is kept by the frontend. It provides `Arc<PipelineAtomics>` handles for:
+  - `config` — wait-free reading and writing of configuration values (e.g., silence threshold)
+  - `runtime` — wait-free polling of runtime observations (e.g., smoothed RMS for the Envelope Viewer)
 
 A frontend contributor just calls `AudioPipeline::new()`, gets a `PipelineHandle`, and never needs to know about Gatekeeper internals, EMA calculations, or lock management.
 
@@ -89,9 +89,9 @@ The pipeline also manages the **`WorkerManager`** (`worker.rs`), which owns a si
 >
 > | Component | Status |
 > | --- | --- |
-> | `pipeline.rs` — AudioPipeline mediator + shared state | ✅ Implemented |
+> | `pipeline.rs` — AudioPipeline mediator + shared state | 🟡 Testing |
 > | `gatekeeper.rs` — 5-state signal validator (pure DSP) | ✅ Implemented |
-> | `engine.rs` — F0 Engine (Scout / TWM / XQIFFT) + Dual-FFT Bass path | ✅ Implemented |
+> | `engine.rs` — F0 Engine (Scout / TWM / XQIFFT) + Dual-FFT Bass path | 🟡 Testing |
 > | `worker.rs` — Background worker (single thread) | ⬜ Wireframe |
 > | TWM — coarse F0 for both registers, `RefinementAlgorithm` enum | 🟡 Testing |
 > | XQIFFT — exponentially-weighted seeded sub-cent refinement | ✅ Implemented |
@@ -106,7 +106,7 @@ To maintain real-time performance without relying on OS priority elevation, the 
 
 - **The Elastic Ring Buffer:** A lock-free circular buffer connecting Thread 1 and Thread 2. Acts as an elastic shock absorber — if the OS briefly suspends the processing thread, audio samples continue to accumulate safely without drops.
 - **Lock-Free Object Pool (`AudioPool`):** Pre-allocated pool of `Box<[f32; 66150]>` arrays (1.5 seconds at 44.1 kHz). Thread 2 borrows an array to record a stable note and passes it to the background worker, which recycles it back to the pool when finished.
-- **`ProcessingFrame`:** Thread-local scratch buffers for zero-allocation per-frame DSP. All fields are `Box<[T]>` — allocated once in `AudioPipeline::new()` via `vec![..].into_boxed_slice()`, never resized. Includes a dedicated `magnitude_buffer` (`Box<[f32]>`, 4096 elements) that the Engine writes into via `spectrum_to_magnitudes_into()` — eliminating per-frame heap allocation from the TWM + XQIFFT chain entirely. This is the project-wide standard for owned DSP state buffers.
+- **`ProcessingFrame`:** Thread-local scratch buffers for zero-allocation per-frame DSP. All fields are `Box<[T]>` — allocated once in `AudioPipeline::new()` via `vec![..].into_boxed_slice()`, never resized. Includes a dedicated `magnitude_buffer` (`Box<[f32]>`, 4096 elements) that the Engine writes into via `spectrum_to_magnitudes_into()` — eliminating per-frame heap allocation from the TWM + XQIFFT chain.
 - **`CircularFifo` (COLA):** Owned by `AudioPipeline`. A `Box<[f32]>` ring buffer that accumulates samples and triggers a new FFT + pipeline frame on every 50% hop. Invisible to `tuner-gui` — the GUI only calls `pipeline.push_audio(&[f32])`.
 
 ### Threading Model
@@ -143,8 +143,8 @@ This thread constantly consumes data from the Elastic Ring Buffer and executes a
     │ [4] RELEASE (Dispatch)  │ ──┐             └────────────┬────────────┘
     └────────────┬────────────┘   │                          │
                  │                │                          ▼
-                 ▼                │                  AnalysisResult (f0)
-          SignalState (UI)        │
+                 ▼                │                     FrameOutput
+          RuntimeAtomics          │
                                   │ (Async Trigger)
                                   ▼
                         ┌──────────────────┐
@@ -163,7 +163,7 @@ This thread constantly consumes data from the Elastic Ring Buffer and executes a
   - **The Router — Dual-FFT / Unified TWM Engine:** Both registers now use **Two-Way Mismatch (TWM)** as the coarse F0 stage. When the Scout locks Bass, the Engine executes a dedicated 8192-point FFT (5.38 Hz resolution at 44.1 kHz) against the full COLA history window — instead of the standard 2048-point treble FFT (21.5 Hz resolution). This resolves the dense partial clusters below 100 Hz that a 2048-point FFT cannot distinguish. When the Scout locks Treble, the standard 2048-point rapid FFT is used (46 ms latency). TWM is a pure mathematical function decoupled from engine state — the engine maps its `RoutingState` to explicit `search_bounds: Option<(f32, f32)>` before calling TWM. If the user has selected a key, TWM evaluates only a microscopic ±50-cent neighborhood around that note — making octave confusion mathematically impossible. TWM also accepts an inharmonicity constant ($B$) from the background worker to stretch its predictive templates to match physical string stiffness.
   - **XQIFFT Refinement:** Once TWM identifies the correct harmonic bin, an exponentially-weighted QIFFT (XQIFFT) refines the estimate to sub-cent accuracy. The peak and its neighbors are raised to power `p` before parabolic interpolation, sharpening the peak shape and eliminating interpolation bias intrinsic to standard QIFFT — at zero additional FFT cost.
   - **Kalman Filter** *(experimental)*: During the Gatekeeper's NINOS2-confirmed Stable phase, a discrete linear Kalman filter smooths the XQIFFT output against a constant-velocity motion model. The filter is bypassed during Attack/Transient states and hard-reset on each new onset pulse. Whether this stage ships in the final release is undecided (will be tested with other probabilistic smoothing methods).
-- **Output:** Pushes the sub-cent accurate $f_0$ float to the UI thread via a lock-free channel.
+- **Output:** Pushes the `FrameOutput` structure, containing the array spectrum and sub-cent accurate $f_0$ floats, to the UI thread via a wait-free `triple_buffer`.
 
 Once the Gatekeeper detects silence, it closes the gate by sending the `is_silence` flag to the Engine to force an immediate state reset and prevent pitch detection from running on background noise.
 
@@ -180,9 +180,19 @@ This is a single detached worker thread pre-allocated at application launch. Thi
 
 This is the graphical interface thread operating at 60 FPS.
 
-- **Action:** Consumes the high-speed stream of $f_0$ floats from Thread 2 to drive the instantaneous tuning visualizers (strobe, cents-deviation, or dial). Polls the `PipelineHandle` for runtime observations (e.g., RMS envelope) and reads/writes configuration (e.g., silence threshold) via `Arc<Mutex<...>>`.
+- **Action:** Consumes the high-speed stream of `FrameOutput` structures from Thread 2 to drive the instantaneous tuning visualizers (spectrogram, cents-deviation, or dial). Polls the `PipelineHandle` for runtime observations (e.g., RMS envelope) and reads/writes configuration (e.g., silence threshold) via `Arc<PipelineAtomics>`.
 
-See [tuner-gui](tuner-gui/README.md) for more information.
+#### Cross-Thread Communication Topology
+
+Because `tuner-core` enforces strict zero-allocation, wait-free real-time audio constraints, it relies on a rigidly defined topology for inter-thread message passing:
+
+| Pathway | Primitive | Direction | Purpose |
+| --- | --- | --- | --- |
+| **Hardware Capture** | `ringbuf` SPSC | Stream (1) → DSP (2) | Lossless elastic buffer for incoming raw audio. |
+| **Structural Output** | `triple_buffer` | DSP (2) → UI (4) | Lossy continuous viz telemetry (`FrameOutput`). |
+| **DSP Parameters** | `Arc<Atomic*>` | UI (4) ↔ DSP (2) | Wait-free configuration and metric reads/writes. |
+| **Heavy Payload** | Lock-Free Object Pool | DSP (2) ↔ Worker (3) | Recycled `Box<[f32]>` audio arrays for offline algorithms. |
+| **Offline Telemetry** | `std::sync::mpsc` | Background → UI (4) | Lossless ad-hoc UI events. *(Exception Rule: Allowed only when real-time pipeline is unused).* |
 
 ## Iced 0.14.0 UI
 
@@ -210,25 +220,21 @@ See [tuner-gui](tuner-gui/README.md) for more information.
 > incompatible Vulkan drivers. Ensure your GPU drivers are fully up-to-date before
 > reporting rendering bugs.
 
+See [tuner-gui](tuner-gui/README.md) for more information.
+
 ## Project Work in Progress
 
-### Pipeline-GUI Decoupling Refactor
+### Pipeline-GUI Decoupling Refactor (Ongoing)
 
-- Update Cross-Thread Communication Structures to avoid the use of unbounded and mpsc channels.
-- Add a Host/Runner module that calls the CPAL stream and passes the audio data to the pipeline to prevent the GUI thread from spawning and managing the audio stream. This will be optional in case the user wants to use the pipeline without a reliance on CPAL.
-- Finalize `AudioPipeline` return types and public API to be frontend-agnostic. This includes will result in:
-  - The removal or refactor of the `AnalysisResult` struct.
-  - The removal the `capture_processing.rs` module and all related code e.g. stability buffer (Replaced with `Worker.rs` module).
-  - The removal of any instance of the `Tuning.rs` module in `tuner-gui` (integrated to `AudioPipeline` return).
-  - The removal of any instance of the `TuningMode` enum in `tuner-gui` (Migration to `tuner-core`).
-  - File I/O of inharmonicity profiles will likely be moved to `tuner-core`.
-  - Generic use of the `PipelineHandle` in `tuner-gui`.
+- Replace the legacy `capture_processing.rs` module and GUI `stability_buffer` with the asynchronous `worker.rs` module for heavy offline operations.
+- Remove the deprecated `AnalysisResult` shim struct entirely once the legacy capture mechanism drops.
+- Migrate `TuningMode` state tracking entirely to `tuner-core`.
+- Move File I/O for inharmonicity profiles into `tuner-core` for true frontend agnosticism.
 
 ### Engine TODOs
 
 - **Two-Way Mismatch (TWM) Integration**: Overhaul of the pitch detection engine to utilize the TWM algorithm for general pitch detection. Still utilizes scout for bass/treble routing, allowing for less complex TWM calculations. If TWM proves to be unstable, it will be replaced with a different algorithm.
 - **Probabilistic Pitch Tracking** *(experimental — may not ship)*: If the engine's pitch detection is deemed unstable, probabilistic pitch tracking will be implemented. Either a **Hidden Markov Model (HMM)** or **Viterbi algorithm** will be used after the Engine stage, or a Gatekeeper-governed temporal smoothing stage will trigger a **Linear Kalman Filter** (engages only during the NINOS2-confirmed Stable phase; bypassed and reset on each new onset). Retention in the final release is undecided.
-
 
 ## Getting Started
 

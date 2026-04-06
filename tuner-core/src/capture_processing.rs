@@ -3,6 +3,10 @@
 //!
 //! Handles the processing of captured audio analysis frames for inharmonicity measurement.
 //! This module provides different processing strategies for analyzing stable audio frames.
+//!
+//! TODO: Remove when replaced by Worker pipeline.
+
+#![allow(deprecated)] // This module uses the deprecated AnalysisResult shim.
 
 use crate::{
     algorithms::inharmonicity::calculate_b_value,
@@ -68,23 +72,12 @@ fn process_best_confidence(buffer: Vec<crate::AnalysisResult>) -> Option<KeyMeas
         {
             let key_index = get_key_index_from_name(note_name);
 
-            // Create the fundamental partial (n=1)
-            let mut all_partials = vec![Partial {
+            // Create the fundamental partial only (overtone partials removed
+            // from AnalysisResult — they will be extracted by the Worker pipeline).
+            let all_partials = vec![Partial {
                 number: 1,
                 frequency: freq,
             }];
-
-            // Create the overtone partials (n=2, 3, 4...)
-            let overtone_partials =
-                best_frame
-                    .partials
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &freq)| Partial {
-                        number: (i + 2) as u32, // find_partials starts at the 2nd partial
-                        frequency: freq,
-                    });
-            all_partials.extend(overtone_partials);
 
             // 3. Create and 4. Calculate 'B' value
             let mut measurement = KeyMeasurement {
