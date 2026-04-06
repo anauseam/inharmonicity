@@ -12,6 +12,7 @@
 //! 4. Output the resulting F0 and confidence back to the pipeline.
 
 use crate::algorithms::{metrics, pitch, spectral};
+use crate::audio::{BASS_WINDOW_SIZE, WINDOW_SIZE};
 use crate::pipeline::ProcessingFrame;
 use std::sync::Arc;
 
@@ -57,7 +58,7 @@ impl Engine {
     /// Creates a new Engine with default algorithms.
     pub fn new(sample_rate: u32) -> Self {
         let mut planner = realfft::RealFftPlanner::<f32>::new();
-        let fft_bass_instance = planner.plan_fft_forward(crate::audio::BASS_WINDOW_SIZE);
+        let fft_bass_instance = planner.plan_fft_forward(BASS_WINDOW_SIZE);
 
         Self {
             refinement_algorithm: RefinementAlgorithm::QIFFT,
@@ -94,7 +95,7 @@ impl Engine {
 
         // If unclassified, use the Band Energy Classifier to lock a routing path.
         if self.routing_state == RoutingState::Unclassified {
-            let expected_bins = 2048 / 2 + 1; // 1025 for a 2048-sample FFT
+            let expected_bins = WINDOW_SIZE / 2 + 1; // 1025 for a 2048-sample FFT
             let ratio =
                 metrics::evaluate_band_energy_ratio(&frame.frequency_buffer[..expected_bins]);
 
@@ -146,42 +147,42 @@ impl Engine {
         // ── Step 1: Bass FFT (8192-point) when Scout locks Bass ──────────
         if self.routing_state == RoutingState::LockedBass {
             crate::algorithms::spectral::perform_fft(
-                &frame.audio_buffer[..crate::audio::BASS_WINDOW_SIZE],
-                &mut frame.time_buffer[..crate::audio::BASS_WINDOW_SIZE],
+                &frame.audio_buffer[..BASS_WINDOW_SIZE],
+                &mut frame.time_buffer[..BASS_WINDOW_SIZE],
                 &mut frame.bass_frequency_buffer[..],
                 &self.fft_bass_instance,
-                crate::audio::BASS_WINDOW_SIZE,
+                BASS_WINDOW_SIZE,
             );
         }
 
         // ── Step 2: Conditional magnitude extraction (zero-alloc) ────────
         let (active_bins, active_window_size) = match self.routing_state {
             RoutingState::LockedBass => {
-                let bins = crate::audio::BASS_WINDOW_SIZE / 2;
-                let expected_complex = crate::audio::BASS_WINDOW_SIZE / 2 + 1;
-                spectral::spectrum_to_magnitudes_into(
+                let bins = BASS_WINDOW_SIZE / 2;
+                let expected_complex = BASS_WINDOW_SIZE / 2 + 1;
+                spectral::spectrum_to_magnitudes(
                     &frame.bass_frequency_buffer[..expected_complex],
-                    crate::audio::BASS_WINDOW_SIZE,
+                    BASS_WINDOW_SIZE,
                     &mut frame.magnitude_buffer[..bins],
                 );
-                (bins, crate::audio::BASS_WINDOW_SIZE)
+                (bins, BASS_WINDOW_SIZE)
             }
             _ => {
-                // LockedTreble or Unclassified — standard 2048-point rapid FFT
-                let bins = 2048 / 2;
-                let expected_complex = 2048 / 2 + 1;
-                spectral::spectrum_to_magnitudes_into(
+                // LockedTreble or Unclassified — standard WINDOW_SIZE-point rapid FFT
+                let bins = WINDOW_SIZE / 2;
+                let expected_complex = WINDOW_SIZE / 2 + 1;
+                spectral::spectrum_to_magnitudes(
                     &frame.frequency_buffer[..expected_complex],
-                    2048,
+                    WINDOW_SIZE,
                     &mut frame.magnitude_buffer[..bins],
                 );
-                (bins, 2048)
+                (bins, WINDOW_SIZE)
             }
         };
         let spectrogram_data = &frame.magnitude_buffer[..active_bins];
 
         // TODO(DPLL): When DPLL refinement is activated, this must use active_window_size.
-        let _audio_frame = &frame.audio_buffer[..2048];
+        let _audio_frame = &frame.audio_buffer[..WINDOW_SIZE];
 
         // ── Step 3: Peak extraction + TWM with dynamic window ────────────
         let peak_count = crate::algorithms::twm::extract_spectral_peaks(
@@ -192,7 +193,7 @@ impl Engine {
         );
 
         let search_bounds = match self.routing_state {
-            RoutingState::LockedBass   => Some((27.5, 400.0)),
+            RoutingState::LockedBass => Some((27.5, 400.0)),
             RoutingState::LockedTreble => Some((130.0, 4186.0)),
             RoutingState::Unclassified => Some((27.5, 4186.0)),
         };

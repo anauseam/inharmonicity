@@ -8,8 +8,8 @@ edition = "2024"
 anyhow = "1.0.102" # For easier error handling
 
 # For running audio on a separate thread and communicating
-crossbeam-channel = { workspace = true }
 ringbuf = { workspace = true }
+triple_buffer = { workspace = true }
 cpal = { workspace = true }
 
 # Add other dependencies for math, etc.

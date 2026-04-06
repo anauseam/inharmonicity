@@ -1,3 +1,4 @@
+
 //! # Audio Processing Pipeline
 //!
 //! This module defines the lock-free memory structures, shared state types,
@@ -13,7 +14,7 @@
 //!   FFT frames transparently.
 //!
 //! - [`PipelineHandle`] is kept by the frontend (GUI, WASM, etc.). It provides
-//!   read/write access to the shared state via `Arc<Mutex<...>>`.
+//!   read/write access to the shared atomic state via `Arc<PipelineAtomics>`.
 //!
 //! ```text
 //! AudioPipeline::new() -> (AudioPipeline, PipelineHandle)
@@ -25,10 +26,12 @@
 use crossbeam_queue::ArrayQueue;
 use realfft::RealToComplex;
 use rustfft::num_complex::Complex;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Arc;
 
 use crate::audio::{BASS_WINDOW_SIZE, HOP_SIZE, WINDOW_SIZE};
 use crate::cola::CircularFifo;
+use crate::FrameOutput;
 
 use crate::engine::Engine;
 use crate::gatekeeper::{Gatekeeper, SignalState};
@@ -86,72 +89,107 @@ impl ProcessingFrame {
     }
 }
 
-// ─── Shared State Types ──────────────────────────────────────────────────────
+// ─── Wait-Free Shared State (Atomics) ────────────────────────────────────────
 
-/// Startup/UI-editable configuration. The audio thread reads only.
+/// Loads an `f32` from an [`AtomicU32`] using bit reinterpretation.
+#[inline]
+pub fn load_f32(atom: &AtomicU32) -> f32 {
+    f32::from_bits(atom.load(Ordering::Relaxed))
+}
+
+/// Stores an `f32` into an [`AtomicU32`] using bit reinterpretation.
+#[inline]
+pub fn store_f32(atom: &AtomicU32, val: f32) {
+    atom.store(val.to_bits(), Ordering::Relaxed);
+}
+
+/// Loads an `Option<f32>` from an [`AtomicU32`], treating `NaN` as `None`.
 ///
-/// These values are initialized at application startup (e.g., via noise floor
-/// calibration) and can be adjusted by the user through the Settings UI.
-/// The audio/processing thread reads them each frame to gate its behavior.
-#[derive(Debug, Clone)]
-pub struct ConfigState {
+/// This sentinel works because `NaN` is never a meaningful value for the
+/// parameters stored here (frequencies, thresholds, B coefficients).
+#[inline]
+pub fn load_option_f32(atom: &AtomicU32) -> Option<f32> {
+    let val = f32::from_bits(atom.load(Ordering::Relaxed));
+    if val.is_nan() { None } else { Some(val) }
+}
+
+/// Stores an `Option<f32>` into an [`AtomicU32`], encoding `None` as `NaN`.
+#[inline]
+pub fn store_option_f32(atom: &AtomicU32, val: Option<f32>) {
+    let bits = match val {
+        Some(v) => v.to_bits(),
+        None => f32::NAN.to_bits(),
+    };
+    atom.store(bits, Ordering::Relaxed);
+}
+
+/// UI-editable configuration parameters. The audio thread reads only.
+///
+/// Each field is an individual [`AtomicU32`] — wait-free reads with zero
+/// risk of priority inversion or lock contention. Replaces the former
+/// `Arc<Mutex<ConfigState>>`.
+pub struct ConfigAtomics {
     /// Minimum RMS amplitude required to exit the `Silence` state.
-    pub silence_threshold: f32,
+    pub silence_threshold: AtomicU32,
     /// NHWRSF threshold required to declare a new transient note event.
-    pub nhwrsf_threshold: f32,
-    /// Expected frequency hint provided by GUI keys
-    pub key_hint: Option<f32>,
-    /// Pre-calculated base inharmonicity metric
-    pub inharmonicity_b: Option<f32>,
+    pub nhwrsf_threshold: AtomicU32,
+    /// Expected frequency hint provided by GUI keys. `NaN` = `None`.
+    pub key_hint: AtomicU32,
+    /// Pre-calculated base inharmonicity metric. `NaN` = `None`.
+    pub inharmonicity_b: AtomicU32,
 }
 
-impl Default for ConfigState {
-    fn default() -> Self {
-        Self {
-            silence_threshold: 0.005,
-            nhwrsf_threshold: 0.5,
-            key_hint: None,
-            inharmonicity_b: None,
-        }
-    }
-}
-
-/// Audio-thread-owned observations. The UI reads only.
+/// Audio-thread-owned runtime observations. The UI reads only.
 ///
-/// These values are updated by the pipeline after each frame.
-/// The UI polls them (e.g., at 60 FPS during `Message::Tick`) to drive
-/// visualizations like the Envelope Viewer.
-#[derive(Debug, Clone)]
-pub struct RuntimeState {
+/// Updated by the pipeline after each frame. The UI polls these atomics
+/// (e.g., at 60 FPS during `Message::Tick`) to drive visualisations
+/// like the Envelope Viewer.
+pub struct RuntimeAtomics {
     /// The current smoothed RMS amplitude (Exponential Moving Average).
-    pub current_rms_ema: f32,
-    /// The current signal flux
-    pub current_nhwrsf: f32,
+    pub current_rms_ema: AtomicU32,
+    /// The current signal flux.
+    pub current_nhwrsf: AtomicU32,
 }
 
-impl Default for RuntimeState {
+/// Combined wait-free shared state between the DSP thread and the GUI thread.
+///
+/// Shared via `Arc<PipelineAtomics>` — both threads get a cheap clone.
+/// All operations are `Ordering::Relaxed` — sufficient for independent
+/// scalar parameters that are not part of a happens-before chain.
+pub struct PipelineAtomics {
+    /// UI → DSP: configuration parameters (silence threshold, key hint, etc.).
+    pub config: ConfigAtomics,
+    /// DSP → UI: runtime observations (RMS, NHWRSF).
+    pub runtime: RuntimeAtomics,
+    /// UI → DSP: shutdown signal. The audio thread checks this every loop iteration.
+    pub shutdown: AtomicBool,
+}
+
+impl Default for PipelineAtomics {
     fn default() -> Self {
         Self {
-            current_rms_ema: 0.0,
-            current_nhwrsf: 0.0,
+            config: ConfigAtomics {
+                silence_threshold: AtomicU32::new(0.005_f32.to_bits()),
+                nhwrsf_threshold: AtomicU32::new(0.5_f32.to_bits()),
+                key_hint: AtomicU32::new(f32::NAN.to_bits()),
+                inharmonicity_b: AtomicU32::new(f32::NAN.to_bits()),
+            },
+            runtime: RuntimeAtomics {
+                current_rms_ema: AtomicU32::new(0.0_f32.to_bits()),
+                current_nhwrsf: AtomicU32::new(0.0_f32.to_bits()),
+            },
+            shutdown: AtomicBool::new(false),
         }
     }
 }
-
-/// Thread-safe handle to `ConfigState`. Frontend writes, audio thread reads.
-pub type SharedConfigState = Arc<Mutex<ConfigState>>;
-
-/// Thread-safe handle to `RuntimeState`. Audio thread writes, frontend reads.
-pub type SharedRuntimeState = Arc<Mutex<RuntimeState>>;
 
 // ─── AudioPipeline (Mediator) ────────────────────────────────────────────────
 
 /// The orchestrator that coordinates all DSP components on the audio thread.
 ///
 /// `AudioPipeline` owns the pure DSP components (like [`Gatekeeper`]) and
-/// is the **only** thing that touches `Arc<Mutex<...>>` shared state.
-/// After each frame, it reads the DSP components' public fields and syncs
-/// the relevant observations to shared state for the frontend to poll.
+/// reads/writes the shared [`PipelineAtomics`] for parameter and observation
+/// exchange with the frontend.
 ///
 /// Created via [`AudioPipeline::new()`], which returns both the pipeline
 /// (moved to the audio thread) and a [`PipelineHandle`] (kept by the frontend).
@@ -161,9 +199,8 @@ pub struct AudioPipeline {
     /// The Engine — F0 detection chain
     pub engine: Engine,
 
-    // Shared state bridges (pipeline ↔ frontend)
-    shared_config: SharedConfigState,
-    shared_runtime: SharedRuntimeState,
+    // Wait-free shared state
+    atomics: Arc<PipelineAtomics>,
 
     // Memory infrastructure
     #[allow(dead_code)] // To be utilized upon full implementation
@@ -178,25 +215,28 @@ pub struct AudioPipeline {
 /// Frontend-side handle to the pipeline's shared state.
 ///
 /// Returned by [`AudioPipeline::new()`] and kept by the frontend (GUI, WASM, etc.).
-/// Provides `Arc<Mutex<...>>` handles for polling runtime observations and
-/// editing configuration values.
-#[derive(Debug, Clone)]
+/// Provides `Arc<PipelineAtomics>` for wait-free reads and writes.
+#[derive(Clone)]
 pub struct PipelineHandle {
-    /// Shared configuration state — the frontend can **read and write** this
-    /// (e.g., to adjust the silence threshold from the Settings UI).
-    pub config: SharedConfigState,
-
-    /// Shared runtime state — the frontend can **read** this
-    /// (e.g., to poll the current RMS for the Envelope Viewer).
-    pub runtime: SharedRuntimeState,
+    /// Shared atomic state — the frontend reads runtime observations and
+    /// writes configuration parameters.
+    pub atomics: Arc<PipelineAtomics>,
 }
 
 impl Default for PipelineHandle {
     fn default() -> Self {
         Self {
-            config: Arc::new(Mutex::new(ConfigState::default())),
-            runtime: Arc::new(Mutex::new(RuntimeState::default())),
+            atomics: Arc::new(PipelineAtomics::default()),
         }
+    }
+}
+
+impl std::fmt::Debug for PipelineHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PipelineHandle")
+            .field("silence_threshold", &load_f32(&self.atomics.config.silence_threshold))
+            .field("rms_ema", &load_f32(&self.atomics.runtime.current_rms_ema))
+            .finish()
     }
 }
 
@@ -210,8 +250,7 @@ impl AudioPipeline {
     /// A tuple of `(AudioPipeline, PipelineHandle)`.
     pub fn new() -> (Self, PipelineHandle) {
         let audio_pool = Arc::new(ArrayQueue::new(4));
-        let shared_config = Arc::new(Mutex::new(ConfigState::default()));
-        let shared_runtime = Arc::new(Mutex::new(RuntimeState::default()));
+        let atomics = Arc::new(PipelineAtomics::default());
 
         let gatekeeper = Gatekeeper::new(Arc::clone(&audio_pool));
         let engine = Engine::new(44100);
@@ -222,8 +261,7 @@ impl AudioPipeline {
         let pipeline = Self {
             gatekeeper,
             engine,
-            shared_config: Arc::clone(&shared_config),
-            shared_runtime: Arc::clone(&shared_runtime),
+            atomics: Arc::clone(&atomics),
             audio_pool,
             cola: CircularFifo::new(BASS_WINDOW_SIZE),
             fft_instance,
@@ -231,19 +269,20 @@ impl AudioPipeline {
         };
 
         let handle = PipelineHandle {
-            config: shared_config,
-            runtime: shared_runtime,
+            atomics,
         };
 
         (pipeline, handle)
     }
 
     /// Pushes new raw audio samples directly into the internal COLA FIFO.
+    ///
     /// Returns `Some` containing the DSP results IF a full hop boundary was reached.
+    /// The returned `FrameOutput` is a fixed-size struct ready for the triple buffer.
     pub fn push_audio(
         &mut self,
         samples: &[f32],
-    ) -> Option<(Option<(f32, Option<f32>)>, std::vec::Vec<f32>)> {
+    ) -> Option<FrameOutput> {
         self.cola.push_samples(samples);
 
         if self.cola.is_hop_ready(HOP_SIZE) {
@@ -254,7 +293,7 @@ impl AudioPipeline {
     }
 
     /// Internal helper that processes a single hop of audio data pulled from the COLA.
-    fn consume_cola_hop(&mut self) -> Option<(Option<(f32, Option<f32>)>, std::vec::Vec<f32>)> {
+    fn consume_cola_hop(&mut self) -> Option<FrameOutput> {
         // Read the FULL history of audio out of the sliding queue
         self.cola.read_window(
             BASS_WINDOW_SIZE,
@@ -277,32 +316,48 @@ impl AudioPipeline {
         // Run the rest of the DSP pipeline
         let engine_result = self.process_frame_internal();
 
-        let spectrogram = crate::algorithms::spectral::spectrum_to_magnitudes(
+        // Build fixed-size FrameOutput — zero heap allocations
+        let mut frame_output = FrameOutput::default();
+        let mag_count = WINDOW_SIZE / 2;
+        crate::algorithms::spectral::spectrum_to_magnitudes(
             &self.processing_frame.frequency_buffer[..],
             WINDOW_SIZE,
+            &mut frame_output.magnitudes[..mag_count],
         );
+        frame_output.magnitude_len = mag_count;
+        frame_output.rms_ema = self.gatekeeper.current_rms_ema;
+        frame_output.nhwrsf = self.gatekeeper.current_nhwrsf;
 
-        Some((engine_result, spectrogram))
+        if let Some((freq, conf)) = engine_result {
+            let note_index = crate::models::find_nearest_note_index(freq);
+            let (_, target_freq) = crate::models::find_nearest_note_by_index(note_index);
+            let cents = crate::algorithms::tuning::calculate_cents_deviation(freq, target_freq);
+            
+            frame_output.detected_frequency = Some(freq);
+            frame_output.confidence = conf;
+            frame_output.note_index = Some(note_index);
+            frame_output.cents_deviation = Some(cents);
+        }
+
+        Some(frame_output)
     }
 
     /// Internal method to run the DSP pipeline on the populated `processing_frame`.
     fn process_frame_internal(&mut self) -> Option<(f32, Option<f32>)> {
-        // 1. Read GUI-set configs into the Gatekeeper and Engine
-        if let Ok(config) = self.shared_config.try_lock() {
-            self.gatekeeper.config.silence_threshold = config.silence_threshold;
-            self.gatekeeper.config.nhwrsf_threshold = config.nhwrsf_threshold;
-            self.engine.key_hint = config.key_hint;
-            self.engine.inharmonicity_b = config.inharmonicity_b;
-        }
+        // 1. Read GUI-set configs into the Gatekeeper and Engine (wait-free)
+        self.gatekeeper.config.silence_threshold =
+            load_f32(&self.atomics.config.silence_threshold);
+        self.gatekeeper.config.nhwrsf_threshold =
+            load_f32(&self.atomics.config.nhwrsf_threshold);
+        self.engine.key_hint = load_option_f32(&self.atomics.config.key_hint);
+        self.engine.inharmonicity_b = load_option_f32(&self.atomics.config.inharmonicity_b);
 
         // 2. Pure DSP — Gatekeeper evaluates signal stability
         self.gatekeeper.process_frame(&self.processing_frame);
 
-        // 3. Sync runtime observations to shared state for the frontend
-        if let Ok(mut runtime) = self.shared_runtime.try_lock() {
-            runtime.current_rms_ema = self.gatekeeper.current_rms_ema;
-            runtime.current_nhwrsf = self.gatekeeper.current_nhwrsf;
-        }
+        // 3. Sync runtime observations to shared atomics for the frontend
+        store_f32(&self.atomics.runtime.current_rms_ema, self.gatekeeper.current_rms_ema);
+        store_f32(&self.atomics.runtime.current_nhwrsf, self.gatekeeper.current_nhwrsf);
 
         // 4. Run the Engine to extract fundamental frequency
         let is_silence = self.gatekeeper.current_state == SignalState::Silence;

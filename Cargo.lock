@@ -659,15 +659,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "crossbeam-channel"
-version = "0.5.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82b8f8f868b36967f9606790d1903570de9ceaf870a7bf9fbbd3016d636a2cb2"
-dependencies = [
- "crossbeam-utils",
-]
-
-[[package]]
 name = "crossbeam-queue"
 version = "0.3.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3216,6 +3207,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "triple_buffer"
+version = "9.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e875ab7068a75b74f419da453927e05527c36f0001b3c7aad3ce443640683487"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
 name = "ttf-parser"
 version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3230,7 +3230,6 @@ version = "0.4.1"
 dependencies = [
  "anyhow",
  "cpal",
- "crossbeam-channel",
  "crossbeam-queue",
  "linreg",
  "once_cell",
@@ -3238,6 +3237,7 @@ dependencies = [
  "ringbuf",
  "rustfft",
  "serde",
+ "triple_buffer",
 ]
 
 [[package]]
@@ -3246,7 +3246,6 @@ version = "0.4.1"
 dependencies = [
  "anyhow",
  "cpal",
- "crossbeam-channel",
  "crossbeam-queue",
  "iced",
  "realfft",
@@ -3254,6 +3253,7 @@ dependencies = [
  "rustfft",
  "serde",
  "serde_json",
+ "triple_buffer",
  "tuner-core",
 ]
 

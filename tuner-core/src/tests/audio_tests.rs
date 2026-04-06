@@ -26,9 +26,10 @@ fn test_fft_magnitude_calculation() {
     let r2c = planner.plan_fft_forward(buffer_size);
     let mut time_buffer = vec![0.0; buffer_size];
     let mut freq_buffer = vec![Complex { re: 0.0, im: 0.0 }; buffer_size / 2 + 1];
+    let mut magnitudes = vec![0.0f32; buffer_size / 2];
 
     spectral::perform_fft(&audio, &mut time_buffer, &mut freq_buffer, &r2c, buffer_size);
-    let magnitudes = spectral::spectrum_to_magnitudes(&freq_buffer, buffer_size);
+    spectral::spectrum_to_magnitudes(&freq_buffer, buffer_size, &mut magnitudes);
 
     assert_eq!(magnitudes.len(), buffer_size / 2);
 
@@ -65,9 +66,10 @@ fn test_qifft_core() {
     
     let mut time_buffer = vec![0.0; 2048];
     let mut freq_buffer = vec![Complex { re: 0.0, im: 0.0 }; 1025];
+    let mut magnitudes = vec![0.0f32; 1024];
     
     spectral::perform_fft(&audio, &mut time_buffer, &mut freq_buffer, &r2c, 2048);
-    let magnitudes = spectral::spectrum_to_magnitudes(&freq_buffer, 2048);
+    spectral::spectrum_to_magnitudes(&freq_buffer, 2048, &mut magnitudes);
     
     let freq = pitch::detect_pitch_qifft(&magnitudes, 44100).unwrap();
     assert!((freq - 440.0).abs() < 1.0, "Expected ~440.0, got {}", freq);

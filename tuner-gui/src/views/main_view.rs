@@ -161,10 +161,10 @@ fn create_spectrogram_panel(
         return None;
     }
 
-    let spectrogram_data = data
-        .last_analysis
+    let spectrogram_data: Vec<f32> = data
+        .last_frame
         .as_ref()
-        .map(|a| a.spectrogram_data.clone())
+        .map(|f| f.magnitudes[..f.magnitude_len].to_vec())
         .unwrap_or_default();
 
     let spectrogram_content: Element<'static, crate::Message> =
@@ -199,23 +199,22 @@ fn create_cent_meter_panel(
 
     // Calculate smoothed cent deviation
     let smoothed_cents = if data.smoothing_buffer.is_empty() {
-        data.last_analysis
-            .as_ref()
-            .and_then(|analysis| analysis.cents_deviation)
+        data.last_cents
     } else {
         let sum: f32 = data.smoothing_buffer.iter().sum();
         let count = data.smoothing_buffer.len() as f32;
         if count > 0.0 { Some(sum / count) } else { None }
     };
 
-    let (note_name, freq_text, confidence, _target_freq_text) = if let Some(analysis) =
-        &data.last_analysis
-    {
-        let current_freq = analysis.detected_frequency.unwrap_or(0.0);
+    let (note_name, freq_text, confidence, _target_freq_text) = {
+        let current_freq = data.last_frequency.unwrap_or(0.0);
         let note_text = match &data.tuning_mode {
-            crate::app::TuningMode::Auto => analysis
-                .note_name
-                .clone()
+            crate::app::TuningMode::Auto => data
+                .last_note_index
+                .map(|idx| {
+                    let (name, _) = tuner_core::models::find_nearest_note_by_index(idx);
+                    name
+                })
                 .unwrap_or_else(|| "--".to_string()),
             crate::app::TuningMode::Manual { note_name, .. } => note_name.clone(),
         };
@@ -223,9 +222,8 @@ fn create_cent_meter_panel(
             crate::app::TuningMode::Auto => String::from("Auto"),
             crate::app::TuningMode::Manual { target_freq, .. } => format!("{:.1} Hz", target_freq),
         };
-        // Convert the confidence value (0.0-1.0) to a percentage string.
-        let confidence_text = analysis
-            .confidence
+        let confidence_text = data
+            .last_confidence
             .map(|c| format!("{:.0}%", c * 100.0))
             .unwrap_or_else(|| "0%".to_string());
 
@@ -234,13 +232,6 @@ fn create_cent_meter_panel(
             format!("{:.2} Hz", current_freq),
             confidence_text,
             target_freq_text,
-        )
-    } else {
-        (
-            "--".to_string(),
-            "0.00 Hz".to_string(),
-            "0%".to_string(),
-            "Auto".to_string(),
         )
     };
 
@@ -274,16 +265,8 @@ fn create_keyboard_panel(
         return None;
     }
 
-    // Determine detected and selected key indices
-    let detected_key_index = data
-        .last_analysis
-        .as_ref()
-        .and_then(|analysis| analysis.note_name.as_ref())
-        .and_then(|name| {
-            Some(tuner_core::models::get_key_index_from_name(
-                name,
-            ))
-        });
+    // Detected key index — directly from NoteEvent (no String→index lookup)
+    let detected_key_index = data.last_note_index;
 
     let selected_key_index = match &data.tuning_mode {
         crate::app::TuningMode::Manual { key_index, .. } => Some(*key_index),
@@ -319,11 +302,9 @@ fn create_partials_panel(
         return None;
     }
 
-    let partials_data = data
-        .last_analysis
-        .as_ref()
-        .map(|a| a.partials.clone())
-        .unwrap_or_default();
+    // Partials have been removed from the pipeline output.
+    // This panel is kept for future use but shows no data currently.
+    let partials_data: Vec<f32> = Vec::new();
 
     let partials_content: Element<'static, crate::Message> =
         partials_display::PartialsDisplay::new(partials_data).view();
