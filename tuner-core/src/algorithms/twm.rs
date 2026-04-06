@@ -1,18 +1,16 @@
 //! # Two-Way Mismatch (TWM) Module
 //!
-//! This module implements the Two-Way Mismatch (TWM) algorithm, serving as the 
-//! coarse fundamental frequency ($f_0$) estimator in the pipeline. By generating 
-//! a theoretical template of harmonic partials and comparing it against measured 
-//! spectral peaks, TWM evaluates both "Predicted-to-Observed" and 
-//! "Observed-to-Predicted" errors to robustly identify the true $f_0$ without 
+//! This module implements the Two-Way Mismatch (TWM) algorithm, serving as the
+//! coarse fundamental frequency ($f_0$) estimator in the pipeline. By generating
+//! a theoretical template of harmonic partials and comparing it against measured
+//! spectral peaks, TWM evaluates both "Predicted-to-Observed" and
+//! "Observed-to-Predicted" errors to robustly identify the true $f_0$ without
 //! octave errors.
 //!
 //! ## Features
 //! - Sub-bin accurate spectral peak extraction via fast parabolic interpolation.
 //! - Targeted harmonic template matching with inharmonicity ($B$) coefficient compensation.
 //! - Octave-error immunity across the full piano range (A0 to C8).
-
-
 
 // Threshold above which a candidate is rejected
 const ERROR_CEILING: f32 = 0.25;
@@ -47,7 +45,7 @@ pub fn extract_spectral_peaks(
 
     let mut count = 0;
     let max_peaks = out.len();
-    
+
     // Ignore DC and Nyquist
     for i in 1..(magnitudes.len() - 1) {
         if count >= max_peaks {
@@ -63,7 +61,7 @@ pub fn extract_spectral_peaks(
             let y1 = mag_prev.max(1e-6).ln();
             let y2 = mag_curr.max(1e-6).ln();
             let y3 = mag_next.max(1e-6).ln();
-            
+
             let denom = y1 - 2.0 * y2 + y3;
             let offset = if denom.abs() > 1e-6 {
                 (y1 - y3) / (2.0 * denom)
@@ -73,7 +71,7 @@ pub fn extract_spectral_peaks(
 
             let interpolated_bin = i as f32 + offset;
             let freq = (interpolated_bin * sample_rate as f32) / window_size as f32;
-            
+
             if freq.is_finite() && freq > 0.0 {
                 out[count] = SpectralPeak {
                     freq,
@@ -83,16 +81,25 @@ pub fn extract_spectral_peaks(
             }
         }
     }
-    
+
     // Sort peaks by magnitude descending and keep only the strongest if we have many
-    out[..count].sort_unstable_by(|a, b| b.magnitude.partial_cmp(&a.magnitude).unwrap_or(std::cmp::Ordering::Equal));
+    out[..count].sort_unstable_by(|a, b| {
+        b.magnitude
+            .partial_cmp(&a.magnitude)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     count
 }
 
 /// Computes the Two-Way Mismatch error for a predicted harmonic template vs observed peaks.
-fn compute_twm_error(candidate_f0: f32, peaks: &[SpectralPeak], _sample_rate: u32, inharmonicity_b: f32) -> f32 {
+fn compute_twm_error(
+    candidate_f0: f32,
+    peaks: &[SpectralPeak],
+    _sample_rate: u32,
+    inharmonicity_b: f32,
+) -> f32 {
     let max_peak_freq = peaks.iter().map(|p| p.freq).fold(0.0_f32, f32::max);
-    
+
     // Dynamically calculate n_partials by generating expected frequencies with inharmonicity
     // until we exceed the highest measured peak (plus a half-step margin).
     let mut n_partials = 0;
@@ -105,22 +112,23 @@ fn compute_twm_error(candidate_f0: f32, peaks: &[SpectralPeak], _sample_rate: u3
         n_partials += 1;
     }
     let n_partials = n_partials.max(1);
-    
+
     // P -> O
     let mut p_to_o = 0.0;
     for n in 1..=n_partials {
         let n_f32 = n as f32;
         let p_n = candidate_f0 * n_f32 * (1.0 + inharmonicity_b * n_f32 * n_f32).sqrt();
-        
-        let min_dist = peaks.iter()
+
+        let min_dist = peaks
+            .iter()
             .map(|peak| (peak.freq - p_n).abs())
             .fold(f32::INFINITY, f32::min);
-        
+
         // Normalize distance by expected freq (cents-like scaling)
-        p_to_o += min_dist / p_n.powf(0.8); 
+        p_to_o += min_dist / p_n.powf(0.8);
     }
     p_to_o /= n_partials as f32;
-    
+
     // O -> P (split into Set α and Set β)
     // Set α: peaks >= candidate_f0 (standard normalized penalty)
     // Set β: peaks < candidate_f0  (Subharmonic Veto — absolute, undiluted penalty)
@@ -163,10 +171,11 @@ fn compute_twm_error(candidate_f0: f32, peaks: &[SpectralPeak], _sample_rate: u3
     } else {
         0.0
     };
-    
+
     // Dynamic ρ: increases when low-frequency energy is sparse (fundamental fading)
     // This prevents the O->P penalty from being globally suppressed at end-of-sustain.
-    let low_freq_energy: f32 = peaks.iter()
+    let low_freq_energy: f32 = peaks
+        .iter()
         .filter(|p| p.freq < 1000.0)
         .map(|p| p.magnitude)
         .sum();
@@ -197,24 +206,28 @@ pub fn detect_pitch_twm(
     if peaks.len() < 1 {
         return None;
     }
-    
+
     let b_val = inharmonicity_b.unwrap_or(0.0);
-    
+
     // 1. Candidate Generation
-    let mut candidates = [TwmCandidate { f0: 0.0, error: 0.0 }; 128];
+    let mut candidates = [TwmCandidate {
+        f0: 0.0,
+        error: 0.0,
+    }; 128];
     let mut num_candidates = 0;
-    
+
     if let Some(target_f0) = key_hint {
         // Targeted Mode: ±50 cents around the hint
         // ~32 candidates spaced logarithmically
         let cents_range = 50.0;
         let num_steps = 32;
-        
+
         for i in 0..num_steps {
             // map i=0..31 to -50..+50 cents
-            let cents_offset = -cents_range + (i as f32 / (num_steps - 1) as f32) * (2.0 * cents_range);
+            let cents_offset =
+                -cents_range + (i as f32 / (num_steps - 1) as f32) * (2.0 * cents_range);
             let f0 = target_f0 * 2.0_f32.powf(cents_offset / 1200.0);
-            
+
             let error = compute_twm_error(f0, peaks, sample_rate, b_val);
             candidates[num_candidates] = TwmCandidate { f0, error };
             num_candidates += 1;
@@ -223,28 +236,33 @@ pub fn detect_pitch_twm(
         // Discovery Mode
         let (min_freq, max_freq) = search_bounds.unwrap_or((27.5, 4186.0));
         let true_step = 2.0_f32.powf(1.0 / 12.0); // Exactly 1 semitone per step
-        
+
         let mut current_f0 = min_freq;
         while current_f0 <= max_freq && num_candidates < candidates.len() {
             let error = compute_twm_error(current_f0, peaks, sample_rate, b_val);
-            candidates[num_candidates] = TwmCandidate { f0: current_f0, error };
+            candidates[num_candidates] = TwmCandidate {
+                f0: current_f0,
+                error,
+            };
             num_candidates += 1;
-            
+
             current_f0 *= true_step;
         }
     }
-    
+
     if num_candidates == 0 {
         return None;
     }
-    
+
     // Find best candidate
-    let best = candidates[..num_candidates].iter().min_by(|a, b| a.error.partial_cmp(&b.error).unwrap())?;
-    
+    let best = candidates[..num_candidates]
+        .iter()
+        .min_by(|a, b| a.error.partial_cmp(&b.error).unwrap())?;
+
     if best.error > ERROR_CEILING {
         return None;
     }
-    
+
     let confidence = 1.0 - (best.error / ERROR_CEILING).clamp(0.0, 1.0);
     Some((best.f0, Some(confidence)))
 }

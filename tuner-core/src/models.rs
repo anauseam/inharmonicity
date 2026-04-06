@@ -20,6 +20,10 @@ pub struct Partial {
     pub number: u32,
     /// The measured frequency of this partial in Hz.
     pub frequency: f32,
+    /// Amplitude of this partial (for spectral envelope analysis).
+    pub amplitude: f32,
+    /// Whether the lobe shape passed the coherence check.
+    pub is_coherent: bool,
 }
 
 /// Stores all measured partials for a single piano key, plus the computed
@@ -31,11 +35,15 @@ pub struct Partial {
 pub struct KeyMeasurement {
     /// The 88-key piano index (0 = A0, 87 = C8).
     pub key_index: u8,
+    /// Measured fundamental frequency (Hz).
+    pub measured_f0: f32,
     /// All measured partials for this key (fundamental + overtones).
     pub partials: Vec<Partial>,
     /// The computed inharmonicity coefficient, or `None` if not yet calculated
     /// or if there were insufficient partials.
     pub calculated_b: Option<f32>,
+    /// UTC timestamp of the most recent capture (ISO format).
+    pub last_captured: String,
 }
 
 /// The complete inharmonicity profile for a specific piano.

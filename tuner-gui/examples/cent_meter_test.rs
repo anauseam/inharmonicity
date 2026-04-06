@@ -21,9 +21,9 @@ enum LocalMessage {
 }
 
 struct CentMeterViewer {
-    last_analysis: Option<tuner_core::AnalysisResult>,
+    last_analysis: Option<tuner_core::FrameOutput>,
     smoothing_buffer: Vec<f32>,
-    channel_rx: crossbeam_channel::Receiver<tuner_core::AnalysisResult>,
+    host_handle: tuner_core::audio::HostHandle,
 }
 
 impl CentMeterViewer {
@@ -35,7 +35,7 @@ impl CentMeterViewer {
             Self {
                 last_analysis: None,
                 smoothing_buffer: Vec::new(),
-                channel_rx: rx,
+                host_handle: rx,
             },
             Task::none(),
         )
@@ -44,17 +44,19 @@ impl CentMeterViewer {
     fn update(&mut self, message: LocalMessage) -> Task<LocalMessage> {
         match message {
             LocalMessage::Tick => {
-                // Drain the channel and take the latest frame
-                while let Ok(result) = self.channel_rx.try_recv() {
-                    if let Some(cents) = result.cents_deviation {
-                        self.smoothing_buffer.push(cents);
-                        if self.smoothing_buffer.len() > 5 {
-                            self.smoothing_buffer.remove(0);
+                if let Some(ref mut rx) = self.host_handle.frame_rx {
+                    if rx.update() {
+                        let result = rx.read().clone();
+                        if let Some(cents) = result.cents_deviation {
+                            self.smoothing_buffer.push(cents);
+                            if self.smoothing_buffer.len() > 5 {
+                                self.smoothing_buffer.remove(0);
+                            }
+                        } else {
+                            self.smoothing_buffer.clear();
                         }
-                    } else {
-                        self.smoothing_buffer.clear();
+                        self.last_analysis = Some(result);
                     }
-                    self.last_analysis = Some(result);
                 }
             }
         }
@@ -71,7 +73,14 @@ impl CentMeterViewer {
 
         let (note_name, freq_text, confidence_text) = if let Some(a) = &self.last_analysis {
             let current_freq = a.detected_frequency.unwrap_or(0.0);
-            let note_text = a.note_name.clone().unwrap_or_else(|| "--".to_string());
+            let note_text = a
+                .note_index
+                .map(|idx| {
+                    tuner_core::models::find_nearest_note_by_index(idx)
+                        .0
+                        .to_string()
+                })
+                .unwrap_or_else(|| "--".to_string());
             let conf_text = a
                 .confidence
                 .map(|c| format!("{:.0}%", c * 100.0))
@@ -82,7 +91,7 @@ impl CentMeterViewer {
             ("--".to_string(), "0.00 Hz".to_string(), "0%".to_string())
         };
 
-        CentMeterDisplay::new(smoothed_cents, note_name, freq_text, confidence_text)
+        CentMeterDisplay::new(smoothed_cents, note_name, freq_text, confidence_text, false)
             .view()
             .map(|_message| LocalMessage::Tick)
     }

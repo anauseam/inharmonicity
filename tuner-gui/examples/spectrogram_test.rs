@@ -22,7 +22,7 @@ enum LocalMessage {
 
 struct SpectrogramViewer {
     spectrum_data: Vec<f32>,
-    channel_rx: crossbeam_channel::Receiver<tuner_core::AnalysisResult>,
+    host_handle: tuner_core::audio::HostHandle,
 }
 
 impl SpectrogramViewer {
@@ -34,7 +34,7 @@ impl SpectrogramViewer {
             Self {
                 // Initialize with an empty 1024-bin FFT
                 spectrum_data: vec![0.0; 1024],
-                channel_rx: rx,
+                host_handle: rx,
             },
             Task::none(),
         )
@@ -43,9 +43,11 @@ impl SpectrogramViewer {
     fn update(&mut self, message: LocalMessage) -> Task<LocalMessage> {
         match message {
             LocalMessage::Tick => {
-                // Drain the channel and take the latest frame
-                while let Ok(result) = self.channel_rx.try_recv() {
-                    self.spectrum_data = result.spectrogram_data;
+                if let Some(ref mut rx) = self.host_handle.frame_rx {
+                    if rx.update() {
+                        let result = rx.read();
+                        self.spectrum_data = result.magnitudes[..result.magnitude_len].to_vec();
+                    }
                 }
             }
         }

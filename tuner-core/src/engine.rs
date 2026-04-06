@@ -6,227 +6,247 @@
 //!
 //! ## Sequence of processing:
 //!
-//! 1. Run the Scout Engine to determine rough frequency neighborhood.
-//! 2. Route candidate frequencies through the Two-Way Mismatch (TWM) algorithm to find coarse F0.
-//! 3. Extract sub-cent accurate F0 by passing the TWM seed bin into XQIFFT (or legacy QIFFT).
-//! 4. Output the resulting F0 and confidence back to the pipeline.
+//! 1. Stage 1: Correlate against 88 SparseTemplates on the pre-computed magnitude spectrum.
+//! 2. Route conditionals (is_bass) based on the cosine similarity crossover.
+//! 3. Stage 1.5: Phantom partial mask (bass only).
+//! 4. Sub-octave probe: O(1) check for 2× octave confusion in bass register.
+//! 5. Stages 2+3: Delegate to MAT (Median-Adjustive Trajectories) for partial extraction and F0 refinement.
 
-use crate::algorithms::{metrics, pitch, spectral};
+use crate::algorithms::{mat, templates};
 use crate::audio::{BASS_WINDOW_SIZE, WINDOW_SIZE};
 use crate::pipeline::ProcessingFrame;
-use std::sync::Arc;
 
-/// Selects the refinement pitch detection algorithm (after TWM stage 1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RefinementAlgorithm {
-    /// Quadratic Interpolated FFT — frequency-domain sub-bin peak detection.
-    XQIFFT,
-    /// Digital Phase-Locked Loop — time-domain phase tracking (future).
-    DPLL,
-    /// Phase Vocoder - frequency-domain phase angle measurement
-    PVOCODER,
-    /// Classical Quadratic Interpolated FFT
-    QIFFT,
-}
+/// Fractional energy threshold for the sub-octave probe.
+/// Both the 3rd and 5th sub-octave partials must exceed this fraction
+/// of the winning template's fundamental bin magnitude to trigger an octave bounce.
+const SUB_OCTAVE_PROBE_THRESHOLD: f32 = 0.25;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum RoutingState {
-    Unclassified,
-    LockedBass,
-    LockedTreble,
+/// Bass/treble register crossover key index.
+/// Key 39 = C4 (261.6 Hz, middle C). Notes identified below this by the 8192-pt
+/// bass FFT use the bass path; notes at or above use the treble path for its
+/// superior temporal resolution.
+const CROSSOVER_KEY: usize = 39;
+
+/// Result of a successful pitch detection frame.
+#[derive(Debug, Clone)]
+pub struct PitchResult {
+    pub f0: f32,
+    pub partial_freqs: [f32; 12],
+    pub partial_ns: [u32; 12],
+    pub partial_count: usize,
+    pub suspend_beta_update: bool,
 }
 
 /// The Fundamental Frequency ($f_0$) Engine.
 ///
-/// Executes the Scout → Router → Bass/Treble detection chain.
+/// Simply acts as a designated router between pure algorithm modules.
 pub struct Engine {
-    pub refinement_algorithm: RefinementAlgorithm,
     pub sample_rate: u32,
-    pub routing_state: RoutingState,
-    pub consecutive_bass_votes: usize,
-    pub consecutive_treble_votes: usize,
-    pub key_hint: Option<f32>,
     pub inharmonicity_b: Option<f32>,
-    pub xqifft_p: f32,
-    /// Scratch space for storing detected local maxima when creating candidates for TWM.
-    pub peak_scratch: Box<[crate::algorithms::twm::SpectralPeak]>,
-    /// Dedicated FFT instance for generating BASS_WINDOW_SIZE spectrums on bass notes.
-    pub fft_bass_instance: Arc<dyn realfft::RealToComplex<f32>>,
+    templates_treble: [templates::SparseTemplate; 88],
+    templates_bass: [templates::SparseTemplate; 88],
+    /// Scratch space for partial frequencies measured by MAT.
+    pub mat_partial_freqs: [f32; 12],
+    /// Scratch space for partial harmonic indices measured by MAT.
+    pub mat_partial_ns: [u32; 12],
 }
 
 impl Engine {
     /// Creates a new Engine with default algorithms.
     pub fn new(sample_rate: u32) -> Self {
-        let mut planner = realfft::RealFftPlanner::<f32>::new();
-        let fft_bass_instance = planner.plan_fft_forward(BASS_WINDOW_SIZE);
+        let templates_treble = templates::build_templates(sample_rate, WINDOW_SIZE);
+        let templates_bass = templates::build_templates(sample_rate, BASS_WINDOW_SIZE);
 
-        Self {
-            refinement_algorithm: RefinementAlgorithm::QIFFT,
+        Engine {
             sample_rate,
-            routing_state: RoutingState::Unclassified,
-            consecutive_bass_votes: 0,
-            consecutive_treble_votes: 0,
-            key_hint: None,
             inharmonicity_b: None,
-            xqifft_p: 0.5,
-            peak_scratch: vec![crate::algorithms::twm::SpectralPeak::default(); 30]
-                .into_boxed_slice(),
-            fft_bass_instance,
+            templates_treble,
+            templates_bass,
+            mat_partial_freqs: [0.0; 12],
+            mat_partial_ns: [0; 12],
         }
-    }
-
-    /// Evaluates the Gatekeeper state and the Band Energy Ratio to determine if the
-    /// signal should be routed to the Bass or Treble detection pipeline.
-    ///
-    /// Returns `true` if the signal is actively locked into a pipeline, or `false`
-    /// if it is still unclassified (waiting for consensus).
-    fn update_routing_state(
-        &mut self,
-        frame: &ProcessingFrame,
-        is_silence: bool,
-        is_new_onset: bool,
-    ) -> bool {
-        // Reset routing state if the signal has dropped to silence or a new hammer strike (CSD) occurs.
-        if is_silence || is_new_onset {
-            self.routing_state = RoutingState::Unclassified;
-            self.consecutive_bass_votes = 0;
-            self.consecutive_treble_votes = 0;
-        }
-
-        // If unclassified, use the Band Energy Classifier to lock a routing path.
-        if self.routing_state == RoutingState::Unclassified {
-            let expected_bins = WINDOW_SIZE / 2 + 1; // 1025 for a 2048-sample FFT
-            let ratio =
-                metrics::evaluate_band_energy_ratio(&frame.frequency_buffer[..expected_bins]);
-
-            // Asymmetric thresholding (Schmitt trigger hysteresis logic)
-            if ratio > 0.25 {
-                self.consecutive_bass_votes += 1;
-                self.consecutive_treble_votes = 0;
-            } else if ratio < 0.15 {
-                self.consecutive_treble_votes += 1;
-                self.consecutive_bass_votes = 0;
-            } else {
-                // Borderline frame (15-25%), resets confidence
-                self.consecutive_bass_votes = 0;
-                self.consecutive_treble_votes = 0;
-            }
-
-            // Lock routing if consensus reached
-            if self.consecutive_bass_votes >= 3 {
-                self.routing_state = RoutingState::LockedBass;
-                println!("Scout Locked: Bass Engine");
-            } else if self.consecutive_treble_votes >= 3 {
-                self.routing_state = RoutingState::LockedTreble;
-                println!("Scout Locked: Treble Engine");
-            }
-
-            // Delay extracting fundamental frequencies until the lock is established
-            return false;
-        }
-
-        true
     }
 
     /// Executes the primary DSP detection loop for a single frame.
-    ///
-    /// The `ProcessingFrame` must already have its `frequency_buffer` populated
-    /// by the Gatekeeper's RFFT. Returns the detected frequency (Hz) and its confidence (0.0 - 1.0).
-    /// Note that confidence is optional, as some algorithms may not produce a confidence metric.
     pub fn process(
         &mut self,
         frame: &mut ProcessingFrame,
         is_silence: bool,
         is_new_onset: bool,
-    ) -> Option<(f32, Option<f32>)> {
-        // Evaluate routing locks before proceeding to pitch detection
-        if !self.update_routing_state(frame, is_silence, is_new_onset) {
+    ) -> Option<PitchResult> {
+        if is_silence || is_new_onset {
             return None;
         }
 
-        // ── Step 1: Bass FFT (8192-point) when Scout locks Bass ──────────
-        if self.routing_state == RoutingState::LockedBass {
-            crate::algorithms::spectral::perform_fft(
-                &frame.audio_buffer[..BASS_WINDOW_SIZE],
-                &mut frame.time_buffer[..BASS_WINDOW_SIZE],
-                &mut frame.bass_frequency_buffer[..],
-                &self.fft_bass_instance,
-                BASS_WINDOW_SIZE,
-            );
+        // ── Stage 1: Dual-Track Template Correlation ──────────
+
+        let mag_count_treble = WINDOW_SIZE / 2;
+        let mag_count_bass = BASS_WINDOW_SIZE / 2;
+
+        let (key_treble, f0_treble, beta_treble, score_treble) = templates::match_template(
+            &self.templates_treble,
+            &frame.treble_magnitude_buffer[..mag_count_treble],
+        );
+
+        let (key_bass, f0_bass, beta_bass, score_bass) = templates::match_template(
+            &self.templates_bass,
+            &frame.bass_magnitude_buffer[..mag_count_bass],
+        );
+
+        // ── Register Crossover ──
+        // Cosine similarity scores are not comparable across different FFT dimensions
+        // (the coarser treble FFT concentrates energy into fewer bins, inflating scores).
+        // Instead, use the bass path's key identification to decide: the 8192-pt FFT has
+        // 4× the frequency resolution and reliably discriminates across the full spectrum.
+        // If it identifies a bass-register key, use the bass path. Otherwise, use treble
+        // for its superior temporal resolution on higher-frequency signals.
+        let is_bass = key_bass < CROSSOVER_KEY;
+
+        // DEBUG: Crossover diagnostics
+        eprintln!(
+            "[ENGINE] treble: key={} f0={:.1}Hz score={:.6} | bass: key={} f0={:.1}Hz score={:.6} | route={}",
+            key_treble,
+            f0_treble,
+            score_treble,
+            key_bass,
+            f0_bass,
+            score_bass,
+            if is_bass { "BASS" } else { "TREBLE" }
+        );
+
+        let (mut f0_et, mut beta_nominal, winning_key, active_magnitudes) = if is_bass {
+            let mags = &mut frame.bass_magnitude_buffer[..mag_count_bass];
+            // ── Stage 1.5: Phantom Partial Mask (bass register only) ──
+            // crate::algorithms::phantom::apply_phantom_mask(
+            //     mags,
+            //     f0_bass,
+            //     beta_bass,
+            //     self.sample_rate,
+            //     BASS_WINDOW_SIZE,
+            // );
+            (f0_bass, beta_bass, key_bass, &*mags)
+        } else {
+            (
+                f0_treble,
+                beta_treble,
+                key_treble,
+                &frame.treble_magnitude_buffer[..mag_count_treble],
+            )
+        };
+
+        // ── Sub-Octave Probe (bass register, key ≥ 12 only) ──
+        // Checks whether the winning template is an octave-up false positive
+        // by looking for the 3rd and 5th partial energy of the sub-octave key.
+        if is_bass && winning_key >= 12 {
+            if let Some((sub_f0, sub_beta)) =
+                self.sub_octave_probe(active_magnitudes, winning_key, f0_et)
+            {
+                f0_et = sub_f0;
+                beta_nominal = sub_beta;
+            }
         }
 
-        // ── Step 2: Conditional magnitude extraction (zero-alloc) ────────
-        let (active_bins, active_window_size) = match self.routing_state {
-            RoutingState::LockedBass => {
-                let bins = BASS_WINDOW_SIZE / 2;
-                let expected_complex = BASS_WINDOW_SIZE / 2 + 1;
-                spectral::spectrum_to_magnitudes(
-                    &frame.bass_frequency_buffer[..expected_complex],
-                    BASS_WINDOW_SIZE,
-                    &mut frame.magnitude_buffer[..bins],
-                );
-                (bins, BASS_WINDOW_SIZE)
-            }
-            _ => {
-                // LockedTreble or Unclassified — standard WINDOW_SIZE-point rapid FFT
-                let bins = WINDOW_SIZE / 2;
-                let expected_complex = WINDOW_SIZE / 2 + 1;
-                spectral::spectrum_to_magnitudes(
-                    &frame.frequency_buffer[..expected_complex],
-                    WINDOW_SIZE,
-                    &mut frame.magnitude_buffer[..bins],
-                );
-                (bins, WINDOW_SIZE)
-            }
-        };
-        let spectrogram_data = &frame.magnitude_buffer[..active_bins];
-
-        // TODO(DPLL): When DPLL refinement is activated, this must use active_window_size.
-        let _audio_frame = &frame.audio_buffer[..WINDOW_SIZE];
-
-        // ── Step 3: Peak extraction + TWM with dynamic window ────────────
-        let peak_count = crate::algorithms::twm::extract_spectral_peaks(
-            spectrogram_data,
+        // ── Stages 2 + 3: Guided Trajectory & MAT Evaluation ────────────
+        let mat_result = mat::detect_pitch_mat(
+            active_magnitudes,
             self.sample_rate,
-            active_window_size,
-            &mut self.peak_scratch,
+            f0_et,
+            beta_nominal,
+            is_bass,
+            &mut self.mat_partial_freqs,
+            &mut self.mat_partial_ns,
+        )?;
+
+        let (f0, partial_count, suspend_beta_update) = mat_result;
+
+        // DEBUG: MAT output diagnostics
+        eprintln!(
+            "[MAT] seed_f0={:.2}Hz → refined_f0={:.2}Hz | partials={} | suspend_beta={}",
+            f0_et, f0, partial_count, suspend_beta_update
         );
 
-        let search_bounds = match self.routing_state {
-            RoutingState::LockedBass => Some((27.5, 400.0)),
-            RoutingState::LockedTreble => Some((130.0, 4186.0)),
-            RoutingState::Unclassified => Some((27.5, 4186.0)),
-        };
+        // NOTE: We see MAT scews the fundamental frequency, so we use the template's f0
+        // as the final f0.This will be fixed in the future.
+        Some(PitchResult {
+            f0: f0_et,
+            partial_freqs: self.mat_partial_freqs,
+            partial_ns: self.mat_partial_ns,
+            partial_count,
+            suspend_beta_update,
+        })
+    }
 
-        let twm_result = crate::algorithms::twm::detect_pitch_twm(
-            &self.peak_scratch[..peak_count],
-            self.sample_rate,
-            search_bounds,
-            self.key_hint,
-            self.inharmonicity_b,
-        );
+    /// Sub-octave energy probe for 2× octave confusion detection.
+    ///
+    /// After the template matcher selects a bass key, this function checks
+    /// whether the sub-octave key (one octave below) has substantial energy
+    /// at its 3rd and 5th inharmonically-stretched partial positions. If both
+    /// exceed `SUB_OCTAVE_PROBE_THRESHOLD` of the winning template's
+    /// fundamental bin magnitude, the sub-octave is confirmed as the true note.
+    ///
+    /// Uses ±1 bin local maximum for spectral smearing robustness.
+    ///
+    /// Returns `Some((sub_f0_et, sub_beta))` if the probe confirms the sub-octave,
+    /// `None` if the original template result stands.
+    fn sub_octave_probe(
+        &self,
+        magnitudes: &[f32],
+        winning_key: usize,
+        winning_f0_et: f32,
+    ) -> Option<(f32, f32)> {
+        let sub_key = winning_key - 12;
+        let sub_template = &self.templates_bass[sub_key];
+        let sub_f0 = sub_template.f0_et;
+        let sub_beta = sub_template.beta_nominal;
 
-        // ── Step 4: Sub-cent refinement on the active magnitude buffer ───
-        if let Some((coarse_f0, _)) = twm_result {
-            match self.refinement_algorithm {
-                RefinementAlgorithm::XQIFFT => pitch::detect_pitch_xqifft_seeded(
-                    spectrogram_data,
-                    self.sample_rate,
-                    coarse_f0,
-                    self.xqifft_p,
-                )
-                .map(|freq| (freq, None)),
-                RefinementAlgorithm::DPLL => {
-                    pitch::detect_pitch_dpll(_audio_frame, self.sample_rate, coarse_f0)
-                }
-                RefinementAlgorithm::PVOCODER => None,
-                RefinementAlgorithm::QIFFT => {
-                    pitch::detect_pitch_qifft_seeded(spectrogram_data, self.sample_rate, coarse_f0)
-                        .map(|freq| (freq, None))
-                }
-            }
+        let hz_per_bin = self.sample_rate as f32 / BASS_WINDOW_SIZE as f32;
+        let max_bin = magnitudes.len().saturating_sub(2); // Leave room for +1 neighbor
+
+        // Reference: energy at the winning template's fundamental bin
+        let winner_bin = (winning_f0_et / hz_per_bin).round() as usize;
+        if winner_bin < 1 || winner_bin > max_bin {
+            return None;
+        }
+        let ref_energy = local_max_3(magnitudes, winner_bin);
+        if ref_energy < 1e-10 {
+            return None;
+        }
+
+        let threshold = ref_energy * SUB_OCTAVE_PROBE_THRESHOLD;
+
+        // Probe: 3rd partial of sub-octave key
+        let f3 = 3.0 * sub_f0 * (1.0 + sub_beta * 9.0).sqrt();
+        let bin3 = (f3 / hz_per_bin).round() as usize;
+        if bin3 < 1 || bin3 > max_bin {
+            return None;
+        }
+        let energy3 = local_max_3(magnitudes, bin3);
+
+        // Probe: 5th partial of sub-octave key
+        let f5 = 5.0 * sub_f0 * (1.0 + sub_beta * 25.0).sqrt();
+        let bin5 = (f5 / hz_per_bin).round() as usize;
+        if bin5 < 1 || bin5 > max_bin {
+            return None;
+        }
+        let energy5 = local_max_3(magnitudes, bin5);
+
+        // AND gate: both partials must exceed threshold
+        if energy3 >= threshold && energy5 >= threshold {
+            Some((sub_f0, sub_beta))
         } else {
             None
         }
     }
+}
+
+/// Returns the maximum magnitude across `magnitudes[bin-1..=bin+1]`.
+///
+/// Accounts for spectral leakage from windowing and β drift
+/// that can push peak energy into adjacent bins.
+#[inline]
+fn local_max_3(magnitudes: &[f32], bin: usize) -> f32 {
+    let left = magnitudes[bin - 1];
+    let center = magnitudes[bin];
+    let right = magnitudes[bin + 1];
+    left.max(center).max(right)
 }

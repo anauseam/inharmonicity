@@ -32,8 +32,8 @@ use ringbuf::{
 use std::sync::atomic::Ordering;
 use std::thread::{self, JoinHandle};
 
-use crate::pipeline::{AudioPipeline, PipelineHandle};
 use crate::FrameOutput;
+use crate::pipeline::{AudioPipeline, PipelineHandle};
 
 /// The standard analysis window size (samples).
 /// Used by the Gatekeeper, Scout, and all Engine paths.
@@ -316,7 +316,7 @@ pub fn spawn_analysis_thread(source: AudioSource) -> Result<HostHandle> {
         let mut pop_buf = [0.0_f32; 512];
 
         // Track state for debug logging
-        let mut last_logged_state = pipeline.gatekeeper.current_state.clone();
+        let mut last_was_silence = true;
 
         // Add a small delay to let GUI initialize
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -333,27 +333,25 @@ pub fn spawn_analysis_thread(source: AudioSource) -> Result<HostHandle> {
             if available > 0 {
                 consumer.pop_slice(&mut pop_buf[..available]);
 
-                let frame_output =
-                    if let Some(res) = pipeline.push_audio(&pop_buf[..available]) {
-                        res
-                    } else {
-                        continue; // Hop boundary not reached yet
-                    };
+                let frame_output = if let Some(res) = pipeline.push_audio(&pop_buf[..available]) {
+                    res
+                } else {
+                    continue; // Hop boundary not reached yet
+                };
 
                 // Write the freshest FrameOutput into the triple buffer (lossy).
                 // The GUI will read only the most recent frame.
-                tri_input.write(frame_output);
+                tri_input.write(frame_output.clone());
 
-                // Log Gatekeeper state transitions
-                if pipeline.gatekeeper.current_state != last_logged_state {
-                    eprintln!(
-                        "[GATEKEEPER] Transition: {:?} -> {:?} (CSD Dly: {}, Stable Cnt: {})",
-                        last_logged_state,
-                        pipeline.gatekeeper.current_state,
-                        pipeline.gatekeeper.transient_delay_counter,
-                        pipeline.gatekeeper.stable_counter
-                    );
-                    last_logged_state = pipeline.gatekeeper.current_state.clone();
+                // Log silence transitions
+                let current_silence = frame_output.is_silence;
+                if current_silence != last_was_silence {
+                    if current_silence {
+                        eprintln!("[GATEKEEPER] → Silence");
+                    } else {
+                        eprintln!("[GATEKEEPER] → Active");
+                    }
+                    last_was_silence = current_silence;
                 }
             } else {
                 std::thread::sleep(std::time::Duration::from_millis(2));

@@ -26,6 +26,8 @@ const METER_RANGE: f32 = 50.0;
 pub struct CentMeter {
     /// Current cent deviation (None if no pitch detected)
     cents: Option<f32>,
+    /// Whether the data is stale (unstable pitch engine)
+    is_stale: bool,
     cache: canvas::Cache,
 }
 
@@ -34,9 +36,10 @@ impl CentMeter {
     ///
     /// # Arguments
     /// * `cents` - Current cent deviation (None if no pitch detected)
-    pub fn new(cents: Option<f32>) -> Self {
+    pub fn new(cents: Option<f32>, is_stale: bool) -> Self {
         Self {
             cents,
+            is_stale,
             cache: canvas::Cache::default(),
         }
     }
@@ -82,7 +85,9 @@ impl<Message> canvas::Program<Message> for CentMeter {
                 let clamped_cents = c.clamp(-METER_RANGE, METER_RANGE);
                 let needle_pos = (clamped_cents + METER_RANGE) / (2.0 * METER_RANGE) * bounds.width;
 
-                let color = if c.abs() < 5.0 {
+                let color = if self.is_stale {
+                    Color::from_rgb8(0x80, 0x80, 0x80) // Gray
+                } else if c.abs() < 5.0 {
                     Color::from_rgb8(0x34, 0xDB, 0x98) // Green
                 } else if c.abs() < 20.0 {
                     Color::from_rgb8(0xFF, 0xC3, 0x00) // Yellow
@@ -109,6 +114,7 @@ pub struct CentMeterDisplay {
     note_name: String,
     freq_text: String,
     confidence_text: String,
+    is_stale: bool,
 }
 
 impl CentMeterDisplay {
@@ -118,34 +124,42 @@ impl CentMeterDisplay {
         note_name: String,
         freq_text: String,
         confidence_text: String,
+        is_stale: bool,
     ) -> Self {
         Self {
             cents,
             note_name,
             freq_text,
             confidence_text,
+            is_stale,
         }
     }
 
     /// Creates the view element for the rich cent meter display.
     pub fn view(self) -> Element<'static, crate::Message> {
+        let text_color = if self.is_stale {
+            Color::from_rgb8(0xAA, 0xAA, 0xAA)
+        } else {
+            Color::WHITE
+        };
+
         let content = column![
             row![
-                text("Note").size(14),
+                text("Note").size(14).color(text_color),
                 Space::new().width(Length::Fill),
-                text("Confidence").size(14),
+                text("Confidence").size(14).color(text_color),
             ],
             Space::new().height(5),
             row![
-                text(self.note_name).size(24),
+                text(self.note_name).size(24).color(text_color),
                 Space::new().width(10),
-                text(self.freq_text).size(24),
+                text(self.freq_text).size(24).color(text_color),
                 Space::new().width(Length::Fill),
-                container(text(self.confidence_text).size(16)).padding([4, 8]),
+                container(text(self.confidence_text).size(16).color(text_color)).padding([4, 8]),
             ]
             .align_y(Alignment::Center),
             Space::new().height(10),
-            CentMeter::new(self.cents).view(),
+            CentMeter::new(self.cents, self.is_stale).view(),
         ]
         .spacing(5);
 

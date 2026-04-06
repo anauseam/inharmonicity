@@ -30,7 +30,7 @@ pub fn initialize_done_timer() {
 /// # Returns
 /// * `Element` - Large, prominently styled capture button
 pub fn make_capture_button(
-    capture_state: crate::app::CaptureState,
+    capture_state: tuner_core::pipeline::CaptureState,
     capture_message: crate::Message,
 ) -> Element<'static, crate::Message> {
     // Handle timer logic for "Done" state display
@@ -60,19 +60,19 @@ pub fn make_capture_button(
     } else {
         // Show normal button behavior based on actual state
         match capture_state {
-            // When off, display "Off" and slightly dim the button.
-            crate::app::CaptureState::Off => ("Off", iced::Color::from_rgb(0.5, 0.5, 0.5), false),
+            // When idle, display "Ready".
+            tuner_core::pipeline::CaptureState::Idle => ("Ready", iced::Color::from_rgb(0.3, 0.4, 0.6), false),
             // When armed, display Armed and use a neutral or slightly distinct color...
-            crate::app::CaptureState::Armed => {
+            tuner_core::pipeline::CaptureState::Armed => {
                 ("Armed", iced::Color::from_rgb(0.8, 0.6, 0.2), false)
             } // Orange-ish
             // When actively capturing (waiting for stability), indicate progress.
-            crate::app::CaptureState::Capturing => {
+            tuner_core::pipeline::CaptureState::Recording => {
                 ("Capturing...", iced::Color::from_rgb(0.8, 0.2, 0.2), true)
             } // Red and pulsing
             // When done, show confirmed status. (A timer elsewhere resets this to Armed).
-            crate::app::CaptureState::Done => {
-                ("Done!", iced::Color::from_rgb(0.2, 0.8, 0.2), false)
+            tuner_core::pipeline::CaptureState::Processing => {
+                ("Processing...", iced::Color::from_rgb(0.2, 0.8, 0.2), false)
             } // Green
         }
     };
@@ -88,6 +88,23 @@ pub fn make_capture_button(
             }
         })
         .on_press(capture_message)
+        .into()
+}
+
+/// Creates a large Undo button that matches the capture button styling.
+/// Used to revert the last captured profile entry.
+pub fn make_undo_button(note_name: String) -> Element<'static, crate::Message> {
+    button(text(format!("Undo Capture ({})", note_name)).size(16).width(Fill))
+        .padding([10, 15])
+        .style(|_theme, _status| {
+            use iced::widget::button;
+            button::Style {
+                background: Some(iced::Background::Color(iced::Color::from_rgb(0.8, 0.4, 0.2))), // Orange
+                text_color: iced::Color::WHITE,
+                ..button::Style::default()
+            }
+        })
+        .on_press(crate::Message::UndoLastCapture)
         .into()
 }
 

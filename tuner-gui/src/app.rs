@@ -10,7 +10,6 @@
 //! - **Communication**: Wait-free SPSC primitives (rtrb + triple_buffer + atomics)
 //! - **Updates**: 60 FPS continuous updates via subscription system
 
-use crate::utils::view_utils::initialize_done_timer;
 use crate::views::{main_view::create_main_view, settings_view::create_settings_view};
 use crate::widgets::envelope::ENVELOPE_HISTORY_LENGTH;
 use iced::{self, Element, Subscription, Theme};
@@ -19,15 +18,13 @@ use tuner_core::{
     FrameOutput,
     algorithms::tuning,
     audio::{self, AudioSource, HostHandle},
-    capture_processing::{self, ProcessingOperation},
-    models::InharmonicityProfile,
-    pipeline::{PipelineHandle, load_f32, store_f32},
+    models::{InharmonicityProfile, KeyMeasurement},
+    pipeline::{PipelineHandle, load_f32, store_f32, CaptureState},
 };
+use std::sync::atomic::Ordering;
 
 // Audio processing constants
 const SMOOTHING_FACTOR: usize = 5; // Number of samples for cent smoothing
-const STABILITY_TARGET: usize = 20; // Number of stable frames required for capture
-const STABILITY_CONFIDENCE_THRESHOLD: f32 = 0.9; // Confidence threshold for stability
 
 /// Main entry point for the Inharmonicity application.
 ///
@@ -64,6 +61,7 @@ pub enum Message {
     // --- Messages for Inharmonicity Measurement & Profile ---
     ToggleMeasurementMode, // Toggle the partial measurement mode
     CaptureButtonClicked,  // Capture button was clicked (behavior depends on current state)
+    UndoLastCapture,       // Reverts the last target key overwrite (Manual or Auto)
     SaveProfile,           // Save the current inharmonicity profile
     LoadProfile,           // Load an inharmonicity profile from file
     // ----------------------------------------------
@@ -114,15 +112,6 @@ pub enum TuningMode {
         note_name: String, // Note name (e.g., "A4", "C#3")
         target_freq: f32,  // Target frequency in Hz
     },
-}
-
-/// State for the stability-gated capture system.
-#[derive(Debug, Clone, PartialEq)]
-pub enum CaptureState {
-    Off,       // Not capturing
-    Armed,     // Ready to capture (button shows "Off")
-    Capturing, // Actively capturing (button shows "Capturing")
-    Done,      // Capture is complete, data is being processed
 }
 
 #[derive(Debug, Clone)]
@@ -176,6 +165,8 @@ pub struct AppDisplayData {
     /// Most recent cents deviation from nearest ET note.
     pub last_cents: Option<f32>,
     pub smoothing_buffer: Vec<f32>,
+    /// Whether the last confident pitch metric is currently stale
+    pub is_stale: bool,
 
     // Calibration state
     pub is_calibrating: bool,
@@ -199,7 +190,9 @@ pub struct AppDisplayData {
     pub tuning_mode: TuningMode,
 
     // Capture state
+    pub measurement_mode_active: bool,
     pub capture_state: CaptureState,
+    pub undo_target_note: Option<String>,
 }
 
 /// Main application state for the Inharmonicity piano tuner.
@@ -214,10 +207,8 @@ pub struct TunerApp {
     frame_rx: Option<triple_buffer::Output<FrameOutput>>,
 
     // --- Inharmonicity State ---
-    // TODO: Remove when capture_processing.rs is replaced by Worker pipeline.
-    #[allow(deprecated)]
-    stability_buffer: VecDeque<tuner_core::AnalysisResult>,
     inharmonicity_profile: InharmonicityProfile,
+    undo_history: Option<(u8, Option<KeyMeasurement>)>,
 
     // Frontend handle to the AudioPipeline's shared atomic state
     pipeline_handle: PipelineHandle,
@@ -248,8 +239,8 @@ impl Default for TunerApp {
         Self {
             host_handle: None,
             frame_rx: None,
-            stability_buffer: VecDeque::with_capacity(STABILITY_TARGET),
             inharmonicity_profile: InharmonicityProfile::default(),
+            undo_history: None,
             pipeline_handle: PipelineHandle::default(),
             display_data: AppDisplayData {
                 audio_worker_active: false,
@@ -259,6 +250,7 @@ impl Default for TunerApp {
                 last_confidence: None,
                 last_cents: None,
                 smoothing_buffer: Vec::new(),
+                is_stale: false,
                 is_calibrating: true,
                 calibration_progress: 0,
                 calibration_total: crate::calibration::CALIBRATION_FRAMES as usize,
@@ -290,7 +282,9 @@ impl Default for TunerApp {
                     },
                 },
                 tuning_mode: TuningMode::Auto,
-                capture_state: CaptureState::Off,
+                measurement_mode_active: false,
+                capture_state: CaptureState::Idle,
+                undo_target_note: None,
             },
         }
     }
@@ -365,6 +359,7 @@ impl TunerApp {
                     if *current_key == key_index {
                         // Same key clicked again - switch to auto mode
                         self.display_data.tuning_mode = TuningMode::Auto;
+                        self.pipeline_handle.atomics.config.target_note.store(255, Ordering::Relaxed);
                         self.display_data.smoothing_buffer.clear();
                         return iced::Task::none();
                     }
@@ -378,55 +373,52 @@ impl TunerApp {
                     note_name,
                     target_freq,
                 };
+                self.pipeline_handle.atomics.config.target_note.store(key_index, Ordering::Relaxed);
                 self.display_data.smoothing_buffer.clear();
             }
             Message::SwitchToAutoMode => {
                 self.display_data.tuning_mode = TuningMode::Auto;
+                self.pipeline_handle.atomics.config.target_note.store(255, Ordering::Relaxed);
                 self.display_data.smoothing_buffer.clear();
             }
             Message::ToggleMeasurementMode => {
                 // This toggles the measurement mode on/off
-                self.display_data.capture_state = match self.display_data.capture_state {
-                    CaptureState::Off => {
-                        eprintln!("[MAIN] Measurement mode ON - starting in Armed state");
-                        CaptureState::Armed // Start in Armed state (ready to capture)
-                    }
-                    CaptureState::Armed => {
-                        eprintln!("[MAIN] Measurement mode OFF");
-                        self.stability_buffer.clear();
-                        CaptureState::Off
-                    }
-                    CaptureState::Capturing => {
-                        eprintln!("[MAIN] Measurement mode OFF (from Capturing)");
-                        self.stability_buffer.clear();
-                        CaptureState::Off
-                    }
-                    CaptureState::Done => {
-                        // If it's done, clicking again resets it
-                        eprintln!("[MAIN] Measurement mode OFF (from Done)");
-                        CaptureState::Off
-                    }
-                };
+                self.display_data.measurement_mode_active = !self.display_data.measurement_mode_active;
+                let mut new_state = CaptureState::Idle;
+
+                if self.display_data.measurement_mode_active {
+                    eprintln!("[MAIN] Measurement mode ON - starting in Armed state");
+                    new_state = CaptureState::Armed;
+                } else {
+                    eprintln!("[MAIN] Measurement mode OFF");
+                }
+                
+                self.display_data.capture_state = new_state.clone();
+                self.pipeline_handle.atomics.capture_state.store(new_state as u8, Ordering::Relaxed);
             }
             Message::CaptureButtonClicked => {
-                // This handles the capture button click behavior
-                match self.display_data.capture_state {
-                    CaptureState::Armed => {
-                        eprintln!("[MAIN] Capture button clicked - starting capture");
-                        self.display_data.capture_state = CaptureState::Capturing;
+                // Clicked the active button
+                // Wait-free: if we are in measurement mode, and state is Idle, we Arm it.
+                // If it is Armed, we can optionally go to Idle (to cancel), but measurement mode remains active.
+                if self.display_data.measurement_mode_active {
+                    let mut new_state = self.display_data.capture_state.clone();
+                    if new_state == CaptureState::Idle {
+                        new_state = CaptureState::Armed;
+                    } else if new_state == CaptureState::Armed {
+                        new_state = CaptureState::Idle;
                     }
-                    CaptureState::Capturing => {
-                        eprintln!("[MAIN] Capture button clicked - stopping capture");
-                        self.display_data.capture_state = CaptureState::Armed;
+                    self.display_data.capture_state = new_state.clone();
+                    self.pipeline_handle.atomics.capture_state.store(new_state as u8, Ordering::Relaxed);
+                }
+            }
+            Message::UndoLastCapture => {
+                if let Some((idx, old_data)) = self.undo_history.take() {
+                    if let Some(m) = old_data {
+                        self.inharmonicity_profile.measurements.insert(idx, m);
+                    } else {
+                        self.inharmonicity_profile.measurements.remove(&idx);
                     }
-                    CaptureState::Done => {
-                        eprintln!("[MAIN] Capture button clicked - resetting to Off");
-                        self.display_data.capture_state = CaptureState::Off;
-                    }
-                    CaptureState::Off => {
-                        eprintln!("[MAIN] Capture button clicked - but not in measurement mode");
-                        // Do nothing - button shouldn't be visible in Off state
-                    }
+                    eprintln!("[MAIN] Undoing profile change at index {}", idx);
                 }
             }
             Message::SaveProfile => {
@@ -593,22 +585,63 @@ impl TunerApp {
                             }
                         }
 
-                        // If no note data was detected at all (Silence or Unstable routing gap),
-                        // we clear the smoothing buffer, but preserve the last scalar integers
-                        // so the UI floats down instead of abruptly vanishing.
-                        if frame.detected_frequency.is_none() && frame.cents_deviation.is_none() {
+                        // Render State Logic: Silence vs Stale vs Valid
+                        if frame.is_silence {
+                            // Valid Silence: Drop all old measurements.
+                            self.display_data.last_frequency = None;
+                            self.display_data.last_note_index = None;
+                            self.display_data.last_confidence = None;
+                            self.display_data.last_cents = None;
                             self.display_data.smoothing_buffer.clear();
+                            self.display_data.is_stale = false;
+                        } else if frame.detected_frequency.is_none() && frame.cents_deviation.is_none() {
+                            // Valid Audio but No Pitch Lock: Freeze scalars but flag as stale to mute visual output
+                            self.display_data.smoothing_buffer.clear();
+                            self.display_data.is_stale = true;
+                        } else {
+                            // Valid Lock: Ensure we are not stale.
+                            self.display_data.is_stale = false;
                         }
-
-                        // 2. Route payload to Legacy Capture System
-                        // TODO: Remove this call when capture_processing is retired.
-                        self.process_legacy_capture(&frame);
+                        
+                        // Sync capture state from atomics for UI rendering
+                        let state_val = self.pipeline_handle.atomics.capture_state.load(Ordering::Relaxed);
+                        self.display_data.capture_state = match state_val {
+                            1 => CaptureState::Armed,
+                            2 => CaptureState::Recording,
+                            3 => CaptureState::Processing,
+                            _ => CaptureState::Idle,
+                        };
                     }
                 }
+                
+                // ── Drain Result Channel from Worker ──
+                while let Ok(measurement) = self.pipeline_handle.result_rx.try_recv() {
+                    let target_idx = measurement.key_index;
+                    
+                    // Backup old data for Undo History
+                    let old_data = self.inharmonicity_profile.measurements.get(&target_idx).cloned();
+                    self.undo_history = Some((target_idx, old_data));
+                    
+                    // Apply to profile
+                    self.inharmonicity_profile.measurements.insert(target_idx, measurement);
+                    
+                    eprintln!("[MAIN] Successfully slotted new capture data into Inharmonicity Profile at index {}", target_idx);
+
+                    // Re-arm automatically if in Auto mode
+                    if let TuningMode::Auto = self.display_data.tuning_mode {
+                        eprintln!("[MAIN] Auto-mode rearming...");
+                        self.pipeline_handle.atomics.capture_state.store(CaptureState::Armed as u8, Ordering::Relaxed);
+                        self.display_data.capture_state = CaptureState::Armed;
+                    }
+                }
+                
+                self.display_data.undo_target_note = self.undo_history.as_ref().map(|(idx, _)| {
+                    tuner_core::models::find_nearest_note_by_index(*idx).0
+                });
 
                 if self.display_data.settings_view_visible {
                     if self.display_data.settings_data.rms.visible {
-                        let rms = load_f32(&self.pipeline_handle.atomics.runtime.current_rms_ema);
+                        let rms = self.display_data.last_frame.as_ref().map(|f| f.rms_ema).unwrap_or(0.0);
                         let history = &mut self.display_data.settings_data.rms.history;
                         history.push_back(rms);
                         if history.len() > ENVELOPE_HISTORY_LENGTH {
@@ -617,7 +650,7 @@ impl TunerApp {
                         self.display_data.settings_data.rms.current_threshold =
                             load_f32(&self.pipeline_handle.atomics.config.silence_threshold);
                     } else if self.display_data.settings_data.transient.visible {
-                        let flux = load_f32(&self.pipeline_handle.atomics.runtime.current_nhwrsf);
+                        let flux = self.display_data.last_frame.as_ref().map(|f| f.nhwrsf).unwrap_or(0.0);
                         let current_threshold =
                             load_f32(&self.pipeline_handle.atomics.config.nhwrsf_threshold);
 
@@ -633,8 +666,7 @@ impl TunerApp {
 
                 // ── Calibration Hook ──
                 if self.display_data.is_calibrating {
-                    let current_rms =
-                        load_f32(&self.pipeline_handle.atomics.runtime.current_rms_ema);
+                    let current_rms = self.display_data.last_frame.as_ref().map(|f| f.rms_ema).unwrap_or(0.0);
                     if let Some(silence_val) = crate::calibration::process_calibration_tick(
                         &mut self.display_data.settings_data.rms,
                         current_rms,
@@ -666,65 +698,9 @@ impl TunerApp {
                     }
                 }
 
-                if self.display_data.capture_state == CaptureState::Done {
-                    eprintln!("[MAIN] Capture complete. Resetting state to Armed.");
-                    self.display_data.capture_state = CaptureState::Armed;
-                }
             }
         }
         iced::Task::none()
-    }
-
-    /// Legacy stability-gated capture bridge logic.
-    ///
-    /// Extracted into its own method to isolate deprecated structures from the
-    /// modern fast-path UI rendering loop above.
-    ///
-    /// TODO: Remove when capture_processing.rs is fully replaced by the new Worker pipeline.
-    fn process_legacy_capture(&mut self, frame: &FrameOutput) {
-        if let (Some(note_index), Some(frequency), Some(confidence), Some(cents_deviation)) = (
-            frame.note_index,
-            frame.detected_frequency,
-            frame.confidence,
-            frame.cents_deviation,
-        ) {
-            // --- Stability-Gated Capture Bridge ---
-            // TODO: Remove when capture_processing.rs is replaced by Worker pipeline.
-            #[allow(deprecated)]
-            if self.display_data.capture_state == CaptureState::Capturing {
-                let (note_name, _) = tuner_core::models::find_nearest_note_by_index(note_index);
-
-                let compat_result = tuner_core::AnalysisResult {
-                    detected_frequency: Some(frequency),
-                    confidence: Some(confidence),
-                    cents_deviation: Some(cents_deviation),
-                    note_name: Some(note_name),
-                };
-
-                self.stability_buffer.push_back(compat_result);
-                if self.stability_buffer.len() > STABILITY_TARGET {
-                    self.stability_buffer.pop_front();
-                }
-
-                if self.stability_buffer.len() == STABILITY_TARGET {
-                    if check_stability(&self.stability_buffer) {
-                        eprintln!("[MAIN] STABILITY DETECTED! Capturing...");
-                        self.display_data.capture_state = CaptureState::Done;
-                        let stability_data: Vec<tuner_core::AnalysisResult> =
-                            self.stability_buffer.drain(..).collect();
-                        if let Some(measurement) = capture_processing::process(
-                            stability_data,
-                            ProcessingOperation::BestConfidence,
-                        ) {
-                            self.inharmonicity_profile
-                                .measurements
-                                .insert(measurement.key_index, measurement);
-                        }
-                        initialize_done_timer();
-                    }
-                }
-            }
-        }
     }
 
     /// Renders the main application interface.
@@ -760,34 +736,6 @@ impl TunerApp {
     }
 }
 
-/// Checks if all frames in the stability buffer have the same note with high confidence.
-///
-/// TODO: Remove when capture_processing.rs is replaced by Worker pipeline.
-#[allow(deprecated)]
-fn check_stability(buffer: &VecDeque<tuner_core::AnalysisResult>) -> bool {
-    if buffer.is_empty() {
-        return false;
-    }
-
-    // Get the note name from the first frame. If it's None, it's not stable.
-    let first_note = match &buffer[0].note_name {
-        Some(n) => n,
-        None => return false,
-    };
-
-    // Use `iter().all()` to efficiently check every frame against the criteria.
-    buffer.iter().all(|frame| {
-        // 1. Check confidence
-        let high_confidence = frame
-            .confidence
-            .map_or(false, |c| c > STABILITY_CONFIDENCE_THRESHOLD);
-
-        // 2. Check for matching note name
-        let matching_note = frame.note_name.as_ref().map_or(false, |n| n == first_note);
-
-        high_confidence && matching_note
-    })
-}
 
 // --- New Profile Save/Load Functions ---
 

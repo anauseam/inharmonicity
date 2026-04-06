@@ -85,8 +85,8 @@ fn test_gatekeeper_integration() {
     let mut frame = ProcessingFrame::new();
     frame.audio_buffer[..2048].copy_from_slice(&silence);
 
-    gatekeeper.process_frame(&frame);
-    assert_eq!(gatekeeper.current_state, SignalState::Silence);
+    let result_1 = gatekeeper.process_frame(&frame);
+    assert_eq!(result_1.state, SignalState::Silence);
 
     let audio = generate_sine_wave(440.0, 44100, 2048);
     let mut planner = RealFftPlanner::<f32>::new();
@@ -102,8 +102,8 @@ fn test_gatekeeper_integration() {
         2048,
     );
 
-    gatekeeper.process_frame(&frame);
-    assert_eq!(gatekeeper.current_state, SignalState::Unstable);
+    let result_2 = gatekeeper.process_frame(&frame);
+    assert_eq!(result_2.state, SignalState::Unstable);
 
     // We expect it to reach Stable over exactly the default frames
     let _reached_stable = false;

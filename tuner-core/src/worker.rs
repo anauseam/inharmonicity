@@ -13,46 +13,335 @@
 //! the next capture could arrive, so a single dedicated thread avoids the overhead
 //! of a full thread pool.
 //!
-//! ## Wireframe Status
+//! ## Implementation
 //!
-//! This module is currently a **wireframe**. The `WorkerManager` struct holds an
-//! `Arc<AudioPool>` reference and exposes a `start_workers()` stub. When implemented:
+//! The `WorkerManager` spawns a single background thread at pipeline startup.
+//! The thread blocks on a crossbeam receiver and processes payloads as they arrive:
 //!
-//! 1. Spawn a single background thread that blocks on a crossbeam receiver
-//! 2. Receive a `Box<[f32; 66150]>` buffer (1.5s at 44.1kHz) from the Gatekeeper
-//! 3. Run MAT (professional) or ICF (educational) to compute the $B$ coefficient
-//! 4. Send the result to the UI thread
-//! 5. Recycle the buffer back to the `AudioPool`
+//! 1. Receive a `CapturePayload` (a `Box<[f32; 66150]>` buffer + metadata)
+//! 2. Perform a high-resolution FFT on the captured audio
+//! 3. Run the 88-Key Template Matcher (Auto mode) or bounded peak search (Manual mode)
+//! 4. Run MAT to extract partials and compute the $B$ coefficient
+//! 5. Write diagnostic files (audio.raw + analysis.json) to disk
+//! 6. Send a `KeyMeasurement` result to the UI via crossbeam SPSC channel
+//! 7. Recycle the buffer back to the `AudioPool`
 
-use crate::pipeline::AudioPool;
+use crate::pipeline::{AudioPool, CapturePayload, CaptureState, PipelineAtomics};
+use crate::models::{KeyMeasurement, Partial};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use crossbeam_channel::{Receiver, Sender};
+use realfft::RealToComplex;
+use rustfft::num_complex::Complex;
+use std::fs;
+use std::io::Write;
+use std::path::PathBuf;
+use crate::audio::BASS_WINDOW_SIZE;
 
 /// Manages the lifecycle of the background worker thread.
 ///
 /// The `WorkerManager` owns an `Arc<AudioPool>` so it can return processed buffers
 /// back to the pool after the heavy DSP is complete. Currently a wireframe.
 pub struct WorkerManager {
-    /// Shared reference to the lock-free object pool for buffer recycling.
-    #[allow(dead_code)] // Wireframe — will be used when worker thread is implemented
     audio_pool: Arc<AudioPool>,
+    atomics: Arc<PipelineAtomics>,
+    capture_rx: Receiver<CapturePayload>,
+    result_tx: Sender<KeyMeasurement>,
 }
 
 impl WorkerManager {
-    /// Creates a new `WorkerManager` bound to the given `AudioPool`.
-    ///
-    /// # Arguments
-    /// * `audio_pool` — Shared reference to the lock-free object pool.
-    pub fn new(audio_pool: Arc<AudioPool>) -> Self {
-        Self { audio_pool }
+    pub fn new(
+        audio_pool: Arc<AudioPool>,
+        atomics: Arc<PipelineAtomics>,
+        capture_rx: Receiver<CapturePayload>,
+        result_tx: Sender<KeyMeasurement>,
+    ) -> Self {
+        Self {
+            audio_pool,
+            atomics,
+            capture_rx,
+            result_tx,
+        }
     }
 
-    /// Spawns the background worker thread.
-    ///
-    /// **Wireframe** — currently a no-op. When implemented, this will:
-    ///
-    /// 1. Spawn a single `std::thread` that blocks on a crossbeam receiver
-    /// 2. On receipt of a buffer: run MAT or ICF → send B coefficient → recycle buffer
-    pub fn start_workers(&self) {
-        // Wireframe — implementation pending
+    pub fn start_workers(self) {
+        std::thread::spawn(move || {
+            let mut planner = realfft::RealFftPlanner::<f32>::new();
+            // Pre-plan for max size
+            let max_fft_size = BASS_WINDOW_SIZE * 8; // 65536
+            let mut fft_instance = planner.plan_fft_forward(max_fft_size);
+            
+            // Scratch buffers
+            let mut time_buffer = vec![0.0f32; max_fft_size];
+            let mut frequency_buffer = vec![Complex { re: 0.0, im: 0.0 }; max_fft_size / 2 + 1];
+            let mut magnitude_buffer = vec![0.0f32; max_fft_size / 2];
+
+            loop {
+                match self.capture_rx.recv() {
+                    Ok(payload) => {
+                        Self::process_payload(
+                            payload,
+                            &self.audio_pool,
+                            &self.atomics,
+                            &self.result_tx,
+                            &mut planner,
+                            &mut fft_instance,
+                            &mut time_buffer,
+                            &mut frequency_buffer,
+                            &mut magnitude_buffer,
+                        );
+                    }
+                    Err(_) => {
+                        // Channel closed, pipeline shut down
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    fn process_payload(
+        payload: CapturePayload,
+        audio_pool: &Arc<AudioPool>,
+        atomics: &Arc<PipelineAtomics>,
+        result_tx: &Sender<KeyMeasurement>,
+        planner: &mut realfft::RealFftPlanner<f32>,
+        fft_instance: &mut Arc<dyn RealToComplex<f32>>,
+        time_buffer: &mut [f32],
+        frequency_buffer: &mut [Complex<f32>],
+        magnitude_buffer: &mut [f32],
+    ) {
+        // Step 1: Calculate power-of-two size
+        let sample_count = payload.sample_count.max(2048);
+        let fft_size = 1 << (usize::BITS - 1 - sample_count.leading_zeros() as u32);
+        
+        if fft_instance.len() != fft_size {
+            *fft_instance = planner.plan_fft_forward(fft_size);
+        }
+
+        // Apply Hann window and copy to scratch
+        crate::algorithms::spectral::perform_fft(
+            &payload.buffer[..fft_size],
+            &mut time_buffer[..fft_size],
+            &mut frequency_buffer[..(fft_size / 2 + 1)],
+            fft_instance,
+            fft_size,
+        );
+
+        crate::algorithms::spectral::spectrum_to_magnitudes(
+            &frequency_buffer[..],
+            fft_size,
+            &mut magnitude_buffer[..(fft_size / 2)],
+        );
+
+        let mut measured_key_index = payload.target_note;
+        let actual_f0;
+        let expected_beta;
+        let hz_per_bin = payload.sample_rate as f32 / fft_size as f32;
+
+        if payload.target_note == 255 {
+            // Auto Mode: Run High-Res Template Matcher
+            let templates = crate::algorithms::templates::build_templates(payload.sample_rate, fft_size);
+            let (best_key, _, best_beta, _) = crate::algorithms::templates::match_template(
+                &templates,
+                &magnitude_buffer[..(fft_size / 2)],
+            );
+            
+            measured_key_index = best_key as u8;
+            expected_beta = best_beta;
+
+            // F0 extraction from highest magnitude in the matched fundamental bin +/- window
+            let expected_f0 = 27.5 * 2.0_f32.powf(measured_key_index as f32 / 12.0);
+            
+            // Search tight window around the organic template selection
+            let search_low = expected_f0 * 2.0_f32.powf(-1.0 / 12.0);
+            let search_high = expected_f0 * 2.0_f32.powf(1.0 / 12.0);
+            let bin_low = (search_low / hz_per_bin).floor().max(1.0) as usize;
+            let bin_high = (search_high / hz_per_bin).ceil().min((fft_size / 2 - 1) as f32) as usize;
+            
+            let mut max_mag = -1.0;
+            let mut peak_bin = bin_low;
+            for i in bin_low..=bin_high {
+                if magnitude_buffer[i] > max_mag {
+                    max_mag = magnitude_buffer[i];
+                    peak_bin = i;
+                }
+            }
+
+            let m_left = magnitude_buffer[peak_bin.saturating_sub(1)];
+            let m_peak = magnitude_buffer[peak_bin];
+            let m_right = magnitude_buffer[(peak_bin + 1).min(magnitude_buffer.len() - 1)];
+
+            if let Some(offset) = crate::algorithms::pitch::parabolic_interpolation_offset(m_left, m_peak, m_right) {
+                actual_f0 = (peak_bin as f32 + offset) * hz_per_bin;
+            } else {
+                actual_f0 = peak_bin as f32 * hz_per_bin;
+            }
+
+        } else {
+            // Manual Mode: Exact bounded F0 Peak Search +/- 1 semitone
+            let expected_f0 = 27.5 * 2.0_f32.powf(payload.target_note as f32 / 12.0);
+            expected_beta = crate::algorithms::templates::get_expected_beta(payload.target_note);
+
+            let search_low = expected_f0 * 2.0_f32.powf(-1.0 / 12.0);
+            let search_high = expected_f0 * 2.0_f32.powf(1.0 / 12.0);
+            
+            let bin_low = (search_low / hz_per_bin).floor().max(1.0) as usize;
+            let bin_high = (search_high / hz_per_bin).ceil().min((fft_size / 2 - 1) as f32) as usize;
+
+            let mut max_mag = -1.0;
+            let mut peak_bin = bin_low;
+            for i in bin_low..=bin_high {
+                if magnitude_buffer[i] > max_mag {
+                    max_mag = magnitude_buffer[i];
+                    peak_bin = i;
+                }
+            }
+
+            let m_left = magnitude_buffer[peak_bin.saturating_sub(1)];
+            let m_peak = magnitude_buffer[peak_bin];
+            let m_right = magnitude_buffer[(peak_bin + 1).min(magnitude_buffer.len() - 1)];
+
+            if let Some(offset) = crate::algorithms::pitch::parabolic_interpolation_offset(m_left, m_peak, m_right) {
+                actual_f0 = (peak_bin as f32 + offset) * hz_per_bin;
+            } else {
+                actual_f0 = peak_bin as f32 * hz_per_bin;
+            }
+        }
+
+        // Step 3: Run MAT via process_payload decoupled procedure
+        let mut partial_freqs_out = [0.0; 12];
+        let mut partial_ns_out = [0u32; 12];
+        
+        // This calculates beta naturally
+        let mut partials = Vec::new();
+        let mut calculated_b = expected_beta;
+
+        let mat_res = crate::algorithms::mat::detect_pitch_mat(
+            magnitude_buffer,
+            payload.sample_rate,
+            actual_f0,
+            expected_beta,
+            true, // is_bass -> use noise resistant Quinn 2nd estimator
+            &mut partial_freqs_out,
+            &mut partial_ns_out,
+        );
+
+        if let Some((_, p_count, _)) = mat_res {
+            // Because detect_pitch_mat doesn't currently return the paired-up Beta array nicely,
+            // we will just use basic pairwise comparison ourselves here to find beta
+            // Or just store the fallback expected_beta
+            
+            // To be accurate, let's just do a quick Beta combination from the extracted partial array:
+            let mut b_sum = 0.0;
+            let mut pairs = 0;
+            for i in 0..p_count {
+                for j in (i + 1)..p_count {
+                    let f_m = partial_freqs_out[i];
+                    let n_m = partial_ns_out[i];
+                    let f_n = partial_freqs_out[j];
+                    let n_n = partial_ns_out[j];
+                    
+                    let k_m = (f_m / n_m as f32).powi(2);
+                    let k_n = (f_n / n_n as f32).powi(2);
+                    let denom = k_m * (n_n as f32).powi(2) - k_n * (n_m as f32).powi(2);
+                    if denom.abs() > 1e-8 {
+                        let b = (k_n - k_m) / denom;
+                        if b > -0.001 && b < 0.01 {
+                            b_sum += b;
+                            pairs += 1;
+                        }
+                    }
+                }
+            }
+            if pairs > 0 {
+                calculated_b = b_sum / pairs as f32;
+            }
+
+            for i in 0..p_count {
+                let bin = (partial_freqs_out[i] / hz_per_bin).round() as usize;
+                let amp = if bin < magnitude_buffer.len() { magnitude_buffer[bin] } else { 0.0 };
+
+                partials.push(Partial {
+                    number: partial_ns_out[i],
+                    frequency: partial_freqs_out[i],
+                    amplitude: amp,
+                    is_coherent: true, // We don't have access to coherence flags out of detect_pitch_mat
+                });
+            }
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // Build Measurement
+        let measurement = KeyMeasurement {
+            key_index: measured_key_index,
+            measured_f0: actual_f0,
+            partials,
+            calculated_b: Some(calculated_b),
+            last_captured: format!("{}", now), // Basic string timestamp
+        };
+
+        // Step 4: Write Diagnostic Dump
+        Self::write_diagnostics(&payload, &measurement, fft_size, payload.sample_rate as f32 / fft_size as f32);
+
+        // Step 5: Clean up and send result
+        let _ = result_tx.try_send(measurement);
+
+        // Reset capture state back to Idle
+        atomics.capture_state.store(CaptureState::Idle as u8, Ordering::Relaxed);
+
+        // Return boxed array to memory pool
+        let _ = audio_pool.push(payload.buffer);
+    }
+
+    fn write_diagnostics(payload: &CapturePayload, measurement: &KeyMeasurement, fft_size: usize, hz_per_bin: f32) {
+        let (key_name, _) = crate::models::find_nearest_note_by_index(measurement.key_index);
+        
+        // Use measurement's organically resolved key_index
+        let mut dir = PathBuf::from("diagnostics");
+        dir.push(format!("key_{:03}_{}", measurement.key_index, key_name));
+        
+        if fs::create_dir_all(&dir).is_ok() {
+            // Write audio.raw
+            let mut file = dir.clone();
+            file.push("audio.raw");
+            if let Ok(mut f) = fs::File::create(file) {
+                // write f32 bytes
+                let slice = &payload.buffer[..payload.sample_count];
+                let byte_slice: &[u8] = unsafe {
+                    std::slice::from_raw_parts(
+                        slice.as_ptr() as *const u8,
+                        slice.len() * std::mem::size_of::<f32>(),
+                    )
+                };
+                let _ = f.write_all(byte_slice);
+            }
+
+            // Write analysis.json
+            let mut file2 = dir.clone();
+            file2.push("analysis.json");
+            if let Ok(mut f2) = fs::File::create(file2) {
+                let json = serde_json::json!({
+                    "key_index": payload.target_note,
+                    "appVersion": "0.1",
+                    "metadata": {
+                        "key_index": measurement.key_index,
+                        "sample_rate": payload.sample_rate,
+                        "target_note_input": payload.target_note,
+                        "measured_f0": measurement.measured_f0,
+                        "expected_f0": 27.5 * 2.0_f32.powf(measurement.key_index as f32 / 12.0),
+                        "fft_size": fft_size,
+                        "hz_per_bin": hz_per_bin,
+                        "calculated_b": measurement.calculated_b,
+                        "partials": measurement.partials,
+                    }
+                });
+                let _ = f2.write_all(serde_json::to_string_pretty(&json).unwrap_or_default().as_bytes());
+            }
+        }
     }
 }
