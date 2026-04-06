@@ -20,20 +20,17 @@
 //! | [`models`] | Domain data types, lookup tables, and serializable structures |
 //! | [`audio`] | CPAL audio capture, stream management, standalone host extension |
 //! | [`pipeline`] | AudioPipeline mediator, shared state types, memory pools |
-//! | [`engine`] | F0 Engine — Scout / Bass / Treble DSP (wireframe) |
+//! | [`engine`] | F0 Engine — 3-Stage Matched Filter pitch detection |
 //! | [`gatekeeper`] | 5-state signal validator (pure DSP, no shared state) |
-//! | [`worker`] | Background worker for heavy offline DSP (wireframe) |
-//! | [`capture_processing`] | Legacy frame processing (deprecated) |
+//! | [`worker`] | Background worker for heavy offline DSP |
 
 /// Stateless DSP building blocks: spectral transforms, pitch detection, signal metrics, and tuning math.
 pub mod algorithms;
 /// CPAL audio capture, device selection, real-time streaming, and standalone host extension.
 pub mod audio;
-/// Legacy capture frame processing (deprecated — to be replaced by `pipeline` + `worker`).
-pub mod capture_processing;
 /// Circular FIFO overlapping analysis sliding window.
 pub mod cola;
-/// F0 Engine — Scout, Bass, and Treble frequency detection (wireframe).
+/// F0 Engine — 3-Stage Matched Filter pitch detection.
 pub mod engine;
 /// 5-state signal validator (pure DSP). Evaluates RMS, CSD, and NINOS2 for stability gating.
 pub mod gatekeeper;
@@ -41,7 +38,7 @@ pub mod gatekeeper;
 pub mod models;
 /// AudioPipeline mediator: orchestrates DSP components, owns shared state, memory pools.
 pub mod pipeline;
-/// Background worker manager for heavy offline DSP (MAT / ICF).
+/// Background worker manager for heavy offline DSP (MAT, Beta calculation).
 pub mod worker;
 
 /// Continuous per-hop visualization payload sent from the DSP thread to the
@@ -65,14 +62,26 @@ pub struct FrameOutput {
     pub rms_ema: f32,
     /// Current Normalised Half-Wave Rectified Spectral Flux.
     pub nhwrsf: f32,
+    /// Indicates whether the Gatekeeper evaluates the current signal as absolute silence.
+    pub is_silence: bool,
     /// 88-key piano index (0 = A0, 87 = C8), if a note is currently locked.
     pub note_index: Option<u8>,
     /// Detected fundamental frequency in Hz, if a note is currently locked.
     pub detected_frequency: Option<f32>,
-    /// Detection confidence (0.0–1.0), if a note is currently locked.
+    /// Detection confidence (0.0–1.0). Currently unused by MAT, returning None.
     pub confidence: Option<f32>,
-    /// Deviation from nearest equal-temperament note in cents (positive = sharp), if a note is currently locked.
+    /// Deviation from nearest equal-temperament note in cents (positive = sharp).
     pub cents_deviation: Option<f32>,
+    /// Real-time partial frequencies for multi-ring strobe visualization.
+    /// Valid entries: `[0..partial_count]`.
+    pub partial_freqs: [f32; 12],
+    /// Harmonic index (n) for each partial. Parallel to `partial_freqs`.
+    pub partial_ns: [u32; 12],
+    /// Number of valid entries in `partial_freqs` / `partial_ns`.
+    pub partial_count: usize,
+    /// Flag indicating the engine encountered beating unisons or distorted spectra.
+    /// Prevents poisoning persistent calibration states downstream.
+    pub suspend_beta_update: bool,
 }
 
 impl Default for FrameOutput {
@@ -82,10 +91,15 @@ impl Default for FrameOutput {
             magnitude_len: 0,
             rms_ema: 0.0,
             nhwrsf: 0.0,
+            is_silence: true,
             note_index: None,
             detected_frequency: None,
             confidence: None,
             cents_deviation: None,
+            partial_freqs: [0.0; 12],
+            partial_ns: [0; 12],
+            partial_count: 0,
+            suspend_beta_update: false,
         }
     }
 }
@@ -95,37 +109,18 @@ impl std::fmt::Debug for FrameOutput {
         f.debug_struct("FrameOutput")
             .field("magnitude_len", &self.magnitude_len)
             .field("rms_ema", &self.rms_ema)
-            .field("nhwrsf", &self.nhwrsf)
+            .field("is_silence", &self.is_silence)
             .field("note_index", &self.note_index)
             .field("detected_frequency", &self.detected_frequency)
             .field("confidence", &self.confidence)
             .field("cents_deviation", &self.cents_deviation)
+            .field("partial_count", &self.partial_count)
+            .field("suspend_beta_update", &self.suspend_beta_update)
             .finish()
     }
 }
 
-// ─── Deprecated Compatibility Shim ───────────────────────────────────────────
 
-/// Temporary compatibility type used only by the deprecated [`capture_processing`] module.
-///
-/// This struct exists solely to keep `capture_processing.rs` compiling until it
-/// is replaced by the Worker pipeline. The GUI (`app.rs`) constructs instances
-/// by repackaging [`NoteEvent`] data on the UI thread.
-///
-/// **Do not use this type for new code.** Use [`FrameOutput`] instead.
-// TODO: Remove when capture_processing.rs is replaced by Worker pipeline.
-#[deprecated(note = "Use FrameOutput instead. Remove with capture_processing.rs.")]
-#[derive(Debug, Clone)]
-pub struct AnalysisResult {
-    /// Detected frequency in Hz, or `None` if silence/noise.
-    pub detected_frequency: Option<f32>,
-    /// Detection confidence (0.0–1.0).
-    pub confidence: Option<f32>,
-    /// Cents deviation from nearest ET note.
-    pub cents_deviation: Option<f32>,
-    /// Note name string (e.g., "A4"). Reconstructed on the UI thread from note index.
-    pub note_name: Option<String>,
-}
 
 #[cfg(test)]
 mod tests {

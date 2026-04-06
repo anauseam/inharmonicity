@@ -32,7 +32,7 @@ impl From<tuner_gui::Message> for LocalMessage {
 struct KeyboardView {
     detected_key_index: Option<u8>,
     selected_key_index: Option<u8>,
-    channel_rx: crossbeam_channel::Receiver<tuner_core::AnalysisResult>,
+    host_handle: tuner_core::audio::HostHandle,
 }
 
 impl KeyboardView {
@@ -44,7 +44,7 @@ impl KeyboardView {
             Self {
                 detected_key_index: None,
                 selected_key_index: None,
-                channel_rx: rx,
+                host_handle: rx,
             },
             Task::none(),
         )
@@ -53,11 +53,11 @@ impl KeyboardView {
     fn update(&mut self, message: LocalMessage) -> Task<LocalMessage> {
         match message {
             LocalMessage::Tick => {
-                // Drain the channel and take the latest frame's note name
-                while let Ok(result) = self.channel_rx.try_recv() {
-                    self.detected_key_index = result
-                        .note_name
-                        .map(|name| tuner_core::models::get_key_index_from_name(&name));
+                if let Some(ref mut rx) = self.host_handle.frame_rx {
+                    if rx.update() {
+                        let result = rx.read().clone();
+                        self.detected_key_index = result.note_index;
+                    }
                 }
             }
             LocalMessage::KeyClicked(idx) => {

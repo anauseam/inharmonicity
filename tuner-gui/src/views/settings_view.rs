@@ -109,8 +109,23 @@ fn create_settings_sidebar(data: &crate::app::AppDisplayData) -> Element<'static
 
     // Add all settings sections
     for (title, buttons) in SETTINGS_SIDEBAR_CONFIG {
-        let in_measurement_mode = data.capture_state != crate::app::CaptureState::Off;
-        sections = sections.push(make_sidebar_section(title, buttons, in_measurement_mode));
+        sections = sections.push(make_sidebar_section(title, buttons, data.measurement_mode_active));
+    }
+
+    // Add capture button if in measurement mode
+    if data.measurement_mode_active {
+        sections = sections.push(
+            crate::utils::view_utils::make_capture_button(
+                data.capture_state.clone(),
+                crate::Message::CaptureButtonClicked,
+            ),
+        );
+    }
+
+    // Show undo button if undo history exists
+    if let Some(note_name) = data.undo_target_note.clone() {
+        sections = sections.push(iced::widget::Space::new().height(20));
+        sections = sections.push(crate::utils::view_utils::make_undo_button(note_name));
     }
 
     container(sections.padding(15))

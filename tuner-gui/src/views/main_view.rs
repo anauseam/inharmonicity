@@ -4,7 +4,7 @@
 //! for the Inharmonicity piano tuning application.
 
 use crate::utils::view_utils::{
-    ButtonConfig, ButtonType, make_capture_button, make_sidebar_section,
+    ButtonConfig, ButtonType, make_capture_button, make_undo_button, make_sidebar_section,
 };
 use crate::widgets::{cent_meter, partials_display, piano_keyboard, spectrogram};
 use iced::widget::{Space, button, column, container, row, text};
@@ -89,7 +89,12 @@ pub fn create_main_view(
     let widget_area = create_widget_area(data);
 
     // Create sidebar
-    let sidebar = create_sidebar(data.capture_state.clone(), capture_message);
+    let sidebar = create_sidebar(
+        data.measurement_mode_active,
+        data.capture_state.clone(),
+        data.undo_target_note.clone(),
+        capture_message,
+    );
 
     // Assemble the final layout
     let main_content = row![sidebar, Space::new().width(10), widget_area,]
@@ -236,7 +241,7 @@ fn create_cent_meter_panel(
     };
 
     let cent_meter_content: Element<'static, crate::Message> = container(
-        cent_meter::CentMeterDisplay::new(smoothed_cents, note_name, freq_text, confidence).view(),
+        cent_meter::CentMeterDisplay::new(smoothed_cents, note_name, freq_text, confidence, data.is_stale).view(),
     )
     .width(Fill)
     .height(Fill)
@@ -369,7 +374,9 @@ fn create_partials_panel(
 /// # Returns
 /// * `Element` - Complete sidebar widget with all controls and sections
 fn create_sidebar(
-    capture_state: crate::app::CaptureState,
+    measurement_mode_active: bool,
+    capture_state: tuner_core::pipeline::CaptureState,
+    undo_target_note: Option<String>,
     capture_message: crate::Message,
 ) -> Element<'static, crate::Message> {
     let mut sections = column![].spacing(10);
@@ -395,13 +402,17 @@ fn create_sidebar(
 
     // Add all settings sections
     for (title, buttons) in MAIN_SIDEBAR_CONFIG {
-        let in_measurement_mode = capture_state != crate::app::CaptureState::Off;
-        sections = sections.push(make_sidebar_section(title, buttons, in_measurement_mode));
+        sections = sections.push(make_sidebar_section(title, buttons, measurement_mode_active));
     }
 
     // Add capture button if in measurement mode
-    if capture_state != crate::app::CaptureState::Off {
+    if measurement_mode_active {
         sections = sections.push(make_capture_button(capture_state, capture_message));
+    }
+
+    if let Some(note_name) = undo_target_note {
+        sections = sections.push(Space::new().height(20));
+        sections = sections.push(make_undo_button(note_name));
     }
 
     container(sections.padding(15))

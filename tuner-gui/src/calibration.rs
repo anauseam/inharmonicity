@@ -4,8 +4,6 @@
 //! noise floor baseline natively within the GUI tick loop, removing the
 //! need to spawn separate CPAL audio streams.
 
-
-
 /// The multiplier applied to the absolute maximum RMS value recorded.
 pub const DEFAULT_NOISE_MULTIPLIER: f32 = 1.5;
 
@@ -14,11 +12,11 @@ pub const DEFAULT_NOISE_MULTIPLIER: f32 = 1.5;
 pub const WARMUP_FRAMES: u32 = 45;
 
 /// The total number of audio hops to measure the noise floor.
-/// 120 hops at ~43Hz = ~2.8 seconds.
-pub const CALIBRATION_FRAMES: u32 = 120;
+/// 86 hops at ~43Hz = ~2 seconds.
+pub const CALIBRATION_FRAMES: u32 = 86;
 
 /// Processes a single GUI tick during the startup or manual RMS noise calibration.
-/// 
+///
 /// Updates the countdowns and tracking. Returns `Some(f32)` if the calibration
 /// has completed on this tick, yielding the newly calculated silence threshold.
 pub fn process_calibration_tick(

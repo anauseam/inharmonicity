@@ -22,7 +22,7 @@ enum LocalMessage {
 
 struct PartialsViewer {
     partials: Vec<f32>,
-    channel_rx: crossbeam_channel::Receiver<tuner_core::AnalysisResult>,
+    host_handle: tuner_core::audio::HostHandle,
 }
 
 impl PartialsViewer {
@@ -33,7 +33,7 @@ impl PartialsViewer {
         (
             Self {
                 partials: Vec::new(),
-                channel_rx: rx,
+                host_handle: rx,
             },
             Task::none(),
         )
@@ -42,9 +42,12 @@ impl PartialsViewer {
     fn update(&mut self, message: LocalMessage) -> Task<LocalMessage> {
         match message {
             LocalMessage::Tick => {
-                // Drain the channel and take the latest frame's partials
-                while let Ok(result) = self.channel_rx.try_recv() {
-                    self.partials = result.partials;
+                // Partials are temporarily stubbed per the GUI refactor
+                if let Some(ref mut rx) = self.host_handle.frame_rx {
+                    if rx.update() {
+                        let _result = rx.read().clone();
+                        self.partials = vec![440.0, 880.0, 1320.0, 1760.0];
+                    }
                 }
             }
         }

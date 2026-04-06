@@ -6,11 +6,12 @@
 
 use iced::widget::container;
 use iced::{Element, Length, Subscription, Theme};
-use tuner_core::AnalysisResult;
+
 
 mod shared;
-use tuner_gui::app::{AppDisplayData, CaptureState, TuningMode};
+use tuner_gui::app::{AppDisplayData, TuningMode};
 use tuner_gui::views::main_view::create_widget_area;
+use tuner_core::pipeline::CaptureState;
 
 pub fn main() -> iced::Result {
     iced::application(
@@ -26,7 +27,7 @@ pub fn main() -> iced::Result {
 
 struct DashboardTest {
     display_data: AppDisplayData,
-    audio_receiver: Option<crossbeam_channel::Receiver<AnalysisResult>>,
+    audio_receiver: Option<tuner_core::audio::HostHandle>,
 }
 
 #[derive(Debug, Clone)]
@@ -46,7 +47,11 @@ impl DashboardTest {
 
         let display_data = AppDisplayData {
             audio_worker_active: true,
-            last_analysis: None,
+            last_frame: None,
+            last_note_index: None,
+            last_frequency: None,
+            last_confidence: None,
+            last_cents: None,
             smoothing_buffer: Vec::new(),
             is_calibrating: false,
             calibration_progress: 0,
@@ -57,14 +62,27 @@ impl DashboardTest {
             partials_visible: true,
             settings_view_visible: false,
             settings_data: tuner_gui::app::SettingsDisplayData {
-                rms_history: std::collections::VecDeque::new(),
-                current_silence_threshold: 0.005,
-                calibration_complete: true,
-                noise_floor_adjustment_visible: false,
-                nhwrsf_noise_floor: 0.0,
+                rms: tuner_gui::app::NoiseFloorSettings {
+                    history: std::collections::VecDeque::new(),
+                    current_threshold: 0.005,
+                    calibration_complete: true,
+                    visible: false,
+                    active_calibration: None,
+                },
+                transient: tuner_gui::app::TransientSettings {
+                    noise_floor_baseline: 0.0,
+                    visible: false,
+                    is_frozen: false,
+                    freeze_countdown: None,
+                    history: std::collections::VecDeque::new(),
+                    current_threshold: 0.05,
+                },
             },
             tuning_mode: TuningMode::Auto,
-            capture_state: CaptureState::Off,
+            measurement_mode_active: false,
+            capture_state: CaptureState::Idle,
+            undo_target_note: None,
+            is_stale: false,
         };
 
         (
@@ -80,20 +98,25 @@ impl DashboardTest {
         match message {
             LocalMessage::Tick => {
                 // Poll the audio receiver 60 times a second
-                if let Some(rx) = &self.audio_receiver {
-                    while let Ok(result) = rx.try_recv() {
-                        // Update the smoothing buffer for the cent meter
-                        if let Some(cents) = result.cents_deviation {
-                            self.display_data.smoothing_buffer.push(cents);
-                            if self.display_data.smoothing_buffer.len() > 5 {
-                                self.display_data.smoothing_buffer.remove(0);
+                if let Some(host) = &mut self.audio_receiver {
+                    if let Some(ref mut rx) = host.frame_rx {
+                        if rx.update() {
+                            let result = rx.read().clone();
+                            if let Some(cents) = result.cents_deviation {
+                                self.display_data.smoothing_buffer.push(cents);
+                                if self.display_data.smoothing_buffer.len() > 5 {
+                                    self.display_data.smoothing_buffer.remove(0);
+                                }
+                            } else {
+                                self.display_data.smoothing_buffer.clear();
                             }
-                        } else {
-                            self.display_data.smoothing_buffer.clear();
+                            // Store the latest analysis
+                            self.display_data.last_frame = Some(result.clone());
+                            self.display_data.last_note_index = result.note_index;
+                            self.display_data.last_frequency = result.detected_frequency;
+                            self.display_data.last_confidence = result.confidence;
+                            self.display_data.last_cents = result.cents_deviation;
                         }
-
-                        // Store the latest analysis
-                        self.display_data.last_analysis = Some(result);
                     }
                 }
             }

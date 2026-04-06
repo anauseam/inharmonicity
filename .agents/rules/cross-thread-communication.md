@@ -22,19 +22,27 @@ Always use the following SPSC/Wait-Free architectures:
 
 3. **Structural DSP Output (DSP -> UI)**
    - Use: Wait-Free Triple Buffer (e.g. `triple_buffer` crate)
-   - Purpose: Moving F0 pitch tracks, partials, metrics, and state out of the DSP. The old pattern of sending discrete events via `rtrb` or channels is **deprecated** in favour of continuous lossy outputs to be parsed completely by the UI tick. Avoid keeping state buffers between DSP and UI threads unless unavoidable.
+   - Purpose: Moving F0 pitch tracks, partials, metrics, and state out of the DSP. The old pattern of sending discrete events via `rtrb` or channels is **removed** in favour of continuous lossy outputs to be parsed completely by the UI tick. Avoid keeping state buffers between DSP and UI threads unless unavoidable.
 
-4. **Non-RT Background Calibration (Background Worker -> UI)**
-   - **Telemetry Exception Rule**: While generic unbounded channels (`std::sync::mpsc`) are strictly forbidden inside the Real-Time audio pipeline (to prevent CPU overhead and xruns), they are the **approved standard** for offline background UI telemetry (like calibration wizard sensing).
-   - Use: Standard MPSC channel (`std::sync::mpsc::channel`)
-   - Purpose: Calibration sequences (e.g. noise floor reading, strike capture) happen offline, wait for user input, and silence the main pipeline. They do not share the strict RT boundary of the CPAL-driven audio stream. Thus, an allocation-free (after setup), lossless elastic buffer like an standard channel is technically superior and safer, providing reliability without risking hardware dropouts.
-
-5. **Single/Isolated DSP Parameters (UI -> DSP)**
+4. **Single/Isolated DSP Parameters (UI -> DSP)**
    - Use: Hardware Atomics (`std::sync::atomic::AtomicUsize`, `AtomicU32`, etc.)
    - Purpose: Adjusting individual settings (thresholds, multipliers). Use `f32::to_bits()` / `f32::from_bits()` for floats.
 
-6. **Grouped/Dependent DSP Parameters (UI → DSP)**
+5. **Grouped/Dependent DSP Parameters (UI → DSP)**
    - Use: Fixed capacity SPSC Ring Buffer sending Command Enums (`ringbuf`).
    - Purpose: Changing complex states that must change atomically on the DSP frame boundary.
    - **Heap-Allocation Invariant:** All DSP-side data must be one-time allocated at startup via `Box<[T]>` or equivalent and must live until program shutdown. Command enum variants flowing from the UI to the DSP thread MUST NOT carry heap-allocated fields (`Vec<T>`, `Box<[T]>`, `String`, etc.). Rust's ownership model guarantees correctness, but `Drop` on a heap object invokes the global OS allocator's `free()`, which uses OS-level mutexes and produces non-deterministic latency spikes (xruns) even without a data race.
    - **Trash Queue:** Only required if the heap-allocation invariant above is ever violated (e.g., a hot filter-coefficient swap). In that case, push the *old* object out through a dedicated SPSC ring buffer (DSP → UI) to be dropped by the UI thread on its next `Tick`. This scenario should be treated as a design smell — reconsider before implementing.
+
+6. **Offline Background Worker Dispatches (DSP → Worker → UI)**
+   - Use: `crossbeam::channel::bounded` (with `.try_send()` on the DSP side).
+   - Purpose: Offloading heavy, non-realtime computations (high-res FFT, Template Matching, MAT partial extraction, β calculation, diagnostics I/O) to a single dedicated background worker thread.
+   - Mechanism: 
+     - DSP → Worker: The pipeline transfers a `CapturePayload` (containing a pre-allocated `Box<[f32; 66150]>` from the `AudioPool` + metadata like `target_note` and `sample_rate`) to the worker via `.try_send()` (wait-free on a bounded crossbeam channel).
+     - Worker → UI: The worker sends the resulting `KeyMeasurement` (which may contain heap-allocated fields like `Vec<Partial>` and `String`) back to the UI via `.send()`. The UI drains it via `.try_recv()` in its tick loop.
+     - Worker → AudioPool: After processing, the worker recycles the buffer back to the `AudioPool` and resets `CaptureState` to `Idle` via the shared `AtomicU8`.
+   - **CaptureState Baton-Pass:** The `CaptureState` `AtomicU8` uses a strict baton-pass pattern. Three threads each own distinct transitions:
+     - GUI: `Idle → Armed` (arm), `Armed → Idle` (cancel)  
+     - DSP Pipeline: `Armed → Recording` (stability detected), `Recording → Processing` (buffer full or silence decay)
+     - Worker: `Processing → Idle` (computation complete)
+   - **Heap-Allocation Exception:** Because the Worker → GUI path involves only non-realtime threads, data structures crossing this boundary (like `KeyMeasurement`) *are allowed* to carry heap-allocated fields (`Vec<T>`, `String`, etc.). The strict zero-allocation invariant only applies to paths interacting with the real-time DSP thread.

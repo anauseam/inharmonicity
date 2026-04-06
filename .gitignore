@@ -27,6 +27,9 @@ README.html
 # Generated JSON files
 tuning_profile.json
 
+# Diagnostics
+diagnostics/
+
 # AI-related files
 .agents/workflows/
 

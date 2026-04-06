@@ -6,18 +6,20 @@
 //! | Submodule | Domain | Returns |
 //! |---|---|---|
 //! | [`spectral`] | Time ↔ frequency transforms | Complex spectra, magnitude vectors |
-//! | [`pitch`] | YIN / pYIN pitch detection | Frequency (Hz), confidence |
-//! | [`dpyin`] | Decimated pYIN (bass register) | Frequency (Hz), confidence |
-//! | [`scout`] | Rough frequency neighborhood | Frequency (Hz) |
-//! | [`twm`] | Two-Way Mismatch pitch detection | Frequency (Hz), confidence |
+//! | [`pitch`] | Pitch detection algorithms | Frequency (Hz), confidence |
+//! | [`templates`] | Sparse matched-filter templates | SparseTemplate configs |
+//! | [`mat`] | MAT pitch + inharmonicity | Frequency (Hz), partials |
+//! | [`twm`] | Two-Way Mismatch (inactive) | — |
 //! | [`metrics`] | Signal property measurement | RMS, EMA, CSD, NINOS2 scalars |
 //! | [`tuning`] | Tuning math | Cent deviations, compensated frequencies |
 //! | [`inharmonicity`] | B-coefficient calculation | B coefficient (deprecated) |
 
-pub mod dpyin;
 pub mod inharmonicity;
-pub mod spectral;
-pub mod pitch;
-pub mod twm;
+pub mod mat;
 pub mod metrics;
+pub mod phantom;
+pub mod pitch;
+pub mod spectral;
+pub mod templates;
 pub mod tuning;
+pub mod twm;

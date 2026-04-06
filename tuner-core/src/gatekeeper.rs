@@ -76,7 +76,7 @@ impl Default for GatekeeperConfig {
 ///
 /// The GUI observes this value (via the pipeline's shared state) to drive
 /// visual feedback (e.g., "listening…", "note detected", silence indicator).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SignalState {
     /// The stream contains a clear, steady fundamental frequency.
     /// The NINOS2 metric has exceeded the stability threshold for
@@ -91,6 +91,18 @@ pub enum SignalState {
     Silence,
 }
 
+/// Observed outputs of a single Gatekeeper frame evaluation.
+///
+/// Returned by value from [`Gatekeeper::process_frame`]. Replaces direct
+/// field reads of internal state, eliminating temporal coupling.
+#[derive(Debug, Clone, Copy)]
+pub struct GateResult {
+    pub rms_ema: f32,
+    pub nhwrsf: f32,
+    pub state: SignalState,
+    pub is_new_onset: bool,
+}
+
 /// The 5-state signal validator. Pure DSP — no shared state awareness.
 ///
 /// See the [module-level docs](crate::gatekeeper) for the full state machine
@@ -102,26 +114,26 @@ pub struct Gatekeeper {
     pub config: GatekeeperConfig,
 
     // Output state
-    pub current_state: SignalState,
+    pub(crate) current_state: SignalState,
 
     // Internal DSP State memory
     // Pre-allocated array matching the size of ProcessingFrame.frequency_buffer (2048)
     // to prevent dynamic heap allocation on the audio hot-path.
     prev_spectrum: Box<[f32]>,
 
-    pub current_nhwrsf: f32,
+    pub(crate) current_nhwrsf: f32,
 
-    // State machine counters
-    pub transient_delay_counter: usize,
-    pub stable_counter: usize,
-    pub capture_counter: usize,
-    pub is_capturing: bool,
+    // State machine counters (internal bookkeeping — not exposed)
+    transient_delay_counter: usize,
+    stable_counter: usize,
+    capture_counter: usize,
+    is_capturing: bool,
 
     // EMA State
-    pub current_rms_ema: f32,
+    pub(crate) current_rms_ema: f32,
 
     // Expose transient detection state for routing engine
-    pub is_new_onset: bool,
+    pub(crate) is_new_onset: bool,
 }
 
 impl Gatekeeper {
@@ -152,9 +164,8 @@ impl Gatekeeper {
 
     /// Evaluates a single [`ProcessingFrame`] through the 5-state machine.
     ///
-    /// This is the main entry point called by [`AudioPipeline::process_frame()`].
-    /// After this returns, the pipeline reads `self.current_state` and
-    /// `self.current_rms_ema` and syncs them to shared state.
+    /// This is the main entry point called by [`AudioPipeline::process_cola_hop()`].
+    /// Returns a [`GateResult`] snapshot of the evaluated signal state.
     ///
     /// ## State Machine Flow
     ///
@@ -162,7 +173,7 @@ impl Gatekeeper {
     /// 2. **Silence gate** — if below threshold, emit `Silence` and reset
     /// 3. **NHWRSF transient detection** — States 1 & 2
     /// 4. **NINOS2 stability + capture** — States 3 & 4
-    pub fn process_frame(&mut self, frame: &ProcessingFrame) {
+    pub fn process_frame(&mut self, frame: &ProcessingFrame) -> GateResult {
         // State 0: Calculate RMS amplitude for Silence fallback
         // Slice only the newest WINDOW_SIZE samples from the historical buffer to keep transient detection snappy
         let rms = calculate_rms(&frame.audio_buffer[frame.audio_buffer.len() - WINDOW_SIZE..]);
@@ -175,18 +186,30 @@ impl Gatekeeper {
             self.current_state = SignalState::Silence;
             self.is_new_onset = false;
             self.reset_capture_state();
-            return;
+            return self.build_result();
         }
 
         let current_spectrum = &frame.frequency_buffer[..];
 
         // State 1 & 2: Calculate CSD to detect transients
         if self.process_transient_detection(current_spectrum) {
-            return;
+            return self.build_result();
         }
 
         // State 3 & 4: NINOS2 Stability Gating & Capture Dispatch
         self.process_stability_and_capture(current_spectrum);
+
+        self.build_result()
+    }
+
+    #[inline]
+    fn build_result(&self) -> GateResult {
+        GateResult {
+            rms_ema: self.current_rms_ema,
+            nhwrsf: self.current_nhwrsf,
+            state: self.current_state.clone(),
+            is_new_onset: self.is_new_onset,
+        }
     }
 
     /// Detects transient events (States 1 & 2) using NHWRSF.
