@@ -7,4 +7,5 @@ pub mod partials_display;
 pub mod piano_keyboard;
 pub mod envelope;
 pub mod spectrogram;
+pub mod seismograph;
 // pub mod inharmonicity_graph;

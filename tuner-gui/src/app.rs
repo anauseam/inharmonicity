@@ -15,13 +15,10 @@ use crate::views::{main_view::create_main_view, settings_view::create_settings_v
 use crate::widgets::envelope::ENVELOPE_HISTORY_LENGTH;
 use iced::{self, Element, Subscription, Theme};
 use std::collections::VecDeque;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use tuner_core::{
     FrameOutput,
     algorithms::tuning,
     audio::{self, AudioSource, HostHandle},
-    calibration::{self, NoiseFloorResult},
     capture_processing::{self, ProcessingOperation},
     models::InharmonicityProfile,
     pipeline::{PipelineHandle, load_f32, store_f32},
@@ -93,7 +90,11 @@ pub enum Message {
     ToggleNoiseFloorAdjustment,   // Show/hide noise floor envelope viewer
     SilenceThresholdChanged(f32), // User dragged the silence threshold slider
     RecalibrateNoiseFloor,        // User clicked the recalibrate button
-    CalibrationComplete(Result<NoiseFloorResult, String>), // Calibration finished
+
+    // --- Transient Calibration Messages ---
+    ToggleTransientCalibration,
+    ResetTransientScope,
+    NhwrsfThresholdChanged(f32),
 
     // Continuous update message
     Tick, // Timer tick for real-time updates
@@ -124,20 +125,37 @@ pub enum CaptureState {
     Done,      // Capture is complete, data is being processed
 }
 
+#[derive(Debug, Clone)]
+pub struct RmsCalibrationState {
+    pub warmup_hops: Option<u32>,
+    pub countdown: Option<u32>,
+    pub max_seen_rms: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct NoiseFloorSettings {
+    pub history: VecDeque<f32>,
+    pub current_threshold: f32,
+    pub calibration_complete: bool,
+    pub visible: bool,
+    pub active_calibration: Option<RmsCalibrationState>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TransientSettings {
+    pub noise_floor_baseline: f32,
+    pub visible: bool,
+    pub is_frozen: bool,
+    pub freeze_countdown: Option<u32>,
+    pub history: VecDeque<f32>,
+    pub current_threshold: f32,
+}
+
 /// Settings-view-specific display data.
 #[derive(Debug, Clone)]
 pub struct SettingsDisplayData {
-    /// Rolling history of smoothed RMS values for the Envelope Viewer.
-    pub rms_history: VecDeque<f32>,
-    /// Current silence threshold (read from shared ConfigState).
-    pub current_silence_threshold: f32,
-    /// Whether noise-floor calibration has completed at least once.
-    pub calibration_complete: bool,
-    /// Whether the Noise Floor Adjustment panel is visible.
-    pub noise_floor_adjustment_visible: bool,
-    /// Peak NHWRSF observed during the last noise-floor calibration ($N_{max}$).
-    /// Used as the lower bound of the transient threshold slider in the wizard.
-    pub nhwrsf_noise_floor: f32,
+    pub rms: NoiseFloorSettings,
+    pub transient: TransientSettings,
 }
 
 /// UI-specific data needed for rendering the interface.
@@ -206,9 +224,6 @@ pub struct TunerApp {
 
     // Single source of truth for all display data
     pub display_data: AppDisplayData,
-
-    // Calibration progress counter (shared with the calibration task)
-    calibration_progress: Arc<AtomicUsize>,
 }
 
 impl std::fmt::Debug for TunerApp {
@@ -236,7 +251,6 @@ impl Default for TunerApp {
             stability_buffer: VecDeque::with_capacity(STABILITY_TARGET),
             inharmonicity_profile: InharmonicityProfile::default(),
             pipeline_handle: PipelineHandle::default(),
-            calibration_progress: Arc::new(AtomicUsize::new(0)),
             display_data: AppDisplayData {
                 audio_worker_active: false,
                 last_frame: None,
@@ -247,7 +261,7 @@ impl Default for TunerApp {
                 smoothing_buffer: Vec::new(),
                 is_calibrating: true,
                 calibration_progress: 0,
-                calibration_total: calibration::DEFAULT_CALIBRATION_FRAMES,
+                calibration_total: crate::calibration::CALIBRATION_FRAMES as usize,
                 spectrogram_visible: true,
                 cent_meter_visible: true,
                 key_select_visible: true,
@@ -255,11 +269,25 @@ impl Default for TunerApp {
                 // inharmonicity_graph_visible: true,
                 settings_view_visible: false,
                 settings_data: SettingsDisplayData {
-                    rms_history: VecDeque::with_capacity(ENVELOPE_HISTORY_LENGTH),
-                    current_silence_threshold: 0.005,
-                    calibration_complete: false,
-                    noise_floor_adjustment_visible: false,
-                    nhwrsf_noise_floor: 0.0,
+                    rms: NoiseFloorSettings {
+                        history: VecDeque::with_capacity(ENVELOPE_HISTORY_LENGTH),
+                        current_threshold: 0.005,
+                        calibration_complete: false,
+                        visible: false,
+                        active_calibration: Some(RmsCalibrationState {
+                            warmup_hops: Some(crate::calibration::WARMUP_FRAMES),
+                            countdown: Some(crate::calibration::CALIBRATION_FRAMES),
+                            max_seen_rms: 0.0,
+                        }),
+                    },
+                    transient: TransientSettings {
+                        noise_floor_baseline: 0.0,
+                        visible: false,
+                        is_frozen: false,
+                        freeze_countdown: None,
+                        history: VecDeque::with_capacity(ENVELOPE_HISTORY_LENGTH),
+                        current_threshold: 0.5,
+                    },
                 },
                 tuning_mode: TuningMode::Auto,
                 capture_state: CaptureState::Off,
@@ -269,23 +297,12 @@ impl Default for TunerApp {
 }
 
 impl TunerApp {
-    /// Creates the app and kicks off noise-floor calibration via `Task::perform`.
-    /// Audio processing starts only after `CalibrationComplete` arrives.
+    /// Creates the app and initiates audio processing immediately.
+    /// Noise floor calibration runs wait-free from the UI's Tick loop.
     pub fn new() -> (Self, iced::Task<Message>) {
-        let app = Self::default();
-        let progress = Arc::clone(&app.calibration_progress);
-        let calibration_task = iced::Task::perform(
-            async move {
-                calibration::calibrate_noise_floor(
-                    AudioSource::Default,
-                    calibration::DEFAULT_NOISE_MULTIPLIER,
-                    calibration::DEFAULT_CALIBRATION_FRAMES,
-                    progress,
-                )
-            },
-            |result| Message::CalibrationComplete(result.map_err(|e| e.to_string())),
-        );
-        (app, calibration_task)
+        let mut app = Self::default();
+        app.start_audio_processing();
+        (app, iced::Task::none())
     }
     /// Starts the dedicated audio processing thread via [`audio::spawn_analysis_thread()`].
     ///
@@ -309,7 +326,7 @@ impl TunerApp {
                 // (since AudioPipeline::new() creates fresh defaults)
                 store_f32(
                     &handle.pipeline_handle.atomics.config.silence_threshold,
-                    self.display_data.settings_data.current_silence_threshold,
+                    self.display_data.settings_data.rms.current_threshold,
                 );
 
                 self.pipeline_handle = handle.pipeline_handle.clone();
@@ -488,12 +505,11 @@ impl TunerApp {
                 self.display_data.settings_view_visible = !self.display_data.settings_view_visible;
             }
             Message::ToggleNoiseFloorAdjustment => {
-                self.display_data
-                    .settings_data
-                    .noise_floor_adjustment_visible = !self
-                    .display_data
-                    .settings_data
-                    .noise_floor_adjustment_visible;
+                let vis = !self.display_data.settings_data.rms.visible;
+                self.display_data.settings_data.rms.visible = vis;
+                if vis {
+                    self.display_data.settings_data.transient.visible = false;
+                }
             }
             Message::SilenceThresholdChanged(value) => {
                 // Write to shared atomics so the audio thread picks it up immediately
@@ -502,81 +518,44 @@ impl TunerApp {
                     value,
                 );
                 // Update local display data for immediate UI feedback
-                self.display_data.settings_data.current_silence_threshold = value;
-            }
-            Message::CalibrationComplete(result) => {
-                self.display_data.is_calibrating = false;
-                match result {
-                    Ok(cal) => {
-                        eprintln!(
-                            "[MAIN] Calibration complete. RMS baseline: {:.6}, threshold: {:.6}, N_max NHWRSF: {:.4}",
-                            cal.rms_baseline, cal.rms_threshold, cal.noise_floor_peak
-                        );
-                        // Write calibrated values to shared atomics
-                        store_f32(
-                            &self.pipeline_handle.atomics.config.silence_threshold,
-                            cal.rms_threshold,
-                        );
-                        // Update display data
-                        self.display_data.settings_data.current_silence_threshold =
-                            cal.rms_threshold;
-                        self.display_data.settings_data.nhwrsf_noise_floor = cal.noise_floor_peak;
-                        self.display_data.settings_data.calibration_complete = true;
-
-                        // Now start the audio processing thread
-                        self.start_audio_processing();
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "[MAIN] Calibration failed: {}. Starting audio with defaults.",
-                            e
-                        );
-                        // Start audio anyway with default threshold
-                        self.display_data.settings_data.calibration_complete = true;
-                        self.start_audio_processing();
-                    }
-                }
+                self.display_data.settings_data.rms.current_threshold = value;
             }
             Message::RecalibrateNoiseFloor => {
-                eprintln!("[MAIN] Recalibration requested — stopping audio thread...");
-                // Stop the audio host
-                if let Some(mut handle) = self.host_handle.take() {
-                    handle.stop();
-                }
-                self.frame_rx = None;
-                self.display_data.audio_worker_active = false;
-                self.display_data.settings_data.calibration_complete = false;
-
-                // Set calibrating state and reset progress counter
                 self.display_data.is_calibrating = true;
-                self.display_data.calibration_progress = 0;
-                self.calibration_progress.store(0, Ordering::Relaxed);
-
-                let progress = Arc::clone(&self.calibration_progress);
-
-                // Kick off recalibration
-                return iced::Task::perform(
-                    async move {
-                        calibration::calibrate_noise_floor(
-                            AudioSource::Default,
-                            calibration::DEFAULT_NOISE_MULTIPLIER,
-                            calibration::DEFAULT_CALIBRATION_FRAMES,
-                            progress,
-                        )
-                    },
-                    |result| Message::CalibrationComplete(result.map_err(|e| e.to_string())),
-                );
+                self.display_data.settings_data.rms.calibration_complete = false;
+                self.display_data.settings_data.rms.active_calibration = Some(crate::app::RmsCalibrationState {
+                    warmup_hops: Some(crate::calibration::WARMUP_FRAMES),
+                    countdown: Some(crate::calibration::CALIBRATION_FRAMES),
+                    max_seen_rms: 0.0,
+                });
+            }
+            Message::ToggleTransientCalibration => {
+                let vis = !self.display_data.settings_data.transient.visible;
+                self.display_data.settings_data.transient.visible = vis;
+                
+                if self.display_data.settings_data.transient.visible {
+                    self.display_data.settings_data.rms.visible = false;
+                    self.display_data.settings_data.transient.is_frozen = false;
+                    self.display_data.settings_data.transient.freeze_countdown = None;
+                    self.display_data.settings_data.transient.history.clear();
+                }
+            }
+            Message::ResetTransientScope => {
+                self.display_data.settings_data.transient.is_frozen = false;
+                self.display_data.settings_data.transient.freeze_countdown = None;
+                self.display_data.settings_data.transient.history.clear();
+            }
+            Message::NhwrsfThresholdChanged(val) => {
+                store_f32(&self.pipeline_handle.atomics.config.nhwrsf_threshold, val);
+                self.display_data.settings_data.transient.current_threshold = val;
             }
             Message::Tick => {
-                // Poll calibration progress (atomic, lock-free)
-                if self.display_data.is_calibrating {
-                    self.display_data.calibration_progress =
-                        self.calibration_progress.load(Ordering::Relaxed);
-                }
+                let mut frame_pushed = false;
 
                 // ── Read freshest FrameOutput from triple buffer ──
                 if let Some(ref mut frame_rx) = self.frame_rx {
                     if frame_rx.update() {
+                        frame_pushed = true;
                         let frame = frame_rx.read().clone();
                         self.display_data.last_frame = Some(frame.clone());
 
@@ -627,24 +606,66 @@ impl TunerApp {
                     }
                 }
 
-                // Poll shared atomics for settings view (only when visible)
-                if self.display_data.settings_view_visible
-                    && self
-                        .display_data
-                        .settings_data
-                        .noise_floor_adjustment_visible
-                {
-                    let rms = load_f32(&self.pipeline_handle.atomics.runtime.current_rms_ema);
-                    let history = &mut self.display_data.settings_data.rms_history;
-                    history.push_back(rms);
-                    if history.len() > ENVELOPE_HISTORY_LENGTH {
-                        history.pop_front();
+                if self.display_data.settings_view_visible {
+                    if self.display_data.settings_data.rms.visible {
+                        let rms = load_f32(&self.pipeline_handle.atomics.runtime.current_rms_ema);
+                        let history = &mut self.display_data.settings_data.rms.history;
+                        history.push_back(rms);
+                        if history.len() > ENVELOPE_HISTORY_LENGTH {
+                            history.pop_front();
+                        }
+                        self.display_data.settings_data.rms.current_threshold =
+                            load_f32(&self.pipeline_handle.atomics.config.silence_threshold);
+                    } else if self.display_data.settings_data.transient.visible {
+                        let flux = load_f32(&self.pipeline_handle.atomics.runtime.current_nhwrsf);
+                        let current_threshold =
+                            load_f32(&self.pipeline_handle.atomics.config.nhwrsf_threshold);
+
+                        crate::views::transient_calibration::process_telemetry_tick(
+                            &mut self.display_data.settings_data.transient,
+                            flux,
+                            current_threshold,
+                        );
+
+                        self.display_data.settings_data.transient.current_threshold = current_threshold;
                     }
-                    self.display_data.settings_data.current_silence_threshold =
-                        load_f32(&self.pipeline_handle.atomics.config.silence_threshold);
                 }
 
-                // State reset after capture processing
+                // ── Calibration Hook ──
+                if self.display_data.is_calibrating {
+                    let current_rms =
+                        load_f32(&self.pipeline_handle.atomics.runtime.current_rms_ema);
+                    if let Some(silence_val) = crate::calibration::process_calibration_tick(
+                        &mut self.display_data.settings_data.rms,
+                        current_rms,
+                        frame_pushed,
+                    ) {
+                        // Finished
+                        self.display_data.is_calibrating = false;
+                        self.display_data.settings_data.rms.calibration_complete = true;
+
+                        store_f32(
+                            &self.pipeline_handle.atomics.config.silence_threshold,
+                            silence_val,
+                        );
+                        self.display_data.settings_data.rms.current_threshold = silence_val;
+                        
+                        // Seed the transient wizard's baseline directly from this calculation point:
+                        if let Some(active) = &self.display_data.settings_data.rms.active_calibration {
+                            self.display_data.settings_data.transient.noise_floor_baseline = active.max_seen_rms;
+                        }
+
+                        eprintln!(
+                            "[MAIN] Lock-Free Calibration complete. Threshold set to: {:.6}",
+                            silence_val
+                        );
+                    } else if let Some(active) = &self.display_data.settings_data.rms.active_calibration {
+                        if let Some(countdown) = active.countdown {
+                            self.display_data.calibration_progress = (crate::calibration::CALIBRATION_FRAMES.saturating_sub(countdown)) as usize;
+                        }
+                    }
+                }
+
                 if self.display_data.capture_state == CaptureState::Done {
                     eprintln!("[MAIN] Capture complete. Resetting state to Armed.");
                     self.display_data.capture_state = CaptureState::Armed;

@@ -29,8 +29,6 @@
 pub mod algorithms;
 /// CPAL audio capture, device selection, real-time streaming, and standalone host extension.
 pub mod audio;
-/// Noise-floor and transient calibration routines (uses [`audio::AudioSource`]).
-pub mod calibration;
 /// Legacy capture frame processing (deprecated — to be replaced by `pipeline` + `worker`).
 pub mod capture_processing;
 /// Circular FIFO overlapping analysis sliding window.
