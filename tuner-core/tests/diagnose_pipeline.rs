@@ -1,6 +1,5 @@
 #[cfg(test)]
 mod tests {
-    use tuner_core::algorithms::metrics::evaluate_band_energy_ratio;
     use rustfft::num_complex::Complex;
     use realfft::RealFftPlanner;
 
@@ -33,7 +32,7 @@ mod tests {
         eprintln!("[SCOUT TEST] A1 Energy Ratio: {:.4}", ratio);
         
         // Let's also simulate C8 (4186 Hz) with a heavy hammer thud (low freq noise)
-        let audio_C8: Vec<f32> = (0..2048).map(|i| {
+        let audio_c8: Vec<f32> = (0..2048).map(|i| {
             let t = i as f32 / sample_rate as f32;
             let window = 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / 2047.0).cos());
             
@@ -46,7 +45,7 @@ mod tests {
             (string_sound + thud_sound) * window
         }).collect();
 
-        let mut time_buf = audio_C8.clone();
+        let mut time_buf = audio_c8.clone();
         let mut freq_buf_2 = vec![Complex { re: 0.0, im: 0.0 }; 1025];
         r2c.process(&mut time_buf, &mut freq_buf_2).unwrap();
 

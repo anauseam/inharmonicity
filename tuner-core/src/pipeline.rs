@@ -1,4 +1,3 @@
-
 //! # Audio Processing Pipeline
 //!
 //! This module defines the lock-free memory structures, shared state types,
@@ -26,12 +25,12 @@
 use crossbeam_queue::ArrayQueue;
 use realfft::RealToComplex;
 use rustfft::num_complex::Complex;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
+use crate::FrameOutput;
 use crate::audio::{BASS_WINDOW_SIZE, HOP_SIZE, WINDOW_SIZE};
 use crate::cola::CircularFifo;
-use crate::FrameOutput;
 
 use crate::engine::Engine;
 use crate::gatekeeper::{Gatekeeper, SignalState};
@@ -170,7 +169,7 @@ impl Default for PipelineAtomics {
         Self {
             config: ConfigAtomics {
                 silence_threshold: AtomicU32::new(0.005_f32.to_bits()),
-                nhwrsf_threshold: AtomicU32::new(0.5_f32.to_bits()),
+                nhwrsf_threshold: AtomicU32::new(0.9_f32.to_bits()),
                 key_hint: AtomicU32::new(f32::NAN.to_bits()),
                 inharmonicity_b: AtomicU32::new(f32::NAN.to_bits()),
             },
@@ -234,7 +233,10 @@ impl Default for PipelineHandle {
 impl std::fmt::Debug for PipelineHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PipelineHandle")
-            .field("silence_threshold", &load_f32(&self.atomics.config.silence_threshold))
+            .field(
+                "silence_threshold",
+                &load_f32(&self.atomics.config.silence_threshold),
+            )
             .field("rms_ema", &load_f32(&self.atomics.runtime.current_rms_ema))
             .finish()
     }
@@ -268,9 +270,7 @@ impl AudioPipeline {
             processing_frame: ProcessingFrame::new(),
         };
 
-        let handle = PipelineHandle {
-            atomics,
-        };
+        let handle = PipelineHandle { atomics };
 
         (pipeline, handle)
     }
@@ -279,10 +279,7 @@ impl AudioPipeline {
     ///
     /// Returns `Some` containing the DSP results IF a full hop boundary was reached.
     /// The returned `FrameOutput` is a fixed-size struct ready for the triple buffer.
-    pub fn push_audio(
-        &mut self,
-        samples: &[f32],
-    ) -> Option<FrameOutput> {
+    pub fn push_audio(&mut self, samples: &[f32]) -> Option<FrameOutput> {
         self.cola.push_samples(samples);
 
         if self.cola.is_hop_ready(HOP_SIZE) {
@@ -332,7 +329,7 @@ impl AudioPipeline {
             let note_index = crate::models::find_nearest_note_index(freq);
             let (_, target_freq) = crate::models::find_nearest_note_by_index(note_index);
             let cents = crate::algorithms::tuning::calculate_cents_deviation(freq, target_freq);
-            
+
             frame_output.detected_frequency = Some(freq);
             frame_output.confidence = conf;
             frame_output.note_index = Some(note_index);
@@ -345,10 +342,8 @@ impl AudioPipeline {
     /// Internal method to run the DSP pipeline on the populated `processing_frame`.
     fn process_frame_internal(&mut self) -> Option<(f32, Option<f32>)> {
         // 1. Read GUI-set configs into the Gatekeeper and Engine (wait-free)
-        self.gatekeeper.config.silence_threshold =
-            load_f32(&self.atomics.config.silence_threshold);
-        self.gatekeeper.config.nhwrsf_threshold =
-            load_f32(&self.atomics.config.nhwrsf_threshold);
+        self.gatekeeper.config.silence_threshold = load_f32(&self.atomics.config.silence_threshold);
+        self.gatekeeper.config.nhwrsf_threshold = load_f32(&self.atomics.config.nhwrsf_threshold);
         self.engine.key_hint = load_option_f32(&self.atomics.config.key_hint);
         self.engine.inharmonicity_b = load_option_f32(&self.atomics.config.inharmonicity_b);
 
@@ -356,8 +351,14 @@ impl AudioPipeline {
         self.gatekeeper.process_frame(&self.processing_frame);
 
         // 3. Sync runtime observations to shared atomics for the frontend
-        store_f32(&self.atomics.runtime.current_rms_ema, self.gatekeeper.current_rms_ema);
-        store_f32(&self.atomics.runtime.current_nhwrsf, self.gatekeeper.current_nhwrsf);
+        store_f32(
+            &self.atomics.runtime.current_rms_ema,
+            self.gatekeeper.current_rms_ema,
+        );
+        store_f32(
+            &self.atomics.runtime.current_nhwrsf,
+            self.gatekeeper.current_nhwrsf,
+        );
 
         // 4. Run the Engine to extract fundamental frequency
         let is_silence = self.gatekeeper.current_state == SignalState::Silence;

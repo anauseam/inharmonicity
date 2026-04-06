@@ -1,10 +1,9 @@
+use crossbeam_queue::ArrayQueue;
 use realfft::RealFftPlanner;
 use std::sync::Arc;
-use crossbeam_queue::ArrayQueue;
 use tuner_core::algorithms::spectral;
 use tuner_core::gatekeeper::{Gatekeeper, SignalState};
-use tuner_core::engine::{Engine, RoutingState};
-use tuner_core::pipeline::{AudioPipeline, ProcessingFrame, PipelineHandle};
+use tuner_core::pipeline::{AudioPipeline, ProcessingFrame, store_f32};
 
 fn generate_sine_wave(freq: f32, sample_rate: u32, length: usize) -> Vec<f32> {
     let realistic_amplitude = 0.05; // Matches realistic mic levels
@@ -27,7 +26,9 @@ fn generate_simulated_piano_strike(sample_rate: u32, duration_sec: f32) -> Vec<f
     let num_samples = (sample_rate as f32 * duration_sec) as usize;
     let mut signal = vec![0.0; num_samples];
 
-    struct Lcg { seed: u32 }
+    struct Lcg {
+        seed: u32,
+    }
     impl Lcg {
         fn next_f32(&mut self) -> f32 {
             self.seed = self.seed.wrapping_mul(1664525).wrapping_add(1013904223);
@@ -50,25 +51,25 @@ fn generate_simulated_piano_strike(sample_rate: u32, duration_sec: f32) -> Vec<f
     }
 
     let strike_idx = (0.2 * sample_rate as f32) as usize;
-    
+
     for i in strike_idx..num_samples {
         let t_note = (i - strike_idx) as f32 / sample_rate as f32;
-        
+
         let transient_envelope = (-40.0 * t_note).exp();
         let transient = rng.next_normal() * 0.5 * transient_envelope * amplitude_scale;
-        
+
         let harmonic_envelope = (-0.8 * t_note).exp();
         let f1 = 440.0;
         let f2 = 441.5;
         let f3 = 438.5;
         let p = 2.0 * std::f32::consts::PI;
-        
-        let ringing = (
-            0.5 * (p * f1 * t_note).sin() +
-            0.5 * (p * f2 * t_note).sin() +
-            0.5 * (p * f3 * t_note).sin()
-        ) * harmonic_envelope * amplitude_scale;
-        
+
+        let ringing = (0.5 * (p * f1 * t_note).sin()
+            + 0.5 * (p * f2 * t_note).sin()
+            + 0.5 * (p * f3 * t_note).sin())
+            * harmonic_envelope
+            * amplitude_scale;
+
         signal[i] += transient + ringing;
     }
 
@@ -79,25 +80,31 @@ fn generate_simulated_piano_strike(sample_rate: u32, duration_sec: f32) -> Vec<f
 fn test_gatekeeper_integration() {
     let pool = Arc::new(ArrayQueue::new(4));
     let mut gatekeeper = Gatekeeper::new(pool);
-    
+
     let silence = create_silence(2048);
     let mut frame = ProcessingFrame::new();
     frame.audio_buffer[..2048].copy_from_slice(&silence);
-    
+
     gatekeeper.process_frame(&frame);
     assert_eq!(gatekeeper.current_state, SignalState::Silence);
-    
+
     let audio = generate_sine_wave(440.0, 44100, 2048);
     let mut planner = RealFftPlanner::<f32>::new();
     let r2c = planner.plan_fft_forward(2048);
-    
+
     frame.audio_buffer[..2048].copy_from_slice(&audio);
     let mut time_scratch = vec![0.0; 2048];
-    spectral::perform_fft(&audio, &mut time_scratch, &mut frame.frequency_buffer[..1025], &r2c, 2048);
-    
+    spectral::perform_fft(
+        &audio,
+        &mut time_scratch,
+        &mut frame.frequency_buffer[..1025],
+        &r2c,
+        2048,
+    );
+
     gatekeeper.process_frame(&frame);
     assert_eq!(gatekeeper.current_state, SignalState::Unstable);
-    
+
     // We expect it to reach Stable over exactly the default frames
     let _reached_stable = false;
     for _ in 0..50 {
@@ -113,31 +120,33 @@ fn test_gatekeeper_integration() {
 fn test_cola_pipeline_integration() {
     let (mut pipeline, _handle) = AudioPipeline::new();
     pipeline.gatekeeper.capture_mode_enabled = true;
-    
+
     // Configure threshold slightly to ensure the sine wave is caught
-    if let Ok(mut config) = _handle.config.lock() {
-        config.silence_threshold = 0.005;
-    }
+    store_f32(&_handle.atomics.config.silence_threshold, 0.005);
 
     // Generate a 1-second 440 Hz sine wave
     let signal = generate_sine_wave(440.0, 44100, 44100);
-    
+
     let hop_size = tuner_core::audio::HOP_SIZE;
     let num_hops = signal.len() / hop_size;
-    
+
     let mut detected = false;
     let mut max_freq: f32 = 0.0;
-    
+
     for i in 0..num_hops {
         let chunk = &signal[i * hop_size..(i + 1) * hop_size];
-        if let Some((engine_res, _spectrogram)) = pipeline.push_audio(chunk) {
-            if let Some((freq, _conf)) = engine_res {
+        if let Some(frame) = pipeline.push_audio(chunk) {
+            if let Some(freq) = frame.detected_frequency {
                 max_freq = max_freq.max(freq);
                 detected = true;
             }
         }
     }
-    
+
     assert!(detected, "The COLA pipeline never detected a pitch");
-    assert!((max_freq - 440.0).abs() < 4.0, "Expected ~440.0, got F0: {}", max_freq);
+    assert!(
+        (max_freq - 440.0).abs() < 4.0,
+        "Expected ~440.0, got F0: {}",
+        max_freq
+    );
 }

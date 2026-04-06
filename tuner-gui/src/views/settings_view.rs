@@ -1,8 +1,8 @@
-use iced::widget::{Space, button, column, container, row, slider, text};
+use iced::widget::{Space, button, column, container, row, text};
 use iced::{Alignment, Element, Fill, Length};
 
 use crate::utils::view_utils::{ButtonConfig, ButtonType, make_sidebar_section};
-use crate::widgets::envelope;
+
 
 const TONAL_CONFIG: [ButtonConfig; 3] = [
     ButtonConfig {
@@ -22,7 +22,12 @@ const TONAL_CONFIG: [ButtonConfig; 3] = [
     },
 ];
 
-const PROGRAM_CONFIG: [ButtonConfig; 2] = [
+const PROGRAM_CONFIG: [ButtonConfig; 3] = [
+    ButtonConfig {
+        label: "Transient Threshold Calibration",
+        message: Some(crate::Message::ToggleTransientCalibration),
+        button_type: ButtonType::Standard,
+    },
     ButtonConfig {
         label: "Noise Floor Adjustment",
         message: Some(crate::Message::ToggleNoiseFloorAdjustment),
@@ -56,60 +61,10 @@ pub fn create_settings_view(data: &crate::app::AppDisplayData) -> Element<'stati
 
     // Build main panel content based on which sub-view is active
     let main_panel_content: Element<'static, crate::Message> =
-        if data.settings_data.noise_floor_adjustment_visible {
-            let rms_data: Vec<f32> = data.settings_data.rms_history.iter().copied().collect();
-            let threshold = data.settings_data.current_silence_threshold;
-
-            let envelope_content: Element<'static, crate::Message> =
-                container(envelope::EnvelopeViewer::new(rms_data, threshold).view())
-                    .width(Fill)
-                    .height(Fill)
-                    .into();
-
-            // Fixed range: covers all realistic noise floors regardless of device.
-            // Calibration sets the initial position; the range never shifts.
-            let slider_min = 0.001_f32;
-            let slider_max = 0.5_f32;
-            let slider_step = 0.0001_f32;
-            let calibration_complete = data.settings_data.calibration_complete;
-
-            let controls: Element<'static, crate::Message> = if calibration_complete {
-                column![
-                    row![
-                        text("Silence Threshold: ").size(14),
-                        slider(slider_min..=slider_max, threshold, crate::Message::SilenceThresholdChanged)
-                            .step(slider_step)
-                            .width(Fill),
-                        text(format!("{:.5}", threshold)).size(14),
-                    ]
-                    .spacing(10)
-                    .align_y(Alignment::Center),
-                    Space::new().height(5),
-                    button(text("Recalibrate Noise Floor").size(14))
-                        .on_press(crate::Message::RecalibrateNoiseFloor)
-                        .padding([8, 16]),
-                ]
-                .spacing(5)
-                .into()
-            } else {
-                text("Calibrating…").size(16).into()
-            };
-
-            container(
-                column![
-                    text("Noise Floor Adjustment").size(18),
-                    Space::new().height(10),
-                    envelope_content,
-                    Space::new().height(10),
-                    controls,
-                ]
-                .width(Fill)
-                .spacing(5)
-                .padding(15),
-            )
-            .width(Fill)
-            .height(Length::Fixed(340.0))
-            .into()
+        if data.settings_data.rms.visible {
+            crate::views::rms_calibration::create_rms_calibration_panel(data)
+        } else if data.settings_data.transient.visible {
+            crate::views::transient_calibration::create_transient_calibration_panel(data)
         } else {
             text("Select a setting to adjust.").size(18).into()
         };

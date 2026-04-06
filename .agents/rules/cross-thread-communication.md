@@ -1,6 +1,8 @@
 ---
+trigger: model_decision
 description: When developing and architecting cross-thread communication between the DSP thread and UI/system threads.
 ---
+
 # Cross-Thread Communication Architecture
 
 When connecting the real-time audio thread (DSP) to the UI or other OS threads, the DSP thread must be strictly wait-free. DO NOT use generic MPMC/MPSC channels (like `std::sync::mpsc`) inside the real-time audio pipeline, as they can fall back to OS locks, Spin-Locks, or heap allocations under contention or capacity growth.
