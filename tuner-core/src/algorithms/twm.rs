@@ -1,268 +1,222 @@
-//! # Two-Way Mismatch (TWM) Module
+//! # Two-Way Mismatch (TWM)
 //!
-//! This module implements the Two-Way Mismatch (TWM) algorithm, serving as the
-//! coarse fundamental frequency ($f_0$) estimator in the pipeline. By generating
-//! a theoretical template of harmonic partials and comparing it against measured
-//! spectral peaks, TWM evaluates both "Predicted-to-Observed" and
-//! "Observed-to-Predicted" errors to robustly identify the true $f_0$ without
-//! octave errors.
-//!
-//! ## Features
-//! - Sub-bin accurate spectral peak extraction via fast parabolic interpolation.
-//! - Targeted harmonic template matching with inharmonicity ($B$) coefficient compensation.
-//! - Octave-error immunity across the full piano range (A0 to C8).
+//! Replaces legacy discrete template matching with continuous, sub-bin precision
+//! scoring using the Maher & Beauchamp (1994) distance-sum formulation.
+//! This stateless module provides robust fundamental frequency discovery.
 
-// Threshold above which a candidate is rejected
-const ERROR_CEILING: f32 = 0.25;
+use crate::algorithms::peaks::SpectralPeak;
+use crate::engine::KeyProfile;
 
-#[derive(Debug, Clone, Copy, Default)]
-pub struct SpectralPeak {
-    pub freq: f32,
-    pub magnitude: f32,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct TwmCandidate {
-    pub f0: f32,
-    pub error: f32,
-}
-
-/// Populates the provided scratch buffer with local maxima from the magnitude spectrum.
-/// Uses parabolic interpolation for sub-bin frequency precision.
+/// Scores a single key profile against observed peaks using the canonical
+/// Maher & Beauchamp (1994) Two-Way Mismatch formulation.
 ///
-/// Returns the number of peaks placed into `out`. No heap allocations occur.
-pub fn extract_spectral_peaks(
-    magnitudes: &[f32],
-    sample_rate: u32,
-    window_size: usize,
-    out: &mut [SpectralPeak],
-) -> usize {
-    let max_magnitude = magnitudes.iter().cloned().fold(0.0_f32, f32::max);
-    if max_magnitude <= 1e-6 {
-        return 0; // Silence: skip entirely
-    }
-    let dynamic_threshold = (max_magnitude * 0.01_f32).max(1e-5);
+/// Implements Equations (1)–(3) from:
+///   Maher, R.C. & Beauchamp, J.W. (1994). JASA 95(4), pp. 2256–2257.
+///   DOI: 10.1121/1.408685
+///
+/// Per-term error weighting function E_w (applied in both Err_{p-m} and Err_{m-p}):
+///   E_w = Δf·(f^-p) + (a/A_max) × [q·Δf·(f^-p) − r]
+///
+/// Total error (Eq. 3):
+///   Err_total = Err_{p-m}/N + ρ·Err_{m-p}/K
+///
+/// Parameters (empirically calibrated by Maher & Beauchamp):
+///   p = 0.5  (frequency weighting exponent)
+///   q = 1.4  (amplitude penalty scaling)
+///   r = 0.5  (reward constant for aligned strong peaks)
+///   ρ = 0.33 (reverse error combination weight)
+///
+/// Returns Err_total in units of Hz — dimensionally consistent regardless
+/// of the number of active partials or observed peaks.
+///
+/// # Noise Floor Boundary
+/// To prevent unbounded error accumulation from low-frequency noise (which causes
+/// high-treble ghost locks), we enforce a topological boundary on the
+/// Measured-to-Predicted error. As derived by:
+///
+/// Duan, Z., Pardo, B., & Zhang, C. (2010). "Multiple Fundamental Frequency
+/// Estimation by Modeling Spectral Peaks and Non-Peak Regions."
+/// IEEE TASLP 18(8). DOI: 10.1109/TASL.2010.2042119
+///
+/// We apply a ceiling to the distance penalty to model the asymptote to the
+/// uniform noise distribution for distant peaks.
+pub fn score_candidate(peaks: &[SpectralPeak], profile: &KeyProfile) -> f32 {
+    #[allow(unused)]
+    const P: f32 = 0.5; // frequency weighting exponent (paper: p)
+    const Q: f32 = 1.4; // amplitude penalty scaling    (paper: q)
+    const R: f32 = 0.5; // reward for correct matches   (paper: r)
+    const RHO: f32 = 0.33; // reverse error weight         (paper: ρ)
 
-    let mut count = 0;
-    let max_peaks = out.len();
+    // These constants will be empirically tuned using the diagnostic tool.
+    const LAMBDA_PENALTY: f32 = 18.0;
 
-    // Ignore DC and Nyquist
-    for i in 1..(magnitudes.len() - 1) {
-        if count >= max_peaks {
-            break; // Stop if scratch buffer is full
-        }
-
-        let mag_prev = magnitudes[i - 1];
-        let mag_curr = magnitudes[i];
-        let mag_next = magnitudes[i + 1];
-
-        if mag_curr > mag_prev && mag_curr > mag_next && mag_curr > dynamic_threshold {
-            // Found a peak, apply parabolic interpolation on log-magnitudes
-            let y1 = mag_prev.max(1e-6).ln();
-            let y2 = mag_curr.max(1e-6).ln();
-            let y3 = mag_next.max(1e-6).ln();
-
-            let denom = y1 - 2.0 * y2 + y3;
-            let offset = if denom.abs() > 1e-6 {
-                (y1 - y3) / (2.0 * denom)
-            } else {
-                0.0
-            };
-
-            let interpolated_bin = i as f32 + offset;
-            let freq = (interpolated_bin * sample_rate as f32) / window_size as f32;
-
-            if freq.is_finite() && freq > 0.0 {
-                out[count] = SpectralPeak {
-                    freq,
-                    magnitude: mag_curr,
-                };
-                count += 1;
-            }
-        }
+    let valid_count = profile.valid_partial_count;
+    if valid_count == 0 || peaks.is_empty() {
+        return f32::MAX;
     }
 
-    // Sort peaks by magnitude descending and keep only the strongest if we have many
-    out[..count].sort_unstable_by(|a, b| {
-        b.magnitude
-            .partial_cmp(&a.magnitude)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    count
-}
-
-/// Computes the Two-Way Mismatch error for a predicted harmonic template vs observed peaks.
-fn compute_twm_error(
-    candidate_f0: f32,
-    peaks: &[SpectralPeak],
-    _sample_rate: u32,
-    inharmonicity_b: f32,
-) -> f32 {
-    let max_peak_freq = peaks.iter().map(|p| p.freq).fold(0.0_f32, f32::max);
-
-    // Dynamically calculate n_partials by generating expected frequencies with inharmonicity
-    // until we exceed the highest measured peak (plus a half-step margin).
-    let mut n_partials = 0;
-    while n_partials < 20 {
-        let n_f32 = (n_partials + 1) as f32;
-        let p_n = candidate_f0 * n_f32 * (1.0 + inharmonicity_b * n_f32 * n_f32).sqrt();
-        if p_n > max_peak_freq + candidate_f0 * 0.5 {
-            break;
-        }
-        n_partials += 1;
-    }
-    let n_partials = n_partials.max(1);
-
-    // P -> O
-    let mut p_to_o = 0.0;
-    for n in 1..=n_partials {
-        let n_f32 = n as f32;
-        let p_n = candidate_f0 * n_f32 * (1.0 + inharmonicity_b * n_f32 * n_f32).sqrt();
-
-        let min_dist = peaks
-            .iter()
-            .map(|peak| (peak.freq - p_n).abs())
-            .fold(f32::INFINITY, f32::min);
-
-        // Normalize distance by expected freq (cents-like scaling)
-        p_to_o += min_dist / p_n.powf(0.8);
-    }
-    p_to_o /= n_partials as f32;
-
-    // O -> P (split into Set α and Set β)
-    // Set α: peaks >= candidate_f0 (standard normalized penalty)
-    // Set β: peaks < candidate_f0  (Subharmonic Veto — absolute, undiluted penalty)
-
-    let a_max = peaks.iter().map(|p| p.magnitude).fold(0.0_f32, f32::max);
-
-    let mut o_to_p_alpha = 0.0_f32;
-    let mut k_alpha = 0_usize;
-    let mut subharmonic_veto = 0.0_f32; // absolute, un-normalized Set β penalty
-
-    let freq_tolerance = candidate_f0 * 0.25; // quarter-tone margin below F0
-
+    // A_max: maximum amplitude across all K measured peaks (paper: A_max = max(a_k))
+    // Peaks are passed sorted by frequency ascending, so we must scan for A_max.
+    let mut a_max = 0.0_f32;
+    let mut max_obs_freq = 0.0_f32;
     for peak in peaks {
-        if peak.freq >= candidate_f0 - freq_tolerance {
-            // Set α: standard M&B O->P matching
-            let mut min_dist = f32::INFINITY;
-            let mut best_p_n = candidate_f0;
-            for n in 1..=n_partials {
-                let n_f32 = n as f32;
-                let p_n = candidate_f0 * n_f32 * (1.0 + inharmonicity_b * n_f32 * n_f32).sqrt();
-                let dist = (peak.freq - p_n).abs();
-                if dist < min_dist {
-                    min_dist = dist;
-                    best_p_n = p_n;
-                }
-            }
-            o_to_p_alpha += min_dist / best_p_n;
-            k_alpha += 1;
-        } else {
-            // Set β: unexplained sub-fundamental peak — Subharmonic Veto
-            // The penalty is quadratic, smoothly ignoring 4% noise floors (<0.05 error)
-            // but instantly and strictly vetoing >=10% weak piano fundamentals (>0.30 error).
-            let relative_amp = (peak.magnitude / a_max.max(1e-6)).clamp(0.0, 1.0);
-            subharmonic_veto += 30.0 * relative_amp.powi(2);
+        if peak.magnitude > a_max {
+            a_max = peak.magnitude;
+        }
+        if peak.frequency > max_obs_freq {
+            max_obs_freq = peak.frequency;
         }
     }
+    a_max = a_max.max(1e-6);
 
-    let o_to_p = if k_alpha > 0 {
-        o_to_p_alpha / k_alpha as f32
-    } else {
-        0.0
-    };
+    // ── Dynamic Bandwidth Cap ────────────────────────────────────────────────
+    // Only evaluate predicted partials within the observable spectral range
+    // plus one fundamental of margin. Partials beyond this carry no
+    // discriminative value and would inflate Err_{p-m} with unconstrained
+    // forward error from harmonics the instrument does not physically produce
+    // in this frame.
+    let cutoff_freq = max_obs_freq + profile.f0_et;
+    let mut active_predicted = 0_usize;
+    for &p_freq in &profile.predicted_partials[..valid_count] {
+        if p_freq <= cutoff_freq {
+            active_predicted += 1;
+        } else {
+            break; // predicted_partials is sorted ascending
+        }
+    }
+    if active_predicted == 0 {
+        active_predicted = 1;
+    }
+    let predicted = &profile.predicted_partials[..active_predicted]; // N terms
 
-    // Dynamic ρ: increases when low-frequency energy is sparse (fundamental fading)
-    // This prevents the O->P penalty from being globally suppressed at end-of-sustain.
-    let low_freq_energy: f32 = peaks
-        .iter()
-        .filter(|p| p.freq < 1000.0)
-        .map(|p| p.magnitude)
-        .sum();
-    let total_energy: f32 = peaks.iter().map(|p| p.magnitude).sum::<f32>().max(1e-6);
-    let low_freq_ratio = (low_freq_energy / total_energy).clamp(0.01, 1.0);
+    // ── Eq. (1): Err_{p-m} (Predicted-to-Measured) ──────────────────────────
+    // For each of N predicted harmonics f_n, find the nearest measured partial.
+    // a_n is the amplitude of that nearest measured partial.
+    // Δf_n = |f_n - f_nearest_measured|
+    //
+    // Per-term:  Δf_n·(f_n^-p) + (a_n/A_max)·[q·Δf_n·(f_n^-p) − r]
+    // O(N + K) Two-Pointer Sweep: Find nearest peak for each predicted partial
+    //
+    // Note on Architectural Constraints (Duan et al. 2010, Eq 7)
+    // While we use Duan's Eq 3 for the M-to-P bound below, we do not apply
+    // Duan's Eq 7 (Non-Peak Region Likelihood) for this P-to-M calculation.
+    // Duan is a polyphonic estimator, which uses a strict likelihood cliff to
+    // harshly punish missing partials (preventing false polyphonic combinations).
+    // Because TWM is a monophonic acoustic estimator, applying a cliff here
+    // would negatively penalize low bass strings (like C1) that naturally exhibit
+    // "missing fundamentals" due to soundboard impedance. We therefore rely on
+    // M&B's f_n^-p diluted distance penalty to preserve missing-fundamental robustness.
+    let mut err_pm = 0.0_f32;
+    let mut j = 0;
+    for &f_n in predicted {
+        // Advance j while the next peak is closer or equally close to f_n
+        while j + 1 < peaks.len()
+            && (peaks[j + 1].frequency - f_n).abs() <= (peaks[j].frequency - f_n).abs()
+        {
+            j += 1;
+        }
+        let delta_f_n = (peaks[j].frequency - f_n).abs();
+        let a_n = peaks[j].magnitude;
 
-    // ρ base = 0.5 (higher than M&B 0.33 to suit piano)
-    // As fundamentals fade (low_freq_ratio → 0), ρ rises toward 0.9
-    let rho = 0.5_f32 + 0.4 * (1.0 / low_freq_ratio - 1.0).clamp(0.0, 1.0);
+        // Standard M&B diluted penalty (Maher & Beauchamp 1994)
+        // Mathematically identical to f_n.powf(-P) since P=0.5, optimized via hardware sqrt
+        let f_weight = 1.0 / f_n.max(1.0).sqrt();
+        let amp_ratio = a_n / a_max; // a_n / A_max
+        let err_pm_n = delta_f_n * f_weight + amp_ratio * (Q * delta_f_n * f_weight - R);
 
-    // Total error = normalized P->O  +  dynamic-ρ weighted O->P  +  absolute subharmonic veto
-    p_to_o + rho * o_to_p + subharmonic_veto
+        err_pm += err_pm_n;
+    }
+
+    // ── Eq. (2): Err_{m-p} (Measured-to-Predicted) ──────────────────────────
+    // For each of K measured peaks, find the nearest predicted harmonic.
+    // f_k and a_k both refer to the measured peak itself.
+    // Δf_k = |f_k - f_nearest_predicted|
+    //
+    // Per-term:  Δf_k·(f_k^-p) + (a_k/A_max)·[q·Δf_k·(f_k^-p) − r]
+    // O(N + K) Two-Pointer Sweep: Find nearest predicted partial for each peak
+    //
+    // Mathematical Equivalency to Duan et al. (2010) Peak Mixture Model (Eq. 3):
+    // We adapt the topological bound proved by Duan et al. Eq (3): as a peak
+    // diverges from all predicted harmonics, the log-likelihood asymptotes to a
+    // constant noise floor. We approximate this smooth asymptote with a piecewise
+    // hard ceiling (.min(LAMBDA_PENALTY)), which preserves the bounded error
+    // topology without computing Gaussians at runtime.
+    //
+    // Duan, Z., Pardo, B., & Zhang, C. (2010). "Multiple Fundamental Frequency
+    // Estimation by Modeling Spectral Peaks and Non-Peak Regions."
+    // IEEE TASLP 18(8). DOI: 10.1109/TASL.2010.2042119
+    let mut err_mp = 0.0_f32;
+    let mut i = 0;
+    for peak in peaks {
+        let f_k = peak.frequency;
+        let a_k = peak.magnitude;
+
+        // Advance i while the next predicted partial is closer or equally close to f_k
+        while i + 1 < predicted.len()
+            && (predicted[i + 1] - f_k).abs() <= (predicted[i] - f_k).abs()
+        {
+            i += 1;
+        }
+        let delta_f_k = (predicted[i] - f_k).abs();
+
+        // Mathematically identical to f_k.powf(-P) since P=0.5, optimized via hardware sqrt
+        let f_weight = 1.0 / f_k.max(1.0).sqrt();
+        let amp_ratio = a_k / a_max; // a_k / A_max
+        let mut err_mp_k = delta_f_k * f_weight + amp_ratio * (Q * delta_f_k * f_weight - R);
+
+        err_mp_k = err_mp_k.min(LAMBDA_PENALTY);
+        err_mp += err_mp_k;
+    }
+
+    // ── Eq. (3): Err_total ───────────────────────────────────────────────────
+    // Err_total = Err_{p-m}/N + ρ·Err_{m-p}/K
+    let n = active_predicted as f32;
+    let k = peaks.len() as f32;
+
+    (err_pm / n) + RHO * (err_mp / k)
 }
 
-/// # Arguments
-/// * `peaks` — Pre-extracted peaks (≥1 required). Use `peak_scratch` from `ProcessingFrame`.
-/// * `sample_rate` - Example: 44100
-/// * `search_bounds` — Frequency range `(f_min, f_max)` for discovery mode. `None` = full range (27.5–4186 Hz).
-/// * `key_hint` — If Some, targeted mode (±50 cents, ~32 candidates).
-/// * `inharmonicity_b` — If Some, stretch harmonic template to physical string stiffness.
-pub fn detect_pitch_twm(
-    peaks: &[SpectralPeak],
-    sample_rate: u32,
-    search_bounds: Option<(f32, f32)>,
-    key_hint: Option<f32>,
-    inharmonicity_b: Option<f32>,
-) -> Option<(f32, Option<f32>)> {
-    if peaks.len() < 1 {
-        return None;
+/// ── Dynamic Programming Temporal Tracking (Viterbi) ──────────────
+/// Resolves sub-harmonic false locks by applying a temporal trajectory
+/// constraint. A jump from the fundamental to a sub-harmonic incurs a
+/// mathematical penalty.
+///
+/// # Reference
+/// Rao, V. & Rao, P. (2010). "Vocal Melody Extraction in the Presence
+/// of Pitched Accompaniment in Polyphonic Audio." IEEE TASLP, 18(8).
+/// DOI: 10.1109/TASL.2010.2042124
+///
+/// # Note on Empirical Constants
+/// Rao & Rao used a Gaussian transition matrix tuned for vocal sliding.
+/// Because a piano string cannot slide, we adapt their architecture to a
+/// binary transition matrix with an empirically tuned flat penalty.
+///
+/// # Algorithm
+/// Online Viterbi decoding. C_t(k) = E_t(k) + min(C_{t-1}(j) + T(j,k))
+/// Since T(j,k) is a constant P_jump when j != k, we optimize the O(|V|^2)
+/// transition matrix into an O(|V|) sweep by precomputing the global minimum.
+pub fn viterbi_update(path_costs: &mut [f32; 88], current_errors: &[f32; 88]) -> u8 {
+    const JUMP_PENALTY: f32 = 12.0; // Temporal rigidity (empirical Hz error equivalent)
+    let min_prev_cost = path_costs.iter().cloned().fold(f32::MAX, f32::min);
+
+    for k in 0..88 {
+        let cost_stay = path_costs[k];
+        let cost_jump = min_prev_cost + JUMP_PENALTY;
+        path_costs[k] = current_errors[k] + cost_stay.min(cost_jump);
     }
 
-    let b_val = inharmonicity_b.unwrap_or(0.0);
-
-    // 1. Candidate Generation
-    let mut candidates = [TwmCandidate {
-        f0: 0.0,
-        error: 0.0,
-    }; 128];
-    let mut num_candidates = 0;
-
-    if let Some(target_f0) = key_hint {
-        // Targeted Mode: ±50 cents around the hint
-        // ~32 candidates spaced logarithmically
-        let cents_range = 50.0;
-        let num_steps = 32;
-
-        for i in 0..num_steps {
-            // map i=0..31 to -50..+50 cents
-            let cents_offset =
-                -cents_range + (i as f32 / (num_steps - 1) as f32) * (2.0 * cents_range);
-            let f0 = target_f0 * 2.0_f32.powf(cents_offset / 1200.0);
-
-            let error = compute_twm_error(f0, peaks, sample_rate, b_val);
-            candidates[num_candidates] = TwmCandidate { f0, error };
-            num_candidates += 1;
-        }
-    } else {
-        // Discovery Mode
-        let (min_freq, max_freq) = search_bounds.unwrap_or((27.5, 4186.0));
-        let true_step = 2.0_f32.powf(1.0 / 12.0); // Exactly 1 semitone per step
-
-        let mut current_f0 = min_freq;
-        while current_f0 <= max_freq && num_candidates < candidates.len() {
-            let error = compute_twm_error(current_f0, peaks, sample_rate, b_val);
-            candidates[num_candidates] = TwmCandidate {
-                f0: current_f0,
-                error,
-            };
-            num_candidates += 1;
-
-            current_f0 *= true_step;
-        }
+    // Normalize to prevent float explosion over infinite frames
+    let new_min_cost = path_costs.iter().cloned().fold(f32::MAX, f32::min);
+    for cost in path_costs.iter_mut() {
+        *cost -= new_min_cost;
     }
 
-    if num_candidates == 0 {
-        return None;
-    }
+    // Select the candidate with the lowest cumulative temporal cost
 
-    // Find best candidate
-    let best = candidates[..num_candidates]
+    path_costs
         .iter()
-        .min_by(|a, b| a.error.partial_cmp(&b.error).unwrap())?;
-
-    if best.error > ERROR_CEILING {
-        return None;
-    }
-
-    let confidence = 1.0 - (best.error / ERROR_CEILING).clamp(0.0, 1.0);
-    Some((best.f0, Some(confidence)))
+        .enumerate()
+        .min_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+        .unwrap()
+        .0 as u8
 }

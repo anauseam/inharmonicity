@@ -54,7 +54,7 @@ impl<Message> canvas::Program<Message> for PartialsDisplay {
                 color: text_color,
                 size: 14.0.into(),
                 align_x: iced::alignment::Horizontal::Center.into(),
-                align_y: iced::alignment::Vertical::Center.into(),
+                align_y: iced::alignment::Vertical::Center,
                 ..Text::default()
             };
             frame.fill_text(placeholder);
@@ -76,7 +76,7 @@ impl<Message> canvas::Program<Message> for PartialsDisplay {
                     color: text_color,
                     size: 14.0.into(),
                     align_x: iced::alignment::Horizontal::Left.into(),
-                    align_y: iced::alignment::Vertical::Top.into(),
+                    align_y: iced::alignment::Vertical::Top,
                     ..Text::default()
                 };
                 frame.fill_text(partial_label);
@@ -88,7 +88,7 @@ impl<Message> canvas::Program<Message> for PartialsDisplay {
                     color: text_color,
                     size: 14.0.into(),
                     align_x: iced::alignment::Horizontal::Right.into(),
-                    align_y: iced::alignment::Vertical::Top.into(),
+                    align_y: iced::alignment::Vertical::Top,
                     ..Text::default()
                 };
                 frame.fill_text(freq_label);

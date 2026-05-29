@@ -53,11 +53,11 @@ impl KeyboardView {
     fn update(&mut self, message: LocalMessage) -> Task<LocalMessage> {
         match message {
             LocalMessage::Tick => {
-                if let Some(ref mut rx) = self.host_handle.frame_rx {
-                    if rx.update() {
-                        let result = rx.read().clone();
-                        self.detected_key_index = result.note_index;
-                    }
+                if let Some(ref mut rx) = self.host_handle.frame_rx
+                    && rx.update()
+                {
+                    let result = rx.read().clone();
+                    self.detected_key_index = result.note_index;
                 }
             }
             LocalMessage::KeyClicked(idx) => {
@@ -70,7 +70,7 @@ impl KeyboardView {
     fn view(&self) -> Element<'_, LocalMessage> {
         PianoKeyboard::new(self.detected_key_index, self.selected_key_index)
             .view()
-            .map(|msg| LocalMessage::from(msg))
+            .map(LocalMessage::from)
     }
 
     fn subscription(&self) -> Subscription<LocalMessage> {

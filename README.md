@@ -5,6 +5,7 @@
 An open source professional-grade piano tuning application built in Rust with real-time audio analysis, pitch detection, and cent deviation measurement. Designed for piano tuners with planned support for inharmonicity compensation.
 
 For a detailed overview of the algorithms used, see the [Anauseam documentation](https://docs.anauseam.org/project-docs/inharmonicity-tuner/00_intro).
+For the design rationale and open observations, see [ARCHITECTURE.md](ARCHITECTURE.md). For contribution guidelines, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 > [!IMPORTANT]
 > **Project Status**
@@ -21,18 +22,18 @@ inharmonicity/
 │   ├── src/
 │   │   ├── algorithms/             # Stateless DSP building blocks
 │   │   │   ├── spectral.rs         # FFT, Hann windowing, spectrum magnitude extraction
-│   │   │   ├── pitch.rs            # XQIFFT/Quinn estimation, sub-cent refinement, unison coherence
+│   │   │   ├── peaks.rs            # Spectral peak extraction with Jacobsen sub-bin interpolation
+│   │   │   ├── twm.rs              # Canonical Two-Way Mismatch (Primary F0 discovery)
+│   │   │   ├── pitch.rs            # XQIFFT/Quinn estimation, sub-cent refinement
 │   │   │   ├── templates.rs        # Structural matched-filters (2-asymptote β model, Gaussian weighting)
-│   │   │   ├── phantom.rs          # Predictive Phantom Partial Mask for intermodulation products
 │   │   │   ├── mat.rs              # Median-Adjustive Trajectories algebraic combinatorial solver
-│   │   │   ├── twm.rs              # Two-Way Mismatch (superseded by Dot-Product Correlation)
 │   │   │   ├── metrics.rs          # RMS, EMA, CSD, NHWRSF, NINOS2 signal metrics
 │   │   │   ├── tuning.rs           # Cent deviation, inharmonicity-compensated frequencies
 │   │   │   └── inharmonicity.rs    # B-coefficient calculation (pending replacement)
 │   │   ├── cola.rs                 # CircularFifo — COLA circular FIFO for overlapping frame analysis
 │   │   ├── models.rs               # Domain types: Note, Partial, KeyMeasurement, profiles
 │   │   ├── pipeline.rs             # AudioPipeline mediator — Dual-FFT unconditional execution
-│   │   ├── engine.rs               # F0 Engine — 3-Stage Matched Filter Architecture
+│   │   ├── engine.rs               # F0 Engine — TWM Discovery + Goertzel Phase Tracking
 │   │   ├── gatekeeper.rs           # 5-state signal validator (DSP only, no shared state)
 │   │   ├── worker.rs               # Background worker for heavy offline DSP
 │   │   ├── audio.rs                # CPAL audio capture, stream management, DC blocking
@@ -94,131 +95,17 @@ The pipeline also manages the **`WorkerManager`** (`worker.rs`), which owns a si
 >
 > The unified `AudioPipeline` system is partially implemented:
 >
-> | Component | Status |
-> | --- | --- |
-> | `pipeline.rs` — AudioPipeline mediator + shared state | 🟡 Testing |
-> | `gatekeeper.rs` — 5-state signal validator (pure DSP) | ✅ Implemented |
-> | `engine.rs` — 3-Stage Matched Filter Architecture | 🟡 Testing |
-> | `worker.rs` — Background worker (single thread) | 🟡 Testing |
-> | `app.rs` — Wait-free GUI dispatcher integration | 🟡 Testing |
-> | Dot-Product Correlation — Replaced Scout/TWM for deterministic lock | 🟡 Testing |
-> | Phantom Partial Masking — Intermodulation filter | 🟡 Testing |
-> | MAT / Guided Trajectory — Algebraic $f_0$ combinatorial solver | 🟡 Testing |
-> | Unison Coherence — `suspend_beta_update` beating detection | 🟡 Testing |
-> | Probabilistic Pitch Tracking — Gatekeeper-governed Kalman | ⬜ Planned |
-> **Currently**, the architecture is in a working testing phase. `app.rs` has been successfully migrated to use the overlapping frame pipeline alongside a lock-free, wait-free SPSC telemetry queue. The `AudioPipeline` serves as the sole frontend-facing DSP orchestrator. The pipeline natively computes unconditional Dual-Track FFT mappings, while the Engine strictly delegates deterministic matching using 88-key sparse templates. Heavy algorithms like MAT are routed completely off-thread to the Background Worker, returning high-resolution inharmonicity measurements natively back to the GUI's `InharmonicityProfile` memory map without ever blocking the audio hot-path.
-
-### Global Data Structures & Memory Management
-
-To maintain real-time performance without relying on OS priority elevation, the core system completely avoids dynamic heap allocation during the audio hot-path by using pre-allocated, lock-free structures:
-
-- **The Elastic Ring Buffer:** A lock-free circular buffer connecting Thread 1 and Thread 2. Acts as an elastic shock absorber — if the OS briefly suspends the processing thread, audio samples continue to accumulate safely without drops.
-- **Lock-Free Object Pool (`AudioPool`):** Pre-allocated pool of `Box<[f32; 66150]>` arrays (1.5 seconds at 44.1 kHz). Thread 2 borrows an array to record a stable note and passes it to the background worker, which recycles it back to the pool when finished.
-- **`ProcessingFrame`:** Thread-local scratch buffers for zero-allocation per-frame DSP. All fields are `Box<[T]>` — allocated once in `AudioPipeline::new()` via `vec![..].into_boxed_slice()`, never resized. Includes dedicated `treble_magnitude_buffer` (1024 bins) and `bass_magnitude_buffer` (4096 bins) for the Dual-Track FFT paths. The Engine reads from these directly — no per-frame heap allocation in the correlation + MAT chain.
-- **`CircularFifo` (COLA):** Owned by `AudioPipeline`. A `Box<[f32]>` ring buffer that accumulates samples and triggers a new FFT + pipeline frame on every 50% hop. Invisible to `tuner-gui` — the GUI only calls `pipeline.push_audio(&[f32])`.
-
-### Threading Model
-
-#### Thread 1: The Audio Stream
-
-This thread is the high-speed hardware ingestor and signal conditioner.
-
-- **Action:** Continuously captures raw audio from the microphone at 44,100 Hz. Each sample passes through a `DcBlocker` (single-pole high-pass IIR, α = 0.995, ~3.5 Hz cutoff) to remove hardware-dependent DC offset, then is pushed into the Elastic Ring Buffer. This guarantees every downstream consumer sees a zero-mean signal regardless of microphone, audio interface, or OS driver.
-- **Rule:** This thread performs zero allocations and no analysis. The DC blocker is the only computation — one multiply and two additions per sample — and is classified as signal *conditioning*, not signal analysis. Its job is to guarantee pristine, zero-mean data throughput.
-
-#### Thread 2: The Audio Processing Pipeline
-
-This thread constantly consumes data from the Elastic Ring Buffer and executes a deterministic DSP pipeline via `AudioPipeline.process_frame()` to calculate the fundamental frequency ($f_0$).
-
-```text
-    Shared ProcessingFrame (Dual FFT Spectra + Sample Buffer)
-                  │
-                  ▼
-    ┌─────────────────────────┐
-    │ AudioPipeline (Mediator)│
-    └──────────┬──┬───────────┘
-               │  │
-    (Synchronous Frame Tick)
-               │  │
-    ┌──────────▼──┴───────────┐  (Logic Relay)  ┌────────────▼────────────┐
-    │  Gatekeeper (Stabilizer)│ ──────────────▶│   f0 Engine (Detector)  │
-    ├─────────────────────────┤ is_silence /    ├─────────────────────────┤
-    │ [0] IDLE (Silence Gate) │ is_new_onset    │ [A] Dual-Track Routing  │
-    │ [1] ATTACK (NHWRSF Flux)│ ──────────────▶│     (Energy Density)    │
-    │ [2] TRANSIENT (Wait)    │                 │ [B] Phantom Partial Mask│
-    │ [3] STABILITY (NINOS2)  │                 │     (Bass Isolation)    │
-    │ [4] RELEASE             │                 │ [C] Guided Trajectory   │
-    └────────────┬────────────┘                 │     (MAT Solver)        │
-                 │                              └────────────┬────────────┘
-                 │                                           │
-                 ▼                                           ▼
-          RuntimeAtomics                                FrameOutput
-                                                     (→ triple_buffer)
-    ┌──────────────────────────────┐
-    │ Capture Accumulation         │
-    │  CaptureState: Armed →       │
-    │    Recording → Processing    │
-    │  AudioPool buffer fill       │
-    └─────────────┬────────────────┘
-                  │ crossbeam SPSC (CapturePayload)
-                  ▼
-    ┌──────────────────────────────┐
-    │ Background Worker (Thread 3) │
-    │  High-Res FFT → Template     │
-    │  Matcher → MAT → β calc      │
-    └─────────────┬────────────────┘
-                  │ crossbeam SPSC (KeyMeasurement)
-                  ▼
-              GUI (Thread 4)
-```
-
-- **The Gatekeeper (Signal Validator & 5-State Logic):** An always-running traffic cop monitoring the signal envelope. It evaluates stability via a `GateResult` return value (replacing the old direct-field-read pattern), executing a 5-stage state machine. The pipeline reads the Gatekeeper's `SignalState` and uses it to drive capture accumulation:
-  - *State 0 (IDLE / Silence Gating):* Uses a dynamic RMS baseline with Exponential Moving Average (EMA) to bypass heavy DSP during periods of noise or silence.
-  - *State 1 (ATTACK):* Uses Normalized Half-Wave Rectified Spectral Flux (NHWRSF) to detect hammer strikes. Sends onset pulse to the Engine to begin pitch detection.
-  - *State 2 (TRANSIENT):* Institutes a hard delay waiting for the chaotic broadband noise of the strike to physically decay.
-  - *State 3 (HARMONIC DECAY):* Uses NINOS2 (Normalized Identification of Note Onset based on Spectral Sparsity) to monitor the signal. It ignores volume swells and identifies the "Golden Window" of pure, stable harmonic decay for capture.
-  - *State 4 (RELEASE):* Caps the capture at 1.5 seconds. The pipeline detects completion (buffer full or silence decay), dispatches the `CapturePayload` to Thread 3 via a bounded crossbeam channel, and transitions `CaptureState` to `Processing` — all without blocking the real-time pipeline.
-- **The Engine (3-Stage Algorithm Router):** A pitch detection chain that operates as an independent state machine, **synchronously reset** by the Gatekeeper's onset pulse but otherwise decoupled from the Gatekeeper's internal transient delays.
-  - **Stage 1: Dual-Track Correlation:** Both 2048-pt (Treble) and 8192-pt (Bass) magnitudes are evaluated on every frame using dot-product correlation against 88 `SparseTemplate` arrays (generated via the two-asymptote β model). An **Energy Density Equivalence** crossover multiplies the Treble score by 4.0 to combat array volume differentials—deterministically selecting the optimal resolution path (`is_bass`).
-  - **Stage 1.5: Phantom Partial Mask:** If the Bass track triggers, a predictive filter identifies longitudinal intermodulation sums (the combinations m+n). We calculate a dynamic frequency smearing radius based on β, completely zeroing out the phantom energy bins to prevent the solver from locking onto physical noise.
-  - **Stage 2: Guided Trajectory Extraction:** Sub-bin frequency peaks are aggressively mapped utilizing the base matching template's layout. We utilize exponential QIFFT refinement on the Treble arrays, and phase-independent `quinn_second_estimator` logic on the dense Bass limits. Concurrent with extraction, spectral peak symmetries and lobe widths are evaluated; if beating unisons are detected, the subsystem flags `suspend_beta_update` to quarantine subsequent offline configurations.
-  - **Stage 3: Median-Adjustive Trajectories (MAT):** The algebraic core evaluating constraints against up to 66 combinatorial pairs of extracted components. Returns the pure fundamental $f_0$.
-  - **Probabilistic Pitch Tracking** *(experimental)*: During the Gatekeeper's NINOS2-confirmed Stable phase, a smoothing algorithm (such as a Kalman Filter, HMM, or Viterbi algorithm) smooths the mathematical output. The filter is bypassed during Attack/Transient states and hard-reset on each new onset pulse. Whether this stage ships in the final release is undecided.
-- **Output:** Pushes a `FrameOutput` structure every hop, containing the treble magnitude spectrum, sub-cent accurate $f_0$, real-time partial frequencies, and the `suspend_beta_update` flag, to the UI thread via a wait-free `triple_buffer`.
-
-Once the Gatekeeper detects silence, it closes the gate by sending the `is_silence` flag to the Engine to force an immediate state reset and prevent pitch detection from running on background noise.
-
-#### Thread 3: The Background Worker
-
-This is a single detached worker thread spawned at pipeline construction inside `AudioPipeline::new()`. It blocks on a crossbeam receiver, waking only when a `CapturePayload` arrives.
-
-- **Action:** When the pipeline dispatches a filled capture buffer, the worker:
-  1. Performs a high-resolution power-of-two FFT on the captured audio (up to 65,536 points).
-  2. **Auto Mode** (`target_note == 255`): Runs the full 88-key Template Matcher at the worker's high-resolution FFT to identify the note, then refines *f₀* via parabolic interpolation.
-  3. **Manual Mode**: Performs a bounded ±1 semitone peak search around the user-selected target, refining with parabolic interpolation.
-  4. Runs MAT (Median-Adjustive Trajectories) to extract partials and compute the inharmonicity coefficient ($B$) via pairwise partial combinations.
-  5. Writes diagnostic files (`audio.raw` + `analysis.json`) to the `diagnostics/` directory.
-- **Output:** Sends a `KeyMeasurement` (containing `key_index`, `measured_f0`, extracted `partials`, and `calculated_b`) to the GUI via the `result_tx` crossbeam SPSC channel. Resets `CaptureState` to `Idle` and recycles the audio buffer back into the `AudioPool`.
-
-#### Thread 4: The UI Thread (The Visual Renderer)
-
-This is the graphical interface thread operating at 60 FPS.
-
-- **Action:** Consumes the high-speed stream of `FrameOutput` structures from Thread 2 via the `triple_buffer` to drive the instantaneous tuning visualizers (spectrogram, cents-deviation, keyboard). Drains `KeyMeasurement` results from the Worker via `pipeline_handle.result_rx` and inserts them into the `InharmonicityProfile`. Reads/writes configuration (e.g., silence threshold, target key) and polls runtime observations (e.g., smoothed RMS for the Envelope Viewer) via `Arc<PipelineAtomics>`.
-
-#### Cross-Thread Communication Topology
-
-Because `tuner-core` enforces strict zero-allocation, wait-free real-time audio constraints, it relies on a rigidly defined topology for inter-thread message passing:
-
-| Pathway | Primitive | Direction | Purpose |
-| --- | --- | --- | --- |
-| **Hardware Capture** | `ringbuf` SPSC | Stream (1) → DSP (2) | Lossless elastic buffer for incoming raw audio. |
-| **Structural Output** | `triple_buffer` | DSP (2) → UI (4) | Lossy continuous viz telemetry (`FrameOutput`). |
-| **DSP Parameters** | `Arc<Atomic*>` | UI (4) ↔ DSP (2) | Wait-free configuration and metric reads/writes. |
-| **Capture Dispatch** | crossbeam SPSC (bounded) | DSP (2) → Worker (3) | `CapturePayload` containing pooled audio buffer + metadata. |
-| **Buffer Recycling** | Lock-Free Object Pool | DSP (2) ↔ Worker (3) | Recycled `Box<[f32; 66150]>` arrays — zero allocation during capture. |
-| **Capture Lifecycle** | `AtomicU8` (baton-pass) | UI (4) → DSP (2) → Worker (3) | `CaptureState`: Idle → Armed → Recording → Processing → Idle. |
-| **Worker Results** | crossbeam SPSC (bounded) | Worker (3) → UI (4) | `KeyMeasurement` with partials, $f_0$, and $B$ coefficient. |
+> | Component                                                      | Status         |
+> | -------------------------------------------------------------- | -------------- |
+> | `pipeline.rs` — AudioPipeline mediator + shared state          | 🟡 Testing     |
+> | `gatekeeper.rs` — 5-state signal validator (pure DSP)          | ✅ Implemented |
+> | `engine.rs` — TWM Discovery + Goertzel Phase Tracking          | 🟡 Testing     |
+> | `peaks.rs` — Jacobsen sub-bin peak extraction                  | 🟡 Testing     |
+> | `twm.rs` — Canonical M&B (1994) Two-Way Mismatch               | 🟡 Testing     |
+> | `worker.rs` — Background worker (single thread)                | 🟡 Testing     |
+> | `app.rs` — Wait-free GUI dispatcher integration                | 🟡 Testing     |
+>
+> **Currently**, the architecture is in a working testing phase. `app.rs` has been successfully migrated to use the overlapping frame pipeline alongside a lock-free, wait-free SPSC telemetry queue. The `AudioPipeline` serves as the sole frontend-facing DSP orchestrator. The pipeline natively computes unconditional Dual-Track FFT mappings, while the Engine identifies the fundamental frequency using the canonical Maher & Beauchamp (1994) Two-Way Mismatch (TWM) algorithm for discovery, followed by per-partial Goertzel phase tracking for sub-cent accuracy. Heavy algorithms like MAT are routed completely off-thread to the Background Worker, returning high-resolution inharmonicity measurements natively back to the GUI's `InharmonicityProfile` memory map without ever blocking the audio hot-path.
 
 ## Iced 0.14.0 UI
 
@@ -254,27 +141,34 @@ See [tuner-gui](tuner-gui/README.md) for more information.
 
 ### Pipeline Hardening
 
-- **Dynamic Sample Rate Plumbing**: The sample rate is currently hardcoded to 44,100 Hz in `Engine::new()` and `CapturePayload`. The actual CPAL-negotiated rate needs to be plumbed from `spawn_analysis_thread()` through the `AudioPipeline` constructor and into the Worker to prevent silent frequency miscalculation on 48 kHz hardware.
+- **Dynamic Sample Rate Plumbing**: The sample rate is currently hardcoded to 44,100 Hz in the `audio.rs` module and `CapturePayload`. The actual CPAL-negotiated rate needs to be plumbed from `spawn_analysis_thread()` through the `AudioPipeline` constructor, into the `Engine`, and into the Worker to prevent silent frequency miscalculation on 48 kHz hardware. Note: The `03-dsp-pipeline.md` guideline explicitly asks new code to read the rate from a single source of truth so this migration remains a single-point change.
 - Move File I/O for inharmonicity profiles into `tuner-core` for true frontend agnosticism.
 
 ### Engine TODOs
 
-- **Engine Refinement / Tuning Rules**: Modify or adjust the current template matching to better avoid note misidentification. If after further testing, template matching deems to be insufficient, we will move to a different algorithmic approach. 
-- **Probabilistic Pitch Tracking** *(experimental — may not ship)*: If the engine's deterministic tuning is deemed visually jittery, probabilistic pitch tracking will be refined (e.g. Hidden Markov Model (HMM), Viterbi sequence, or a Gatekeeper-governed Linear Kalman filter).
+- **TWM Parameter Optimization (MOBO)**: The default heuristics for the Two-Way Mismatch algorithm ($q=1.4, r=0.5, \rho=0.33$) were originally calibrated by Maher & Beauchamp for general audio. To fully optimize these constants for the unique inharmonicity and missing-fundamental characteristics of a piano, a Multi-Objective Bayesian Optimization (MOBO) framework will be implemented to rigorously tune them against a 10,000-frame generative synthetic dataset. See [`docs/adr/0001-mobo-tuning.md`](docs/adr/0001-mobo-tuning.md) for the full methodology.
+- **Viterbi Transient Contamination**: The Viterbi path cost accumulator runs from the first frame after an onset, which includes frames during the Gatekeeper's TRANSIENT state (State 2) before the chaotic strike energy has fully decayed. Bass key profiles are cheap to score on broadband transient noise (due to the $f^{-0.5}$ frequency weighting and fewer predicted partials), giving them an early path cost advantage that the `JUMP_PENALTY` then makes very sticky. The proposed fix is to reset `path_costs` on every frame while the Gatekeeper is in TRANSIENT state, so accumulation only begins once the Gatekeeper reaches its STABILITY window. The `JUMP_PENALTY` itself can also be tuned lower (experimentally, `5.0`–`8.0` reduced perceived stickiness in manual testing). See [`docs/adr/0002-twm-peak-masking-validation.md`](docs/adr/0002-twm-peak-masking-validation.md) for the diagnostic methodology to test changes.
+- **TWM Bass-Lock Bias (Sub-Harmonic Locks)**: Real-world testing shows the engine occasionally locks to extreme bass candidates (e.g. D#4 → A#0, F#3 → A0, D2 → E1). This is a TWM scoring problem independent of Viterbi: because A#0's harmonic series is so dense across the mid-range spectrum, many mid-range peaks accidentally align with its predicted partials, and the $f^{-0.5}$ weighting makes those alignments very cheap. The Viterbi amplifies this by making the false lock sticky, but it does not cause it. Resolution requires MOBO-tuned parameters or an additional penalty for octave-relationship false locks.
+- **Inharmonic Curve Calculation**: A solver to calculate the optimal tuning stretch (inharmonic curve) for the entire piano so that the harmonics of the bass align with the fundamentals of the treble. This will be implemented after the inharmonicity profile cross-thread transfer is completed.
 
 ### Worker TODOs
 
+- **Replace Quinn with CSPE in MAT**: The offline MAT solver (`worker.rs` → `mat.rs`) currently uses Quinn's second estimator for sub-bin peak extraction. Since MAT runs entirely on the non-realtime Worker thread, it should be upgraded to use CSPE (Combined Spectral Peak Estimation) — the same method used in the original Hodgkinson DAFx-09 paper. CSPE provides instantaneous frequency from phase derivatives, giving fundamentally more information than any magnitude-only interpolator. The complex spectrum is already available in the worker's scratch buffers.
 - **CaptureState `compare_exchange`**: The current baton-pass relies on convention (each thread writes only its owned transitions). Switching to `compare_exchange` would enforce correct ordering at the atomic level and prevent a category of future bugs.
 
-### Known issues 
+### Known Issues
 
-- **MAT instability**: MAT scews the fundamental frequency, so we use the template's f0 as the final f0. This will be fixed in the future.
-- **Bass register identification instability**: Lower bass notes are often misidentified due to a mix of tighter partial density, and the linear limits of the bin width regarding the FFT. Further invesitagtion will be done. Manual selection of the key is a workaround for now.
+- **Noisy Environments**: The engine uses a `-30 dB` relative amplitude threshold to filter sympathetic noise before TWM evaluation. If used in a noisy rehearsal environment where the Signal-to-Noise Ratio (SNR) drops below 30 dB, the noise will bleed past the mask and may cause stability issues.
+- **MAT instability**: MAT skews the fundamental frequency in some cases, so the template's $f_0$ is used as the final $f_0$. Upgrading to CSPE-based peak extraction may resolve this.
+- **Stereo DC Blocker**: The `DcBlocker` currently uses a single state variable. If a stereo audio stream is ingested, the interleaved channels will corrupt the 1-pole IIR filter. The app either needs to explicitly force CPAL to Mono or support stereo state tracking.
 
+### Follow-up Documentation & Verification
+
+- **Review the `unsafe` byte-slice transmute in `worker.rs::write_diagnostics`.** Used to serialize the captured `f32` audio buffer to `audio.raw`. Functionally correct but worth reviewing whether `bytemuck` or a safe-wrapper crate could replace the raw `from_raw_parts` call without a performance regression.
 
 ### Architecture Goals (No ETA)
 
-- **Tuner-core standalone package**: Completely separate the DSP pipeline from the GUI into its own crate. This will allow us to use the tuner-core library in other applications ourside of the tuner GUI.
+- **`models/` growth pattern**: The current `models.rs` is a single file. It will eventually become a `models/` directory with submodules (`models/note.rs`, `models/partial.rs`, …) once the single file becomes uncomfortable. There is no specific threshold beyond "when it stops feeling right." Documented in `04-algorithms-and-models.md`.
 
 ## Getting Started
 
@@ -294,12 +188,12 @@ cargo run -p tuner-gui
 
 ### Diagnostic Files
 
-Every capture will produce two files in the `diagnostics/` directory:
+Every capture will produce two files in a key-specific subdirectory within the `diagnostics/` folder (e.g., `diagnostics/key_001_A#0/`):
 
 - `audio.raw`: The raw audio buffer that was captured.
 - `analysis.json`: The analysis of the audio buffer.
 
-This is useful for debugging and for testing new algorithms. Each file is categorized by the note that was detected.
+This is useful for debugging and for testing new algorithms. Each folder is categorized by the note that was detected.
 
 A script has been created to quickly analyze and visualize the data. Running the script alone will just print results to the console.
 
@@ -312,6 +206,16 @@ to view the plots that visualize the data:
 ```bash
 python3 scripts/analyze_capture.py diagnostics/ --gui
 ```
+
+#### CLI Developer Tools
+
+To test the core DSP algorithms offline without launching the GUI, a standalone Cargo example is provided:
+
+- **`diagnose_engine`**: A heavy-duty offline telemetry harness. It allows you to feed a captured `.raw` audio file back into the `tuner-core` engine to dump exactly what the STFT, peak extractor, and TWM algorithm observed at every frame into `spectrum.csv` and `peaks.csv`.
+
+  ```bash
+  cargo run --example diagnose_engine -- diagnostics/key_001_A#0/audio.raw
+  ```
 
 ### License & Contact
 

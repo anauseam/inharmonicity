@@ -7,9 +7,9 @@
 //! This module contains pure data structures used throughout the tuner domain,
 //! divorced from the mathematical algorithms that operate on them.
 
-use serde::{Serialize, Deserialize};
-use std::collections::BTreeMap;
 use once_cell::sync::Lazy;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// A single measured partial (overtone) of a piano note.
 ///
@@ -22,8 +22,6 @@ pub struct Partial {
     pub frequency: f32,
     /// Amplitude of this partial (for spectral envelope analysis).
     pub amplitude: f32,
-    /// Whether the lobe shape passed the coherence check.
-    pub is_coherent: bool,
 }
 
 /// Stores all measured partials for a single piano key, plus the computed
@@ -67,7 +65,7 @@ pub struct Note {
 }
 
 /// Statically computed notes for a standard 88-key piano (A0 to C8).
-/// 
+///
 /// This lazy static contains all 88 piano keys with their corresponding
 /// frequencies calculated using equal temperament tuning with A4 = 440 Hz.
 /// The notes are computed once at startup for optimal performance.
@@ -91,11 +89,12 @@ pub static NOTES: Lazy<Vec<Note>> = Lazy::new(|| {
 });
 
 /// Static map for quick note name to key index lookups.
-/// 
+///
 /// This provides O(log n) lookup time for converting note names
 /// (like "A4", "C#3") to their corresponding piano key indices.
 pub static NOTE_MAP: Lazy<BTreeMap<String, u8>> = Lazy::new(|| {
-    NOTES.iter()
+    NOTES
+        .iter()
         .enumerate()
         .map(|(i, note)| (note.name.clone(), i as u8))
         .collect()
@@ -175,4 +174,23 @@ pub fn find_nearest_note_index(freq: f32) -> u8 {
 /// * Piano key index (0-87), defaults to 0 if note not found
 pub fn get_key_index_from_name(name: &str) -> u8 {
     *NOTE_MAP.get(name).unwrap_or(&0)
+}
+
+/// Returns the expected physical inharmonicity coefficient (beta) for a given piano key.
+///
+/// The dual-exponential parametric model is utilized to smoothly interpolate
+/// the physical transition from the bass bridge to the treble bridge.
+///
+/// Implements Equation for B(n):
+///   B(n) = exp(-0.066n - 9.211) + exp(0.0926n - 11.788)
+///
+/// # Reference
+/// 1. Rigaud, F., David, B., & Daudet, L. (2013). "A parametric model and estimation techniques
+///    for the inharmonicity and tuning of the piano". JASA 133(5), pp. 3107-3118.
+///    DOI: 10.1121/1.4802644
+pub fn get_expected_beta(key_index: u8) -> f32 {
+    // Rigaud model uses a 1-indexed key number (A0 = 1).
+    // key_index is 0-indexed (A0 = 0), so we offset by 1.
+    let n = key_index as f32 + 1.0;
+    (-0.066 * n - 9.211).exp() + (0.0926 * n - 11.788).exp()
 }

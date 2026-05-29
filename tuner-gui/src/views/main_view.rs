@@ -4,7 +4,7 @@
 //! for the Inharmonicity piano tuning application.
 
 use crate::utils::view_utils::{
-    ButtonConfig, ButtonType, make_capture_button, make_undo_button, make_sidebar_section,
+    ButtonConfig, ButtonType, make_capture_button, make_sidebar_section, make_undo_button,
 };
 use crate::widgets::{cent_meter, partials_display, piano_keyboard, spectrogram};
 use iced::widget::{Space, button, column, container, row, text};
@@ -73,7 +73,8 @@ pub fn create_main_view(
         let message = if data.is_calibrating {
             format!(
                 "Calibrating… {}/{}",
-                data.calibration_progress, crate::calibration::CALIBRATION_FRAMES
+                data.calibration_progress,
+                crate::calibration::CALIBRATION_FRAMES
             )
         } else {
             "Shutting down...".to_string()
@@ -241,7 +242,14 @@ fn create_cent_meter_panel(
     };
 
     let cent_meter_content: Element<'static, crate::Message> = container(
-        cent_meter::CentMeterDisplay::new(smoothed_cents, note_name, freq_text, confidence, data.is_stale).view(),
+        cent_meter::CentMeterDisplay::new(
+            smoothed_cents,
+            note_name,
+            freq_text,
+            confidence,
+            data.is_stale,
+        )
+        .view(),
     )
     .width(Fill)
     .height(Fill)
@@ -402,7 +410,11 @@ fn create_sidebar(
 
     // Add all settings sections
     for (title, buttons) in MAIN_SIDEBAR_CONFIG {
-        sections = sections.push(make_sidebar_section(title, buttons, measurement_mode_active));
+        sections = sections.push(make_sidebar_section(
+            title,
+            buttons,
+            measurement_mode_active,
+        ));
     }
 
     // Add capture button if in measurement mode

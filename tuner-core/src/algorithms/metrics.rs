@@ -57,36 +57,6 @@ pub fn calculate_ema(current_val: f32, previous_ema: f32, alpha: f32) -> f32 {
     }
 }
 
-/// Calculates the Complex Spectral Difference (CSD) between two successive frames.
-///
-/// CSD measures the Euclidean distance between complex spectra. A large CSD
-/// indicates a sudden spectral change — exactly what happens when a piano hammer
-/// strikes a string (State 1: ATTACK). The Gatekeeper compares CSD against
-/// `csd_attack_threshold` to trigger the Attack state.
-///
-/// # Arguments
-/// * `prev` — Complex spectrum from the previous frame.
-/// * `curr` — Complex spectrum from the current frame.
-///
-/// # Returns
-/// The squared Euclidean distance between the two spectra (not square-rooted,
-/// for performance — the Gatekeeper thresholds work on squared values).
-///
-/// # Formula
-/// $$\text{CSD} = \sum_{k} \left[ (\text{Re}_k^{\text{curr}} - \text{Re}_k^{\text{prev}})^2 + (\text{Im}_k^{\text{curr}} - \text{Im}_k^{\text{prev}})^2 \right]$$
-pub fn calculate_csd(
-    prev: &[rustfft::num_complex::Complex<f32>],
-    curr: &[rustfft::num_complex::Complex<f32>],
-) -> f32 {
-    let mut sum_sq = 0.0;
-    for (p, c) in prev.iter().zip(curr.iter()) {
-        let diff_re = c.re - p.re;
-        let diff_im = c.im - p.im;
-        sum_sq += diff_re * diff_re + diff_im * diff_im;
-    }
-    sum_sq
-}
-
 /// Calculates the Normalized Half-Wave Rectified Spectral Flux (NHWRSF).
 ///
 /// This measures the increase in transient energy between two frames by summing
@@ -105,23 +75,24 @@ pub fn calculate_nhwrsf(
     prev_spectrum_mags: &mut [f32],
 ) -> f32 {
     // 2048-window FFT at 44100 Hz = ~21.533 Hz per bin.
-    const START_BIN: usize = 2;   // ~43 Hz
-    const END_BIN: usize = 464;   // ~9991 Hz
+    const START_BIN: usize = 2; // ~43 Hz
+    const END_BIN: usize = 464; // ~9991 Hz
 
     let mut total_flux = 0.0;
     let mut current_energy = 0.0;
-    
+
     // Ensure we don't panic if buffers are small for some reason
-    let limit = current_spectrum.len()
+    let limit = current_spectrum
+        .len()
         .min(prev_spectrum_mags.len())
         .min(END_BIN + 1);
-        
+
     let start = START_BIN.min(limit);
 
     for k in start..limit {
         let c = current_spectrum[k];
         let mag = (c.re * c.re + c.im * c.im).sqrt();
-        
+
         current_energy += mag;
 
         let diff = mag - prev_spectrum_mags[k];
@@ -173,44 +144,4 @@ pub fn calculate_ninos2(spectrum: &[rustfft::num_complex::Complex<f32>]) -> f32 
     // The fewer the peaks (more sparse), the closer this ratio gets to N.
     // For white noise, it approaches 1.
     (sum_mag_sq * spectrum.len() as f32) / (sum_mag * sum_mag)
-}
-
-/// Evaluates the Band Energy Ratio to determine if the audio frame is
-/// predominantly a bass register note (< 300 Hz) or treble register.
-///
-/// Instead of attempting to locate an exact fundamental frequency via spectral
-/// peaks (which fails for low bass notes due to FFT resolution and the missing
-/// fundamental), this calculates what fraction of the total acoustic energy
-/// lives in the lower frequency band.
-///
-/// # Returns
-/// A ratio `0.0..=1.0` representing the low-band energy fraction.
-pub fn evaluate_band_energy_ratio(spectrum: &[rustfft::num_complex::Complex<f32>]) -> f32 {
-    // 2048-sample FFT at 44100 Hz = ~21.53 Hz per bin.
-    const LOW_BAND_BINS: usize = 14;   // Up to ~301.4 Hz
-    const TOTAL_BAND_BINS: usize = 200; // Up to ~4306.6 Hz
-
-    let limit = spectrum.len().min(TOTAL_BAND_BINS);
-    if limit == 0 {
-        return 0.0;
-    }
-
-    let mut low_band_energy = 0.0;
-    let mut total_energy = 0.0;
-
-    // Start at bin 1 to ignore DC offset (bin 0)
-    for (k, complex) in spectrum.iter().enumerate().take(limit).skip(1) {
-        let power = complex.re * complex.re + complex.im * complex.im;
-        if k <= LOW_BAND_BINS {
-            low_band_energy += power;
-        }
-        total_energy += power;
-    }
-
-    // Guard against division by zero (pure digital silence)
-    if total_energy <= f32::EPSILON {
-        return 0.0;
-    }
-
-    low_band_energy / total_energy
 }

@@ -14,14 +14,14 @@ use crate::views::{main_view::create_main_view, settings_view::create_settings_v
 use crate::widgets::envelope::ENVELOPE_HISTORY_LENGTH;
 use iced::{self, Element, Subscription, Theme};
 use std::collections::VecDeque;
+use std::sync::atomic::Ordering;
 use tuner_core::{
     FrameOutput,
     algorithms::tuning,
     audio::{self, AudioSource, HostHandle},
     models::{InharmonicityProfile, KeyMeasurement},
-    pipeline::{PipelineHandle, load_f32, store_f32, CaptureState},
+    pipeline::{CaptureState, PipelineHandle, load_f32, store_f32},
 };
-use std::sync::atomic::Ordering;
 
 // Audio processing constants
 const SMOOTHING_FACTOR: usize = 5; // Number of samples for cent smoothing
@@ -355,14 +355,17 @@ impl TunerApp {
                     key_index: current_key,
                     ..
                 } = &self.display_data.tuning_mode
+                    && *current_key == key_index
                 {
-                    if *current_key == key_index {
-                        // Same key clicked again - switch to auto mode
-                        self.display_data.tuning_mode = TuningMode::Auto;
-                        self.pipeline_handle.atomics.config.target_note.store(255, Ordering::Relaxed);
-                        self.display_data.smoothing_buffer.clear();
-                        return iced::Task::none();
-                    }
+                    // Same key clicked again - switch to auto mode
+                    self.display_data.tuning_mode = TuningMode::Auto;
+                    self.pipeline_handle
+                        .atomics
+                        .config
+                        .target_note
+                        .store(255, Ordering::Relaxed);
+                    self.display_data.smoothing_buffer.clear();
+                    return iced::Task::none();
                 }
 
                 // Different key or not in manual mode - switch to manual mode with new key
@@ -373,17 +376,26 @@ impl TunerApp {
                     note_name,
                     target_freq,
                 };
-                self.pipeline_handle.atomics.config.target_note.store(key_index, Ordering::Relaxed);
+                self.pipeline_handle
+                    .atomics
+                    .config
+                    .target_note
+                    .store(key_index, Ordering::Relaxed);
                 self.display_data.smoothing_buffer.clear();
             }
             Message::SwitchToAutoMode => {
                 self.display_data.tuning_mode = TuningMode::Auto;
-                self.pipeline_handle.atomics.config.target_note.store(255, Ordering::Relaxed);
+                self.pipeline_handle
+                    .atomics
+                    .config
+                    .target_note
+                    .store(255, Ordering::Relaxed);
                 self.display_data.smoothing_buffer.clear();
             }
             Message::ToggleMeasurementMode => {
                 // This toggles the measurement mode on/off
-                self.display_data.measurement_mode_active = !self.display_data.measurement_mode_active;
+                self.display_data.measurement_mode_active =
+                    !self.display_data.measurement_mode_active;
                 let mut new_state = CaptureState::Idle;
 
                 if self.display_data.measurement_mode_active {
@@ -392,9 +404,12 @@ impl TunerApp {
                 } else {
                     eprintln!("[MAIN] Measurement mode OFF");
                 }
-                
+
                 self.display_data.capture_state = new_state.clone();
-                self.pipeline_handle.atomics.capture_state.store(new_state as u8, Ordering::Relaxed);
+                self.pipeline_handle
+                    .atomics
+                    .capture_state
+                    .store(new_state as u8, Ordering::Relaxed);
             }
             Message::CaptureButtonClicked => {
                 // Clicked the active button
@@ -408,7 +423,10 @@ impl TunerApp {
                         new_state = CaptureState::Idle;
                     }
                     self.display_data.capture_state = new_state.clone();
-                    self.pipeline_handle.atomics.capture_state.store(new_state as u8, Ordering::Relaxed);
+                    self.pipeline_handle
+                        .atomics
+                        .capture_state
+                        .store(new_state as u8, Ordering::Relaxed);
                 }
             }
             Message::UndoLastCapture => {
@@ -515,16 +533,17 @@ impl TunerApp {
             Message::RecalibrateNoiseFloor => {
                 self.display_data.is_calibrating = true;
                 self.display_data.settings_data.rms.calibration_complete = false;
-                self.display_data.settings_data.rms.active_calibration = Some(crate::app::RmsCalibrationState {
-                    warmup_hops: Some(crate::calibration::WARMUP_FRAMES),
-                    countdown: Some(crate::calibration::CALIBRATION_FRAMES),
-                    max_seen_rms: 0.0,
-                });
+                self.display_data.settings_data.rms.active_calibration =
+                    Some(crate::app::RmsCalibrationState {
+                        warmup_hops: Some(crate::calibration::WARMUP_FRAMES),
+                        countdown: Some(crate::calibration::CALIBRATION_FRAMES),
+                        max_seen_rms: 0.0,
+                    });
             }
             Message::ToggleTransientCalibration => {
                 let vis = !self.display_data.settings_data.transient.visible;
                 self.display_data.settings_data.transient.visible = vis;
-                
+
                 if self.display_data.settings_data.transient.visible {
                     self.display_data.settings_data.rms.visible = false;
                     self.display_data.settings_data.transient.is_frozen = false;
@@ -545,103 +564,122 @@ impl TunerApp {
                 let mut frame_pushed = false;
 
                 // ── Read freshest FrameOutput from triple buffer ──
-                if let Some(ref mut frame_rx) = self.frame_rx {
-                    if frame_rx.update() {
-                        frame_pushed = true;
-                        let frame = frame_rx.read().clone();
-                        self.display_data.last_frame = Some(frame.clone());
+                if let Some(ref mut frame_rx) = self.frame_rx
+                    && frame_rx.update()
+                {
+                    frame_pushed = true;
+                    let frame = frame_rx.read().clone();
+                    self.display_data.last_frame = Some(frame.clone());
 
-                        // 1. Independent Decoupling of Scalar Data
-                        // Assign values individually. If one drops out (e.g. confidence),
-                        // we still display the others.
-                        if let Some(freq) = frame.detected_frequency {
-                            self.display_data.last_frequency = Some(freq);
-                        }
-                        if let Some(idx) = frame.note_index {
-                            self.display_data.last_note_index = Some(idx);
-                        }
-                        if let Some(conf) = frame.confidence {
-                            self.display_data.last_confidence = Some(conf);
-                        }
-                        if let Some(cents) = frame.cents_deviation {
-                            self.display_data.last_cents = Some(cents);
+                    // 1. Independent Decoupling of Scalar Data
+                    // Assign values individually. If one drops out (e.g. confidence),
+                    // we still display the others.
+                    if let Some(freq) = frame.detected_frequency {
+                        self.display_data.last_frequency = Some(freq);
+                    }
+                    if let Some(idx) = frame.note_index {
+                        self.display_data.last_note_index = Some(idx);
+                    }
+                    if let Some(conf) = frame.confidence {
+                        self.display_data.last_confidence = Some(conf);
+                    }
+                    if let Some(cents) = frame.cents_deviation {
+                        self.display_data.last_cents = Some(cents);
 
-                            // Update smoothing buffer
-                            let cents_for_smoothing = match self.display_data.tuning_mode {
-                                TuningMode::Auto => Some(cents),
-                                TuningMode::Manual { target_freq, .. } => {
-                                    if let Some(f) = frame.detected_frequency {
-                                        Some(tuning::calculate_cents_deviation(f, target_freq))
-                                    } else {
-                                        None
-                                    }
-                                }
-                            };
-                            if let Some(c) = cents_for_smoothing {
-                                self.display_data.smoothing_buffer.push(c);
-                                if self.display_data.smoothing_buffer.len() > SMOOTHING_FACTOR {
-                                    self.display_data.smoothing_buffer.remove(0);
-                                }
+                        // Update smoothing buffer
+                        let cents_for_smoothing = match self.display_data.tuning_mode {
+                            TuningMode::Auto => Some(cents),
+                            TuningMode::Manual { target_freq, .. } => frame
+                                .detected_frequency
+                                .map(|f| tuning::calculate_cents_deviation(f, target_freq)),
+                        };
+                        if let Some(c) = cents_for_smoothing {
+                            self.display_data.smoothing_buffer.push(c);
+                            if self.display_data.smoothing_buffer.len() > SMOOTHING_FACTOR {
+                                self.display_data.smoothing_buffer.remove(0);
                             }
                         }
-
-                        // Render State Logic: Silence vs Stale vs Valid
-                        if frame.is_silence {
-                            // Valid Silence: Drop all old measurements.
-                            self.display_data.last_frequency = None;
-                            self.display_data.last_note_index = None;
-                            self.display_data.last_confidence = None;
-                            self.display_data.last_cents = None;
-                            self.display_data.smoothing_buffer.clear();
-                            self.display_data.is_stale = false;
-                        } else if frame.detected_frequency.is_none() && frame.cents_deviation.is_none() {
-                            // Valid Audio but No Pitch Lock: Freeze scalars but flag as stale to mute visual output
-                            self.display_data.smoothing_buffer.clear();
-                            self.display_data.is_stale = true;
-                        } else {
-                            // Valid Lock: Ensure we are not stale.
-                            self.display_data.is_stale = false;
-                        }
-                        
-                        // Sync capture state from atomics for UI rendering
-                        let state_val = self.pipeline_handle.atomics.capture_state.load(Ordering::Relaxed);
-                        self.display_data.capture_state = match state_val {
-                            1 => CaptureState::Armed,
-                            2 => CaptureState::Recording,
-                            3 => CaptureState::Processing,
-                            _ => CaptureState::Idle,
-                        };
                     }
+
+                    // Render State Logic: Silence vs Stale vs Valid
+                    if frame.is_silence {
+                        // Valid Silence: Drop all old measurements.
+                        self.display_data.last_frequency = None;
+                        self.display_data.last_note_index = None;
+                        self.display_data.last_confidence = None;
+                        self.display_data.last_cents = None;
+                        self.display_data.smoothing_buffer.clear();
+                        self.display_data.is_stale = false;
+                    } else if frame.detected_frequency.is_none() && frame.cents_deviation.is_none()
+                    {
+                        // Valid Audio but No Pitch Lock: Freeze scalars but flag as stale to mute visual output
+                        self.display_data.smoothing_buffer.clear();
+                        self.display_data.is_stale = true;
+                    } else {
+                        // Valid Lock: Ensure we are not stale.
+                        self.display_data.is_stale = false;
+                    }
+
+                    // Sync capture state from atomics for UI rendering
+                    let state_val = self
+                        .pipeline_handle
+                        .atomics
+                        .capture_state
+                        .load(Ordering::Relaxed);
+                    self.display_data.capture_state = match state_val {
+                        1 => CaptureState::Armed,
+                        2 => CaptureState::Recording,
+                        3 => CaptureState::Processing,
+                        _ => CaptureState::Idle,
+                    };
                 }
-                
+
                 // ── Drain Result Channel from Worker ──
                 while let Ok(measurement) = self.pipeline_handle.result_rx.try_recv() {
                     let target_idx = measurement.key_index;
-                    
+
                     // Backup old data for Undo History
-                    let old_data = self.inharmonicity_profile.measurements.get(&target_idx).cloned();
+                    let old_data = self
+                        .inharmonicity_profile
+                        .measurements
+                        .get(&target_idx)
+                        .cloned();
                     self.undo_history = Some((target_idx, old_data));
-                    
+
                     // Apply to profile
-                    self.inharmonicity_profile.measurements.insert(target_idx, measurement);
-                    
-                    eprintln!("[MAIN] Successfully slotted new capture data into Inharmonicity Profile at index {}", target_idx);
+                    self.inharmonicity_profile
+                        .measurements
+                        .insert(target_idx, measurement);
+
+                    eprintln!(
+                        "[MAIN] Successfully slotted new capture data into Inharmonicity Profile at index {}",
+                        target_idx
+                    );
 
                     // Re-arm automatically if in Auto mode
                     if let TuningMode::Auto = self.display_data.tuning_mode {
                         eprintln!("[MAIN] Auto-mode rearming...");
-                        self.pipeline_handle.atomics.capture_state.store(CaptureState::Armed as u8, Ordering::Relaxed);
+                        self.pipeline_handle
+                            .atomics
+                            .capture_state
+                            .store(CaptureState::Armed as u8, Ordering::Relaxed);
                         self.display_data.capture_state = CaptureState::Armed;
                     }
                 }
-                
-                self.display_data.undo_target_note = self.undo_history.as_ref().map(|(idx, _)| {
-                    tuner_core::models::find_nearest_note_by_index(*idx).0
-                });
+
+                self.display_data.undo_target_note = self
+                    .undo_history
+                    .as_ref()
+                    .map(|(idx, _)| tuner_core::models::find_nearest_note_by_index(*idx).0);
 
                 if self.display_data.settings_view_visible {
                     if self.display_data.settings_data.rms.visible {
-                        let rms = self.display_data.last_frame.as_ref().map(|f| f.rms_ema).unwrap_or(0.0);
+                        let rms = self
+                            .display_data
+                            .last_frame
+                            .as_ref()
+                            .map(|f| f.rms_ema)
+                            .unwrap_or(0.0);
                         let history = &mut self.display_data.settings_data.rms.history;
                         history.push_back(rms);
                         if history.len() > ENVELOPE_HISTORY_LENGTH {
@@ -650,7 +688,12 @@ impl TunerApp {
                         self.display_data.settings_data.rms.current_threshold =
                             load_f32(&self.pipeline_handle.atomics.config.silence_threshold);
                     } else if self.display_data.settings_data.transient.visible {
-                        let flux = self.display_data.last_frame.as_ref().map(|f| f.nhwrsf).unwrap_or(0.0);
+                        let flux = self
+                            .display_data
+                            .last_frame
+                            .as_ref()
+                            .map(|f| f.nhwrsf)
+                            .unwrap_or(0.0);
                         let current_threshold =
                             load_f32(&self.pipeline_handle.atomics.config.nhwrsf_threshold);
 
@@ -660,13 +703,19 @@ impl TunerApp {
                             current_threshold,
                         );
 
-                        self.display_data.settings_data.transient.current_threshold = current_threshold;
+                        self.display_data.settings_data.transient.current_threshold =
+                            current_threshold;
                     }
                 }
 
                 // ── Calibration Hook ──
                 if self.display_data.is_calibrating {
-                    let current_rms = self.display_data.last_frame.as_ref().map(|f| f.rms_ema).unwrap_or(0.0);
+                    let current_rms = self
+                        .display_data
+                        .last_frame
+                        .as_ref()
+                        .map(|f| f.rms_ema)
+                        .unwrap_or(0.0);
                     if let Some(silence_val) = crate::calibration::process_calibration_tick(
                         &mut self.display_data.settings_data.rms,
                         current_rms,
@@ -681,23 +730,30 @@ impl TunerApp {
                             silence_val,
                         );
                         self.display_data.settings_data.rms.current_threshold = silence_val;
-                        
+
                         // Seed the transient wizard's baseline directly from this calculation point:
-                        if let Some(active) = &self.display_data.settings_data.rms.active_calibration {
-                            self.display_data.settings_data.transient.noise_floor_baseline = active.max_seen_rms;
+                        if let Some(active) =
+                            &self.display_data.settings_data.rms.active_calibration
+                        {
+                            self.display_data
+                                .settings_data
+                                .transient
+                                .noise_floor_baseline = active.max_seen_rms;
                         }
 
                         eprintln!(
                             "[MAIN] Lock-Free Calibration complete. Threshold set to: {:.6}",
                             silence_val
                         );
-                    } else if let Some(active) = &self.display_data.settings_data.rms.active_calibration {
-                        if let Some(countdown) = active.countdown {
-                            self.display_data.calibration_progress = (crate::calibration::CALIBRATION_FRAMES.saturating_sub(countdown)) as usize;
-                        }
+                    } else if let Some(active) =
+                        &self.display_data.settings_data.rms.active_calibration
+                        && let Some(countdown) = active.countdown
+                    {
+                        self.display_data.calibration_progress =
+                            (crate::calibration::CALIBRATION_FRAMES.saturating_sub(countdown))
+                                as usize;
                     }
                 }
-
             }
         }
         iced::Task::none()
@@ -736,7 +792,6 @@ impl TunerApp {
     }
 }
 
-
 // --- New Profile Save/Load Functions ---
 
 use serde_json;
@@ -758,8 +813,7 @@ use std::io::{Read, Write};
 /// * `Ok(())` - Profile saved successfully
 /// * `Err(io::Error)` - File I/O error or JSON serialization error
 fn save_profile(profile: &InharmonicityProfile, path: &str) -> std::io::Result<()> {
-    let json_string = serde_json::to_string_pretty(profile)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let json_string = serde_json::to_string_pretty(profile).map_err(std::io::Error::other)?;
     let mut file = File::create(path)?;
     file.write_all(json_string.as_bytes())?;
     Ok(())
@@ -781,7 +835,7 @@ fn load_profile(path: &str) -> std::io::Result<InharmonicityProfile> {
     let mut file = File::open(path)?;
     let mut data = String::new();
     file.read_to_string(&mut data)?;
-    let profile: InharmonicityProfile = serde_json::from_str(&data)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let profile: InharmonicityProfile =
+        serde_json::from_str(&data).map_err(std::io::Error::other)?;
     Ok(profile)
 }

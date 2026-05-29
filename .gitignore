@@ -24,14 +24,14 @@ target
 README_files/
 README.html
 
-# Generated JSON files
-tuning_profile.json
-
 # Diagnostics
 diagnostics/
 
 # AI-related files
-.agents/workflows/
+.agents/
+plan.md
 
 # User-specific files
-docs/
+docs/old
+resources/
+tuning_profile.json

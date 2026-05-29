@@ -79,9 +79,6 @@ pub struct FrameOutput {
     pub partial_ns: [u32; 12],
     /// Number of valid entries in `partial_freqs` / `partial_ns`.
     pub partial_count: usize,
-    /// Flag indicating the engine encountered beating unisons or distorted spectra.
-    /// Prevents poisoning persistent calibration states downstream.
-    pub suspend_beta_update: bool,
 }
 
 impl Default for FrameOutput {
@@ -99,7 +96,6 @@ impl Default for FrameOutput {
             partial_freqs: [0.0; 12],
             partial_ns: [0; 12],
             partial_count: 0,
-            suspend_beta_update: false,
         }
     }
 }
@@ -115,14 +111,12 @@ impl std::fmt::Debug for FrameOutput {
             .field("confidence", &self.confidence)
             .field("cents_deviation", &self.cents_deviation)
             .field("partial_count", &self.partial_count)
-            .field("suspend_beta_update", &self.suspend_beta_update)
             .finish()
     }
 }
 
-
-
 #[cfg(test)]
 mod tests {
     mod audio_tests;
+    mod peaks_tests;
 }

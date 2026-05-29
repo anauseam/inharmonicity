@@ -61,7 +61,9 @@ pub fn make_capture_button(
         // Show normal button behavior based on actual state
         match capture_state {
             // When idle, display "Ready".
-            tuner_core::pipeline::CaptureState::Idle => ("Ready", iced::Color::from_rgb(0.3, 0.4, 0.6), false),
+            tuner_core::pipeline::CaptureState::Idle => {
+                ("Ready", iced::Color::from_rgb(0.3, 0.4, 0.6), false)
+            }
             // When armed, display Armed and use a neutral or slightly distinct color...
             tuner_core::pipeline::CaptureState::Armed => {
                 ("Armed", iced::Color::from_rgb(0.8, 0.6, 0.2), false)
@@ -94,18 +96,24 @@ pub fn make_capture_button(
 /// Creates a large Undo button that matches the capture button styling.
 /// Used to revert the last captured profile entry.
 pub fn make_undo_button(note_name: String) -> Element<'static, crate::Message> {
-    button(text(format!("Undo Capture ({})", note_name)).size(16).width(Fill))
-        .padding([10, 15])
-        .style(|_theme, _status| {
-            use iced::widget::button;
-            button::Style {
-                background: Some(iced::Background::Color(iced::Color::from_rgb(0.8, 0.4, 0.2))), // Orange
-                text_color: iced::Color::WHITE,
-                ..button::Style::default()
-            }
-        })
-        .on_press(crate::Message::UndoLastCapture)
-        .into()
+    button(
+        text(format!("Undo Capture ({})", note_name))
+            .size(16)
+            .width(Fill),
+    )
+    .padding([10, 15])
+    .style(|_theme, _status| {
+        use iced::widget::button;
+        button::Style {
+            background: Some(iced::Background::Color(iced::Color::from_rgb(
+                0.8, 0.4, 0.2,
+            ))), // Orange
+            text_color: iced::Color::WHITE,
+            ..button::Style::default()
+        }
+    })
+    .on_press(crate::Message::UndoLastCapture)
+    .into()
 }
 
 /// Configuration for a single button in the settings sidebar

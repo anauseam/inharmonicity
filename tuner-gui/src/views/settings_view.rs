@@ -3,7 +3,6 @@ use iced::{Alignment, Element, Fill, Length};
 
 use crate::utils::view_utils::{ButtonConfig, ButtonType, make_sidebar_section};
 
-
 const TONAL_CONFIG: [ButtonConfig; 3] = [
     ButtonConfig {
         label: "Temperament",
@@ -60,14 +59,13 @@ pub fn create_settings_view(data: &crate::app::AppDisplayData) -> Element<'stati
     let title = text("Settings").size(28);
 
     // Build main panel content based on which sub-view is active
-    let main_panel_content: Element<'static, crate::Message> =
-        if data.settings_data.rms.visible {
-            crate::views::rms_calibration::create_rms_calibration_panel(data)
-        } else if data.settings_data.transient.visible {
-            crate::views::transient_calibration::create_transient_calibration_panel(data)
-        } else {
-            text("Select a setting to adjust.").size(18).into()
-        };
+    let main_panel_content: Element<'static, crate::Message> = if data.settings_data.rms.visible {
+        crate::views::rms_calibration::create_rms_calibration_panel(data)
+    } else if data.settings_data.transient.visible {
+        crate::views::transient_calibration::create_transient_calibration_panel(data)
+    } else {
+        text("Select a setting to adjust.").size(18).into()
+    };
 
     let main_panel = container(
         column![title, Space::new().height(20), main_panel_content]
@@ -109,17 +107,19 @@ fn create_settings_sidebar(data: &crate::app::AppDisplayData) -> Element<'static
 
     // Add all settings sections
     for (title, buttons) in SETTINGS_SIDEBAR_CONFIG {
-        sections = sections.push(make_sidebar_section(title, buttons, data.measurement_mode_active));
+        sections = sections.push(make_sidebar_section(
+            title,
+            buttons,
+            data.measurement_mode_active,
+        ));
     }
 
     // Add capture button if in measurement mode
     if data.measurement_mode_active {
-        sections = sections.push(
-            crate::utils::view_utils::make_capture_button(
-                data.capture_state.clone(),
-                crate::Message::CaptureButtonClicked,
-            ),
-        );
+        sections = sections.push(crate::utils::view_utils::make_capture_button(
+            data.capture_state.clone(),
+            crate::Message::CaptureButtonClicked,
+        ));
     }
 
     // Show undo button if undo history exists

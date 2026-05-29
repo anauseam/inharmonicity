@@ -16,7 +16,7 @@ use linreg::linear_regression;
 /// $B = \text{slope} / \text{intercept}$.
 ///
 /// # Deprecation Notice
-/// **DEPRECATED**: This function is deprecated. After the pipeline migration happens, 
+/// **DEPRECATED**: This function is deprecated. After the pipeline migration happens,
 /// other algorithms will perform this role in a manner better in line with the new program structure.
 ///
 /// # Returns
@@ -25,7 +25,9 @@ use linreg::linear_regression;
 ///
 /// # Side Effects
 /// Stores the result in `measurement.calculated_b` for later retrieval.
-#[deprecated(note = "After the pipeline migration happens, other algorithms will perform this role.")]
+#[deprecated(
+    note = "After the pipeline migration happens, other algorithms will perform this role."
+)]
 pub fn calculate_b_value(measurement: &mut KeyMeasurement) -> Option<f32> {
     if measurement.partials.len() < 3 {
         return None; // Need at least 3 points for a meaningful regression
@@ -33,7 +35,9 @@ pub fn calculate_b_value(measurement: &mut KeyMeasurement) -> Option<f32> {
 
     // Prepare the (x, y) data points for linear regression
     // x = n^2, y = (f_n / n)^2
-    let (xs, ys): (Vec<f64>, Vec<f64>) = measurement.partials.iter()
+    let (xs, ys): (Vec<f64>, Vec<f64>) = measurement
+        .partials
+        .iter()
         .filter(|p| p.number > 0 && p.frequency > 0.0)
         .map(|p| {
             let n = p.number as f64;
@@ -44,12 +48,12 @@ pub fn calculate_b_value(measurement: &mut KeyMeasurement) -> Option<f32> {
         })
         .unzip();
 
-    if let Ok((slope, intercept)) = linear_regression::<_, _, f64>(&xs, &ys) {
-        if intercept.abs() > 1e-6 {
-            let b_value = slope / intercept;
-            measurement.calculated_b = Some(b_value as f32);
-            return measurement.calculated_b;
-        }
+    if let Ok((slope, intercept)) = linear_regression::<_, _, f64>(&xs, &ys)
+        && intercept.abs() > 1e-6
+    {
+        let b_value = slope / intercept;
+        measurement.calculated_b = Some(b_value as f32);
+        return measurement.calculated_b;
     }
 
     None
