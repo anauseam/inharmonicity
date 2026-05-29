@@ -12,7 +12,7 @@ version = "0.4.1"
 # Define common dependencies for the workspace to ensure version consistency
 [workspace.dependencies]
 cpal = "0.17.3"
-ringbuf = "0.4.8"
+ringbuf = "0.5.0"
 triple_buffer = "9.0.0"
 
 rustfft = "6.4.1"

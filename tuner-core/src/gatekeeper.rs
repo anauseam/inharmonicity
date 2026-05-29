@@ -46,7 +46,7 @@ pub struct GatekeeperConfig {
     pub rms_ema_alpha: f32,
     /// The threshold for Normalized Half-Wave Rectified Spectral Flux (NHWRSF) above which we declare a transient
     pub nhwrsf_threshold: f32,
-    /// How many frames to hard-wait after a CSD transient is detected (e.g., 10 frames ≈ 464ms)
+    /// How many frames to hard-wait after a NHWRSF transient is detected (e.g., 10 frames ≈ 464ms)
     pub transient_delay_frames: usize,
     /// The NINOS2 sparsity threshold above which the signal is considered harmonically stable
     pub ninos2_stability_threshold: f32,
@@ -87,7 +87,7 @@ pub enum SignalState {
     /// This covers States 1 (ATTACK) and 2 (TRANSIENT) of the state machine.
     Unstable,
     /// The EMA-smoothed RMS falls below `silence_threshold`.
-    /// No DSP beyond RMS is performed in this state (bypasses CSD, NINOS2).
+    /// No DSP beyond RMS is performed in this state (bypasses NHWRSF, NINOS2).
     Silence,
 }
 
@@ -191,7 +191,7 @@ impl Gatekeeper {
 
         let current_spectrum = &frame.frequency_buffer[..];
 
-        // State 1 & 2: Calculate CSD to detect transients
+        // State 1 & 2: Calculate NHWRSF to detect transients
         if self.process_transient_detection(current_spectrum) {
             return self.build_result();
         }
@@ -207,7 +207,7 @@ impl Gatekeeper {
         GateResult {
             rms_ema: self.current_rms_ema,
             nhwrsf: self.current_nhwrsf,
-            state: self.current_state.clone(),
+            state: self.current_state,
             is_new_onset: self.is_new_onset,
         }
     }
@@ -220,7 +220,7 @@ impl Gatekeeper {
     /// **State 2 (TRANSIENT):** While the delay counter is nonzero, the Gatekeeper
     /// waits for the broadband strike noise to physically decay.
     ///
-    /// Also updates `prev_spectrum` for the next frame's CSD calculation.
+    /// Also updates `prev_spectrum` for the next frame's NHWRSF calculation.
     ///
     /// # Returns
     /// `true` if a transient was detected or we are still in the bypass delay.
@@ -291,8 +291,9 @@ impl Gatekeeper {
         if self.is_capturing {
             self.capture_counter += 1;
             if self.capture_counter >= self.config.capture_max_frames {
-                // Time to close the gate and dispatch the buffer!
-                // TODO: Pop the 1.5s array out of audio_pool, fill with logic, send to Thread 3
+                // The AudioPipeline mediator monitors this state transition.
+                // It handles popping the filled capture buffer out of the audio_pool
+                // and dispatching it to the Worker thread (Thread 3).
                 self.reset_capture_state();
             }
         }

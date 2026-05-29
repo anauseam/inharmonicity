@@ -9,6 +9,7 @@
 //! - Hamming windowing for zero-overlap transient preservation
 //! - Optimized for real-time processing
 
+use once_cell::sync::Lazy;
 use realfft::RealToComplex;
 use rustfft::num_complex::Complex;
 use std::sync::Arc;
@@ -62,7 +63,10 @@ pub fn perform_fft(
     // The realfft crate modifies the input buffer in-place during calculation
     // and outputs the N/2 + 1 complex bins directly into our frequency_buffer.
     fft_instance
-        .process(&mut time_buffer[..window_size], &mut frequency_buffer[..expected_bins])
+        .process(
+            &mut time_buffer[..window_size],
+            &mut frequency_buffer[..expected_bins],
+        )
         .expect("FFT Process Failed");
 }
 
@@ -83,13 +87,57 @@ pub fn perform_fft(
 ///
 /// # Panics
 /// * If `out.len() < window_size / 2`.
-pub fn spectrum_to_magnitudes(
-    spectrum: &[Complex<f32>],
-    window_size: usize,
-    out: &mut [f32],
-) {
+pub fn spectrum_to_magnitudes(spectrum: &[Complex<f32>], window_size: usize, out: &mut [f32]) {
     let count = window_size / 2;
     for (o, c) in out[..count].iter_mut().zip(spectrum.iter().take(count)) {
         *o = c.norm();
     }
+}
+
+/// Precomputed Hann window for the 1024-sample Goertzel hop.
+static HANN_1024: Lazy<[f32; 1024]> = Lazy::new(|| {
+    let mut window = [0.0; 1024];
+    for i in 0..1024 {
+        window[i] = 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / 1023.0).cos());
+    }
+    window
+});
+
+/// Hann-windowed non-integer Goertzel algorithm.
+///
+/// Evaluates the DFT at an arbitrary `target_hz` (not restricted to FFT bin centers).
+/// Applies a precomputed window (e.g., `HANN_1024`) to the first 1024 samples.
+///
+/// Returns `(amplitude, phase)` where the amplitude is normalized by `4/N`
+/// (Hann coherent gain = 0.5, ×2 for single-sided) to match physical time-domain units.
+pub fn goertzel(samples: &[f32], sample_rate: u32, target_hz: f32) -> (f32, f32) {
+    if samples.len() < 1024 {
+        return (0.0, 0.0);
+    }
+
+    let k = (1024.0 * target_hz) / sample_rate as f32;
+    let omega = (2.0 * std::f32::consts::PI * k) / 1024.0;
+    let cosine = omega.cos();
+    let sine = omega.sin();
+    let coeff = 2.0 * cosine;
+
+    let mut q1 = 0.0_f32;
+    let mut q2 = 0.0_f32;
+
+    for (&sample, &w) in samples.iter().take(1024).zip(HANN_1024.iter()) {
+        let q0 = coeff * q1 - q2 + (sample * w);
+        q2 = q1;
+        q1 = q0;
+    }
+
+    let real = q1 - q2 * cosine;
+    let imag = q2 * sine;
+
+    let magnitude = (real * real + imag * imag).sqrt();
+    let phase = imag.atan2(real);
+
+    // Normalize by 4.0 / 1024.0 to correct for windowing and single-sided spectrum
+    let amplitude = magnitude * 4.0 / 1024.0;
+
+    (amplitude, phase)
 }

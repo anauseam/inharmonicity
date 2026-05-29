@@ -130,14 +130,13 @@ where
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> Option<iced::widget::canvas::Action<Message>> {
-        if let Some(position) = cursor.position_in(bounds) {
-            if let Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) = event {
-                if let Some(key_index) = self.key_index_from_pos(bounds.size(), position) {
-                    return Some(iced::widget::canvas::Action::publish(
-                        crate::Message::KeySelected(key_index).into(),
-                    ));
-                }
-            }
+        if let Some(position) = cursor.position_in(bounds)
+            && let Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) = event
+            && let Some(key_index) = self.key_index_from_pos(bounds.size(), position)
+        {
+            return Some(iced::widget::canvas::Action::publish(
+                crate::Message::KeySelected(key_index).into(),
+            ));
         }
         None
     }

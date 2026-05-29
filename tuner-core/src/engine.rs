@@ -3,67 +3,144 @@
 //! The "Brains" of the pipeline. The Engine is orchestrated by the `AudioPipeline`
 //! after the signal has been validated by the Gatekeeper. Its sole responsibility
 //! is to process the signal and extract the exact fundamental frequency.
-//!
-//! ## Sequence of processing:
-//!
-//! 1. Stage 1: Correlate against 88 SparseTemplates on the pre-computed magnitude spectrum.
-//! 2. Route conditionals (is_bass) based on the cosine similarity crossover.
-//! 3. Stage 1.5: Phantom partial mask (bass only).
-//! 4. Sub-octave probe: O(1) check for 2× octave confusion in bass register.
-//! 5. Stages 2+3: Delegate to MAT (Median-Adjustive Trajectories) for partial extraction and F0 refinement.
 
-use crate::algorithms::{mat, templates};
-use crate::audio::{BASS_WINDOW_SIZE, WINDOW_SIZE};
+use crate::algorithms::{
+    peaks::{self, SpectralPeak, extract_peaks},
+    spectral::goertzel,
+    twm,
+};
+use crate::audio::BASS_WINDOW_SIZE;
+use crate::models::{NOTES, get_expected_beta};
 use crate::pipeline::ProcessingFrame;
 
-/// Fractional energy threshold for the sub-octave probe.
-/// Both the 3rd and 5th sub-octave partials must exceed this fraction
-/// of the winning template's fundamental bin magnitude to trigger an octave bounce.
-const SUB_OCTAVE_PROBE_THRESHOLD: f32 = 0.25;
+pub const MAX_PARTIALS: usize = 128;
 
-/// Bass/treble register crossover key index.
-/// Key 39 = C4 (261.6 Hz, middle C). Notes identified below this by the 8192-pt
-/// bass FFT use the bass path; notes at or above use the treble path for its
-/// superior temporal resolution.
-const CROSSOVER_KEY: usize = 39;
+/// Precomputed per-key data.
+#[derive(Debug, Clone)]
+pub struct KeyProfile {
+    pub f0_et: f32,
+    pub beta: f32,
+    pub predicted_partials: [f32; MAX_PARTIALS],
+    pub valid_partial_count: usize,
+}
+
+impl KeyProfile {
+    pub fn new(f0_et: f32, beta: f32) -> Self {
+        let mut predicted_partials = [0.0; MAX_PARTIALS];
+        let mut valid_partial_count = 0;
+
+        for n in 1..=MAX_PARTIALS {
+            let n_f32 = n as f32;
+            let f_n = n_f32 * f0_et * (1.0 + beta * n_f32 * n_f32).sqrt();
+            if f_n < 22050.0 {
+                predicted_partials[n - 1] = f_n;
+                valid_partial_count += 1;
+            } else {
+                break;
+            }
+        }
+
+        Self {
+            f0_et,
+            beta,
+            predicted_partials,
+            valid_partial_count,
+        }
+    }
+}
 
 /// Result of a successful pitch detection frame.
 #[derive(Debug, Clone)]
 pub struct PitchResult {
-    pub f0: f32,
-    pub partial_freqs: [f32; 12],
-    pub partial_ns: [u32; 12],
+    /// 0–87 key index of the identified note.
+    pub key_index: u8,
+    /// MVUE-combined cents deviation (weighted average across all live partials).
+    pub cents_deviation: f32,
+    /// Absolute physical fundamental frequency (Hz), derived from cents_deviation.
+    pub measured_f0: f32,
+    /// Per-partial instantaneous frequency (Hz). Valid entries: [0..partial_count].
+    pub partial_freqs: [f32; MAX_PARTIALS],
+    /// Per-partial cents deviation relative to tuning curve target.
+    pub partial_cents: [f32; MAX_PARTIALS],
+    /// Harmonic index (n) for each live partial.
+    pub partial_ns: [u32; MAX_PARTIALS],
+    /// Per-partial amplitude from Goertzel (used as weight by consumer if desired).
+    pub partial_amplitudes: [f32; MAX_PARTIALS],
+    /// Number of live (non-ghost) partials contributing to this frame.
     pub partial_count: usize,
-    pub suspend_beta_update: bool,
+}
+
+impl Default for PitchResult {
+    fn default() -> Self {
+        Self {
+            key_index: 0,
+            cents_deviation: 0.0,
+            measured_f0: 0.0,
+            partial_freqs: [0.0; MAX_PARTIALS],
+            partial_cents: [0.0; MAX_PARTIALS],
+            partial_ns: [0; MAX_PARTIALS],
+            partial_amplitudes: [0.0; MAX_PARTIALS],
+            partial_count: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PartialTracker {
+    prev_phase: f32,
+    prev_f_inst: f32,
+    phase_var_ema: f32,
 }
 
 /// The Fundamental Frequency ($f_0$) Engine.
-///
-/// Simply acts as a designated router between pure algorithm modules.
 pub struct Engine {
     pub sample_rate: u32,
-    pub inharmonicity_b: Option<f32>,
-    templates_treble: [templates::SparseTemplate; 88],
-    templates_bass: [templates::SparseTemplate; 88],
-    /// Scratch space for partial frequencies measured by MAT.
-    pub mat_partial_freqs: [f32; 12],
-    /// Scratch space for partial harmonic indices measured by MAT.
-    pub mat_partial_ns: [u32; 12],
+
+    // Discovery State
+    pub identified_key: Option<u8>,
+    pub path_costs: [f32; 88],
+    pub dp_consistency_key: u8,
+    pub stable_frames: u8,
+
+    // Tracking state
+    tracking_targets: [f32; MAX_PARTIALS],
+    partial_trackers: [PartialTracker; MAX_PARTIALS],
+    warmup_hops: u8,
+
+    // Shared
+    pub noise_floor: f32,
+    profiles: Box<[KeyProfile; 88]>,
+    peak_scratch: Box<[SpectralPeak]>,
+}
+
+fn hz_to_cents(freq: f32, reference: f32) -> f32 {
+    1200.0 * (freq / reference).log2()
 }
 
 impl Engine {
     /// Creates a new Engine with default algorithms.
     pub fn new(sample_rate: u32) -> Self {
-        let templates_treble = templates::build_templates(sample_rate, WINDOW_SIZE);
-        let templates_bass = templates::build_templates(sample_rate, BASS_WINDOW_SIZE);
+        let mut profiles_vec = Vec::with_capacity(88);
+        for i in 0..88 {
+            let note = &NOTES[i];
+            let beta = get_expected_beta(i as u8);
+            profiles_vec.push(KeyProfile::new(note.frequency, beta));
+        }
+
+        let profiles_array: [KeyProfile; 88] = profiles_vec.try_into().unwrap();
 
         Engine {
             sample_rate,
-            inharmonicity_b: None,
-            templates_treble,
-            templates_bass,
-            mat_partial_freqs: [0.0; 12],
-            mat_partial_ns: [0; 12],
+            identified_key: None,
+            path_costs: [0.0; 88],
+            dp_consistency_key: 0,
+            stable_frames: 0,
+            tracking_targets: [0.0; MAX_PARTIALS],
+            partial_trackers: [PartialTracker::default(); MAX_PARTIALS],
+            warmup_hops: 0,
+            noise_floor: 0.0, // updated by pipeline
+            profiles: Box::new(profiles_array),
+            peak_scratch: vec![SpectralPeak::default(); 64].into_boxed_slice(),
         }
     }
 
@@ -73,180 +150,264 @@ impl Engine {
         frame: &mut ProcessingFrame,
         is_silence: bool,
         is_new_onset: bool,
+        target_note: Option<u8>,
     ) -> Option<PitchResult> {
-        if is_silence || is_new_onset {
+        if is_silence {
+            self.path_costs.fill(0.0);
+            self.stable_frames = 0;
+            self.identified_key = None;
+            self.partial_trackers = [PartialTracker::default(); MAX_PARTIALS];
             return None;
         }
 
-        // ── Stage 1: Dual-Track Template Correlation ──────────
+        if is_new_onset {
+            self.identified_key = None;
+            self.path_costs.fill(0.0);
+            self.stable_frames = 0;
+        }
 
-        let mag_count_treble = WINDOW_SIZE / 2;
+        // Force re-evaluation for instant UI response
+        if let Some(target_idx) = target_note
+            && self.identified_key.is_some()
+            && self.identified_key != Some(target_idx)
+        {
+            self.identified_key = None;
+        }
+
         let mag_count_bass = BASS_WINDOW_SIZE / 2;
+        let bass_magnitudes = &frame.bass_magnitude_buffer[..mag_count_bass];
 
-        let (key_treble, f0_treble, beta_treble, score_treble) = templates::match_template(
-            &self.templates_treble,
-            &frame.treble_magnitude_buffer[..mag_count_treble],
-        );
+        // ── Discovery State ──
+        if self.identified_key.is_none() {
+            // ── Gaussian Noise Filter (Detection Theory) ─────────────────────
+            // Computes a Neyman-Pearson threshold for Additive White Gaussian Noise.
+            // Foundation: Kay, S. M. (1998) Fundamentals of Statistical Signal Processing.
+            //
+            // Kay defines the false-alarm rate for a power threshold (gamma') as:
+            // P_fa = exp(-gamma' / sigma^2) (eq. 7.26, ISBN: 0-13-504135-X)
+            //
+            // For efficiency, we target a magnitude threshold (T) where gamma' = T^2.
+            // The total bin power variance (sigma^2) is pre-calculated here as `p_bin`
+            // using the unnormalized FFT Hann window energy (sum_w2 = 0.375 * N).
+            //
+            // Substituting these yields: P_fa = exp(-T^2 / p_bin)
+            // Solving for T gives:       T = sqrt(-p_bin * ln(P_fa))
+            //
+            // Here we target a 0.1% false-alarm rate (P_fa = 0.001).
+            let sum_w2 = 0.375 * BASS_WINDOW_SIZE as f32;
+            let p_bin = self.noise_floor * self.noise_floor * sum_w2;
+            let min_magnitude = if p_bin > 0.0 {
+                (-p_bin * 0.001_f32.ln()).sqrt()
+            } else {
+                0.0
+            };
 
-        let (key_bass, f0_bass, beta_bass, score_bass) = templates::match_template(
-            &self.templates_bass,
-            &frame.bass_magnitude_buffer[..mag_count_bass],
-        );
+            let count = extract_peaks(
+                bass_magnitudes,
+                &frame.bass_frequency_buffer[..],
+                self.sample_rate,
+                BASS_WINDOW_SIZE,
+                min_magnitude,
+                &mut self.peak_scratch,
+            );
 
-        // ── Register Crossover ──
-        // Cosine similarity scores are not comparable across different FFT dimensions
-        // (the coarser treble FFT concentrates energy into fewer bins, inflating scores).
-        // Instead, use the bass path's key identification to decide: the 8192-pt FFT has
-        // 4× the frequency resolution and reliably discriminates across the full spectrum.
-        // If it identifies a bass-register key, use the bass path. Otherwise, use treble
-        // for its superior temporal resolution on higher-frequency signals.
-        let is_bass = key_bass < CROSSOVER_KEY;
+            let k = count.min(64);
+            let active_peaks = &mut self.peak_scratch[..k];
 
-        // DEBUG: Crossover diagnostics
-        eprintln!(
-            "[ENGINE] treble: key={} f0={:.1}Hz score={:.6} | bass: key={} f0={:.1}Hz score={:.6} | route={}",
-            key_treble,
-            f0_treble,
-            score_treble,
-            key_bass,
-            f0_bass,
-            score_bass,
-            if is_bass { "BASS" } else { "TREBLE" }
-        );
+            // 1. Peak Masking (Gómez 2006 / Cano 1998)
+            let valid_count = peaks::mask_peaks(active_peaks);
+            let active_peaks = &mut active_peaks[..valid_count];
 
-        let (mut f0_et, mut beta_nominal, winning_key, active_magnitudes) = if is_bass {
-            let mags = &mut frame.bass_magnitude_buffer[..mag_count_bass];
-            // ── Stage 1.5: Phantom Partial Mask (bass register only) ──
-            // crate::algorithms::phantom::apply_phantom_mask(
-            //     mags,
-            //     f0_bass,
-            //     beta_bass,
-            //     self.sample_rate,
-            //     BASS_WINDOW_SIZE,
-            // );
-            (f0_bass, beta_bass, key_bass, &*mags)
-        } else {
-            (
-                f0_treble,
-                beta_treble,
-                key_treble,
-                &frame.treble_magnitude_buffer[..mag_count_treble],
-            )
-        };
+            // 2. Safe Bypass Gate
+            let (winning_key, temporal_gate) = if let Some(target_idx) = target_note {
+                (target_idx, true) // Bypass 88-key TWM array and Viterbi
+            } else {
+                // Auto Mode: TWM Error Scoring
+                let mut current_errors = [0.0_f32; 88];
+                for k in 0..88 {
+                    current_errors[k] = twm::score_candidate(active_peaks, &self.profiles[k]);
+                }
 
-        // ── Sub-Octave Probe (bass register, key ≥ 12 only) ──
-        // Checks whether the winning template is an octave-up false positive
-        // by looking for the 3rd and 5th partial energy of the sub-octave key.
-        if is_bass && winning_key >= 12 {
-            if let Some((sub_f0, sub_beta)) =
-                self.sub_octave_probe(active_magnitudes, winning_key, f0_et)
-            {
-                f0_et = sub_f0;
-                beta_nominal = sub_beta;
+                // Dynamic Programming Temporal Tracking (Viterbi)
+                let winning_key = twm::viterbi_update(&mut self.path_costs, &current_errors);
+
+                // Stabilization Gate
+                if winning_key == self.dp_consistency_key {
+                    self.stable_frames += 1;
+                } else {
+                    self.dp_consistency_key = winning_key;
+                    self.stable_frames = 1;
+                }
+                (winning_key, self.stable_frames >= 3)
+            };
+
+            let profile = &self.profiles[winning_key as usize];
+
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "[ENGINE] DP Tracking: peaks={}, key_idx={}, f0={:.1}, path_cost={:.1}, consis={}/3",
+                valid_count,
+                winning_key,
+                profile.f0_et,
+                self.path_costs[winning_key as usize],
+                self.stable_frames
+            );
+
+            if temporal_gate {
+                // Lock
+                #[cfg(debug_assertions)]
+                eprintln!("[ENGINE] *** LOCK ACQUIRED *** -> key_idx={}", winning_key);
+                self.identified_key = Some(winning_key);
+                self.warmup_hops = 0;
+
+                let limit = profile.valid_partial_count.min(MAX_PARTIALS);
+                for i in 0..limit {
+                    let predicted = profile.predicted_partials[i];
+                    let tol = predicted * 0.03;
+
+                    let nearest_obs = self.peak_scratch[..count].iter().min_by(|a, b| {
+                        (a.frequency - predicted)
+                            .abs()
+                            .partial_cmp(&(b.frequency - predicted).abs())
+                            .unwrap()
+                    });
+
+                    self.tracking_targets[i] = match nearest_obs {
+                        Some(p) if (p.frequency - predicted).abs() < tol => p.frequency,
+                        _ => predicted,
+                    };
+
+                    self.partial_trackers[i].prev_phase = 0.0;
+                    self.partial_trackers[i].prev_f_inst = self.tracking_targets[i];
+                    self.partial_trackers[i].phase_var_ema = 0.0;
+                }
+            } else {
+                return None;
             }
         }
 
-        // ── Stages 2 + 3: Guided Trajectory & MAT Evaluation ────────────
-        let mat_result = mat::detect_pitch_mat(
-            active_magnitudes,
-            self.sample_rate,
-            f0_et,
-            beta_nominal,
-            is_bass,
-            &mut self.mat_partial_freqs,
-            &mut self.mat_partial_ns,
-        )?;
+        // ── Tracking State ──
+        let key = self.identified_key?;
+        let profile = &self.profiles[key as usize];
+        let audio_slice = &frame.audio_buffer[7168..8192];
+        let t_hop = 1024.0 / self.sample_rate as f32;
 
-        let (f0, partial_count, suspend_beta_update) = mat_result;
+        let mut weight_sum = 0.0;
+        let mut cents_sum = 0.0;
+        let mut live_partials = 0;
+        let mut result = PitchResult {
+            key_index: key,
+            ..Default::default()
+        };
 
-        // DEBUG: MAT output diagnostics
-        eprintln!(
-            "[MAT] seed_f0={:.2}Hz → refined_f0={:.2}Hz | partials={} | suspend_beta={}",
-            f0_et, f0, partial_count, suspend_beta_update
-        );
+        const ALPHA: f32 = 0.1;
+        let fs = self.sample_rate as f32;
+        let c_crlb_geometric = 6.0 * fs * fs
+            / (core::f32::consts::PI * core::f32::consts::PI * 1024.0 * 1024.0 * 1024.0);
 
-        // NOTE: We see MAT scews the fundamental frequency, so we use the template's f0
-        // as the final f0.This will be fixed in the future.
-        Some(PitchResult {
-            f0: f0_et,
-            partial_freqs: self.mat_partial_freqs,
-            partial_ns: self.mat_partial_ns,
-            partial_count,
-            suspend_beta_update,
-        })
-    }
+        for i in 0..profile.valid_partial_count.min(MAX_PARTIALS) {
+            let f_target = self.tracking_targets[i];
+            let (amplitude, phase_current) = goertzel(audio_slice, self.sample_rate, f_target);
+            let tracker = &mut self.partial_trackers[i];
 
-    /// Sub-octave energy probe for 2× octave confusion detection.
-    ///
-    /// After the template matcher selects a bass key, this function checks
-    /// whether the sub-octave key (one octave below) has substantial energy
-    /// at its 3rd and 5th inharmonically-stretched partial positions. If both
-    /// exceed `SUB_OCTAVE_PROBE_THRESHOLD` of the winning template's
-    /// fundamental bin magnitude, the sub-octave is confirmed as the true note.
-    ///
-    /// Uses ±1 bin local maximum for spectral smearing robustness.
-    ///
-    /// Returns `Some((sub_f0_et, sub_beta))` if the probe confirms the sub-octave,
-    /// `None` if the original template result stands.
-    fn sub_octave_probe(
-        &self,
-        magnitudes: &[f32],
-        winning_key: usize,
-        winning_f0_et: f32,
-    ) -> Option<(f32, f32)> {
-        let sub_key = winning_key - 12;
-        let sub_template = &self.templates_bass[sub_key];
-        let sub_f0 = sub_template.f0_et;
-        let sub_beta = sub_template.beta_nominal;
+            if self.warmup_hops == 0 {
+                tracker.prev_phase = phase_current;
+                continue;
+            }
 
-        let hz_per_bin = self.sample_rate as f32 / BASS_WINDOW_SIZE as f32;
-        let max_bin = magnitudes.len().saturating_sub(2); // Leave room for +1 neighbor
+            // ── Phase Vocoder / Sinusoidal Tracking ──
+            // Foundation: McAulay, R. J., & Quatieri, T. F. (1986). Speech analysis/synthesis based
+            // on a sinusoidal representation. IEEE Transactions on Acoustics, Speech, and Signal Processing.
+            //
+            // Computes instantaneous frequency by unwrapping the phase derivative relative to the static f_target:
+            // Δφ = (φ_n - φ_{n-1} - 2π f_target t_hop) mod 2π
+            // f_inst = f_target + Δφ / (2π t_hop)
+            let expected_advance = 2.0 * core::f32::consts::PI * f_target * t_hop;
+            let phase_diff = phase_current - tracker.prev_phase - expected_advance;
+            let delta_phi = (phase_diff + core::f32::consts::PI)
+                .rem_euclid(2.0 * core::f32::consts::PI)
+                - core::f32::consts::PI;
 
-        // Reference: energy at the winning template's fundamental bin
-        let winner_bin = (winning_f0_et / hz_per_bin).round() as usize;
-        if winner_bin < 1 || winner_bin > max_bin {
+            let f_inst = f_target + delta_phi / (2.0 * core::f32::consts::PI * t_hop);
+            tracker.prev_phase = phase_current;
+
+            if self.warmup_hops == 1 {
+                tracker.prev_f_inst = f_inst;
+                continue;
+            }
+
+            let delta_f_inst = f_inst - tracker.prev_f_inst;
+            tracker.phase_var_ema =
+                ALPHA * delta_f_inst * delta_f_inst + (1.0 - ALPHA) * tracker.phase_var_ema;
+            tracker.prev_f_inst = f_inst;
+
+            // ── MVUE Frequency Estimation ──
+            // Calculates the Minimum Variance Unbiased Estimator (MVUE) for the true fundamental.
+            // Foundation: Kay, S. M. (1993). Fundamentals of Statistical Signal Processing: Estimation Theory.
+            //
+            // The Cramer-Rao Lower Bound (CRLB) for the variance of a sinusoidal frequency estimate in AWGN is:
+            // var(f) >= 12 / ((2*pi)^2 * SNR * N(N^2-1))
+            // Because SNR is proportional to amplitude^2, optimal MVUE weighting combines partials
+            // using W_i = A_i^2. The missing fundamental tracks noise, exceeds the CRLB variance
+            // threshold, and is assigned a weight of 0.0, cleanly erasing it from the final pitch.
+            let expected_var = c_crlb_geometric * (self.noise_floor * self.noise_floor)
+                / (amplitude * amplitude + 1e-12);
+
+            let weight = if tracker.phase_var_ema > 3.0 * expected_var {
+                0.0
+            } else {
+                amplitude * amplitude
+            };
+
+            if weight > 0.0 {
+                result.partial_freqs[live_partials] = f_inst;
+                result.partial_amplitudes[live_partials] = amplitude;
+
+                let tuning_curve_target = profile.predicted_partials[i];
+                let cents_i = hz_to_cents(f_inst, tuning_curve_target);
+                result.partial_cents[live_partials] = cents_i;
+                result.partial_ns[live_partials] = (i + 1) as u32;
+
+                weight_sum += weight;
+                cents_sum += weight * cents_i;
+                live_partials += 1;
+            }
+        }
+
+        if self.warmup_hops == 0 {
+            self.warmup_hops = 1;
+            return None;
+        } else if self.warmup_hops == 1 {
+            self.warmup_hops = 2;
+            return None; // No f_inst diff variance available yet
+        }
+
+        if live_partials < 2 {
+            self.identified_key = None;
             return None;
         }
-        let ref_energy = local_max_3(magnitudes, winner_bin);
-        if ref_energy < 1e-10 {
-            return None;
-        }
 
-        let threshold = ref_energy * SUB_OCTAVE_PROBE_THRESHOLD;
-
-        // Probe: 3rd partial of sub-octave key
-        let f3 = 3.0 * sub_f0 * (1.0 + sub_beta * 9.0).sqrt();
-        let bin3 = (f3 / hz_per_bin).round() as usize;
-        if bin3 < 1 || bin3 > max_bin {
-            return None;
-        }
-        let energy3 = local_max_3(magnitudes, bin3);
-
-        // Probe: 5th partial of sub-octave key
-        let f5 = 5.0 * sub_f0 * (1.0 + sub_beta * 25.0).sqrt();
-        let bin5 = (f5 / hz_per_bin).round() as usize;
-        if bin5 < 1 || bin5 > max_bin {
-            return None;
-        }
-        let energy5 = local_max_3(magnitudes, bin5);
-
-        // AND gate: both partials must exceed threshold
-        if energy3 >= threshold && energy5 >= threshold {
-            Some((sub_f0, sub_beta))
+        result.cents_deviation = if weight_sum > 0.0 {
+            cents_sum / weight_sum
         } else {
-            None
-        }
-    }
-}
+            0.0
+        };
 
-/// Returns the maximum magnitude across `magnitudes[bin-1..=bin+1]`.
-///
-/// Accounts for spectral leakage from windowing and β drift
-/// that can push peak energy into adjacent bins.
-#[inline]
-fn local_max_3(magnitudes: &[f32], bin: usize) -> f32 {
-    let left = magnitudes[bin - 1];
-    let center = magnitudes[bin];
-    let right = magnitudes[bin + 1];
-    left.max(center).max(right)
+        // ── Mathematical Proof of f0 Reconstruction ──
+        // Let f_n be the physical frequency of partial n.
+        // The expected tuning curve is: f_{n, curve} = n * f_{0, et} * sqrt(1 + B * n^2).
+        // The cents deviation is: c_n = 1200 * log2(f_n / f_{n, curve}).
+        // Substituting the uniform global deviation C back into the ET fundamental gives:
+        // f_{0, measured} = f_{0, et} * 2^(C / 1200)
+        //                 = f_{0, et} * (f_n / f_{n, curve})
+        //                 = f_{0, et} * (f_n / (n * f_{0, et} * sqrt(1 + B * n^2)))
+        //                 = f_n / (n * sqrt(1 + B * n^2))
+        // This is the EXACT algebraic inverse mapping for extracting the fundamental from an
+        // inharmonic partial! Doing it logarithmically via cents explicitly factors out f_{0, et}
+        // and yields the pure physical fundamental without any division or square roots in the hot path.
+        result.measured_f0 = profile.f0_et * 2.0_f32.powf(result.cents_deviation / 1200.0);
+        result.partial_count = live_partials;
+
+        Some(result)
+    }
 }

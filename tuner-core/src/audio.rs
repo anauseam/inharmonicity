@@ -227,7 +227,7 @@ impl std::fmt::Debug for HostHandle {
                 &self
                     .thread_handle
                     .as_ref()
-                    .map_or(false, |h| !h.is_finished()),
+                    .is_some_and(|h| !h.is_finished()),
             )
             .finish()
     }
@@ -273,7 +273,7 @@ impl std::fmt::Debug for HostHandle {
 /// let mut handle = spawn_analysis_thread(AudioSource::Default).unwrap();
 ///
 /// // Read the freshest visualization frame
-/// let frame = handle.frame_rx.read();
+/// let frame = handle.frame_rx.as_mut().unwrap().read();
 /// println!("RMS: {}", frame.rms_ema);
 ///
 

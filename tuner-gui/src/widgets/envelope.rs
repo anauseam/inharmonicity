@@ -161,7 +161,7 @@ impl<Message> canvas::Program<Message> for EnvelopeViewer {
                     position: Point::new(4.0, y + 2.0),
                     color: label_color,
                     align_x: alignment::Horizontal::Left.into(),
-                    align_y: alignment::Vertical::Top.into(),
+                    align_y: alignment::Vertical::Top,
                     size: iced::Pixels(10.0),
                     ..Default::default()
                 };
@@ -175,7 +175,7 @@ impl<Message> canvas::Program<Message> for EnvelopeViewer {
                     position: Point::new(bounds.width - 5.0, 5.0),
                     color: Color::from_rgb8(0x2E, 0xCC, 0x71), // Match envelope color
                     align_x: alignment::Horizontal::Right.into(),
-                    align_y: alignment::Vertical::Top.into(),
+                    align_y: alignment::Vertical::Top,
                     ..Default::default()
                 };
                 frame.fill_text(rms_text);
@@ -187,7 +187,7 @@ impl<Message> canvas::Program<Message> for EnvelopeViewer {
                 position: Point::new(5.0, threshold_y - 5.0),
                 color: Color::from_rgba8(0xE7, 0x4C, 0x3C, 0.9), // Match threshold color
                 align_x: alignment::Horizontal::Left.into(),
-                align_y: alignment::Vertical::Bottom.into(),
+                align_y: alignment::Vertical::Bottom,
                 ..Default::default()
             };
             frame.fill_text(threshold_text);

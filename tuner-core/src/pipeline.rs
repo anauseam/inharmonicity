@@ -22,12 +22,12 @@
 //!   Audio Thread              GUI Thread
 //! ```
 
+use crossbeam_channel::{Receiver, Sender, bounded};
 use crossbeam_queue::ArrayQueue;
 use realfft::RealToComplex;
 use rustfft::num_complex::Complex;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
-use crossbeam_channel::{bounded, Receiver, Sender};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 use crate::FrameOutput;
 use crate::audio::{BASS_WINDOW_SIZE, HOP_SIZE, WINDOW_SIZE};
@@ -48,6 +48,10 @@ pub struct CapturePayload {
     pub target_note: u8,
     /// Fixed sampling rate of the pipeline.
     pub sample_rate: u32,
+    /// Calibrated noise floor for the capture.
+    pub noise_floor: f32,
+    /// Highly accurate unified Goertzel seed for MAT (None if tracking failed)
+    pub measured_f0: Option<f32>,
 }
 
 /// Capture lifecycle state, communicated via AtomicU8.
@@ -250,13 +254,17 @@ pub struct AudioPipeline {
 
     // Worker Thread Dispatch
     pub capture_tx: Sender<CapturePayload>,
-    
+
     // Capture Accumulation State
     capture_buffer: Option<Box<[f32; 66150]>>,
     capture_count: usize,
     /// Latches 'true' when a new onset is detected while Armed.
     /// Reset to 'false' upon capture start or Silence.
     capture_onset_pending: bool,
+    /// Latched fundamental frequency for Auto-Mode dispatch validation
+    latched_auto_key: Option<u8>,
+    /// Last measured physical frequency from the Engine
+    pub last_measured_f0: Option<f32>,
 }
 
 /// Frontend-side handle to the pipeline's shared state.
@@ -289,7 +297,10 @@ impl std::fmt::Debug for PipelineHandle {
                 "silence_threshold",
                 &crate::pipeline::load_f32(&self.atomics.config.silence_threshold),
             )
-            .field("rms_ema", &crate::pipeline::load_f32(&self.atomics.runtime.current_rms_ema))
+            .field(
+                "rms_ema",
+                &crate::pipeline::load_f32(&self.atomics.runtime.current_rms_ema),
+            )
             .finish()
     }
 }
@@ -308,7 +319,7 @@ impl AudioPipeline {
         for _ in 0..4 {
             let _ = audio_pool.push(Box::new([0.0; 66150]));
         }
-        
+
         let atomics = Arc::new(PipelineAtomics::default());
 
         let gatekeeper = Gatekeeper::new(Arc::clone(&audio_pool));
@@ -326,7 +337,8 @@ impl AudioPipeline {
             Arc::clone(&atomics),
             capture_rx,
             result_tx,
-        ).start_workers();
+        )
+        .start_workers();
 
         let pipeline = Self {
             gatekeeper,
@@ -341,12 +353,11 @@ impl AudioPipeline {
             capture_buffer: None,
             capture_count: 0,
             capture_onset_pending: false,
+            latched_auto_key: None,
+            last_measured_f0: None,
         };
 
-        let handle = PipelineHandle {
-            atomics,
-            result_rx,
-        };
+        let handle = PipelineHandle { atomics, result_rx };
 
         (pipeline, handle)
     }
@@ -396,12 +407,19 @@ impl AudioPipeline {
 
         self.cola.acknowledge_hop(HOP_SIZE);
 
-        // ─── Step 2: Signal Gating (Gatekeeper) ───
+        // ─── Step 2: Read Shared Atomics ───
 
-        // Read GUI-set configs into the Gatekeeper and Engine (wait-free)
         self.gatekeeper.config.silence_threshold = load_f32(&self.atomics.config.silence_threshold);
         self.gatekeeper.config.nhwrsf_threshold = load_f32(&self.atomics.config.nhwrsf_threshold);
-        self.engine.inharmonicity_b = load_option_f32(&self.atomics.config.inharmonicity_b);
+        self.engine.noise_floor = load_f32(&self.atomics.config.silence_threshold);
+
+        let target_note = match self.atomics.config.target_note.load(Ordering::Relaxed) {
+            255 => None,
+            val if val < 88 => Some(val), // Bounds Safety
+            _ => None,
+        };
+
+        // ─── Step 3: Signal Gating (Gatekeeper) ───
 
         // Pure DSP — Gatekeeper evaluates signal stability and returns result
         let gate_result = self.gatekeeper.process_frame(&self.processing_frame);
@@ -410,69 +428,8 @@ impl AudioPipeline {
         store_f32(&self.atomics.runtime.current_rms_ema, gate_result.rms_ema);
         store_f32(&self.atomics.runtime.current_nhwrsf, gate_result.nhwrsf);
 
-        // ─── Capture Accumulation Logic ───
+        // ─── Step 4: Treble Magnitude Extraction ───
 
-        // Reset onset pending on silence
-        if gate_result.state == crate::gatekeeper::SignalState::Silence {
-            self.capture_onset_pending = false;
-        }
-        
-        let current_capture_state = self.atomics.capture_state.load(Ordering::Relaxed);
-
-        if current_capture_state == CaptureState::Armed as u8 {
-            // Latch onset when it first appears while Armed
-            if gate_result.is_new_onset {
-                self.capture_onset_pending = true;
-            }
-
-            // Only trigger transition to Recording if we have a pending onset AND reached stability
-            if self.capture_onset_pending && gate_result.state == crate::gatekeeper::SignalState::Stable {
-                // Pop buffer from AudioPool
-                if let Some(buf) = self.audio_pool.pop() {
-                    self.capture_onset_pending = false; // Reset latch
-                    self.capture_buffer = Some(buf);
-                    self.capture_count = 0;
-                    self.atomics.capture_state.store(CaptureState::Recording as u8, Ordering::Relaxed);
-                }
-            }
-        } else if current_capture_state == CaptureState::Recording as u8 {
-            if let Some(mut buf) = self.capture_buffer.take() {
-                // Copy newest HOP_SIZE samples
-                let start_idx = BASS_WINDOW_SIZE - HOP_SIZE;
-                let src_slice = &self.processing_frame.audio_buffer[start_idx..BASS_WINDOW_SIZE];
-                
-                let remaining = 66150 - self.capture_count;
-                let to_copy = src_slice.len().min(remaining);
-                
-                buf[self.capture_count..self.capture_count + to_copy]
-                    .copy_from_slice(&src_slice[..to_copy]);
-                
-                self.capture_count += to_copy;
-
-                let done = self.capture_count == 66150;
-                let decayed = gate_result.state == crate::gatekeeper::SignalState::Silence;
-
-                if done || decayed {
-                    // Dispatch
-                    let target_note = self.atomics.config.target_note.load(Ordering::Relaxed);
-                    let payload = CapturePayload {
-                        buffer: buf,
-                        sample_count: self.capture_count,
-                        target_note,
-                        sample_rate: 44100, // Assuming static sample rate for now
-                    };
-                    
-                    let _ = self.capture_tx.try_send(payload);
-                    self.atomics.capture_state.store(CaptureState::Processing as u8, Ordering::Relaxed);
-                } else {
-                    // Keep accumulating
-                    self.capture_buffer = Some(buf);
-                }
-            }
-        }
-
-        // ─── Step 3: Treble Magnitude Extraction ───
-        
         let mag_count = WINDOW_SIZE / 2;
         crate::algorithms::spectral::spectrum_to_magnitudes(
             &self.processing_frame.frequency_buffer[..],
@@ -487,16 +444,102 @@ impl AudioPipeline {
             &mut self.processing_frame.bass_magnitude_buffer[..mag_count_bass],
         );
 
-        // ─── Step 4: Pitch Detection (Engine) ───
+        // ─── Step 5: Pitch Detection (Engine) ───
 
         let is_silence = gate_result.state == crate::gatekeeper::SignalState::Silence;
+        if gate_result.is_new_onset {
+            self.last_measured_f0 = None;
+        }
+
         let pitch_result = self.engine.process(
             &mut self.processing_frame,
             is_silence,
             gate_result.is_new_onset,
+            target_note,
         );
 
-        // ─── Step 5: Triple Buffer Telemetry Assembly ───
+        // ─── Step 6: Capture Accumulation & Worker Dispatch ───
+
+        if gate_result.state == crate::gatekeeper::SignalState::Silence {
+            self.capture_onset_pending = false;
+        }
+        let current_capture_state = self.atomics.capture_state.load(Ordering::Relaxed);
+
+        if current_capture_state == CaptureState::Armed as u8 {
+            if gate_result.is_new_onset {
+                self.capture_onset_pending = true;
+            }
+            if self.capture_onset_pending
+                && gate_result.state == crate::gatekeeper::SignalState::Stable
+                && let Some(buf) = self.audio_pool.pop()
+            {
+                self.capture_onset_pending = false;
+                self.capture_buffer = Some(buf);
+                self.capture_count = 0;
+                self.atomics
+                    .capture_state
+                    .store(CaptureState::Recording as u8, Ordering::Relaxed);
+            }
+        } else if current_capture_state == CaptureState::Recording as u8 {
+            // ── Latch ──
+            if let Some(ref result) = pitch_result {
+                self.latched_auto_key = Some(result.key_index);
+                self.last_measured_f0 = Some(result.measured_f0);
+            }
+
+            if let Some(mut buf) = self.capture_buffer.take() {
+                let start_idx = BASS_WINDOW_SIZE - HOP_SIZE;
+                let src_slice = &self.processing_frame.audio_buffer[start_idx..BASS_WINDOW_SIZE];
+
+                let remaining = 66150 - self.capture_count;
+                let to_copy = src_slice.len().min(remaining);
+
+                buf[self.capture_count..self.capture_count + to_copy]
+                    .copy_from_slice(&src_slice[..to_copy]);
+
+                self.capture_count += to_copy;
+
+                let done = self.capture_count == 66150;
+                let decayed = gate_result.state == crate::gatekeeper::SignalState::Silence;
+
+                if done || decayed {
+                    let target_note = self.atomics.config.target_note.load(Ordering::Relaxed);
+
+                    // ── Dispatch Gate ──
+                    let dispatch_note = if target_note == 255 {
+                        self.latched_auto_key
+                    } else {
+                        Some(target_note)
+                    };
+
+                    if let Some(note_to_send) = dispatch_note {
+                        let payload = CapturePayload {
+                            buffer: buf,
+                            sample_count: self.capture_count,
+                            target_note: note_to_send,
+                            sample_rate: 44100,
+                            noise_floor: load_f32(&self.atomics.config.silence_threshold),
+                            measured_f0: self.last_measured_f0,
+                        };
+                        let _ = self.capture_tx.try_send(payload);
+                        self.atomics
+                            .capture_state
+                            .store(CaptureState::Processing as u8, Ordering::Relaxed);
+                    } else {
+                        // Garbage detected (No Lock). Recycle buffer and reset to Armed.
+                        let _ = self.audio_pool.push(buf);
+                        self.atomics
+                            .capture_state
+                            .store(CaptureState::Armed as u8, Ordering::Relaxed);
+                    }
+                    self.latched_auto_key = None;
+                } else {
+                    self.capture_buffer = Some(buf);
+                }
+            }
+        }
+
+        // ─── Step 7: Triple Buffer Telemetry Assembly ───
 
         // Build fixed-size FrameOutput — zero heap allocations
         let mut frame_output = FrameOutput::default();
@@ -510,22 +553,18 @@ impl AudioPipeline {
         frame_output.is_silence = is_silence;
 
         if let Some(result) = pitch_result {
-            let note_index = crate::models::find_nearest_note_index(result.f0);
-            let (_, target_freq) = crate::models::find_nearest_note_by_index(note_index);
-            let cents = crate::algorithms::tuning::calculate_cents_deviation(result.f0, target_freq);
+            frame_output.detected_frequency = Some(result.measured_f0);
+            frame_output.confidence = None;
+            frame_output.note_index = Some(result.key_index);
+            frame_output.cents_deviation = Some(result.cents_deviation);
 
-            frame_output.detected_frequency = Some(result.f0);
-            frame_output.confidence = None; // MAT does not currently output confidence
-            frame_output.note_index = Some(note_index);
-            frame_output.cents_deviation = Some(cents);
-
-            // Populate strobe arrays
-            frame_output.partial_freqs[..result.partial_count]
-                .copy_from_slice(&result.partial_freqs[..result.partial_count]);
-            frame_output.partial_ns[..result.partial_count]
-                .copy_from_slice(&result.partial_ns[..result.partial_count]);
-            frame_output.partial_count = result.partial_count;
-            frame_output.suspend_beta_update = result.suspend_beta_update;
+            // Populate strobe arrays (limit to 12 for GUI rendering)
+            let strobe_count = result.partial_count.min(12);
+            frame_output.partial_freqs[..strobe_count]
+                .copy_from_slice(&result.partial_freqs[..strobe_count]);
+            frame_output.partial_ns[..strobe_count]
+                .copy_from_slice(&result.partial_ns[..strobe_count]);
+            frame_output.partial_count = strobe_count;
         }
 
         Some(frame_output)

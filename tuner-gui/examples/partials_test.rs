@@ -43,11 +43,11 @@ impl PartialsViewer {
         match message {
             LocalMessage::Tick => {
                 // Partials are temporarily stubbed per the GUI refactor
-                if let Some(ref mut rx) = self.host_handle.frame_rx {
-                    if rx.update() {
-                        let _result = rx.read().clone();
-                        self.partials = vec![440.0, 880.0, 1320.0, 1760.0];
-                    }
+                if let Some(ref mut rx) = self.host_handle.frame_rx
+                    && rx.update()
+                {
+                    let _result = rx.read().clone();
+                    self.partials = vec![440.0, 880.0, 1320.0, 1760.0];
                 }
             }
         }

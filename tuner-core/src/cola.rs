@@ -1,9 +1,9 @@
 //! # Constant Overlap-Add (COLA) Module
 //!
-//! This module provides the lock-free, zero-allocation circular FIFO ring buffer 
-//! necessary to implement the Constant Overlap-Add (COLA) audio processing architecture. 
-//! By accumulating continuous audio and advancing by overlapping hop sizes, it guarantees 
-//! temporal coverage and completely eliminates boundary blind-spots for transient events. 
+//! This module provides the lock-free, zero-allocation circular FIFO ring buffer
+//! necessary to implement the Constant Overlap-Add (COLA) audio processing architecture.
+//! By accumulating continuous audio and advancing by overlapping hop sizes, it guarantees
+//! temporal coverage and completely eliminates boundary blind-spots for transient events.
 
 /// Circular FIFO for overlapping audio frame analysis.
 ///

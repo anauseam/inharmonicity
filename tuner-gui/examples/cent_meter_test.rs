@@ -44,19 +44,19 @@ impl CentMeterViewer {
     fn update(&mut self, message: LocalMessage) -> Task<LocalMessage> {
         match message {
             LocalMessage::Tick => {
-                if let Some(ref mut rx) = self.host_handle.frame_rx {
-                    if rx.update() {
-                        let result = rx.read().clone();
-                        if let Some(cents) = result.cents_deviation {
-                            self.smoothing_buffer.push(cents);
-                            if self.smoothing_buffer.len() > 5 {
-                                self.smoothing_buffer.remove(0);
-                            }
-                        } else {
-                            self.smoothing_buffer.clear();
+                if let Some(ref mut rx) = self.host_handle.frame_rx
+                    && rx.update()
+                {
+                    let result = rx.read().clone();
+                    if let Some(cents) = result.cents_deviation {
+                        self.smoothing_buffer.push(cents);
+                        if self.smoothing_buffer.len() > 5 {
+                            self.smoothing_buffer.remove(0);
                         }
-                        self.last_analysis = Some(result);
+                    } else {
+                        self.smoothing_buffer.clear();
                     }
+                    self.last_analysis = Some(result);
                 }
             }
         }

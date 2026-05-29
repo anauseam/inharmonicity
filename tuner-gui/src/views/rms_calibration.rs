@@ -23,9 +23,13 @@ pub fn create_rms_calibration_panel(data: &AppDisplayData) -> Element<'static, c
         column![
             row![
                 text("Silence Threshold: ").size(14),
-                slider(slider_min..=slider_max, threshold, crate::Message::SilenceThresholdChanged)
-                    .step(slider_step)
-                    .width(Fill),
+                slider(
+                    slider_min..=slider_max,
+                    threshold,
+                    crate::Message::SilenceThresholdChanged
+                )
+                .step(slider_step)
+                .width(Fill),
                 text(format!("{:.5}", threshold)).size(14),
             ]
             .spacing(10)

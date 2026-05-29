@@ -29,10 +29,7 @@ pub fn process_calibration_tick(
         return None;
     }
 
-    let active = match settings.active_calibration.as_mut() {
-        Some(a) => a,
-        None => return None,
-    };
+    let active = settings.active_calibration.as_mut()?;
 
     // If we're still warming up, only decrement if a completely new audio buffer arrived.
     if let Some(mut warmup) = active.warmup_hops {

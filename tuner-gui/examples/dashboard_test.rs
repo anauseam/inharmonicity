@@ -7,11 +7,10 @@
 use iced::widget::container;
 use iced::{Element, Length, Subscription, Theme};
 
-
 mod shared;
+use tuner_core::pipeline::CaptureState;
 use tuner_gui::app::{AppDisplayData, TuningMode};
 use tuner_gui::views::main_view::create_widget_area;
-use tuner_core::pipeline::CaptureState;
 
 pub fn main() -> iced::Result {
     iced::application(
@@ -98,26 +97,25 @@ impl DashboardTest {
         match message {
             LocalMessage::Tick => {
                 // Poll the audio receiver 60 times a second
-                if let Some(host) = &mut self.audio_receiver {
-                    if let Some(ref mut rx) = host.frame_rx {
-                        if rx.update() {
-                            let result = rx.read().clone();
-                            if let Some(cents) = result.cents_deviation {
-                                self.display_data.smoothing_buffer.push(cents);
-                                if self.display_data.smoothing_buffer.len() > 5 {
-                                    self.display_data.smoothing_buffer.remove(0);
-                                }
-                            } else {
-                                self.display_data.smoothing_buffer.clear();
-                            }
-                            // Store the latest analysis
-                            self.display_data.last_frame = Some(result.clone());
-                            self.display_data.last_note_index = result.note_index;
-                            self.display_data.last_frequency = result.detected_frequency;
-                            self.display_data.last_confidence = result.confidence;
-                            self.display_data.last_cents = result.cents_deviation;
+                if let Some(host) = &mut self.audio_receiver
+                    && let Some(ref mut rx) = host.frame_rx
+                    && rx.update()
+                {
+                    let result = rx.read().clone();
+                    if let Some(cents) = result.cents_deviation {
+                        self.display_data.smoothing_buffer.push(cents);
+                        if self.display_data.smoothing_buffer.len() > 5 {
+                            self.display_data.smoothing_buffer.remove(0);
                         }
+                    } else {
+                        self.display_data.smoothing_buffer.clear();
                     }
+                    // Store the latest analysis
+                    self.display_data.last_frame = Some(result.clone());
+                    self.display_data.last_note_index = result.note_index;
+                    self.display_data.last_frequency = result.detected_frequency;
+                    self.display_data.last_confidence = result.confidence;
+                    self.display_data.last_cents = result.cents_deviation;
                 }
             }
             LocalMessage::IgnoreWidgetMessage(_msg) => {
@@ -132,8 +130,7 @@ impl DashboardTest {
         // Create the widget area using the extracted layout function.
         // It returns an Element<'static, tuner_gui::Message>, so we MUST map
         // those messages to our LocalMessage enum.
-        let content = create_widget_area(&self.display_data)
-            .map(|msg| LocalMessage::IgnoreWidgetMessage(msg));
+        let content = create_widget_area(&self.display_data).map(LocalMessage::IgnoreWidgetMessage);
 
         container(content)
             .width(Length::Fill)

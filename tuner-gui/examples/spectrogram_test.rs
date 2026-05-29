@@ -43,11 +43,11 @@ impl SpectrogramViewer {
     fn update(&mut self, message: LocalMessage) -> Task<LocalMessage> {
         match message {
             LocalMessage::Tick => {
-                if let Some(ref mut rx) = self.host_handle.frame_rx {
-                    if rx.update() {
-                        let result = rx.read();
-                        self.spectrum_data = result.magnitudes[..result.magnitude_len].to_vec();
-                    }
+                if let Some(ref mut rx) = self.host_handle.frame_rx
+                    && rx.update()
+                {
+                    let result = rx.read();
+                    self.spectrum_data = result.magnitudes[..result.magnitude_len].to_vec();
                 }
             }
         }
