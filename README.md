@@ -146,6 +146,7 @@ See [tuner-gui](tuner-gui/README.md) for more information.
 
 ### Engine TODOs
 
+- **Tune Gatekeeper (Onset & Transient Phase)**: Use the newly implemented offline pre-roll diagnostic captures (`audio_full_event.raw`) to analyze the exact moment of hammer impact. This ground-truth data will be used to refine the Gatekeeper's onset detection and transient decay rules.
 - **TWM Parameter Optimization (MOBO)**: The default heuristics for the Two-Way Mismatch algorithm ($q=1.4, r=0.5, \rho=0.33$) were originally calibrated by Maher & Beauchamp for general audio. To fully optimize these constants for the unique inharmonicity and missing-fundamental characteristics of a piano, a Multi-Objective Bayesian Optimization (MOBO) framework will be implemented to rigorously tune them against a 10,000-frame generative synthetic dataset. See [`docs/adr/0001-mobo-tuning.md`](docs/adr/0001-mobo-tuning.md) for the full methodology.
 - **Viterbi Transient Contamination**: The Viterbi path cost accumulator runs from the first frame after an onset, which includes frames during the Gatekeeper's TRANSIENT state (State 2) before the chaotic strike energy has fully decayed. Bass key profiles are cheap to score on broadband transient noise (due to the $f^{-0.5}$ frequency weighting and fewer predicted partials), giving them an early path cost advantage that the `JUMP_PENALTY` then makes very sticky. The proposed fix is to reset `path_costs` on every frame while the Gatekeeper is in TRANSIENT state, so accumulation only begins once the Gatekeeper reaches its STABILITY window. The `JUMP_PENALTY` itself can also be tuned lower (experimentally, `5.0`–`8.0` reduced perceived stickiness in manual testing). See [`docs/adr/0002-twm-peak-masking-validation.md`](docs/adr/0002-twm-peak-masking-validation.md) for the diagnostic methodology to test changes.
 - **TWM Bass-Lock Bias (Sub-Harmonic Locks)**: Real-world testing shows the engine occasionally locks to extreme bass candidates (e.g. D#4 → A#0, F#3 → A0, D2 → E1). This is a TWM scoring problem independent of Viterbi: because A#0's harmonic series is so dense across the mid-range spectrum, many mid-range peaks accidentally align with its predicted partials, and the $f^{-0.5}$ weighting makes those alignments very cheap. The Viterbi amplifies this by making the false lock sticky, but it does not cause it. Resolution requires MOBO-tuned parameters or an additional penalty for octave-relationship false locks.
@@ -153,8 +154,12 @@ See [tuner-gui](tuner-gui/README.md) for more information.
 
 ### Worker TODOs
 
-- **Replace Quinn with CSPE in MAT**: The offline MAT solver (`worker.rs` → `mat.rs`) currently uses Quinn's second estimator for sub-bin peak extraction. Since MAT runs entirely on the non-realtime Worker thread, it should be upgraded to use CSPE (Combined Spectral Peak Estimation) — the same method used in the original Hodgkinson DAFx-09 paper. CSPE provides instantaneous frequency from phase derivatives, giving fundamentally more information than any magnitude-only interpolator. The complex spectrum is already available in the worker's scratch buffers.
+- **Replace Quinn with CSPE in MAT**: The offline MAT solver (`worker.rs` → `mat.rs`) currently uses Quinn's second estimator for sub-bin peak extraction. Since MAT runs entirely on the non-realtime Worker thread, it should be upgraded to use CSPE (Combined Spectral Peak Estimation) — the same method used in the original Hodgkinson DAFx-09 paper. CSPE provides instantaneous frequency from phase derivatives, giving fundamentally more information than any magnitude-only interpolator. The complex spectrum is already available in the worker's scratch buffers. Validation of CSPE will be done by building a new offline CLI tool in `tuner-core/examples`.
 - **CaptureState `compare_exchange`**: The current baton-pass relies on convention (each thread writes only its owned transitions). Switching to `compare_exchange` would enforce correct ordering at the atomic level and prevent a category of future bugs.
+
+### GUI TODOs
+
+- **Diagnostics Importer**: Build a mechanism in the GUI to directly import an offline-generated `analysis.json` into the `InharmonicityProfile`. This serves as a developer/diagnostic tool to allow us to easily load test outputs from our offline CLI harnesses into the GUI for visual inspection and graph plotting.
 
 ### Known Issues
 
@@ -188,10 +193,11 @@ cargo run -p tuner-gui
 
 ### Diagnostic Files
 
-Every capture will produce two files in a key-specific subdirectory within the `diagnostics/` folder (e.g., `diagnostics/key_001_A#0/`):
+Every capture will produce three files in a key-specific subdirectory within the `diagnostics/` folder (e.g., `diagnostics/key_001_A#0/`):
 
-- `audio.raw`: The raw audio buffer that was captured.
-- `analysis.json`: The analysis of the audio buffer.
+- `audio.raw`: The strictly causal, stable audio buffer that triggered the capture.
+- `audio_full_event.raw`: The non-causal diagnostic buffer capturing ~348ms of pre-roll, the physical hammer strike, and the resulting decay.
+- `analysis.json`: The analytical telemetry from the background worker.
 
 This is useful for debugging and for testing new algorithms. Each folder is categorized by the note that was detected.
 
@@ -211,10 +217,10 @@ python3 scripts/analyze_capture.py diagnostics/ --gui
 
 To test the core DSP algorithms offline without launching the GUI, a standalone Cargo example is provided:
 
-- **`diagnose_engine`**: A heavy-duty offline telemetry harness. It allows you to feed a captured `.raw` audio file back into the `tuner-core` engine to dump exactly what the STFT, peak extractor, and TWM algorithm observed at every frame into `spectrum.csv` and `peaks.csv`.
+- **`diagnose_engine`**: A heavy-duty offline telemetry harness. It allows you to feed captured `.raw` audio files (`audio.raw` or `audio_full_event.raw`) back into the `tuner-core` engine to dump exactly what the STFT, peak extractor, and TWM algorithm observed at every frame into `spectrum.csv` and `peaks.csv`.
 
   ```bash
-  cargo run --example diagnose_engine -- diagnostics/key_001_A#0/audio.raw
+  cargo run --example diagnose_engine -- diagnostics/key_001_A#0/audio_full_event.raw
   ```
 
 ### License & Contact

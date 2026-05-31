@@ -27,7 +27,7 @@ By using a generative synthetic dataset, we achieve:
 1. **Perfect Ground Truth:** We mathematically define the exact $f_0$, $B$, and noise floor of every frame before generating the audio.
 2. **Controlled Edge Cases:** We can programmatically generate edge cases that cause TWM to fail in the wild, such as extreme missing fundamentals (A0), heavy sympathetic tonal noise, and specific beating unisons.
 
-_(Note: The standard ML practice is to optimize against the massive synthetic dataset, and then validate the resulting Pareto optimal parameters against a smaller, manually verified dataset of real acoustic recordings.)_
+_(Note: The standard ML practice is to optimize against the massive synthetic dataset, and then validate the resulting Pareto optimal parameters against a smaller, manually verified dataset of real acoustic recordings.)
 
 ### The Objectives
 

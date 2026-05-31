@@ -208,7 +208,7 @@ pub struct TunerApp {
 
     // --- Inharmonicity State ---
     inharmonicity_profile: InharmonicityProfile,
-    undo_history: Option<(u8, Option<KeyMeasurement>)>,
+    undo_history: VecDeque<(u8, Option<KeyMeasurement>)>,
 
     // Frontend handle to the AudioPipeline's shared atomic state
     pipeline_handle: PipelineHandle,
@@ -240,7 +240,7 @@ impl Default for TunerApp {
             host_handle: None,
             frame_rx: None,
             inharmonicity_profile: InharmonicityProfile::default(),
-            undo_history: None,
+            undo_history: VecDeque::new(),
             pipeline_handle: PipelineHandle::default(),
             display_data: AppDisplayData {
                 audio_worker_active: false,
@@ -430,7 +430,7 @@ impl TunerApp {
                 }
             }
             Message::UndoLastCapture => {
-                if let Some((idx, old_data)) = self.undo_history.take() {
+                if let Some((idx, old_data)) = self.undo_history.pop_back() {
                     if let Some(m) = old_data {
                         self.inharmonicity_profile.measurements.insert(idx, m);
                     } else {
@@ -448,6 +448,7 @@ impl TunerApp {
             Message::LoadProfile => match load_profile("tuning_profile.json") {
                 Ok(profile) => {
                     self.inharmonicity_profile = profile;
+                    self.undo_history.clear();
                     eprintln!("[MAIN] Tuning profile loaded successfully.");
                 }
                 Err(e) => eprintln!("[MAIN] Error loading profile: {}", e),
@@ -644,7 +645,10 @@ impl TunerApp {
                         .measurements
                         .get(&target_idx)
                         .cloned();
-                    self.undo_history = Some((target_idx, old_data));
+                    self.undo_history.push_back((target_idx, old_data));
+                    if self.undo_history.len() > 100 {
+                        self.undo_history.pop_front();
+                    }
 
                     // Apply to profile
                     self.inharmonicity_profile
@@ -669,7 +673,7 @@ impl TunerApp {
 
                 self.display_data.undo_target_note = self
                     .undo_history
-                    .as_ref()
+                    .back()
                     .map(|(idx, _)| tuner_core::models::find_nearest_note_by_index(*idx).0);
 
                 if self.display_data.settings_view_visible {

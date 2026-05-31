@@ -36,7 +36,7 @@ is a hard architectural constraint (see
 layout is a consequence of needing to keep audio capture, real-time
 DSP, heavy asynchronous DSP, and rendering all isolated from each other.
 
-## Global Data Structures & Memory Management
+### Global Data Structures & Memory Management
 
 To maintain real-time performance without relying on OS priority elevation, the core system completely avoids dynamic heap allocation during the audio hot-path by using pre-allocated, lock-free structures:
 
@@ -45,7 +45,7 @@ To maintain real-time performance without relying on OS priority elevation, the 
 - **`ProcessingFrame`:** Thread-local scratch buffers for zero-allocation per-frame DSP. All fields are `Box<[T]>` — allocated once in `AudioPipeline::new()` via `vec![..].into_boxed_slice()`, never resized. Includes dedicated `treble_magnitude_buffer` (1024 bins) and `bass_magnitude_buffer` (4096 bins) for the Dual-Track FFT paths. The Engine reads from these directly — no per-frame heap allocation in the correlation + MAT chain.
 - **`CircularFifo` (COLA):** Owned by `AudioPipeline`. A `Box<[f32]>` ring buffer that accumulates samples and triggers a new FFT + pipeline frame on every 50% hop. Invisible to `tuner-gui` — the GUI only calls `pipeline.push_audio(&[f32])`.
 
-## Threading Model
+### Threading Model
 
 The four threads:
 

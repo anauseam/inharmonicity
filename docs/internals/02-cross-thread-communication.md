@@ -82,9 +82,11 @@ design smell — reconsider the design before implementing it.
 ### Mechanism
 
 - **DSP → Worker.** The pipeline transfers a `CapturePayload`
-  (containing a pre-allocated `Box<[f32; 66150]>` from the `AudioPool`
-  plus metadata such as `target_note` and `sample_rate`) to the worker
-  via `.try_send()` — wait-free on a bounded crossbeam channel.
+  (containing a `stable_buffer` and an optional `full_event_buffer`
+  from the `AudioPool` plus metadata such as `target_note` and
+  `sample_rate`) to the worker via `.try_send()` — wait-free on a
+  bounded crossbeam channel. The `AudioPool` has a capacity of 8 to
+  safely accommodate these dual-buffer payloads without exhaustion.
 - **Worker → UI.** The worker sends the resulting `KeyMeasurement`
   (which may carry heap-allocated fields like `Vec<Partial>` and
   `String`) back to the UI via `.send()`. The UI drains it with
@@ -101,7 +103,8 @@ transitions:
 
 - **GUI:** `Idle → Armed` (arm), `Armed → Idle` (cancel).
 - **DSP pipeline:** `Armed → Recording` (stability detected),
-  `Recording → Processing` (buffer full or silence decay).
+  `Recording → Processing` (buffer full or silence decay),
+  `Recording → Armed` (worker queue backpressure failure recovery).
 - **Worker:** `Processing → Idle` (computation complete).
 
 This is currently a convention-only contract (plain `.store(...,
