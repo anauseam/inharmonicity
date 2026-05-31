@@ -72,6 +72,7 @@ run async to the hot path. They may heap-allocate freely.
 | Async background worker                      | `worker.rs`                                                                 |
 | Stateless DSP math                           | `algorithms/{spectral,peaks,pitch,twm,mat,metrics,tuning,inharmonicity}.rs` |
 | Domain types and lookup tables               | `models.rs`                                                                 |
+| Developer CLI tools & testing harnesses      | `examples/`                                                                 |
 
 ## File map — `tuner-gui/src/`
 

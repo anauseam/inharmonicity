@@ -38,12 +38,23 @@ use crate::gatekeeper::Gatekeeper;
 
 // ─── Memory Infrastructure ───────────────────────────────────────────────────
 
+// Buffer capacity for non-causal pre-roll.
+// 32,768 samples provides ~743ms of history at 44.1kHz, safely accommodating
+// the 15-frame (15,360 sample) pre-roll requirement.
+const ONSET_HISTORY_SAMPLES: usize = 32768;
+
 /// Payload dispatched from the pipeline to the Worker thread.
 pub struct CapturePayload {
     /// 1.5 seconds of high-resolution overlap-added buffer content.
-    pub buffer: Box<[f32; 66150]>,
-    /// Number of valid samples written to the buffer.
-    pub sample_count: usize,
+    pub stable_buffer: Box<[f32; 66150]>,
+    /// Number of valid samples written to the stable buffer.
+    pub stable_sample_count: usize,
+    /// Purely diagnostic buffer containing the full acoustic event (pre-roll, strike, and decay).
+    /// This is written to disk for analysis tooling (`diagnose_engine.rs`) and is NEVER
+    /// fed back into the Engine or MAT algorithms.
+    pub full_event_buffer: Option<Box<[f32; 66150]>>,
+    /// Number of valid samples written to the full event buffer.
+    pub full_event_sample_count: usize,
     /// The target note index the UI requested, or 255 for Auto.
     pub target_note: u8,
     /// Fixed sampling rate of the pipeline.
@@ -258,6 +269,13 @@ pub struct AudioPipeline {
     // Capture Accumulation State
     capture_buffer: Option<Box<[f32; 66150]>>,
     capture_count: usize,
+    /// Parallel accumulator for the diagnostic `full_event_buffer`.
+    full_event_buffer: Option<Box<[f32; 66150]>>,
+    full_event_count: usize,
+    /// Continuous circular history of the raw audio stream.
+    /// Maintained strictly to provide non-causal pre-roll for diagnostic captures.
+    history_buffer: Box<[f32; ONSET_HISTORY_SAMPLES]>,
+    history_idx: usize,
     /// Latches 'true' when a new onset is detected while Armed.
     /// Reset to 'false' upon capture start or Silence.
     capture_onset_pending: bool,
@@ -314,9 +332,9 @@ impl AudioPipeline {
     /// # Returns
     /// A tuple of `(AudioPipeline, PipelineHandle)`.
     pub fn new() -> (Self, PipelineHandle) {
-        let audio_pool = Arc::new(ArrayQueue::new(4));
+        let audio_pool = Arc::new(ArrayQueue::new(8));
         // Pre-fill pool
-        for _ in 0..4 {
+        for _ in 0..8 {
             let _ = audio_pool.push(Box::new([0.0; 66150]));
         }
 
@@ -352,6 +370,13 @@ impl AudioPipeline {
             capture_tx,
             capture_buffer: None,
             capture_count: 0,
+            full_event_buffer: None,
+            full_event_count: 0,
+            history_buffer: vec![0.0f32; ONSET_HISTORY_SAMPLES]
+                .into_boxed_slice()
+                .try_into()
+                .unwrap(),
+            history_idx: 0,
             capture_onset_pending: false,
             latched_auto_key: None,
             last_measured_f0: None,
@@ -407,6 +432,16 @@ impl AudioPipeline {
 
         self.cola.acknowledge_hop(HOP_SIZE);
 
+        // --- Synchronous History Accumulator ---
+        // Perfectly aligned with the DSP clock to prevent OS buffer chunk misalignment
+        // Placed AFTER read_window() so the audio_buffer contains the freshest data
+        let start_idx = BASS_WINDOW_SIZE - HOP_SIZE;
+        let new_samples = &self.processing_frame.audio_buffer[start_idx..BASS_WINDOW_SIZE];
+        for &s in new_samples {
+            self.history_buffer[self.history_idx] = s;
+            self.history_idx = (self.history_idx + 1) % self.history_buffer.len();
+        }
+
         // ─── Step 2: Read Shared Atomics ───
 
         self.gatekeeper.config.silence_threshold = load_f32(&self.atomics.config.silence_threshold);
@@ -460,15 +495,44 @@ impl AudioPipeline {
 
         // ─── Step 6: Capture Accumulation & Worker Dispatch ───
 
+        let current_capture_state = self.atomics.capture_state.load(Ordering::Relaxed);
+
         if gate_result.state == crate::gatekeeper::SignalState::Silence {
             self.capture_onset_pending = false;
+            // Proactively recover diagnostic buffer on false transients
+            if current_capture_state == CaptureState::Armed as u8 {
+                if let Some(dbuf) = self.full_event_buffer.take() {
+                    let _ = self.audio_pool.push(dbuf);
+                }
+                self.full_event_count = 0;
+            }
         }
-        let current_capture_state = self.atomics.capture_state.load(Ordering::Relaxed);
+
+        // ─── MUST Split the original else-if chain into two if blocks here ───
 
         if current_capture_state == CaptureState::Armed as u8 {
             if gate_result.is_new_onset {
                 self.capture_onset_pending = true;
+                // Prevent memory leak if an old diagnostic buffer was abandoned (e.g. decayed to silence)
+                if let Some(old_buf) = self.full_event_buffer.take() {
+                    let _ = self.audio_pool.push(old_buf);
+                }
+                self.full_event_count = 0; // Unconditionally reset stale state
+
+                // Grab non-causal pre-roll from history for the diagnostic buffer
+                if let Some(mut buf) = self.audio_pool.pop() {
+                    let pre_roll_samples = 15 * HOP_SIZE; // 15360 samples (~348ms)
+                    let hist_len = self.history_buffer.len();
+                    for i in 0..pre_roll_samples {
+                        let idx = (self.history_idx + hist_len - pre_roll_samples - HOP_SIZE + i)
+                            % hist_len;
+                        buf[i] = self.history_buffer[idx];
+                    }
+                    self.full_event_buffer = Some(buf);
+                    self.full_event_count = pre_roll_samples;
+                }
             }
+
             if self.capture_onset_pending
                 && gate_result.state == crate::gatekeeper::SignalState::Stable
                 && let Some(buf) = self.audio_pool.pop()
@@ -480,7 +544,24 @@ impl AudioPipeline {
                     .capture_state
                     .store(CaptureState::Recording as u8, Ordering::Relaxed);
             }
-        } else if current_capture_state == CaptureState::Recording as u8 {
+        }
+
+        // --- Diagnostic Accumulator ---
+        // Accumulate the full event buffer globally. This runs unconditionally
+        // AFTER the initialization block to ensure the very first frame of the onset is captured seamlessly.
+        // This audio is solely for CLI diagnostics and is isolated from the live Engine.
+        if let Some(mut buf) = self.full_event_buffer.take() {
+            let start_idx = BASS_WINDOW_SIZE - HOP_SIZE;
+            let src_slice = &self.processing_frame.audio_buffer[start_idx..BASS_WINDOW_SIZE];
+            let remaining = 66150 - self.full_event_count;
+            let to_copy = src_slice.len().min(remaining);
+            buf[self.full_event_count..self.full_event_count + to_copy]
+                .copy_from_slice(&src_slice[..to_copy]);
+            self.full_event_count += to_copy;
+            self.full_event_buffer = Some(buf);
+        }
+
+        if current_capture_state == CaptureState::Recording as u8 {
             // ── Latch ──
             if let Some(ref result) = pitch_result {
                 self.latched_auto_key = Some(result.key_index);
@@ -514,20 +595,43 @@ impl AudioPipeline {
 
                     if let Some(note_to_send) = dispatch_note {
                         let payload = CapturePayload {
-                            buffer: buf,
-                            sample_count: self.capture_count,
+                            stable_buffer: buf,
+                            stable_sample_count: self.capture_count,
+                            full_event_buffer: self.full_event_buffer.take(),
+                            full_event_sample_count: self.full_event_count,
                             target_note: note_to_send,
                             sample_rate: 44100,
                             noise_floor: load_f32(&self.atomics.config.silence_threshold),
                             measured_f0: self.last_measured_f0,
                         };
-                        let _ = self.capture_tx.try_send(payload);
-                        self.atomics
-                            .capture_state
-                            .store(CaptureState::Processing as u8, Ordering::Relaxed);
+                        self.full_event_count = 0; // Clear state after dispatch
+
+                        // Safely dispatch and recover buffers if the worker is backed up
+                        // Fixes pre-existing bricked-state bug when try_send fails
+                        match self.capture_tx.try_send(payload) {
+                            Ok(()) => {
+                                self.atomics
+                                    .capture_state
+                                    .store(CaptureState::Processing as u8, Ordering::Relaxed);
+                            }
+                            Err(e) => {
+                                let dropped = e.into_inner();
+                                let _ = self.audio_pool.push(dropped.stable_buffer);
+                                if let Some(dbuf) = dropped.full_event_buffer {
+                                    let _ = self.audio_pool.push(dbuf);
+                                }
+                                self.atomics
+                                    .capture_state
+                                    .store(CaptureState::Armed as u8, Ordering::Relaxed);
+                            }
+                        }
                     } else {
                         // Garbage detected (No Lock). Recycle buffer and reset to Armed.
                         let _ = self.audio_pool.push(buf);
+                        if let Some(dbuf) = self.full_event_buffer.take() {
+                            let _ = self.audio_pool.push(dbuf);
+                        }
+                        self.full_event_count = 0; // Clear state on garbage
                         self.atomics
                             .capture_state
                             .store(CaptureState::Armed as u8, Ordering::Relaxed);

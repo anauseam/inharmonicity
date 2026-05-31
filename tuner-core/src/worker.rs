@@ -112,7 +112,7 @@ impl WorkerManager {
         magnitude_buffer: &mut [f32],
     ) {
         // Step 1: Calculate power-of-two size
-        let sample_count = payload.sample_count.max(2048);
+        let sample_count = payload.stable_sample_count.max(2048);
         let fft_size = 1 << (usize::BITS - 1 - sample_count.leading_zeros());
 
         if fft_instance.len() != fft_size {
@@ -121,7 +121,7 @@ impl WorkerManager {
 
         // Apply Hann window and copy to scratch
         crate::algorithms::spectral::perform_fft(
-            &payload.buffer[..fft_size],
+            &payload.stable_buffer[..fft_size],
             &mut time_buffer[..fft_size],
             &mut frequency_buffer[..(fft_size / 2 + 1)],
             fft_instance,
@@ -247,8 +247,11 @@ impl WorkerManager {
             .capture_state
             .store(CaptureState::Idle as u8, Ordering::Relaxed);
 
-        // Return boxed array to memory pool
-        let _ = audio_pool.push(payload.buffer);
+        // Return boxed arrays to memory pool
+        let _ = audio_pool.push(payload.stable_buffer);
+        if let Some(dbuf) = payload.full_event_buffer {
+            let _ = audio_pool.push(dbuf);
+        }
     }
 
     fn write_diagnostics(
@@ -269,7 +272,7 @@ impl WorkerManager {
             file.push("audio.raw");
             if let Ok(mut f) = fs::File::create(file) {
                 // write f32 bytes
-                let slice = &payload.buffer[..payload.sample_count];
+                let slice = &payload.stable_buffer[..payload.stable_sample_count];
                 let byte_slice: &[u8] = unsafe {
                     std::slice::from_raw_parts(
                         slice.as_ptr() as *const u8,
@@ -277,6 +280,22 @@ impl WorkerManager {
                     )
                 };
                 let _ = f.write_all(byte_slice);
+            }
+
+            // Write audio_full_event.raw
+            let mut file_full = dir.clone();
+            file_full.push("audio_full_event.raw");
+            if let Some(ref dbuf) = payload.full_event_buffer {
+                if let Ok(mut f_full) = fs::File::create(file_full) {
+                    let slice = &dbuf[..payload.full_event_sample_count];
+                    let byte_slice: &[u8] = unsafe {
+                        std::slice::from_raw_parts(
+                            slice.as_ptr() as *const u8,
+                            std::mem::size_of_val(slice),
+                        )
+                    };
+                    let _ = f_full.write_all(byte_slice);
+                }
             }
 
             // Write analysis.json
