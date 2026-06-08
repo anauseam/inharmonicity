@@ -6,12 +6,16 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
 
+use crossbeam_queue::ArrayQueue;
+use std::sync::Arc;
 use tuner_core::algorithms::peaks::{SpectralPeak, extract_peaks};
 use tuner_core::algorithms::spectral::{perform_fft, spectrum_to_magnitudes};
 use tuner_core::algorithms::twm::score_candidate;
-use tuner_core::audio::{BASS_WINDOW_SIZE, HOP_SIZE};
+use tuner_core::audio::{BASS_WINDOW_SIZE, HOP_SIZE, WINDOW_SIZE};
 use tuner_core::engine::KeyProfile;
+use tuner_core::gatekeeper::Gatekeeper;
 use tuner_core::models::{NOTES, get_expected_beta};
+use tuner_core::pipeline::ProcessingFrame;
 
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
@@ -29,12 +33,15 @@ fn main() -> Result<()> {
     let mut noise_floor = 0.0;
     if let Ok(json_str) = fs::read_to_string(&json_path)
         && let Ok(json) = serde_json::from_str::<serde_json::Value>(&json_str)
-            && let Some(nf) = json["metadata"]["noise_floor"].as_f64() {
-                noise_floor = nf as f32;
-            }
+        && let Some(nf) = json["metadata"]["noise_floor"].as_f64()
+    {
+        noise_floor = nf as f32;
+    }
 
     if noise_floor <= 0.0 {
-        println!("Warning: Failed to read 'noise_floor' from analysis.json. Defaulting to 0.001 (-60 dBFS).");
+        println!(
+            "Warning: Failed to read 'noise_floor' from analysis.json. Defaulting to 0.001 (-60 dBFS)."
+        );
         noise_floor = 0.001;
     }
 
@@ -79,6 +86,12 @@ fn main() -> Result<()> {
 
     let mut peak_scratch = vec![SpectralPeak::default(); 128].into_boxed_slice();
 
+    let fft_gatekeeper = planner.plan_fft_forward(WINDOW_SIZE);
+    let mut processing_frame = ProcessingFrame::new();
+    let audio_pool = Arc::new(ArrayQueue::new(1));
+    let mut gatekeeper = Gatekeeper::new(audio_pool);
+    gatekeeper.config.silence_threshold = noise_floor;
+
     // Reconstruct KeyProfiles directly since they are private in Engine
     let mut profiles_vec = Vec::with_capacity(88);
     for i in 0..88 {
@@ -108,9 +121,10 @@ fn main() -> Result<()> {
     } else {
         0.0
     };
-    println!("Pre-calculated min_magnitude for peak extraction: {:.3}", min_magnitude);
-
-    let mut path_costs = [0.0_f32; 88];
+    println!(
+        "Pre-calculated min_magnitude for peak extraction: {:.3}",
+        min_magnitude
+    );
 
     // Loop through frame-by-frame- Sliding Window Loop ---
     let mut frame_idx = 0;
@@ -147,6 +161,18 @@ fn main() -> Result<()> {
             .collect();
         writeln!(spectrum_csv, "{}", row_strs.join(","))?;
 
+        // Run Gatekeeper
+        processing_frame.audio_buffer[..BASS_WINDOW_SIZE].copy_from_slice(frame_audio);
+        let newest_start = BASS_WINDOW_SIZE - WINDOW_SIZE;
+        perform_fft(
+            &processing_frame.audio_buffer[newest_start..BASS_WINDOW_SIZE],
+            &mut processing_frame.time_buffer[..WINDOW_SIZE],
+            &mut processing_frame.frequency_buffer[..],
+            &fft_gatekeeper,
+            WINDOW_SIZE,
+        );
+        let gate_result = gatekeeper.process_frame(&processing_frame);
+
         let count = extract_peaks(
             &magnitude_buffer,
             &frequency_buffer,
@@ -158,20 +184,42 @@ fn main() -> Result<()> {
 
         let k = count.min(64);
         let active_peaks = &mut peak_scratch[..k];
-        
+
         let valid_count = tuner_core::algorithms::peaks::mask_peaks(active_peaks);
         let active_peaks = &mut active_peaks[..valid_count];
 
-        let mut current_errors = [0.0_f32; 88];
-        for key in 0..88 {
-            current_errors[key] = score_candidate(active_peaks, &profiles_array[key]);
+        let winning_key;
+        let e_win;
+        let profile;
+        let note_name;
+
+        if gate_result.is_transient_bypass {
+            winning_key = 255;
+            e_win = 0.0;
+            profile = &profiles_array[0];
+            note_name = "BYPASS";
+        } else {
+            let mut current_errors = [0.0_f32; 88];
+            for key in 0..88 {
+                current_errors[key] = score_candidate(active_peaks, &profiles_array[key]);
+            }
+
+            let raw_winner = current_errors
+                .iter()
+                .enumerate()
+                .min_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .unwrap()
+                .0 as u8;
+            winning_key = raw_winner;
+            println!(
+                "TWM Lock: {} ({:.1})",
+                &NOTES[raw_winner as usize].name, current_errors[raw_winner as usize]
+            );
+
+            e_win = current_errors[winning_key as usize];
+            profile = &profiles_array[winning_key as usize];
+            note_name = &NOTES[winning_key as usize].name;
         }
-
-        let winning_key = tuner_core::algorithms::twm::viterbi_update(&mut path_costs, &current_errors);
-
-        let e_win = current_errors[winning_key as usize];
-        let profile = &profiles_array[winning_key as usize];
-        let note_name = &NOTES[winning_key as usize].name;
 
         // Print terminal block
         println!(
@@ -192,23 +240,14 @@ fn main() -> Result<()> {
         }
         println!("Top {} Frequencies: [{}]", top_k, peak_str);
 
-        // Extract target key from directory name (e.g., "key_075_C7")
-        let mut target_idx = 51; // Default C5
-        if let Some(dir_name) = path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str())
-            && let Some(idx_str) = dir_name.split('_').nth(1)
-                && let Ok(idx) = idx_str.parse::<usize>() {
-                    target_idx = idx;
-                }
-        
-        println!(
-            "TWM Discovery  : Winner = {} (key_idx {}) with e_win = {:.1}, dp_cost = {:.1}",
-            note_name, winning_key, e_win, path_costs[winning_key as usize]
-        );
-        let target_name = &NOTES[target_idx].name;
-        println!(
-            "                 Target {} (key_idx {})  with e_raw = {:.1}, dp_cost = {:.1}",
-            target_name, target_idx, current_errors[target_idx], path_costs[target_idx]
-        );
+        if gate_result.is_transient_bypass {
+            println!("Gatekeeper     : [TRANSIENT BYPASS ACTIVE] -> TWM Discovery Skipped.");
+        } else {
+            println!(
+                "TWM Discovery  : Winner = {} (key_idx {}) with e_win = {:.1}",
+                note_name, winning_key, e_win
+            );
+        }
         println!("--------------------------------------------------");
 
         // Write to peaks CSV

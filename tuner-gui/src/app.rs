@@ -440,12 +440,12 @@ impl TunerApp {
                 }
             }
             Message::SaveProfile => {
-                match save_profile(&self.inharmonicity_profile, "tuning_profile.json") {
+                match self.inharmonicity_profile.to_file("tuning_profile.json") {
                     Ok(_) => eprintln!("[MAIN] Tuning profile saved successfully."),
                     Err(e) => eprintln!("[MAIN] Error saving profile: {}", e),
                 }
             }
-            Message::LoadProfile => match load_profile("tuning_profile.json") {
+            Message::LoadProfile => match InharmonicityProfile::from_file("tuning_profile.json") {
                 Ok(profile) => {
                     self.inharmonicity_profile = profile;
                     self.undo_history.clear();
@@ -794,52 +794,4 @@ impl TunerApp {
     fn theme(&self) -> Theme {
         Theme::Dark
     }
-}
-
-// --- New Profile Save/Load Functions ---
-
-use serde_json;
-use std::fs::File;
-use std::io::{Read, Write};
-
-/// Saves the inharmonicity profile to a JSON file.
-///
-/// Serializes the complete inharmonicity profile (including all measured
-/// partials and calculated B values) to a JSON file for persistent storage.
-/// This allows users to save their piano's unique inharmonicity characteristics
-/// and reload them in future tuning sessions.
-///
-/// # Arguments
-/// * `profile` - The inharmonicity profile to save
-/// * `path` - File path where the profile should be saved (e.g., "tuning_profile.json")
-///
-/// # Returns
-/// * `Ok(())` - Profile saved successfully
-/// * `Err(io::Error)` - File I/O error or JSON serialization error
-fn save_profile(profile: &InharmonicityProfile, path: &str) -> std::io::Result<()> {
-    let json_string = serde_json::to_string_pretty(profile).map_err(std::io::Error::other)?;
-    let mut file = File::create(path)?;
-    file.write_all(json_string.as_bytes())?;
-    Ok(())
-}
-
-/// Loads an inharmonicity profile from a JSON file.
-///
-/// Deserializes a previously saved inharmonicity profile from a JSON file.
-/// This allows users to restore their piano's unique inharmonicity characteristics
-/// from a previous tuning session, maintaining consistency across tuning sessions.
-///
-/// # Arguments
-/// * `path` - File path to load the profile from (e.g., "tuning_profile.json")
-///
-/// # Returns
-/// * `Ok(InharmonicityProfile)` - Successfully loaded profile
-/// * `Err(io::Error)` - File I/O error or JSON deserialization error
-fn load_profile(path: &str) -> std::io::Result<InharmonicityProfile> {
-    let mut file = File::open(path)?;
-    let mut data = String::new();
-    file.read_to_string(&mut data)?;
-    let profile: InharmonicityProfile =
-        serde_json::from_str(&data).map_err(std::io::Error::other)?;
-    Ok(profile)
 }

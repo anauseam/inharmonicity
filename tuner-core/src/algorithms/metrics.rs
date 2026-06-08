@@ -24,7 +24,7 @@
 /// The RMS amplitude as a non-negative `f32`. A silent signal returns `0.0`.
 ///
 /// # Formula
-/// $$\text{RMS} = \sqrt{\frac{1}{N} \sum_{i=0}^{N-1} x_i^2}$$
+///   RMS = √ [ (1/N) × ∑ (x_i)² ]
 pub fn calculate_rms(buffer: &[f32]) -> f32 {
     let sum_sq: f32 = buffer.iter().map(|&x| x * x).sum();
     (sum_sq / buffer.len() as f32).sqrt()
@@ -48,7 +48,11 @@ pub fn calculate_rms(buffer: &[f32]) -> f32 {
 /// The updated EMA value.
 ///
 /// # Formula
-/// $$\text{EMA}_{\ell} = \alpha \cdot x_{\ell} + (1 - \alpha) \cdot \text{EMA}_{\ell-1}$$
+///   EMA_current = α × x_current + (1 - α) × EMA_previous
+///
+/// # Citation
+/// Giannoulis, D., Massberg, M., and Reiss, J. D. (2012). "Digital Dynamic Range Compressor Design—
+/// A Tutorial and Analysis." *Journal of the Audio Engineering Society*, 60(6), 399-408.
 pub fn calculate_ema(current_val: f32, previous_ema: f32, alpha: f32) -> f32 {
     if previous_ema == 0.0 {
         current_val
@@ -124,7 +128,14 @@ pub fn calculate_nhwrsf(
 /// For white noise, the value approaches `1.0`.
 ///
 /// # Formula
-/// $$\text{NINOS2} = \frac{N \cdot \sum |X_k|^2}{\left(\sum |X_k|\right)^2}$$
+///   NINOS2 = N × (∑ |X_k|²) / (∑ |X_k|)²
+///
+/// # Citation
+/// Mounir, M., Karsmakers, P., and van Waterschoot, T. (2021). "Musical note onset detection based on
+/// a spectral sparsity measure." *EURASIP Journal on Audio, Speech, and Music Processing*, 2021(30).
+///
+/// *Note: This implements the ℓ₁/ℓ₂ variant (Eqs. 14-15), which is computationally cheaper
+/// than the original 2016 ℓ₂/ℓ₄ formulation.*
 pub fn calculate_ninos2(spectrum: &[rustfft::num_complex::Complex<f32>]) -> f32 {
     let mut sum_mag = 0.0;
     let mut sum_mag_sq = 0.0;

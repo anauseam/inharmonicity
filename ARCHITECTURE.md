@@ -105,15 +105,15 @@ This thread constantly consumes data from the Elastic Ring Buffer and executes a
 - **The Gatekeeper (Signal Validator & 5-State Logic):** An always-running traffic cop monitoring the signal envelope. It evaluates stability via a `GateResult` return value (replacing the old direct-field-read pattern), executing a 5-stage state machine. The pipeline reads the Gatekeeper's `SignalState` and uses it to drive capture accumulation:
   - _State 0 (IDLE / Silence Gating):_ Uses a dynamic RMS baseline with Exponential Moving Average (EMA) to bypass heavy DSP during periods of noise or silence.
   - _State 1 (ATTACK):_ Uses Normalized Half-Wave Rectified Spectral Flux (NHWRSF) to detect hammer strikes. Sends onset pulse to the Engine to begin pitch detection.
-  - _State 2 (TRANSIENT):_ Institutes a hard delay waiting for the chaotic broadband noise of the strike to physically decay.
-  - _State 3 (HARMONIC DECAY):_ Uses NINOS2 (Normalized Identification of Note Onset based on Spectral Sparsity) to monitor the signal. It ignores volume swells and identifies the "Golden Window" of pure, stable harmonic decay for capture.
+  - _State 2 (TRANSIENT):_ A one-frame buffer state that resolves the `transient_active` flag once NHWRSF drops back below its threshold. Because the entire hammer-string transient is shorter than the 46.4ms FFT window, physical recovery happens rapidly. State 2 serves purely to allow a clean NINOS2 entry on the subsequent frame.
+  - _State 3 (HARMONIC DECAY):_ Uses NINOS2 (Normalized Identification of Note Onset based on Spectral Sparsity) to monitor the signal. After the State 2 delay clears, NINOS2 ignores volume swells and identifies the "Golden Window" of pure, stable harmonic decay for capture. It enforces a secondary `required_stable_frames` threshold (e.g. 4 frames) to gracefully bridge any remaining chaos that the fixed delay missed.
   - _State 4 (RELEASE):_ Caps the capture at 1.5 seconds. The pipeline detects completion (buffer full or silence decay), dispatches the `CapturePayload` to Thread 3 via a bounded crossbeam channel, and transitions `CaptureState` to `Processing` — all without blocking the real-time pipeline.
 - **The Engine (TWM Discovery + Goertzel Phase Tracking):** A pitch detection chain that operates as an independent state machine, **synchronously reset** by the Gatekeeper's onset pulse but otherwise decoupled from the Gatekeeper's internal transient delays.
   - **Discovery Phase (State: Unlocked):** Identifies the fundamental frequency from the 8192-pt bass FFT buffer using the canonical Maher & Beauchamp (1994) Two-Way Mismatch algorithm.
     1. **Peak Extraction:** Sub-bin peaks are extracted using the Jacobsen complex-domain estimator (Candan 2015). To establish a statistical minimum magnitude for Additive White Gaussian Noise (AWGN) rejection, a dynamic Neyman-Pearson threshold (Kay 1998) is computed against the pipeline's dynamic noise floor and acts as a floor gate. _(Note: Because the piano's acoustic noise floor during an active note is vastly higher than the room's silence threshold, this AWGN boundary is mathematically sound but practically negligible in effect)._
     2. **Peak Masking:** A two-stage masking process is applied: first, a `-30 dB` relative global magnitude floor removes absolute structural noise, followed by proportional critical band masking (Gómez 2006 / Cano 1998) to aggressively drop sympathetic tonal noise and structural intermodulation distortion.
     3. **TWM Scoring:** The surviving peaks are scored against 88 pre-computed inharmonicity-stretched `KeyProfile` arrays. The algorithm evaluates both forward error and reverse error with psychoacoustic frequency weighting ($f^{-0.5}$). To prevent unbounded error accumulation from distant noise, the Measured-to-Predicted error is topologically bounded using a piecewise ceiling derived from Duan et al. (2010).
-    4. **Temporal Tracking:** An online Viterbi decoder (Rao & Rao 2010) applies a transition penalty to track the candidate trajectory across frames. A 3-frame temporal consistency gate confirms the lock and transitions the Engine to the Tracking Phase.
+    4. **Temporal Tracking:** A mathematically stateless 3-frame temporal consistency gate confirms the lock and transitions the Engine to the Tracking Phase. (Note: The historic Viterbi hidden Markov model was permanently excised because its path cost persistence caused unrecoverable sub-harmonic locks following noisy hammer strikes).
   - **Tracking Phase (State: Locked):** Once a key is locked, the engine switches to per-partial Goertzel analysis on 1024-sample segments to refine the tuning measurement.
     1. **Phase Vocoder:** Phase differences between consecutive hops are unwrapped to yield instantaneous frequency estimates (McAulay & Quatieri 1986).
     2. **MVUE Variance Filter:** A Minimum Variance Unbiased Estimator (MVUE, Kay 1993) dynamically weights each partial by its amplitude squared (SNR). A Cramer-Rao Lower Bound (CRLB) geometric variance filter compares the measured phase jitter against the theoretical noise floor limit; if a partial's phase variance exceeds 3x the CRLB, it is rejected as a "ghost" and given zero weight.
@@ -171,7 +171,8 @@ For example, to handle spectral peaks distorted by beating unisons, it's temptin
 
 The major DSP components and their foundations:
 
-- **Transient Stability Detection**: Miron et al. (2014) NINOS2
+- **Transient Stability Detection**: Mounir et al. (2021) NINOS2 (ℓ₁/ℓ₂ variant)
+- **Onset Detection**: Normalized Half-Wave Rectified Spectral Flux (NHWRSF) — via spectral difference
 - **Peak Extraction**: Candan (2015) Jacobsen complex-domain estimator
 - **Note Discovery**: Maher & Beauchamp (1994) Two-Way Mismatch
 - **Sympathetic Noise Rejection**: Gómez (2006) / Cano (1998) SMS peak masking (`mask_peaks`), with a Duan et al. (2010) topological ceiling on the reverse TWM error term
@@ -249,6 +250,16 @@ The current implementation is convention-only (plain `.store`/
 `.load` with `Ordering::Relaxed`); hardening it to
 `compare_exchange` is tracked as a follow-up in the README's
 Work-in-Progress section.
+
+### Hardcoded 44.1kHz Sample Rate Architecture
+
+The pipeline is statically locked to a 44,100 Hz sample rate. This is not just a surface-level parameter; it is deeply baked into the zero-allocation memory layout and temporal math of the DSP chain:
+
+- **Static Buffer Sizes**: The `AudioPool` uses fixed `[f32; 66150]` arrays exactly dimensioned for 1.5 seconds at 44.1kHz.
+- **Time/Frame Conversions**: Gatekeeper threshold frames (e.g., `transient_timeout_frames = 20`) mathematically assume a ~46.4ms hop.
+- **Math Constants**: Parameters like EMA smoothing alphas (`rms_ema_alpha = 0.1`) and the Engine's `c_crlb_geometric` variance estimators are calibrated against 44.1kHz timing and frequency bin widths.
+
+Attempting to change the sample rate dynamically would require migrating away from fixed-size arrays to dynamic allocations on the audio hot-path, breaking the core real-time guarantees. While we currently rely on the host OS audio daemon (e.g., PipeWire or CoreAudio) to resample native hardware inputs down to 44.1kHz, this is strictly a temporary stopgap. Full dynamic sample rate support is planned for the future, but it requires a complex architectural overhaul; shipping a robust, working pipeline at a fixed rate remains the immediate priority.
 
 ## Pointers
 

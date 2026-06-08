@@ -98,8 +98,7 @@ pub struct Engine {
 
     // Discovery State
     pub identified_key: Option<u8>,
-    pub path_costs: [f32; 88],
-    pub dp_consistency_key: u8,
+    pub consistency_key: u8,
     pub stable_frames: u8,
 
     // Tracking state
@@ -132,8 +131,7 @@ impl Engine {
         Engine {
             sample_rate,
             identified_key: None,
-            path_costs: [0.0; 88],
-            dp_consistency_key: 0,
+            consistency_key: 0,
             stable_frames: 0,
             tracking_targets: [0.0; MAX_PARTIALS],
             partial_trackers: [PartialTracker::default(); MAX_PARTIALS],
@@ -150,20 +148,25 @@ impl Engine {
         frame: &mut ProcessingFrame,
         is_silence: bool,
         is_new_onset: bool,
+        is_transient_bypass: bool,
         target_note: Option<u8>,
     ) -> Option<PitchResult> {
         if is_silence {
-            self.path_costs.fill(0.0);
             self.stable_frames = 0;
             self.identified_key = None;
             self.partial_trackers = [PartialTracker::default(); MAX_PARTIALS];
             return None;
         }
 
-        if is_new_onset {
-            self.identified_key = None;
-            self.path_costs.fill(0.0);
+        if is_transient_bypass {
             self.stable_frames = 0;
+            self.identified_key = None;
+            return None;
+        }
+
+        if is_new_onset {
+            self.stable_frames = 0;
+            self.identified_key = None;
         }
 
         // Force re-evaluation for instant UI response
@@ -219,38 +222,37 @@ impl Engine {
             let active_peaks = &mut active_peaks[..valid_count];
 
             // 2. Safe Bypass Gate
-            let (winning_key, temporal_gate) = if let Some(target_idx) = target_note {
-                (target_idx, true) // Bypass 88-key TWM array and Viterbi
+            let (winning_key, temporal_gate, min_error) = if let Some(target_idx) = target_note {
+                (target_idx, true, 0.0) // Bypass 88-key TWM array
             } else {
                 // Auto Mode: TWM Error Scoring
-                let mut current_errors = [0.0_f32; 88];
+                let mut min_error = f32::MAX;
+                let mut winning_key = 0;
                 for k in 0..88 {
-                    current_errors[k] = twm::score_candidate(active_peaks, &self.profiles[k]);
+                    let err = twm::score_candidate(active_peaks, &self.profiles[k]);
+                    if err < min_error {
+                        min_error = err;
+                        winning_key = k as u8;
+                    }
                 }
 
-                // Dynamic Programming Temporal Tracking (Viterbi)
-                let winning_key = twm::viterbi_update(&mut self.path_costs, &current_errors);
-
-                // Stabilization Gate
-                if winning_key == self.dp_consistency_key {
+                // 3-Frame Consistency Gate
+                if winning_key == self.consistency_key {
                     self.stable_frames += 1;
                 } else {
-                    self.dp_consistency_key = winning_key;
+                    self.consistency_key = winning_key;
                     self.stable_frames = 1;
                 }
-                (winning_key, self.stable_frames >= 3)
+
+                (winning_key, self.stable_frames >= 3, min_error)
             };
 
             let profile = &self.profiles[winning_key as usize];
 
             #[cfg(debug_assertions)]
             eprintln!(
-                "[ENGINE] DP Tracking: peaks={}, key_idx={}, f0={:.1}, path_cost={:.1}, consis={}/3",
-                valid_count,
-                winning_key,
-                profile.f0_et,
-                self.path_costs[winning_key as usize],
-                self.stable_frames
+                "[ENGINE] Consistency Gate: peaks={}, key_idx={}, f0={:.1}, min_error={:.2}",
+                valid_count, winning_key, profile.f0_et, min_error
             );
 
             if temporal_gate {
