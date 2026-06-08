@@ -55,6 +55,27 @@ pub struct InharmonicityProfile {
     pub measurements: BTreeMap<u8, KeyMeasurement>,
 }
 
+impl InharmonicityProfile {
+    /// Saves the inharmonicity profile to a JSON file.
+    pub fn to_file(&self, path: &str) -> std::io::Result<()> {
+        let json_string = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
+        let mut file = std::fs::File::create(path)?;
+        use std::io::Write;
+        file.write_all(json_string.as_bytes())?;
+        Ok(())
+    }
+
+    /// Loads an inharmonicity profile from a JSON file.
+    pub fn from_file(path: &str) -> std::io::Result<Self> {
+        let mut file = std::fs::File::open(path)?;
+        let mut data = String::new();
+        use std::io::Read;
+        file.read_to_string(&mut data)?;
+        let profile: Self = serde_json::from_str(&data).map_err(std::io::Error::other)?;
+        Ok(profile)
+    }
+}
+
 /// Represents a single musical note with its name and frequency.
 #[derive(Debug, Clone)]
 pub struct Note {

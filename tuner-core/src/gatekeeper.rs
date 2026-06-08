@@ -18,7 +18,7 @@
 //! |---|---|---|---|
 //! | 0 | IDLE | RMS + EMA | Silence gating — ignore background noise |
 //! | 1 | ATTACK | NHWRSF | Detect the hammer strike transient |
-//! | 2 | TRANSIENT | Counter | Hard delay for broadband noise to decay |
+//! | 2 | TRANSIENT | NHWRSF drop | One-frame buffer: resolves transient_active flag once NHWRSF falls |
 //! | 3 | HARMONIC DECAY | NINOS2 | Identify the "Golden Window" of stable harmonics |
 //! | 4 | RELEASE | Counter | Cap capture at 1.5s, dispatch to Worker, reset |
 //!
@@ -46,8 +46,6 @@ pub struct GatekeeperConfig {
     pub rms_ema_alpha: f32,
     /// The threshold for Normalized Half-Wave Rectified Spectral Flux (NHWRSF) above which we declare a transient
     pub nhwrsf_threshold: f32,
-    /// How many frames to hard-wait after a NHWRSF transient is detected (e.g., 10 frames ≈ 464ms)
-    pub transient_delay_frames: usize,
     /// The NINOS2 sparsity threshold above which the signal is considered harmonically stable
     pub ninos2_stability_threshold: f32,
     /// How many consecutive frames the NINOS2 threshold must be met to declare the signal `Stable` (e.g., 4 frames ≈ 185ms)
@@ -64,7 +62,6 @@ impl Default for GatekeeperConfig {
             silence_threshold: 0.005, // Default until overwritten by calibration or GUI
             rms_ema_alpha: 0.1, // Strong smoothing to ride through momentary unison beating dips
             nhwrsf_threshold: 0.5, // Arbitrary starting threshold
-            transient_delay_frames: 10, // Hard bypass delay after transient (~464ms)
             ninos2_stability_threshold: 10.0, // Scale 1 (white noise) to N (pure tone)
             required_stable_frames: 4, // (~185ms)
             capture_max_frames: 32, // (~1.48 seconds)
@@ -99,8 +96,10 @@ pub enum SignalState {
 pub struct GateResult {
     pub rms_ema: f32,
     pub nhwrsf: f32,
+    pub ninos2: f32,
     pub state: SignalState,
     pub is_new_onset: bool,
+    pub is_transient_bypass: bool,
 }
 
 /// The 5-state signal validator. Pure DSP — no shared state awareness.
@@ -122,18 +121,22 @@ pub struct Gatekeeper {
     prev_spectrum: Box<[f32]>,
 
     pub(crate) current_nhwrsf: f32,
+    pub(crate) current_ninos2: f32,
 
     // State machine counters (internal bookkeeping — not exposed)
-    transient_delay_counter: usize,
     stable_counter: usize,
     capture_counter: usize,
     is_capturing: bool,
+
+    // Dynamic transient gating state
+    transient_active: bool,
 
     // EMA State
     pub(crate) current_rms_ema: f32,
 
     // Expose transient detection state for routing engine
     pub(crate) is_new_onset: bool,
+    pub(crate) is_transient_bypass: bool,
 }
 
 impl Gatekeeper {
@@ -153,12 +156,14 @@ impl Gatekeeper {
             current_state: SignalState::Silence,
             prev_spectrum: vec![0.0; 2048].into_boxed_slice(),
             current_nhwrsf: 0.0,
-            transient_delay_counter: 0,
+            current_ninos2: 0.0,
             stable_counter: 0,
             capture_counter: 0,
             is_capturing: false,
             current_rms_ema: 0.0,
             is_new_onset: false,
+            is_transient_bypass: false,
+            transient_active: false,
         }
     }
 
@@ -178,26 +183,45 @@ impl Gatekeeper {
         // Slice only the newest WINDOW_SIZE samples from the historical buffer to keep transient detection snappy
         let rms = calculate_rms(&frame.audio_buffer[frame.audio_buffer.len() - WINDOW_SIZE..]);
 
-        // Apply Exponential Moving Average (EMA) to smooth out momentary wave nodes / unison dips
-        self.current_rms_ema = calculate_ema(rms, self.current_rms_ema, self.config.rms_ema_alpha);
+        // Evaluate signal deterioration using EMA alpha.
+        // We rely purely on the slow EMA release or the next NHWRSF onset
+        // to detect the note boundary.
+        let alpha = if rms > self.current_rms_ema {
+            1.0 // Instant attack: track volume surges immediately
+        } else {
+            self.config.rms_ema_alpha // Slow release: Ride smoothly over unison beating dips
+        };
+
+        // Apply dynamic Exponential Moving Average
+        self.current_rms_ema = calculate_ema(rms, self.current_rms_ema, alpha);
         let smoothed_rms = self.current_rms_ema;
 
-        if smoothed_rms < self.config.silence_threshold {
+        // State 0: Claude's Transient Guard — do not abort to Silence mid-transient.
+        // A weak note's RMS can dip below the silence threshold during the mechanical
+        // strike itself. If transient_active is true, we know a transient is actively
+        // resolving and we ride it out.
+        if smoothed_rms < self.config.silence_threshold && !self.transient_active {
             self.current_state = SignalState::Silence;
             self.is_new_onset = false;
+            self.is_transient_bypass = false;
             self.reset_capture_state();
             return self.build_result();
         }
 
         let current_spectrum = &frame.frequency_buffer[..];
 
-        // State 1 & 2: Calculate NHWRSF to detect transients
-        if self.process_transient_detection(current_spectrum) {
+        // Calculate all active-state spectral metrics
+        self.current_ninos2 = calculate_ninos2(current_spectrum);
+        self.current_nhwrsf = calculate_nhwrsf(current_spectrum, &mut self.prev_spectrum[..]);
+
+        // State 1 & 2: Transient detection routing
+        self.is_transient_bypass = self.process_transient_detection();
+        if self.is_transient_bypass {
             return self.build_result();
         }
 
-        // State 3 & 4: NINOS2 Stability Gating & Capture Dispatch
-        self.process_stability_and_capture(current_spectrum);
+        // State 3 & 4: Stability & Capture routing
+        self.process_stability_and_capture();
 
         self.build_result()
     }
@@ -207,8 +231,10 @@ impl Gatekeeper {
         GateResult {
             rms_ema: self.current_rms_ema,
             nhwrsf: self.current_nhwrsf,
+            ninos2: self.current_ninos2,
             state: self.current_state,
             is_new_onset: self.is_new_onset,
+            is_transient_bypass: self.is_transient_bypass,
         }
     }
 
@@ -224,32 +250,24 @@ impl Gatekeeper {
     ///
     /// # Returns
     /// `true` if a transient was detected or we are still in the bypass delay.
-    fn process_transient_detection(
-        &mut self,
-        current_spectrum: &[rustfft::num_complex::Complex<f32>],
-    ) -> bool {
-        let nhwrsf = calculate_nhwrsf(current_spectrum, &mut self.prev_spectrum[..]);
-        self.current_nhwrsf = nhwrsf;
-
-        // Reset the onset flag by default; it only fires true on the exact frame the transient triggers
+    fn process_transient_detection(&mut self) -> bool {
         self.is_new_onset = false;
 
-        // State 1: ATTACK
-        if nhwrsf > self.config.nhwrsf_threshold {
-            // Hammer strike detected
-            self.transient_delay_counter = self.config.transient_delay_frames;
+        // Failsafe: ALWAYS reset capture on a new hammer strike.
+        // Even if EMA hasn't hit silence_threshold yet, a new strike means a new note.
+        if self.current_nhwrsf > self.config.nhwrsf_threshold {
             self.stable_counter = 0;
             self.current_state = SignalState::Unstable;
             self.is_new_onset = true;
+            self.reset_capture_state(); // reset counters and stop any in-progress capture
+            self.transient_active = true; // arm AFTER reset so it isn't cleared by reset_capture_state
             return true;
         }
 
-        // State 2: TRANSIENT
-        if self.transient_delay_counter > 0 {
-            // Waiting for transient tail to die down
-            self.transient_delay_counter -= 1;
-            self.current_state = SignalState::Unstable;
-            return true;
+        // State 2: TRANSIENT — Wait for onset energy to physically subside.
+        if self.transient_active {
+            // Once NHWRSF drops below threshold, the physical transient is over.
+            self.transient_active = false;
         }
 
         false
@@ -264,14 +282,11 @@ impl Gatekeeper {
     /// **State 4 (RELEASE):** Once stable and `capture_mode_enabled`, the
     /// Gatekeeper counts frames up to `capture_max_frames` (~1.5s), then
     /// dispatches the buffer to the Worker and resets.
-    fn process_stability_and_capture(
-        &mut self,
-        current_spectrum: &[rustfft::num_complex::Complex<f32>],
-    ) {
+    fn process_stability_and_capture(&mut self) {
         // State 3: HARMONIC DECAY (NINOS2 Stability Gating)
-        let ninos2 = calculate_ninos2(current_spectrum);
+        // Note: self.current_ninos2 is now calculated unconditionally in process_frame
 
-        if ninos2 > self.config.ninos2_stability_threshold {
+        if self.current_ninos2 > self.config.ninos2_stability_threshold {
             self.stable_counter += 1;
         } else {
             self.stable_counter = 0;
@@ -304,7 +319,7 @@ impl Gatekeeper {
     /// Called when transitioning back to Silence, after a capture completes,
     /// or during noise floor calibration.
     fn reset_capture_state(&mut self) {
-        self.transient_delay_counter = 0;
+        self.transient_active = false;
         self.stable_counter = 0;
         self.capture_counter = 0;
         self.is_capturing = false;

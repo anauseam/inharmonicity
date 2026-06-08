@@ -490,6 +490,7 @@ impl AudioPipeline {
             &mut self.processing_frame,
             is_silence,
             gate_result.is_new_onset,
+            gate_result.is_transient_bypass,
             target_note,
         );
 
