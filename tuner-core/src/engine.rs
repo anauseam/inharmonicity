@@ -9,11 +9,18 @@ use crate::algorithms::{
     spectral::goertzel,
     twm,
 };
-use crate::audio::BASS_WINDOW_SIZE;
+use crate::audio::{BASS_WINDOW_SIZE, HOP_SIZE};
 use crate::models::{NOTES, get_expected_beta};
 use crate::pipeline::ProcessingFrame;
 
 pub const MAX_PARTIALS: usize = 128;
+
+// ── Neyman-Pearson Amplitude SNR Gate ──
+// Foundation: Kay, S. M. (1998). Fundamentals of Statistical Signal Processing: Detection Theory (Vol 2), Chapter 9.
+// For a target false-alarm probability P_fa = 0.001 (0.1%), the threshold is derived from the Rayleigh tail.
+// Scaled for physical amplitude (Hann window energy = 0.375 * HOP_SIZE):
+// T_amp = σ * (4/HOP_SIZE) * sqrt(-(0.375 * HOP_SIZE) * ln(0.001))
+const NEYMAN_PEARSON_K: f32 = 0.201184;
 
 /// Precomputed per-key data.
 #[derive(Debug, Clone)]
@@ -54,10 +61,10 @@ impl KeyProfile {
 pub struct PitchResult {
     /// 0–87 key index of the identified note.
     pub key_index: u8,
-    /// MVUE-combined cents deviation (weighted average across all live partials).
-    pub cents_deviation: f32,
-    /// Absolute physical fundamental frequency (Hz), derived from cents_deviation.
-    pub measured_f0: f32,
+    /// Physical fundamental frequency (Partial 1), tracked via Goertzel phase vocoder. Returns None if Partial 1 is dead.
+    pub cents_deviation: Option<f32>,
+    /// Absolute physical fundamental frequency (Partial 1) in Hz. Returns None if Partial 1 is dead.
+    pub measured_f0: Option<f32>,
     /// Per-partial instantaneous frequency (Hz). Valid entries: [0..partial_count].
     pub partial_freqs: [f32; MAX_PARTIALS],
     /// Per-partial cents deviation relative to tuning curve target.
@@ -68,19 +75,35 @@ pub struct PitchResult {
     pub partial_amplitudes: [f32; MAX_PARTIALS],
     /// Number of live (non-ghost) partials contributing to this frame.
     pub partial_count: usize,
+    #[cfg(feature = "telemetry")]
+    pub telemetry_count: usize,
+    #[cfg(feature = "telemetry")]
+    pub partial_targets: [f32; MAX_PARTIALS],
+    #[cfg(feature = "telemetry")]
+    pub partial_t_amps: [f32; MAX_PARTIALS],
+    #[cfg(feature = "telemetry")]
+    pub partial_is_alive: [bool; MAX_PARTIALS],
 }
 
 impl Default for PitchResult {
     fn default() -> Self {
         Self {
             key_index: 0,
-            cents_deviation: 0.0,
-            measured_f0: 0.0,
+            cents_deviation: None,
+            measured_f0: None,
             partial_freqs: [0.0; MAX_PARTIALS],
             partial_cents: [0.0; MAX_PARTIALS],
             partial_ns: [0; MAX_PARTIALS],
             partial_amplitudes: [0.0; MAX_PARTIALS],
             partial_count: 0,
+            #[cfg(feature = "telemetry")]
+            telemetry_count: 0,
+            #[cfg(feature = "telemetry")]
+            partial_targets: [0.0; MAX_PARTIALS],
+            #[cfg(feature = "telemetry")]
+            partial_t_amps: [0.0; MAX_PARTIALS],
+            #[cfg(feature = "telemetry")]
+            partial_is_alive: [false; MAX_PARTIALS],
         }
     }
 }
@@ -88,8 +111,6 @@ impl Default for PitchResult {
 #[derive(Debug, Clone, Copy, Default)]
 struct PartialTracker {
     prev_phase: f32,
-    prev_f_inst: f32,
-    phase_var_ema: f32,
 }
 
 /// The Fundamental Frequency ($f_0$) Engine.
@@ -265,23 +286,10 @@ impl Engine {
                 let limit = profile.valid_partial_count.min(MAX_PARTIALS);
                 for i in 0..limit {
                     let predicted = profile.predicted_partials[i];
-                    let tol = predicted * 0.03;
 
-                    let nearest_obs = self.peak_scratch[..count].iter().min_by(|a, b| {
-                        (a.frequency - predicted)
-                            .abs()
-                            .partial_cmp(&(b.frequency - predicted).abs())
-                            .unwrap()
-                    });
-
-                    self.tracking_targets[i] = match nearest_obs {
-                        Some(p) if (p.frequency - predicted).abs() < tol => p.frequency,
-                        _ => predicted,
-                    };
+                    self.tracking_targets[i] = predicted;
 
                     self.partial_trackers[i].prev_phase = 0.0;
-                    self.partial_trackers[i].prev_f_inst = self.tracking_targets[i];
-                    self.partial_trackers[i].phase_var_ema = 0.0;
                 }
             } else {
                 return None;
@@ -291,21 +299,14 @@ impl Engine {
         // ── Tracking State ──
         let key = self.identified_key?;
         let profile = &self.profiles[key as usize];
-        let audio_slice = &frame.audio_buffer[7168..8192];
-        let t_hop = 1024.0 / self.sample_rate as f32;
+        let audio_slice = &frame.audio_buffer[(BASS_WINDOW_SIZE - HOP_SIZE)..BASS_WINDOW_SIZE];
+        let t_hop = HOP_SIZE as f32 / self.sample_rate as f32;
 
-        let mut weight_sum = 0.0;
-        let mut cents_sum = 0.0;
         let mut live_partials = 0;
         let mut result = PitchResult {
             key_index: key,
             ..Default::default()
         };
-
-        const ALPHA: f32 = 0.1;
-        let fs = self.sample_rate as f32;
-        let c_crlb_geometric = 6.0 * fs * fs
-            / (core::f32::consts::PI * core::f32::consts::PI * 1024.0 * 1024.0 * 1024.0);
 
         for i in 0..profile.valid_partial_count.min(MAX_PARTIALS) {
             let f_target = self.tracking_targets[i];
@@ -333,35 +334,22 @@ impl Engine {
             let f_inst = f_target + delta_phi / (2.0 * core::f32::consts::PI * t_hop);
             tracker.prev_phase = phase_current;
 
-            if self.warmup_hops == 1 {
-                tracker.prev_f_inst = f_inst;
-                continue;
-            }
+            let t_amp = self.noise_floor * NEYMAN_PEARSON_K;
 
-            let delta_f_inst = f_inst - tracker.prev_f_inst;
-            tracker.phase_var_ema =
-                ALPHA * delta_f_inst * delta_f_inst + (1.0 - ALPHA) * tracker.phase_var_ema;
-            tracker.prev_f_inst = f_inst;
-
-            // ── MVUE Frequency Estimation ──
-            // Calculates the Minimum Variance Unbiased Estimator (MVUE) for the true fundamental.
-            // Foundation: Kay, S. M. (1993). Fundamentals of Statistical Signal Processing: Estimation Theory.
-            //
-            // The Cramer-Rao Lower Bound (CRLB) for the variance of a sinusoidal frequency estimate in AWGN is:
-            // var(f) >= 12 / ((2*pi)^2 * SNR * N(N^2-1))
-            // Because SNR is proportional to amplitude^2, optimal MVUE weighting combines partials
-            // using W_i = A_i^2. The missing fundamental tracks noise, exceeds the CRLB variance
-            // threshold, and is assigned a weight of 0.0, cleanly erasing it from the final pitch.
-            let expected_var = c_crlb_geometric * (self.noise_floor * self.noise_floor)
-                / (amplitude * amplitude + 1e-12);
-
-            let weight = if tracker.phase_var_ema > 3.0 * expected_var {
+            let weight = if amplitude < t_amp {
                 0.0
             } else {
                 amplitude * amplitude
             };
 
             if weight > 0.0 {
+                // ── Adaptive Tracking Seed (Phase Vocoder Feedback) ──
+                // Foundation: Dolson, M. (1986). The Phase Vocoder: A Tutorial. Computer Music Journal.
+                // Slowly adapts the Goertzel evaluation center toward the measured physical frequency.
+                // We only adapt when the signal survives the SNR gate, ensuring we track the physical
+                // string and not phase-unwrapping noise.
+                self.tracking_targets[i] = 0.95 * self.tracking_targets[i] + 0.05 * f_inst;
+
                 result.partial_freqs[live_partials] = f_inst;
                 result.partial_amplitudes[live_partials] = amplitude;
 
@@ -370,44 +358,47 @@ impl Engine {
                 result.partial_cents[live_partials] = cents_i;
                 result.partial_ns[live_partials] = (i + 1) as u32;
 
-                weight_sum += weight;
-                cents_sum += weight * cents_i;
                 live_partials += 1;
             }
+
+            #[cfg(feature = "telemetry")]
+            {
+                result.partial_targets[i] = self.tracking_targets[i];
+                result.partial_amplitudes[i] = amplitude;
+                result.partial_t_amps[i] = t_amp;
+                result.partial_is_alive[i] = weight > 0.0;
+            }
+        }
+
+        #[cfg(feature = "telemetry")]
+        {
+            result.telemetry_count = profile.valid_partial_count;
         }
 
         if self.warmup_hops == 0 {
             self.warmup_hops = 1;
-            return None;
-        } else if self.warmup_hops == 1 {
-            self.warmup_hops = 2;
-            return None; // No f_inst diff variance available yet
+            return None; // Need one hop to calculate the first phase derivative
         }
 
-        if live_partials < 2 {
-            self.identified_key = None;
+        if live_partials < 1 {
             return None;
         }
 
-        result.cents_deviation = if weight_sum > 0.0 {
-            cents_sum / weight_sum
-        } else {
-            0.0
-        };
+        // ── Global Pitch Reconstruction (Partial 1 Only) ──
+        // We deliberately use Partial 1 exclusively to drive the Cent Meter.
+        // If the stored inharmonicity profile (B_profile) doesn't perfectly match the physical string
+        // (B_true) due to uncalibrated models or string aging, higher partials will carry an n^2
+        // systematic cents error. Partial 1 carries no B correction (n=1) and is immune to this inaccuracy.
+        // For extreme bass notes where Partial 1 has no acoustic energy, this correctly returns None,
+        // and the tuner naturally falls back to the strobe display.
+        for i in 0..live_partials {
+            if result.partial_ns[i] == 1 {
+                result.cents_deviation = Some(result.partial_cents[i]);
+                result.measured_f0 = Some(result.partial_freqs[i]);
+                break;
+            }
+        }
 
-        // ── Mathematical Proof of f0 Reconstruction ──
-        // Let f_n be the physical frequency of partial n.
-        // The expected tuning curve is: f_{n, curve} = n * f_{0, et} * sqrt(1 + B * n^2).
-        // The cents deviation is: c_n = 1200 * log2(f_n / f_{n, curve}).
-        // Substituting the uniform global deviation C back into the ET fundamental gives:
-        // f_{0, measured} = f_{0, et} * 2^(C / 1200)
-        //                 = f_{0, et} * (f_n / f_{n, curve})
-        //                 = f_{0, et} * (f_n / (n * f_{0, et} * sqrt(1 + B * n^2)))
-        //                 = f_n / (n * sqrt(1 + B * n^2))
-        // This is the EXACT algebraic inverse mapping for extracting the fundamental from an
-        // inharmonic partial! Doing it logarithmically via cents explicitly factors out f_{0, et}
-        // and yields the pure physical fundamental without any division or square roots in the hot path.
-        result.measured_f0 = profile.f0_et * 2.0_f32.powf(result.cents_deviation / 1200.0);
         result.partial_count = live_partials;
 
         Some(result)

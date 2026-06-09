@@ -12,7 +12,7 @@ use tuner_core::algorithms::peaks::{SpectralPeak, extract_peaks};
 use tuner_core::algorithms::spectral::{perform_fft, spectrum_to_magnitudes};
 use tuner_core::algorithms::twm::score_candidate;
 use tuner_core::audio::{BASS_WINDOW_SIZE, HOP_SIZE, WINDOW_SIZE};
-use tuner_core::engine::KeyProfile;
+use tuner_core::engine::{Engine, KeyProfile};
 use tuner_core::gatekeeper::Gatekeeper;
 use tuner_core::models::{NOTES, get_expected_beta};
 use tuner_core::pipeline::ProcessingFrame;
@@ -92,6 +92,9 @@ fn main() -> Result<()> {
     let mut gatekeeper = Gatekeeper::new(audio_pool);
     gatekeeper.config.silence_threshold = noise_floor;
 
+    let mut engine = Engine::new(44100);
+    engine.noise_floor = noise_floor;
+
     // Reconstruct KeyProfiles directly since they are private in Engine
     let mut profiles_vec = Vec::with_capacity(88);
     for i in 0..88 {
@@ -107,10 +110,15 @@ fn main() -> Result<()> {
     let parent_dir = path.parent().unwrap_or(Path::new(""));
     let mut spectrum_csv = File::create(parent_dir.join("spectrum.csv"))?;
     let mut peaks_csv = File::create(parent_dir.join("peaks.csv"))?;
+    let mut goertzel_csv = File::create(parent_dir.join("goertzel.csv"))?;
 
     writeln!(
         peaks_csv,
         "frame,rms_power,key_idx,key_name,e_win,f0_et,num_peaks,peak_freqs,peak_mags"
+    )?;
+    writeln!(
+        goertzel_csv,
+        "frame,key_idx,partial_n,target_hz,measured_hz,amplitude,t_amp,is_alive"
     )?;
 
     // Calculate noise threshold formula just like engine.rs line 189
@@ -248,6 +256,79 @@ fn main() -> Result<()> {
                 note_name, winning_key, e_win
             );
         }
+
+        // Run full engine to get Goertzel Phase Tracking results
+        let is_silence = gate_result.state == tuner_core::gatekeeper::SignalState::Silence;
+        let pitch_result = engine.process(
+            &mut processing_frame,
+            is_silence,
+            gate_result.is_new_onset,
+            gate_result.is_transient_bypass,
+            Some(winning_key),
+        );
+
+        if let Some(res) = pitch_result {
+            let p1_freq = res.partial_freqs[0];
+            let p1_cents = res.partial_cents[0];
+            let p1_n = res.partial_ns[0];
+
+            let p1_status = if p1_n == 1 {
+                format!("ALIVE ({:.2} Hz, {:.1}¢)", p1_freq, p1_cents)
+            } else {
+                "DEAD (CRLB Variance Rejected)".to_string()
+            };
+
+            println!(
+                "Goertzel Stage : Lock = {} (key_idx {})",
+                tuner_core::models::NOTES[res.key_index as usize].name,
+                res.key_index
+            );
+            println!("-> Partial 1   : {}", p1_status);
+
+            let mut alive_str = String::new();
+            for i in 0..res.partial_count {
+                if res.partial_ns[i] > 0 {
+                    alive_str.push_str(&format!(
+                        "n{}={:.1}Hz, ",
+                        res.partial_ns[i], res.partial_freqs[i]
+                    ));
+                }
+            }
+            println!("-> All Alive   : [{}]", alive_str.trim_end_matches(", "));
+
+            #[cfg(feature = "telemetry")]
+            {
+                for i in 0..res.telemetry_count {
+                    let partial_n = i + 1;
+                    let target_hz = res.partial_targets[i];
+                    let mut measured_hz = 0.0;
+                    if res.partial_is_alive[i] {
+                        for j in 0..res.partial_count {
+                            if res.partial_ns[j] == partial_n as u32 {
+                                measured_hz = res.partial_freqs[j];
+                                break;
+                            }
+                        }
+                    }
+                    writeln!(
+                        goertzel_csv,
+                        "{},{},{},{:.2},{:.2},{:.6},{:.6},{}",
+                        frame_idx,
+                        res.key_index,
+                        partial_n,
+                        target_hz,
+                        measured_hz,
+                        res.partial_amplitudes[i],
+                        res.partial_t_amps[i],
+                        res.partial_is_alive[i]
+                    )
+                    .unwrap();
+                }
+            }
+        } else {
+            println!("Goertzel Stage : [TRACKING FAILED OR WARMING UP]");
+        }
+
         println!("--------------------------------------------------");
 
         // Write to peaks CSV

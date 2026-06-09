@@ -3,6 +3,9 @@ name = "tuner-core"
 version.workspace = true
 edition = "2024"
 
+[features]
+telemetry = []
+
 [dependencies]
 # Use the workspace-defined versions
 anyhow = "1.0.102" # For easier error handling

@@ -566,7 +566,7 @@ impl AudioPipeline {
             // ── Latch ──
             if let Some(ref result) = pitch_result {
                 self.latched_auto_key = Some(result.key_index);
-                self.last_measured_f0 = Some(result.measured_f0);
+                self.last_measured_f0 = result.measured_f0;
             }
 
             if let Some(mut buf) = self.capture_buffer.take() {
@@ -658,10 +658,10 @@ impl AudioPipeline {
         frame_output.is_silence = is_silence;
 
         if let Some(result) = pitch_result {
-            frame_output.detected_frequency = Some(result.measured_f0);
+            frame_output.detected_frequency = result.measured_f0;
             frame_output.confidence = None;
             frame_output.note_index = Some(result.key_index);
-            frame_output.cents_deviation = Some(result.cents_deviation);
+            frame_output.cents_deviation = result.cents_deviation;
 
             // Populate strobe arrays (limit to 12 for GUI rendering)
             let strobe_count = result.partial_count.min(12);
