@@ -44,6 +44,13 @@ comments.
 In hot-path code prefer `debug_assert!` so the check is compiled out
 of release builds.
 
+## Feature Flags vs Debug Assertions
+
+When instrumenting the code for diagnostic logging:
+
+- Use `#[cfg(debug_assertions)]` for simple, lightweight textual traces (e.g., `eprintln!("[ENGINE] Lock Acquired")`) that you want visible during day-to-day development but automatically stripped from `--release` builds to prevent console I/O blocking.
+- Use `#[cfg(feature = "telemetry")]` for heavy structural data gathering (e.g., adding `[f32; 128]` arrays to data structures) required for offline mathematical analysis and Python plotting. Because DSP must be tested in `--release` mode to prevent audio dropouts, tying structural data to debug builds is physically unusable for acoustic analysis.
+
 ## `#[inline]` discipline
 
 `#[inline]` is reserved for small functions called from hot-path code

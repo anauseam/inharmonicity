@@ -213,7 +213,12 @@ fn create_cent_meter_panel(
     };
 
     let (note_name, freq_text, confidence, _target_freq_text) = {
-        let current_freq = data.last_frequency.unwrap_or(0.0);
+        let freq_str = if let Some(freq) = data.last_frequency {
+            format!("{:.2} Hz", freq)
+        } else {
+            "--".to_string()
+        };
+
         let note_text = match &data.tuning_mode {
             crate::app::TuningMode::Auto => data
                 .last_note_index
@@ -228,17 +233,17 @@ fn create_cent_meter_panel(
             crate::app::TuningMode::Auto => String::from("Auto"),
             crate::app::TuningMode::Manual { target_freq, .. } => format!("{:.1} Hz", target_freq),
         };
-        let confidence_text = data
-            .last_confidence
-            .map(|c| format!("{:.0}%", c * 100.0))
-            .unwrap_or_else(|| "0%".to_string());
+        let status_text = if data.last_note_index.is_some() && !data.is_stale {
+            if data.last_frequency.is_some() {
+                "Tracking".to_string()
+            } else {
+                "Dropped".to_string()
+            }
+        } else {
+            "--".to_string()
+        };
 
-        (
-            note_text,
-            format!("{:.2} Hz", current_freq),
-            confidence_text,
-            target_freq_text,
-        )
+        (note_text, freq_str, status_text, target_freq_text)
     };
 
     let cent_meter_content: Element<'static, crate::Message> = container(

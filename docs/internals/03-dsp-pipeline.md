@@ -56,25 +56,29 @@ Full)` is a valid outcome (typically: drop the frame, increment a
   counter that the GUI can observe).
 - Channel receives in the audio path use `.try_recv()` likewise.
 
-## Diagnostic printing
+## Diagnostics and Telemetry
 
-`println!` / `eprintln!` / `dbg!` on the hot path can produce
-non-deterministic latency, so unconditional prints belong in the Worker
-(writing `analysis.json` to disk) or in the GUI thread.
+Extracting state from the hot path without breaking real-time audio constraints requires strict discipline. There are two distinct patterns depending on whether you need lightweight textual traces or heavy mathematical profiling.
 
-For development-time tracing, the project gates hot-path prints behind
-`#[cfg(debug_assertions)]` — the same compile-time switch used in
-`engine.rs`. Debug-only prints survive incremental development work,
-disappear entirely in release builds, and never appear in shipped
-binaries. The pattern looks like:
+### 1. Lightweight Textual Traces (`debug_assertions`)
+
+`println!` / `eprintln!` / `dbg!` on the hot path produce non-deterministic latency. Unconditional prints belong entirely in the Worker thread or GUI thread.
+
+For development-time tracing (e.g., observing lock acquisition), the project gates hot-path prints behind `#[cfg(debug_assertions)]`. These prints survive incremental development work but disappear entirely in `--release` builds, ensuring the shipped binary never incurs I/O blocking. The pattern looks like:
 
 ```rust
 #[cfg(debug_assertions)]
-println!("[engine] f0={f0:.2} cents={cents:.2}");
+eprintln!("[ENGINE] *** LOCK ACQUIRED *** -> key_idx={}", winning_key);
 ```
 
-If a hot-path probe needs to ship in release builds, it should be moved
-out of the hop and into the Worker or the GUI tick.
+### 2. Mathematical Profiling (`feature = "telemetry"`)
+
+Because the DSP pipeline must run in `--release` mode to keep up with the audio thread without buffer underruns, `debug_assertions` are physically unusable for acoustic analysis.
+
+Heavy diagnostic data structures (such as arrays of `[f32; 128]` for Goertzel tracking) must instead be gated behind `#[cfg(feature = "telemetry")]`. This ensures:
+
+- The structures are completely compiled out in production, preventing cache-line bloat and preserving the pipeline's blazingly fast memory footprint.
+- CLI diagnostic tools (like `diagnose_engine`) can compile the optimized `--release` binary *with* the heavy array data included by passing `--features telemetry`.
 
 ## Sample-rate handling (transitional)
 
@@ -82,7 +86,7 @@ The audio sample rate is currently hard-coded to 44 100 Hz in
 `Engine::new`, in `CapturePayload`, and in the constants of `audio.rs`.
 Plumbing the CPAL-negotiated rate end-to-end is tracked in the README's
 Work-in-Progress section. Until that lands, new code must not introduce
-_more_ hard-coded references to 44 100 — read the rate from the
+more hard-coded references to 44 100 — read the rate from the
 `AudioPipeline` (or the constant being used as the single source of
 truth) so the migration to dynamic rates remains a single-point
 change.

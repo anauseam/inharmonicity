@@ -575,18 +575,15 @@ impl TunerApp {
                     // 1. Independent Decoupling of Scalar Data
                     // Assign values individually. If one drops out (e.g. confidence),
                     // we still display the others.
-                    if let Some(freq) = frame.detected_frequency {
-                        self.display_data.last_frequency = Some(freq);
-                    }
+                    self.display_data.last_frequency = frame.detected_frequency;
+                    self.display_data.last_confidence = frame.confidence;
+                    self.display_data.last_cents = frame.cents_deviation;
+
                     if let Some(idx) = frame.note_index {
                         self.display_data.last_note_index = Some(idx);
                     }
-                    if let Some(conf) = frame.confidence {
-                        self.display_data.last_confidence = Some(conf);
-                    }
-                    if let Some(cents) = frame.cents_deviation {
-                        self.display_data.last_cents = Some(cents);
 
+                    if let Some(cents) = frame.cents_deviation {
                         // Update smoothing buffer
                         let cents_for_smoothing = match self.display_data.tuning_mode {
                             TuningMode::Auto => Some(cents),
@@ -600,6 +597,8 @@ impl TunerApp {
                                 self.display_data.smoothing_buffer.remove(0);
                             }
                         }
+                    } else {
+                        self.display_data.smoothing_buffer.clear();
                     }
 
                     // Render State Logic: Silence vs Stale vs Valid
@@ -611,8 +610,7 @@ impl TunerApp {
                         self.display_data.last_cents = None;
                         self.display_data.smoothing_buffer.clear();
                         self.display_data.is_stale = false;
-                    } else if frame.detected_frequency.is_none() && frame.cents_deviation.is_none()
-                    {
+                    } else if frame.note_index.is_none() {
                         // Valid Audio but No Pitch Lock: Freeze scalars but flag as stale to mute visual output
                         self.display_data.smoothing_buffer.clear();
                         self.display_data.is_stale = true;

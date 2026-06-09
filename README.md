@@ -25,7 +25,6 @@ inharmonicity/
 │   │   │   ├── peaks.rs            # Spectral peak extraction with Jacobsen sub-bin interpolation
 │   │   │   ├── twm.rs              # Canonical Two-Way Mismatch (Primary F0 discovery)
 │   │   │   ├── pitch.rs            # XQIFFT/Quinn estimation, sub-cent refinement
-│   │   │   ├── templates.rs        # Structural matched-filters (2-asymptote β model, Gaussian weighting)
 │   │   │   ├── mat.rs              # Median-Adjustive Trajectories algebraic combinatorial solver
 │   │   │   ├── metrics.rs          # RMS, EMA, NHWRSF, NINOS2 signal metrics
 │   │   │   ├── tuning.rs           # Cent deviation, inharmonicity-compensated frequencies
@@ -144,12 +143,15 @@ See [tuner-gui](tuner-gui/README.md) for more information.
 - **Dynamic Sample Rate Plumbing**: The sample rate is currently hardcoded to 44,100 Hz in the `audio.rs` module and `CapturePayload`. The actual CPAL-negotiated rate needs to be plumbed from `spawn_analysis_thread()` through the `AudioPipeline` constructor, into the `Engine`, and into the Worker to prevent silent frequency miscalculation on 48 kHz hardware. Note: The `03-dsp-pipeline.md` guideline explicitly asks new code to read the rate from a single source of truth so this migration remains a single-point change.
 - Move File I/O for inharmonicity profiles into `tuner-core` for true frontend agnosticism.
 
+### Gatekeeper TODOs
+
+- **Optimize DSP Thresholds (NHWRSF & NINOS2)**: The current thresholds (`nhwrsf_threshold = 0.5`, `ninos2_stability_threshold = 10.0`) are arbitrary starting values that empirically happened to work across the test suite. They need to be mathematically optimized using the 87 offline diagnostic captures to find the true statistical floor for hammer strikes and ceiling for non-musical room noise. See ADR 0004 for methodology.
+
 ### Engine TODOs
 
-- **Tune Gatekeeper (Onset & Transient Phase)**: Use the newly implemented offline pre-roll diagnostic captures (`audio_full_event.raw`) to analyze the exact moment of hammer impact. This ground-truth data will be used to refine the Gatekeeper's onset detection and transient decay rules.
-- **Investigate $f_0$ Reconstruction Math**: Review the algebraic inverse mapping used to extract the physical fundamental from inharmonic partials in the engine (currently calculated by substituting global cents deviation back into the ET fundamental). Verify against academic literature whether this uniform logarithmic shift method accurately calculates $f_0$ or if it introduces systemic error.
 - **TWM Parameter Optimization (MOBO)**: The default heuristics for the Two-Way Mismatch algorithm ($q=1.4, r=0.5, \rho=0.33$) were originally calibrated by Maher & Beauchamp for general audio. To fully optimize these constants for the unique inharmonicity and missing-fundamental characteristics of a piano, a Multi-Objective Bayesian Optimization (MOBO) framework will be implemented to rigorously tune them against a 10,000-frame generative synthetic dataset. See [`docs/adr/0001-mobo-tuning.md`](docs/adr/0001-mobo-tuning.md) for the full methodology.
 - **TWM Bass-Lock Bias (Sub-Harmonic Locks)**: Real-world testing shows the engine occasionally locks to extreme bass candidates (e.g. D#4 → A#0, F#3 → A0, D2 → E1). This is a fundamental TWM scoring problem: because A#0's harmonic series is so dense across the mid-range spectrum, many mid-range peaks accidentally align with its predicted partials, and the $f^{-0.5}$ weighting makes those alignments very cheap. While the excision of the Viterbi module removed the "stickiness" of these false locks, the fundamental scoring bias remains. Resolution requires MOBO-tuned parameters or an additional penalty for octave-relationship false locks.
+- **Per-Bin Noise Floor Estimation**: The Neyman-Pearson Amplitude SNR gate relies on a global, broadband noise floor (`self.noise_floor`) calculated during silence. Real acoustic noise is colored (1/f pink noise, HVAC hum, soundboard modes). This global scalar can inadvertently pass noise at bass frequencies (where 1/f noise is loudest) or inappropriately kill real signals at treble frequencies. A future architectural fix should calculate and maintain a *per-bin* (or per-octave) noise baseline by actively tracking the Goertzel magnitude of tuning curve targets during Gatekeeper silence periods.
 - **Inharmonic Curve Calculation**: A solver to calculate the optimal tuning stretch (inharmonic curve) for the entire piano so that the harmonics of the bass align with the fundamentals of the treble. This will be implemented after the inharmonicity profile cross-thread transfer is completed.
 
 ### Worker TODOs
@@ -217,7 +219,7 @@ python3 scripts/analyze_capture.py diagnostics/ --gui
 
 To test the core DSP algorithms offline without launching the GUI, a standalone Cargo example is provided:
 
-- **`diagnose_engine`**: A heavy-duty offline telemetry harness. It allows you to feed captured `.raw` audio files (`audio.raw` or `audio_full_event.raw`) back into the `tuner-core` engine to dump exactly what the STFT, peak extractor, and TWM algorithm observed at every frame into `spectrum.csv` and `peaks.csv`.
+- **`diagnose_engine`**: A heavy-duty offline telemetry harness. It allows you to feed captured `.raw` audio files (`audio.raw` or `audio_full_event.raw`) back into the `tuner-core` engine to dump exactly what the STFT, peak extractor, and TWM algorithm observed at every frame into `spectrum.csv` and `peaks.csv`. When compiled with `--features telemetry`, it also writes `goertzel.csv` containing per-partial Goertzel amplitude and Neyman-Pearson threshold data for each tracking frame.
 
   ```bash
   cargo run --example diagnose_engine -- diagnostics/key_001_A#0/audio_full_event.raw

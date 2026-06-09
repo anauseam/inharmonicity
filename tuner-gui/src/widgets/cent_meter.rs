@@ -113,7 +113,7 @@ pub struct CentMeterDisplay {
     cents: Option<f32>,
     note_name: String,
     freq_text: String,
-    confidence_text: String,
+    status_text: String,
     is_stale: bool,
 }
 
@@ -123,14 +123,14 @@ impl CentMeterDisplay {
         cents: Option<f32>,
         note_name: String,
         freq_text: String,
-        confidence_text: String,
+        status_text: String,
         is_stale: bool,
     ) -> Self {
         Self {
             cents,
             note_name,
             freq_text,
-            confidence_text,
+            status_text,
             is_stale,
         }
     }
@@ -143,11 +143,19 @@ impl CentMeterDisplay {
             Color::WHITE
         };
 
+        let status_color = if self.status_text == "Dropped" {
+            Color::from_rgb8(0xFF, 0x88, 0x00) // Orange/Amber
+        } else if self.status_text == "Tracking" {
+            Color::from_rgb8(0x34, 0xDB, 0x98) // Green
+        } else {
+            text_color
+        };
+
         let content = column![
             row![
                 text("Note").size(14).color(text_color),
                 Space::new().width(Length::Fill),
-                text("Confidence").size(14).color(text_color),
+                text("Partial 1").size(14).color(text_color),
             ],
             Space::new().height(5),
             row![
@@ -155,7 +163,7 @@ impl CentMeterDisplay {
                 Space::new().width(10),
                 text(self.freq_text).size(24).color(text_color),
                 Space::new().width(Length::Fill),
-                container(text(self.confidence_text).size(16).color(text_color)).padding([4, 8]),
+                container(text(self.status_text).size(16).color(status_color)).padding([4, 8]),
             ]
             .align_y(Alignment::Center),
             Space::new().height(10),

@@ -116,8 +116,9 @@ This thread constantly consumes data from the Elastic Ring Buffer and executes a
     4. **Temporal Tracking:** A mathematically stateless 3-frame temporal consistency gate confirms the lock and transitions the Engine to the Tracking Phase. (Note: The historic Viterbi hidden Markov model was permanently excised because its path cost persistence caused unrecoverable sub-harmonic locks following noisy hammer strikes).
   - **Tracking Phase (State: Locked):** Once a key is locked, the engine switches to per-partial Goertzel analysis on 1024-sample segments to refine the tuning measurement.
     1. **Phase Vocoder:** Phase differences between consecutive hops are unwrapped to yield instantaneous frequency estimates (McAulay & Quatieri 1986).
-    2. **MVUE Variance Filter:** A Minimum Variance Unbiased Estimator (MVUE, Kay 1993) dynamically weights each partial by its amplitude squared (SNR). A Cramer-Rao Lower Bound (CRLB) geometric variance filter compares the measured phase jitter against the theoretical noise floor limit; if a partial's phase variance exceeds 3x the CRLB, it is rejected as a "ghost" and given zero weight.
-    3. **f0 Reconstruction:** The MVUE-weighted average of the surviving partials' cents deviations is computed. This uniform global deviation is algebraically mapped back through the Equal Temperament fundamental to yield the precise physical $f_0$, elegantly condensing the math into a single log-domain weighted average to avoid per-partial division in the hot path.
+    2. **Amplitude SNR Gate:** A Neyman-Pearson threshold (derived from a Generalized Likelihood Ratio Test) compares the Goertzel unnormalized magnitude against the noise floor. Partials that fail this threshold are rejected as noise.
+    3. **Adaptive Seed Feedback:** For partials that survive the SNR gate, an Exponential Moving Average ($\alpha = 0.05$) adapts the theoretical Goertzel tracking seed toward the measured instantaneous frequency (Dolson 1986), ensuring the tracker stays locked onto detuned strings without losing coherent integration energy.
+    4. **f0 Reconstruction:** The engine exclusively uses Partial 1 to drive the primary Cent Meter. This intentionally avoids averaging higher partials, which carry an $n^2$ systematic cents error when the theoretical inharmonicity profile ($B_{profile}$) diverges from the physical string ($B_{true}$).
 - **Output:** Pushes a `FrameOutput` structure every hop, containing the treble magnitude spectrum, sub-cent accurate $f_0$, and real-time partial frequencies to the UI thread via a wait-free `triple_buffer`.
 
 Once the Gatekeeper detects silence, it closes the gate by sending the `is_silence` flag to the Engine to force an immediate state reset and prevent pitch detection from running on background noise.
@@ -257,7 +258,7 @@ The pipeline is statically locked to a 44,100 Hz sample rate. This is not just a
 
 - **Static Buffer Sizes**: The `AudioPool` uses fixed `[f32; 66150]` arrays exactly dimensioned for 1.5 seconds at 44.1kHz.
 - **Time/Frame Conversions**: Gatekeeper threshold frames (e.g., `transient_timeout_frames = 20`) mathematically assume a ~46.4ms hop.
-- **Math Constants**: Parameters like EMA smoothing alphas (`rms_ema_alpha = 0.1`) and the Engine's `c_crlb_geometric` variance estimators are calibrated against 44.1kHz timing and frequency bin widths.
+- **Math Constants**: Parameters like EMA smoothing alphas (`rms_ema_alpha = 0.1`) and the Gatekeeper's timing thresholds are calibrated against 44.1kHz timing and frequency bin widths.
 
 Attempting to change the sample rate dynamically would require migrating away from fixed-size arrays to dynamic allocations on the audio hot-path, breaking the core real-time guarantees. While we currently rely on the host OS audio daemon (e.g., PipeWire or CoreAudio) to resample native hardware inputs down to 44.1kHz, this is strictly a temporary stopgap. Full dynamic sample rate support is planned for the future, but it requires a complex architectural overhaul; shipping a robust, working pipeline at a fixed rate remains the immediate priority.
 
