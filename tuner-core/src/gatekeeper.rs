@@ -19,7 +19,7 @@
 //! | 0 | IDLE | RMS + EMA | Silence gating — ignore background noise |
 //! | 1 | ATTACK | NHWRSF | Detect the hammer strike transient |
 //! | 2 | TRANSIENT | NHWRSF drop | One-frame buffer: resolves transient_active flag once NHWRSF falls |
-//! | 3 | HARMONIC DECAY | NINOS2 | Identify the "Golden Window" of stable harmonics |
+//! | 3 | HARMONIC DECAY | NINOS2 (EMA) | Identify the "Golden Window" of stable harmonics |
 //! | 4 | RELEASE | Counter | Cap capture at 1.5s, dispatch to Worker, reset |
 //!
 //! ## Noise Floor
@@ -48,6 +48,10 @@ pub struct GatekeeperConfig {
     pub nhwrsf_threshold: f32,
     /// The NINOS2 sparsity threshold above which the signal is considered harmonically stable
     pub ninos2_stability_threshold: f32,
+    /// Smoothing factor for the NINOS2 EMA. Chosen at 0.5 to ride through
+    /// single-frame phase-cancellation dropouts during unison beating while
+    /// still clearing the stability threshold within 1 frame for treble decay.
+    pub ninos2_ema_alpha: f32,
     /// How many consecutive frames the NINOS2 threshold must be met to declare the signal `Stable` (e.g., 4 frames ≈ 185ms)
     pub required_stable_frames: usize,
     /// Hard limit on the number of frames to capture (e.g., 32 frames ≈ 1.5 seconds)
@@ -63,6 +67,7 @@ impl Default for GatekeeperConfig {
             rms_ema_alpha: 0.1, // Strong smoothing to ride through momentary unison beating dips
             nhwrsf_threshold: 0.5, // Arbitrary starting threshold
             ninos2_stability_threshold: 10.0, // Scale 1 (white noise) to N (pure tone)
+            ninos2_ema_alpha: 0.5, // Smooths over phase cancellation dips during unison beating
             required_stable_frames: 4, // (~185ms)
             capture_max_frames: 32, // (~1.48 seconds)
         }
@@ -96,7 +101,8 @@ pub enum SignalState {
 pub struct GateResult {
     pub rms_ema: f32,
     pub nhwrsf: f32,
-    pub ninos2: f32,
+    pub ninos2_ema: f32,
+    pub ninos2_raw: f32,
     pub state: SignalState,
     pub is_new_onset: bool,
     pub is_transient_bypass: bool,
@@ -121,7 +127,8 @@ pub struct Gatekeeper {
     prev_spectrum: Box<[f32]>,
 
     pub(crate) current_nhwrsf: f32,
-    pub(crate) current_ninos2: f32,
+    pub(crate) current_ninos2_ema: f32,
+    pub(crate) current_ninos2_raw: f32,
 
     // State machine counters (internal bookkeeping — not exposed)
     stable_counter: usize,
@@ -156,7 +163,8 @@ impl Gatekeeper {
             current_state: SignalState::Silence,
             prev_spectrum: vec![0.0; 2048].into_boxed_slice(),
             current_nhwrsf: 0.0,
-            current_ninos2: 0.0,
+            current_ninos2_ema: 0.0,
+            current_ninos2_raw: 0.0,
             stable_counter: 0,
             capture_counter: 0,
             is_capturing: false,
@@ -204,6 +212,9 @@ impl Gatekeeper {
             self.current_state = SignalState::Silence;
             self.is_new_onset = false;
             self.is_transient_bypass = false;
+            self.current_ninos2_ema = 0.0;
+            self.current_ninos2_raw = 0.0;
+            self.current_nhwrsf = 0.0;
             self.reset_capture_state();
             return self.build_result();
         }
@@ -211,7 +222,13 @@ impl Gatekeeper {
         let current_spectrum = &frame.frequency_buffer[..];
 
         // Calculate all active-state spectral metrics
-        self.current_ninos2 = calculate_ninos2(current_spectrum);
+        let raw_ninos2 = calculate_ninos2(current_spectrum);
+        self.current_ninos2_raw = raw_ninos2;
+        self.current_ninos2_ema = calculate_ema(
+            raw_ninos2,
+            self.current_ninos2_ema,
+            self.config.ninos2_ema_alpha,
+        );
         self.current_nhwrsf = calculate_nhwrsf(current_spectrum, &mut self.prev_spectrum[..]);
 
         // State 1 & 2: Transient detection routing
@@ -231,7 +248,8 @@ impl Gatekeeper {
         GateResult {
             rms_ema: self.current_rms_ema,
             nhwrsf: self.current_nhwrsf,
-            ninos2: self.current_ninos2,
+            ninos2_ema: self.current_ninos2_ema,
+            ninos2_raw: self.current_ninos2_raw,
             state: self.current_state,
             is_new_onset: self.is_new_onset,
             is_transient_bypass: self.is_transient_bypass,
@@ -284,9 +302,9 @@ impl Gatekeeper {
     /// dispatches the buffer to the Worker and resets.
     fn process_stability_and_capture(&mut self) {
         // State 3: HARMONIC DECAY (NINOS2 Stability Gating)
-        // Note: self.current_ninos2 is now calculated unconditionally in process_frame
+        // Note: self.current_ninos2_ema is now calculated unconditionally in process_frame
 
-        if self.current_ninos2 > self.config.ninos2_stability_threshold {
+        if self.current_ninos2_ema > self.config.ninos2_stability_threshold {
             self.stable_counter += 1;
         } else {
             self.stable_counter = 0;

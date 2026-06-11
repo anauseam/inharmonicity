@@ -179,6 +179,8 @@ pub struct ConfigAtomics {
     pub silence_threshold: AtomicU32,
     /// NHWRSF threshold required to declare a new transient note event.
     pub nhwrsf_threshold: AtomicU32,
+    /// NINOS2 threshold required to declare a stable harmonic sustain.
+    pub ninos2_stability_threshold: AtomicU32,
     /// Pre-calculated base inharmonicity metric. `NaN` = `None`.
     pub inharmonicity_b: AtomicU32,
     /// GUI → Pipeline: Unison target selection. Indicates the 0-87 key index
@@ -221,6 +223,7 @@ impl Default for PipelineAtomics {
             config: ConfigAtomics {
                 silence_threshold: AtomicU32::new(0.005_f32.to_bits()),
                 nhwrsf_threshold: AtomicU32::new(0.9_f32.to_bits()),
+                ninos2_stability_threshold: AtomicU32::new(10.0_f32.to_bits()),
                 inharmonicity_b: AtomicU32::new(f32::NAN.to_bits()),
                 target_note: AtomicU8::new(255), // Default to Auto
             },
@@ -446,6 +449,8 @@ impl AudioPipeline {
 
         self.gatekeeper.config.silence_threshold = load_f32(&self.atomics.config.silence_threshold);
         self.gatekeeper.config.nhwrsf_threshold = load_f32(&self.atomics.config.nhwrsf_threshold);
+        self.gatekeeper.config.ninos2_stability_threshold =
+            load_f32(&self.atomics.config.ninos2_stability_threshold);
         self.engine.noise_floor = load_f32(&self.atomics.config.silence_threshold);
 
         let target_note = match self.atomics.config.target_note.load(Ordering::Relaxed) {
@@ -655,6 +660,7 @@ impl AudioPipeline {
         // Map gate telemetry (is_new_onset intentionally dropped — internal to DSP)
         frame_output.rms_ema = gate_result.rms_ema;
         frame_output.nhwrsf = gate_result.nhwrsf;
+        frame_output.ninos2 = gate_result.ninos2_ema;
         frame_output.is_silence = is_silence;
 
         if let Some(result) = pitch_result {

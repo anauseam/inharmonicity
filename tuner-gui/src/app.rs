@@ -94,6 +94,11 @@ pub enum Message {
     ResetTransientScope,
     NhwrsfThresholdChanged(f32),
 
+    // --- NINOS2 Calibration Messages ---
+    ToggleNinosCalibration,
+    ResetNinosScope,
+    NinosThresholdChanged(f32),
+
     // Continuous update message
     Tick, // Timer tick for real-time updates
 }
@@ -140,11 +145,19 @@ pub struct TransientSettings {
     pub current_threshold: f32,
 }
 
+#[derive(Debug, Clone)]
+pub struct NinosSettings {
+    pub visible: bool,
+    pub history: VecDeque<f32>,
+    pub current_threshold: f32,
+}
+
 /// Settings-view-specific display data.
 #[derive(Debug, Clone)]
 pub struct SettingsDisplayData {
     pub rms: NoiseFloorSettings,
     pub transient: TransientSettings,
+    pub ninos: NinosSettings,
 }
 
 /// UI-specific data needed for rendering the interface.
@@ -279,6 +292,11 @@ impl Default for TunerApp {
                         freeze_countdown: None,
                         history: VecDeque::with_capacity(ENVELOPE_HISTORY_LENGTH),
                         current_threshold: 0.5,
+                    },
+                    ninos: NinosSettings {
+                        visible: false,
+                        history: VecDeque::with_capacity(ENVELOPE_HISTORY_LENGTH),
+                        current_threshold: 10.0,
                     },
                 },
                 tuning_mode: TuningMode::Auto,
@@ -547,6 +565,7 @@ impl TunerApp {
 
                 if self.display_data.settings_data.transient.visible {
                     self.display_data.settings_data.rms.visible = false;
+                    self.display_data.settings_data.ninos.visible = false;
                     self.display_data.settings_data.transient.is_frozen = false;
                     self.display_data.settings_data.transient.freeze_countdown = None;
                     self.display_data.settings_data.transient.history.clear();
@@ -560,6 +579,30 @@ impl TunerApp {
             Message::NhwrsfThresholdChanged(val) => {
                 store_f32(&self.pipeline_handle.atomics.config.nhwrsf_threshold, val);
                 self.display_data.settings_data.transient.current_threshold = val;
+            }
+            Message::ToggleNinosCalibration => {
+                let vis = !self.display_data.settings_data.ninos.visible;
+                self.display_data.settings_data.ninos.visible = vis;
+
+                if self.display_data.settings_data.ninos.visible {
+                    self.display_data.settings_data.rms.visible = false;
+                    self.display_data.settings_data.transient.visible = false;
+                    self.display_data.settings_data.ninos.history.clear();
+                }
+            }
+            Message::ResetNinosScope => {
+                self.display_data.settings_data.ninos.history.clear();
+            }
+            Message::NinosThresholdChanged(val) => {
+                store_f32(
+                    &self
+                        .pipeline_handle
+                        .atomics
+                        .config
+                        .ninos2_stability_threshold,
+                    val,
+                );
+                self.display_data.settings_data.ninos.current_threshold = val;
             }
             Message::Tick => {
                 let mut frame_pushed = false;
@@ -707,6 +750,28 @@ impl TunerApp {
 
                         self.display_data.settings_data.transient.current_threshold =
                             current_threshold;
+                    } else if self.display_data.settings_data.ninos.visible {
+                        let ninos2 = self
+                            .display_data
+                            .last_frame
+                            .as_ref()
+                            .map(|f| f.ninos2)
+                            .unwrap_or(0.0);
+
+                        let current_threshold = load_f32(
+                            &self
+                                .pipeline_handle
+                                .atomics
+                                .config
+                                .ninos2_stability_threshold,
+                        );
+
+                        crate::views::ninos2_calibration::process_telemetry_tick(
+                            &mut self.display_data.settings_data.ninos,
+                            ninos2,
+                        );
+
+                        self.display_data.settings_data.ninos.current_threshold = current_threshold;
                     }
                 }
 

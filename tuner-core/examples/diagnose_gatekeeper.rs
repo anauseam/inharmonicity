@@ -87,7 +87,7 @@ fn main() -> Result<()> {
     let mut gatekeeper_csv = File::create(parent_dir.join("gatekeeper.csv"))?;
     writeln!(
         gatekeeper_csv,
-        "frame_idx,time_ms,rms_ema,nhwrsf,ninos2,state_enum,is_new_onset,state_name"
+        "frame_idx,time_ms,rms_ema,nhwrsf,ninos2_ema,ninos2_raw,state_enum,is_new_onset,state_name"
     )?;
 
     // Loop through frame-by-frame- Sliding Window Loop ---
@@ -142,19 +142,20 @@ fn main() -> Result<()> {
         // Only print interesting frames to terminal to avoid spam
         if gate_result.state != SignalState::Silence || gate_result.is_new_onset {
             println!(
-                "Frame {:4} | {:6.1} ms | {:8} | RMS EMA: {:.5} | NINOS2: {:.1}",
-                frame_idx, time_ms, state_name, gate_result.rms_ema, gate_result.ninos2
+                "Frame {:4} | {:6.1} ms | {:8} | RMS EMA: {:.5} | NINOS2 EMA: {:.1}",
+                frame_idx, time_ms, state_name, gate_result.rms_ema, gate_result.ninos2_ema
             );
         }
 
         writeln!(
             gatekeeper_csv,
-            "{},{:.2},{:.5},{:.3},{:.3},{},{},{}",
+            "{},{:.2},{:.5},{:.3},{:.3},{:.3},{},{},{}",
             frame_idx,
             time_ms,
             gate_result.rms_ema,
             gate_result.nhwrsf,
-            gate_result.ninos2,
+            gate_result.ninos2_ema,
+            gate_result.ninos2_raw,
             state_enum,
             gate_result.is_new_onset,
             state_name

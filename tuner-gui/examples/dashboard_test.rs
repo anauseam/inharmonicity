@@ -76,6 +76,11 @@ impl DashboardTest {
                     history: std::collections::VecDeque::new(),
                     current_threshold: 0.05,
                 },
+                ninos: tuner_gui::app::NinosSettings {
+                    visible: false,
+                    history: std::collections::VecDeque::new(),
+                    current_threshold: 10.0,
+                },
             },
             tuning_mode: TuningMode::Auto,
             measurement_mode_active: false,

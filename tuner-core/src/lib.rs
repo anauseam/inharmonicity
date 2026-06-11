@@ -62,6 +62,8 @@ pub struct FrameOutput {
     pub rms_ema: f32,
     /// Current Normalised Half-Wave Rectified Spectral Flux.
     pub nhwrsf: f32,
+    /// Current NINOS2 stability metric.
+    pub ninos2: f32,
     /// Indicates whether the Gatekeeper evaluates the current signal as absolute silence.
     pub is_silence: bool,
     /// 88-key piano index (0 = A0, 87 = C8), if a note is currently locked.
@@ -88,6 +90,7 @@ impl Default for FrameOutput {
             magnitude_len: 0,
             rms_ema: 0.0,
             nhwrsf: 0.0,
+            ninos2: 0.0,
             is_silence: true,
             note_index: None,
             detected_frequency: None,
