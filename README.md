@@ -117,6 +117,7 @@ The pipeline also manages the **`WorkerManager`** (`worker.rs`), which owns a si
 - **Profile Management**: Save and load piano tuning profiles with JSON persistence
 - **Transient Detection Calibration**: Manual and automatic transient detection calibration
 - **Noise Floor Calibration**: Manual and automatic noise floor calibration
+- **NINOS2 Stability Calibration**: Live oscilloscope with adjustable threshold for tuning the NINOS2 tonal stability gate
 
 ### Planned Features
 
@@ -142,10 +143,6 @@ See [tuner-gui](tuner-gui/README.md) for more information.
 
 - **Dynamic Sample Rate Plumbing**: The sample rate is currently hardcoded to 44,100 Hz in the `audio.rs` module and `CapturePayload`. The actual CPAL-negotiated rate needs to be plumbed from `spawn_analysis_thread()` through the `AudioPipeline` constructor, into the `Engine`, and into the Worker to prevent silent frequency miscalculation on 48 kHz hardware. Note: The `03-dsp-pipeline.md` guideline explicitly asks new code to read the rate from a single source of truth so this migration remains a single-point change.
 - Move File I/O for inharmonicity profiles into `tuner-core` for true frontend agnosticism.
-
-### Gatekeeper TODOs
-
-- **Optimize DSP Thresholds (NHWRSF & NINOS2)**: The current thresholds (`nhwrsf_threshold = 0.5`, `ninos2_stability_threshold = 10.0`) are arbitrary starting values that empirically happened to work across the test suite. They need to be mathematically optimized using the 87 offline diagnostic captures to find the true statistical floor for hammer strikes and ceiling for non-musical room noise. See ADR 0004 for methodology.
 
 ### Engine TODOs
 

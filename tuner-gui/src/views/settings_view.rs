@@ -21,10 +21,15 @@ const TONAL_CONFIG: [ButtonConfig; 3] = [
     },
 ];
 
-const PROGRAM_CONFIG: [ButtonConfig; 3] = [
+const PROGRAM_CONFIG: [ButtonConfig; 4] = [
     ButtonConfig {
         label: "Transient Threshold Calibration",
         message: Some(crate::Message::ToggleTransientCalibration),
+        button_type: ButtonType::Standard,
+    },
+    ButtonConfig {
+        label: "NINOS2 Stability Calibration",
+        message: Some(crate::Message::ToggleNinosCalibration),
         button_type: ButtonType::Standard,
     },
     ButtonConfig {
@@ -63,6 +68,8 @@ pub fn create_settings_view(data: &crate::app::AppDisplayData) -> Element<'stati
         crate::views::rms_calibration::create_rms_calibration_panel(data)
     } else if data.settings_data.transient.visible {
         crate::views::transient_calibration::create_transient_calibration_panel(data)
+    } else if data.settings_data.ninos.visible {
+        crate::views::ninos2_calibration::create_ninos2_calibration_panel(data)
     } else {
         text("Select a setting to adjust.").size(18).into()
     };

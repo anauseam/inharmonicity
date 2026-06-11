@@ -29,6 +29,7 @@ diagnostics/
 
 # AI-related files
 .agents/
+.claude/
 plan.md
 
 # User-specific files

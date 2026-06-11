@@ -2,19 +2,36 @@ use crate::widgets::envelope::ENVELOPE_HISTORY_LENGTH;
 use iced::widget::canvas::{self, Canvas, Geometry, Text, path};
 use iced::{Color, Element, Fill, Point, Rectangle, Renderer, Theme, alignment, mouse};
 
+struct Annotation {
+    value: f32,
+    color: Color,
+    label: String,
+}
+
 pub struct SeismographViewer {
     history: Vec<f32>,
-    noise_ceiling: f32, // target threshold N_max
+    current_threshold: f32,
+    annotations: Vec<Annotation>,
     cache: canvas::Cache,
 }
 
 impl SeismographViewer {
-    pub fn new(history: Vec<f32>, noise_ceiling: f32) -> Self {
+    pub fn new(history: Vec<f32>, current_threshold: f32) -> Self {
         Self {
             history,
-            noise_ceiling,
+            current_threshold,
+            annotations: Vec::new(),
             cache: canvas::Cache::default(),
         }
+    }
+
+    pub fn with_annotation(mut self, value: f32, color: Color, label: String) -> Self {
+        self.annotations.push(Annotation {
+            value,
+            color,
+            label,
+        });
+        self
     }
 
     pub fn view(self) -> Element<'static, crate::Message> {
@@ -46,12 +63,19 @@ impl<Message> canvas::Program<Message> for SeismographViewer {
                 return;
             }
 
-            let max_val = self
+            let mut max_val = self
                 .history
                 .iter()
                 .copied()
-                .fold(self.noise_ceiling * 1.5, f32::max)
+                .fold(self.current_threshold * 1.5, f32::max)
                 .max(1.0);
+
+            for ann in &self.annotations {
+                if ann.value * 1.5 > max_val {
+                    max_val = ann.value * 1.5;
+                }
+            }
+
             let y_scale = max_val * 1.1;
 
             let len = self.history.len();
@@ -78,8 +102,8 @@ impl<Message> canvas::Program<Message> for SeismographViewer {
                     .with_width(2.0),
             );
 
-            // Draw noise ceiling
-            let threshold_n = (self.noise_ceiling / y_scale).clamp(0.0, 1.0);
+            // Draw current threshold
+            let threshold_n = (self.current_threshold / y_scale).clamp(0.0, 1.0);
             let th_y = bounds.height - (threshold_n * bounds.height);
             let t_line = canvas::Path::line(Point::new(0.0, th_y), Point::new(bounds.width, th_y));
             frame.stroke(
@@ -90,7 +114,7 @@ impl<Message> canvas::Program<Message> for SeismographViewer {
             );
 
             let th_text = Text {
-                content: format!("N_max: {:.2}", self.noise_ceiling),
+                content: format!("Threshold: {:.2}", self.current_threshold),
                 position: Point::new(5.0, th_y - 5.0),
                 color: Color::from_rgba8(0xF3, 0x9C, 0x12, 0.9),
                 align_x: alignment::Horizontal::Left.into(),
@@ -98,6 +122,34 @@ impl<Message> canvas::Program<Message> for SeismographViewer {
                 ..Default::default()
             };
             frame.fill_text(th_text);
+
+            // Draw annotations
+            for ann in &self.annotations {
+                let ann_n = (ann.value / y_scale).clamp(0.0, 1.0);
+                let ann_y = bounds.height - (ann_n * bounds.height);
+                let a_line =
+                    canvas::Path::line(Point::new(0.0, ann_y), Point::new(bounds.width, ann_y));
+
+                frame.stroke(
+                    &a_line,
+                    canvas::Stroke::default()
+                        .with_color(Color {
+                            a: 0.8,
+                            ..ann.color
+                        })
+                        .with_width(1.5),
+                );
+
+                let a_text = Text {
+                    content: format!("{}: {:.2}", ann.label, ann.value),
+                    position: Point::new(bounds.width - 5.0, ann_y - 5.0),
+                    color: ann.color,
+                    align_x: alignment::Horizontal::Right.into(),
+                    align_y: alignment::Vertical::Bottom,
+                    ..Default::default()
+                };
+                frame.fill_text(a_text);
+            }
         });
 
         vec![geometry]
