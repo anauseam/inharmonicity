@@ -5,6 +5,7 @@
 //! is to process the signal and extract the exact fundamental frequency.
 
 use crate::algorithms::{
+    discovery,
     peaks::{self, SpectralPeak, extract_peaks},
     spectral::goertzel,
     twm,
@@ -83,6 +84,9 @@ pub struct PitchResult {
     pub partial_t_amps: [f32; MAX_PARTIALS],
     #[cfg(feature = "telemetry")]
     pub partial_is_alive: [bool; MAX_PARTIALS],
+    /// Stage B winning scale of the current lock, in cents (0.0 = locked at ET).
+    #[cfg(feature = "telemetry")]
+    pub s_win_cents: f32,
 }
 
 impl Default for PitchResult {
@@ -104,6 +108,8 @@ impl Default for PitchResult {
             partial_t_amps: [0.0; MAX_PARTIALS],
             #[cfg(feature = "telemetry")]
             partial_is_alive: [false; MAX_PARTIALS],
+            #[cfg(feature = "telemetry")]
+            s_win_cents: 0.0,
         }
     }
 }
@@ -126,6 +132,8 @@ pub struct Engine {
     tracking_targets: [f32; MAX_PARTIALS],
     partial_trackers: [PartialTracker; MAX_PARTIALS],
     warmup_hops: u8,
+    /// Winning Stage B scale (s_win) of the current lock; 1.0 when unlocked.
+    locked_scale: f32,
 
     // Shared
     pub noise_floor: f32,
@@ -157,6 +165,7 @@ impl Engine {
             tracking_targets: [0.0; MAX_PARTIALS],
             partial_trackers: [PartialTracker::default(); MAX_PARTIALS],
             warmup_hops: 0,
+            locked_scale: 1.0,
             noise_floor: 0.0, // updated by pipeline
             profiles: Box::new(profiles_array),
             peak_scratch: vec![SpectralPeak::default(); 64].into_boxed_slice(),
@@ -176,6 +185,7 @@ impl Engine {
             self.stable_frames = 0;
             self.identified_key = None;
             self.partial_trackers = [PartialTracker::default(); MAX_PARTIALS];
+            self.locked_scale = 1.0;
             return None;
         }
 
@@ -243,30 +253,34 @@ impl Engine {
             let active_peaks = &mut active_peaks[..valid_count];
 
             // 2. Safe Bypass Gate
-            let (winning_key, temporal_gate, min_error) = if let Some(target_idx) = target_note {
-                (target_idx, true, 0.0) // Bypass 88-key TWM array
+            let cfg = twm::TwmConfig::default();
+            let (winning_key, temporal_gate, s_win, min_error) = if let Some(target_idx) =
+                target_note
+            {
+                // Manual Mode: bypass the 88-key scan, but still run Stage B scale
+                // refinement on the single target profile — otherwise this is the
+                // worst-seeded path (pure ET), and it is the critical one for
+                // Pitch Raise on heavily mistuned strings.
+                let (s, err) = discovery::refine_scale(
+                    active_peaks,
+                    &self.profiles[target_idx as usize],
+                    &cfg,
+                );
+                (target_idx, true, s, err)
             } else {
-                // Auto Mode: TWM Error Scoring
-                let mut min_error = f32::MAX;
-                let mut winning_key = 0;
-                let cfg = twm::TwmConfig::default();
-                for k in 0..88 {
-                    let err = twm::score_candidate(active_peaks, &self.profiles[k], 1.0, &cfg);
-                    if err < min_error {
-                        min_error = err;
-                        winning_key = k as u8;
-                    }
-                }
+                // Auto Mode: split discovery (ADR 0005) — Stage A discrete 88-key
+                // scan, Stage B basin-clamped scale refinement of the top-3.
+                let res = discovery::discover(active_peaks, &self.profiles, &cfg, true);
 
-                // 3-Frame Consistency Gate
-                if winning_key == self.consistency_key {
+                // 3-Frame Consistency Gate (key-based, unchanged)
+                if res.key_index == self.consistency_key {
                     self.stable_frames += 1;
                 } else {
-                    self.consistency_key = winning_key;
+                    self.consistency_key = res.key_index;
                     self.stable_frames = 1;
                 }
 
-                (winning_key, self.stable_frames >= 3, min_error)
+                (res.key_index, self.stable_frames >= 3, res.scale, res.error)
             };
 
             let profile = &self.profiles[winning_key as usize];
@@ -280,15 +294,22 @@ impl Engine {
             if temporal_gate {
                 // Lock
                 #[cfg(debug_assertions)]
-                eprintln!("[ENGINE] *** LOCK ACQUIRED *** -> key_idx={}", winning_key);
+                eprintln!(
+                    "[ENGINE] *** LOCK ACQUIRED *** -> key_idx={}, s_win={:+.1}c",
+                    winning_key,
+                    1200.0 * s_win.log2()
+                );
                 self.identified_key = Some(winning_key);
                 self.warmup_hops = 0;
+                self.locked_scale = s_win;
 
                 let limit = profile.valid_partial_count.min(MAX_PARTIALS);
                 for i in 0..limit {
-                    let predicted = profile.predicted_partials[i];
-
-                    self.tracking_targets[i] = predicted;
+                    // Seed the Goertzel trackers from the REFINED series, not ET:
+                    // an ET seed for partial n of a mistuned note is off by
+                    // δ·n·f0, which exceeds the ±21.5 Hz phase-unwrap range at
+                    // the 1024-sample hop for high partials.
+                    self.tracking_targets[i] = profile.predicted_partials[i] * s_win;
 
                     self.partial_trackers[i].prev_phase = 0.0;
                 }
@@ -374,6 +395,7 @@ impl Engine {
         #[cfg(feature = "telemetry")]
         {
             result.telemetry_count = profile.valid_partial_count;
+            result.s_win_cents = 1200.0 * self.locked_scale.log2();
         }
 
         if self.warmup_hops == 0 {
