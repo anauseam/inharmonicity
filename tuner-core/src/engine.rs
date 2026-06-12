@@ -249,8 +249,9 @@ impl Engine {
                 // Auto Mode: TWM Error Scoring
                 let mut min_error = f32::MAX;
                 let mut winning_key = 0;
+                let cfg = twm::TwmConfig::default();
                 for k in 0..88 {
-                    let err = twm::score_candidate(active_peaks, &self.profiles[k]);
+                    let err = twm::score_candidate(active_peaks, &self.profiles[k], 1.0, &cfg);
                     if err < min_error {
                         min_error = err;
                         winning_key = k as u8;

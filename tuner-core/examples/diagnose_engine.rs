@@ -208,8 +208,9 @@ fn main() -> Result<()> {
             note_name = "BYPASS";
         } else {
             let mut current_errors = [0.0_f32; 88];
+            let cfg = tuner_core::algorithms::twm::TwmConfig::default();
             for key in 0..88 {
-                current_errors[key] = score_candidate(active_peaks, &profiles_array[key]);
+                current_errors[key] = score_candidate(active_peaks, &profiles_array[key], 1.0, &cfg);
             }
 
             let raw_winner = current_errors
