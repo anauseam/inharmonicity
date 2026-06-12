@@ -10,7 +10,6 @@ use crossbeam_queue::ArrayQueue;
 use std::sync::Arc;
 use tuner_core::algorithms::peaks::{SpectralPeak, extract_peaks};
 use tuner_core::algorithms::spectral::{perform_fft, spectrum_to_magnitudes};
-use tuner_core::algorithms::twm::score_candidate;
 use tuner_core::audio::{BASS_WINDOW_SIZE, HOP_SIZE, WINDOW_SIZE};
 use tuner_core::engine::{Engine, KeyProfile};
 use tuner_core::gatekeeper::Gatekeeper;
@@ -19,14 +18,23 @@ use tuner_core::pipeline::ProcessingFrame;
 
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        println!("Usage: cargo run --example diagnose_engine -- <path_to_audio.raw>");
+    let mut file_path = String::new();
+    let mut refine = false;
+
+    for arg in args.iter().skip(1) {
+        if arg == "--refine" {
+            refine = true;
+        } else if !arg.starts_with("--") {
+            file_path = arg.clone();
+        }
+    }
+
+    if file_path.is_empty() {
+        println!("Usage: cargo run --example diagnose_engine -- <path_to_audio.raw> [--refine]");
         return Ok(());
     }
 
-    let file_path = &args[1];
-
-    let path = Path::new(file_path);
+    let path = Path::new(&file_path);
     let parent_dir = path.parent().unwrap_or(Path::new(""));
     let json_path = parent_dir.join("analysis.json");
 
@@ -48,7 +56,7 @@ fn main() -> Result<()> {
     println!("Loading file: {}", file_path);
     println!("Using noise floor: {:.6} (from analysis.json)", noise_floor);
 
-    let audio_bytes = fs::read(file_path).context("Failed to read audio.raw")?;
+    let audio_bytes = fs::read(&file_path).context("Failed to read audio.raw")?;
     if audio_bytes.len() % 4 != 0 {
         return Err(anyhow!(
             "File size not divisible by 4, might not be an f32 array"
@@ -106,7 +114,7 @@ fn main() -> Result<()> {
     let profiles_array: [KeyProfile; 88] = profiles_vec.try_into().unwrap();
 
     // Setup output files
-    let path = Path::new(file_path);
+    let path = Path::new(&file_path);
     let parent_dir = path.parent().unwrap_or(Path::new(""));
     let mut spectrum_csv = File::create(parent_dir.join("spectrum.csv"))?;
     let mut peaks_csv = File::create(parent_dir.join("peaks.csv"))?;
@@ -114,7 +122,7 @@ fn main() -> Result<()> {
 
     writeln!(
         peaks_csv,
-        "frame,rms_power,key_idx,key_name,e_win,f0_et,num_peaks,peak_freqs,peak_mags"
+        "frame,rms_power,key_idx,key_name,e_win,f0_et,num_peaks,peak_freqs,peak_mags,s_win_cents"
     )?;
     writeln!(
         goertzel_csv,
@@ -200,34 +208,28 @@ fn main() -> Result<()> {
         let e_win;
         let profile;
         let note_name;
+        let s_win_cents;
 
         if gate_result.is_transient_bypass {
             winning_key = 255;
             e_win = 0.0;
             profile = &profiles_array[0];
             note_name = "BYPASS";
+            s_win_cents = 0.0;
         } else {
-            let mut current_errors = [0.0_f32; 88];
             let cfg = tuner_core::algorithms::twm::TwmConfig::default();
-            for key in 0..88 {
-                current_errors[key] = score_candidate(active_peaks, &profiles_array[key], 1.0, &cfg);
-            }
-
-            let raw_winner = current_errors
-                .iter()
-                .enumerate()
-                .min_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-                .unwrap()
-                .0 as u8;
-            winning_key = raw_winner;
-            println!(
-                "TWM Lock: {} ({:.1})",
-                &NOTES[raw_winner as usize].name, current_errors[raw_winner as usize]
-            );
-
-            e_win = current_errors[winning_key as usize];
+            let res = tuner_core::algorithms::discovery::discover(active_peaks, &profiles_array, &cfg, refine);
+            
+            winning_key = res.key_index;
+            e_win = res.error;
             profile = &profiles_array[winning_key as usize];
             note_name = &NOTES[winning_key as usize].name;
+            s_win_cents = if refine { 1200.0 * res.scale.log2() } else { 0.0 };
+
+            println!(
+                "TWM Lock: {} ({:.1})",
+                note_name, e_win
+            );
         }
 
         // Print terminal block
@@ -343,7 +345,7 @@ fn main() -> Result<()> {
             .collect();
         writeln!(
             peaks_csv,
-            "{},{},{},{},{:.2},{:.2},{},\"{}\",\"{}\"",
+            "{},{},{},{},{:.2},{:.2},{},\"{}\",\"{}\",{:.2}",
             frame_idx,
             rms,
             winning_key,
@@ -352,7 +354,8 @@ fn main() -> Result<()> {
             profile.f0_et,
             count,
             freqs_str.join(";"),
-            mags_str.join(";")
+            mags_str.join(";"),
+            s_win_cents
         )?;
 
         cursor += HOP_SIZE;
