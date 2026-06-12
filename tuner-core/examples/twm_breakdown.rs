@@ -21,11 +21,7 @@ struct TwmBreakdown {
 }
 
 fn score_detailed(peaks: &[SpectralPeak], profile: &KeyProfile) -> TwmBreakdown {
-    #[allow(dead_code)]
-    const P: f32 = 0.5;
-    const Q: f32 = 1.4;
-    const R: f32 = 0.5;
-    const RHO: f32 = 0.33;
+    let cfg = tuner_core::algorithms::twm::TwmConfig::default();
 
     let valid_count = profile.valid_partial_count;
     if valid_count == 0 || peaks.is_empty() {
@@ -77,7 +73,7 @@ fn score_detailed(peaks: &[SpectralPeak], profile: &KeyProfile) -> TwmBreakdown 
 
         let f_weight = 1.0 / f_n.max(1.0).sqrt();
         let amp_ratio = a_n / a_max;
-        let err_pm_n = delta_f_n * f_weight + amp_ratio * (Q * delta_f_n * f_weight - R);
+        let err_pm_n = delta_f_n * f_weight + amp_ratio * (cfg.q * delta_f_n * f_weight - cfg.r);
         err_pm += err_pm_n;
     }
 
@@ -96,14 +92,14 @@ fn score_detailed(peaks: &[SpectralPeak], profile: &KeyProfile) -> TwmBreakdown 
 
         let f_weight = 1.0 / f_k.max(1.0).sqrt();
         let amp_ratio = a_k / a_max;
-        err_mp += delta_f_k * f_weight + amp_ratio * (Q * delta_f_k * f_weight - R);
+        err_mp += delta_f_k * f_weight + amp_ratio * (cfg.q * delta_f_k * f_weight - cfg.r);
     }
 
     let n = active_predicted as f32;
     let k = peaks.len() as f32;
 
     let err_pm_norm = err_pm / n;
-    let err_mp_norm = RHO * (err_mp / k);
+    let err_mp_norm = cfg.rho * (err_mp / k);
 
     TwmBreakdown {
         total: err_pm_norm + err_mp_norm,
