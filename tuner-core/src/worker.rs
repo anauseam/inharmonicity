@@ -285,8 +285,8 @@ impl WorkerManager {
             // Write audio_full_event.raw
             let mut file_full = dir.clone();
             file_full.push("audio_full_event.raw");
-            if let Some(ref dbuf) = payload.full_event_buffer {
-                if let Ok(mut f_full) = fs::File::create(file_full) {
+            if let Some(ref dbuf) = payload.full_event_buffer
+                && let Ok(mut f_full) = fs::File::create(file_full) {
                     let slice = &dbuf[..payload.full_event_sample_count];
                     let byte_slice: &[u8] = unsafe {
                         std::slice::from_raw_parts(
@@ -296,7 +296,6 @@ impl WorkerManager {
                     };
                     let _ = f_full.write_all(byte_slice);
                 }
-            }
 
             // Write analysis.json
             let mut file2 = dir.clone();

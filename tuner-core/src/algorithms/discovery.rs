@@ -25,9 +25,18 @@ use crate::algorithms::peaks::SpectralPeak;
 use crate::algorithms::twm::{self, TwmConfig};
 use crate::engine::KeyProfile;
 
-/// Number of Stage A candidates carried into Stage B refinement.
-/// Provisional (see plan: validated by the evaluator's Stage A recall metric).
-pub const TOP_K: usize = 3;
+/// Candidates carried from Stage A into Stage B refinement. 88 = **exhaustive**:
+/// every key is refined, so there is no shortlist cutoff to justify (no magic
+/// number under the Topological Scrutiny Test) and the true key can never be
+/// dropped before refinement — recall is total, and production false-lock then
+/// equals pure separability. This is canonical Maher & Beauchamp continuous f0
+/// search tiled into the 88 physical key-basins (ADR 0005 §3); the per-candidate
+/// ±80-cent basin clamp still prevents any escape toward a sub-harmonic.
+///
+/// Cost is ~1 ms per discovery frame (onset-only, until the 3-frame lock) — set
+/// below 88 ONLY if a micro-bench on target hardware shows the hop budget can't
+/// afford it, at which point it becomes a latency-vs-recall knob.
+pub const TOP_K: usize = 88;
 
 /// Half-width of the Stage B refinement window, in cents. Adjacent-key basins
 /// (100 cents apart) barely overlap, and sub-harmonics sit 1200 cents away, so
@@ -139,13 +148,15 @@ pub fn refine_scale(peaks: &[SpectralPeak], profile: &KeyProfile, cfg: &TwmConfi
 /// With `refine = true`, Stage B refines each candidate and the minimum refined
 /// error wins. Cost: 88 + ~18·TOP_K ≈ 142 `score_candidate` calls per frame,
 /// discovery frames only.
-pub fn discover(
+/// Stage A only: the coarse 88-key scan at `scale = 1.0`, returning the top-K
+/// `(key, error)` candidates ascending by error (ties keep the lower key,
+/// matching the legacy argmin). Exposed for the MOBO evaluator's Stage A recall
+/// metric; `discover` is built on this same function.
+pub fn stage_a(
     peaks: &[SpectralPeak],
     profiles: &[KeyProfile; 88],
     cfg: &TwmConfig,
-    refine: bool,
-) -> DiscoveryResult {
-    // ── Stage A: coarse 88-key scan, top-K collection ──
+) -> [(usize, f32); TOP_K] {
     let mut top: [(usize, f32); TOP_K] = [(0, f32::MAX); TOP_K];
     for (k, profile) in profiles.iter().enumerate() {
         let err = twm::score_candidate(peaks, profile, 1.0, cfg);
@@ -158,6 +169,17 @@ pub fn discover(
             }
         }
     }
+    top
+}
+
+pub fn discover(
+    peaks: &[SpectralPeak],
+    profiles: &[KeyProfile; 88],
+    cfg: &TwmConfig,
+    refine: bool,
+) -> DiscoveryResult {
+    // ── Stage A: coarse 88-key scan, top-K collection ──
+    let top = stage_a(peaks, profiles, cfg);
 
     // Discrete mode, or nothing scoreable at all: legacy behavior.
     if !refine || top[0].1 == f32::MAX {
@@ -292,10 +314,13 @@ mod tests {
         }
         let refined = t1.elapsed();
 
-        // Theory: ~142 vs 88 score calls ≈ 1.6×. Generous 6× bound absorbs
-        // scheduler jitter; a violation means the search grew structurally.
+        // At TOP_K=88 (exhaustive): discrete = 88 score calls; refined adds
+        // ~18 calls per key (pre-grid + golden), so refined/discrete ≈ 1+18 ≈ 19×.
+        // The ratio is hardware-independent; a generous 40× bound catches a
+        // structural regression (an alloc or O(n²) creeping into the hot path)
+        // while tolerating CI jitter. Absolute cost is ~1 ms/frame, onset-only.
         assert!(
-            refined < discrete * 6,
+            refined < discrete * 40,
             "refined {refined:?} vs discrete {discrete:?} exceeds budget"
         );
     }
