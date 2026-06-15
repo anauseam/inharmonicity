@@ -254,6 +254,8 @@ impl Engine {
 
             // 2. Safe Bypass Gate
             let cfg = twm::TwmConfig::default();
+            // `min_error` feeds only the debug_assertions diagnostic below.
+            #[cfg_attr(not(debug_assertions), allow(unused_variables))]
             let (winning_key, temporal_gate, s_win, min_error) = if let Some(target_idx) =
                 target_note
             {
