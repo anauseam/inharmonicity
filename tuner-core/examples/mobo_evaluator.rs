@@ -32,7 +32,7 @@ use std::time::Instant;
 
 use tuner_core::algorithms::discovery::{self, TOP_K};
 use tuner_core::algorithms::peaks::{SpectralPeak, mask_peaks};
-use tuner_core::algorithms::twm::TwmConfig;
+use tuner_core::algorithms::twm::{self, TwmConfig};
 use tuner_core::engine::KeyProfile;
 use tuner_core::models::get_expected_beta;
 
@@ -486,95 +486,123 @@ fn stage_a_rank_study(frames: &[Frame], profiles: &[KeyProfile; 88], cfg: &TwmCo
 
 // ───────────────────────────── Evaluation ─────────────────────────────
 
-#[derive(Default)]
-struct Bucket {
+/// Mergeable, `Copy` trial accumulator (one per thread, summed at the end).
+/// Registers: 0 bass (0–26), 1 mid (27–59), 2 treble (60–87), 3 hard subset.
+#[derive(Default, Clone, Copy)]
+struct Acc {
     n: usize,
-    /// MOBO Objective A. K-independent: the true key's refined error is NOT the
-    /// minimum over {top-K impostors ∪ true key}. Isolates the constants' job
-    /// (separability) from the search's job (recall) — the same principle as
-    /// "don't bake grid-compensation into the constants". Uses synthetic
-    /// ground-truth to refine the true key even when Stage A drops it.
-    sep_losses: usize,
-    /// Production realism: what `discover()` ships at the current TOP_K (recall
-    /// miss ⇒ guaranteed false lock). `prod_false_locks ≥ sep_losses`; the gap
-    /// is the cost the current K imposes under these constants.
-    prod_false_locks: usize,
-    /// True key absent from Stage A top-K (then unrecoverable in production).
-    recall_misses: usize,
-    fidelity: Vec<f32>, // |ŝ − D| cents, separability-correct locks (refined mode)
+    false_locks: usize,
+    margin_sum: f64,
+    fid_sum: f64,
+    fid_n: usize,
+    reg_n: [usize; 4],
+    reg_fl: [usize; 4],
 }
 
-struct Report {
-    overall: Bucket,
-    bass: Bucket,    // keys 0–26
-    mid: Bucket,     // keys 27–59
-    treble: Bucket,  // keys 60–87
-    hard: Bucket,
-}
-
-fn evaluate(frames: &[Frame], profiles: &[KeyProfile; 88], cfg: &TwmConfig, refine: bool) -> Report {
-    let mut rep = Report {
-        overall: Bucket::default(),
-        bass: Bucket::default(),
-        mid: Bucket::default(),
-        treble: Bucket::default(),
-        hard: Bucket::default(),
-    };
-    for f in frames.iter().filter(|f| !f.ambiguous) {
-        let key = f.key as usize;
-        let top = discovery::stage_a(&f.peaks, profiles, cfg);
-        let recall_miss = !top[..TOP_K].iter().any(|&(k, _)| k == key);
-
-        // Production behavior at the shipped TOP_K.
-        let res = discovery::discover(&f.peaks, profiles, cfg, refine);
-        let prod_wrong = res.key_index != f.key;
-
-        // K-independent separability: refine the true key plus each top-K
-        // impostor; the true key must own the minimum refined error.
-        let score_key = |k: usize| -> (f32, f32) {
-            if refine {
-                discovery::refine_scale(&f.peaks, &profiles[k], cfg)
-            } else {
-                (1.0, tuner_core::algorithms::twm::score_candidate(&f.peaks, &profiles[k], 1.0, cfg))
-            }
-        };
-        let (true_scale, true_err) = score_key(key);
-        let mut sep_loss = false;
-        for &(k, _) in &top[..TOP_K] {
-            if k == key {
-                continue;
-            }
-            if score_key(k).1 < true_err {
-                sep_loss = true;
-                break;
-            }
-        }
-        let fid = if !sep_loss && refine {
-            Some((1200.0 * true_scale.log2() - f.d_cents).abs())
-        } else {
-            None
-        };
-
-        let tally = |b: &mut Bucket| {
-            b.n += 1;
-            b.sep_losses += sep_loss as usize;
-            b.prod_false_locks += prod_wrong as usize;
-            b.recall_misses += recall_miss as usize;
-            if let Some(d) = fid {
-                b.fidelity.push(d);
-            }
-        };
-        tally(&mut rep.overall);
-        match f.key {
-            0..=26 => tally(&mut rep.bass),
-            27..=59 => tally(&mut rep.mid),
-            _ => tally(&mut rep.treble),
-        }
-        if f.hard {
-            tally(&mut rep.hard);
+impl Acc {
+    fn merge(&mut self, o: &Acc) {
+        self.n += o.n;
+        self.false_locks += o.false_locks;
+        self.margin_sum += o.margin_sum;
+        self.fid_sum += o.fid_sum;
+        self.fid_n += o.fid_n;
+        for i in 0..4 {
+            self.reg_n[i] += o.reg_n[i];
+            self.reg_fl[i] += o.reg_fl[i];
         }
     }
-    rep
+}
+
+/// Score one frame against all 88 keys in the active mode (exhaustive = the
+/// production K=88 behavior) and fold the two objectives into `acc`:
+/// - **Objective A:** false lock = the true key is not the argmin refined error.
+/// - **Objective B:** dimensionless margin `(best_impostor − true) / median₈₈`,
+///   signed (negative on a false lock) and scale-invariant (the per-frame median
+///   over all 88 errors normalizes away parameter-scale inflation). Median is the
+///   normalizer — not `true_err` — because TWM totals can be ≤ 0 when the −r
+///   reward dominates; the 88-key median is dominated by wrong keys and stays > 0.
+fn process_frame(f: &Frame, profiles: &[KeyProfile; 88], cfg: &TwmConfig, refine: bool, acc: &mut Acc) {
+    let key = f.key as usize;
+    let mut errs = [0f32; 88];
+    let mut true_scale = 1.0f32;
+    for (k, e) in errs.iter_mut().enumerate() {
+        if refine {
+            let (s, err) = discovery::refine_scale(&f.peaks, &profiles[k], cfg);
+            *e = err;
+            if k == key {
+                true_scale = s;
+            }
+        } else {
+            *e = twm::score_candidate(&f.peaks, &profiles[k], 1.0, cfg);
+        }
+    }
+
+    let true_err = errs[key];
+    let mut argmin = 0usize;
+    let mut best_imp = f32::MAX;
+    for (k, &e) in errs.iter().enumerate() {
+        if e < errs[argmin] {
+            argmin = k;
+        }
+        if k != key && e < best_imp {
+            best_imp = e;
+        }
+    }
+    let false_lock = argmin != key;
+
+    let mut sorted = errs;
+    sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+    let median = 0.5 * (sorted[43] + sorted[44]);
+    let margin = (best_imp - true_err) / median.max(1e-3);
+
+    acc.n += 1;
+    acc.false_locks += false_lock as usize;
+    acc.margin_sum += margin as f64;
+    if !false_lock && refine {
+        acc.fid_sum += (1200.0 * true_scale.log2() - f.d_cents).abs() as f64;
+        acc.fid_n += 1;
+    }
+    let reg = match f.key {
+        0..=26 => 0,
+        27..=59 => 1,
+        _ => 2,
+    };
+    acc.reg_n[reg] += 1;
+    acc.reg_fl[reg] += false_lock as usize;
+    if f.hard {
+        acc.reg_n[3] += 1;
+        acc.reg_fl[3] += false_lock as usize;
+    }
+}
+
+/// One trial = score every scored frame under `cfg`/`mode`. Embarrassingly
+/// parallel over frames (read-only shared data), chunked across the available
+/// cores via `thread::scope` — at TOP_K=88 a single trial is ~16 s
+/// single-threaded, so this is what keeps the MOBO loop in the hours, not days.
+fn run_trial(scored: &[&Frame], profiles: &[KeyProfile; 88], cfg: &TwmConfig, refine: bool) -> Acc {
+    let nthreads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let chunk = scored.len().div_ceil(nthreads).max(1);
+    std::thread::scope(|s| {
+        let handles: Vec<_> = scored
+            .chunks(chunk)
+            .map(|c| {
+                s.spawn(move || {
+                    let mut acc = Acc::default();
+                    for &f in c {
+                        process_frame(f, profiles, cfg, refine, &mut acc);
+                    }
+                    acc
+                })
+            })
+            .collect();
+        let mut total = Acc::default();
+        for h in handles {
+            total.merge(&h.join().unwrap());
+        }
+        total
+    })
 }
 
 /// One-off dense-scan oracle (plan: validates the pre-grid/golden-section
@@ -634,84 +662,165 @@ fn pct(num: usize, den: usize) -> f32 {
     if den == 0 { 0.0 } else { 100.0 * num as f32 / den as f32 }
 }
 
-fn print_bucket(name: &str, b: &Bucket, refined: bool) {
-    let mut line = format!(
-        "  {:<8} n={:<6} sep-loss(ObjA) {:>6.2}%  prod-FL@K={} {:>6.2}%  stageA-miss {:>5.2}%",
-        name,
-        b.n,
-        pct(b.sep_losses, b.n),
-        TOP_K,
-        pct(b.prod_false_locks, b.n),
-        pct(b.recall_misses, b.n)
-    );
-    if refined && !b.fidelity.is_empty() {
-        let mut f = b.fidelity.clone();
-        f.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        line += &format!(
-            "  fidelity med {:.2}c p90 {:.2}c",
-            f[f.len() / 2],
-            f[(f.len() * 9) / 10]
-        );
+fn build_profiles() -> Box<[KeyProfile; 88]> {
+    let mut v = Vec::with_capacity(88);
+    for i in 0..88 {
+        v.push(KeyProfile::new(et_freq(i), get_expected_beta(i as u8)));
     }
-    println!("{line}");
+    Box::new(v.try_into().unwrap())
 }
 
-fn main() {
-    let t0 = Instant::now();
-    let frames = generate_dataset(FIXED_SEED);
-    let fp = dataset_fingerprint(&frames);
-    // Determinism gate: byte-identical regeneration, every run.
-    let fp2 = dataset_fingerprint(&generate_dataset(FIXED_SEED));
-    assert_eq!(fp, fp2, "dataset generation is non-deterministic!");
+/// One JSON metrics line per trial to stdout — the orchestrator's contract.
+/// objA = false-lock rate (minimize); objB = mean dimensionless margin (maximize).
+fn emit_json(acc: &Acc) {
+    let n = acc.n.max(1) as f64;
+    let obj_a = acc.false_locks as f64 / n;
+    let obj_b = acc.margin_sum / n;
+    let fl = |i: usize| acc.reg_fl[i] as f64 / acc.reg_n[i].max(1) as f64;
+    let fid = if acc.fid_n > 0 {
+        acc.fid_sum / acc.fid_n as f64
+    } else {
+        0.0
+    };
+    println!(
+        "{{\"objA\":{obj_a:.6},\"objB\":{obj_b:.6},\"n\":{},\"fl_bass\":{:.6},\"fl_mid\":{:.6},\"fl_treble\":{:.6},\"fl_hard\":{:.6},\"fidelity_mean\":{fid:.4}}}",
+        acc.n,
+        fl(0),
+        fl(1),
+        fl(2),
+        fl(3)
+    );
+    use std::io::Write;
+    std::io::stdout().flush().ok();
+}
 
+/// Persistent server: dataset built once, then one trial per stdin line
+/// `mode p q r rho lambda` (mode ∈ {discrete, refine}; lambda may be `inf`).
+/// stdout carries ONLY JSON lines; banners/errors go to stderr.
+fn serve(frames: &[Frame], profiles: &[KeyProfile; 88]) {
+    let scored: Vec<&Frame> = frames.iter().filter(|f| !f.ambiguous).collect();
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    eprintln!(
+        "ready: {} scored frames, K={} exhaustive, {threads} threads",
+        scored.len(),
+        TOP_K
+    );
+    let mut line = String::new();
+    let stdin = std::io::stdin();
+    loop {
+        line.clear();
+        if stdin.read_line(&mut line).unwrap_or(0) == 0 {
+            break; // EOF — orchestrator closed the pipe
+        }
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let p: Vec<&str> = t.split_whitespace().collect();
+        let parsed = (|| -> Option<(bool, TwmConfig)> {
+            if p.len() != 6 {
+                return None;
+            }
+            let refine = match p[0] {
+                "refine" => true,
+                "discrete" => false,
+                _ => return None,
+            };
+            Some((
+                refine,
+                TwmConfig {
+                    p: p[1].parse().ok()?,
+                    q: p[2].parse().ok()?,
+                    r: p[3].parse().ok()?,
+                    rho: p[4].parse().ok()?,
+                    lambda_penalty: p[5].parse().ok()?, // "inf" parses to f32::INFINITY
+                },
+            ))
+        })();
+        match parsed {
+            Some((refine, cfg)) => emit_json(&run_trial(&scored, profiles, &cfg, refine)),
+            None => eprintln!("skip: malformed trial line: {t:?}"),
+        }
+    }
+}
+
+fn print_summary(label: &str, acc: &Acc, refine: bool) {
+    println!("── {label} ──");
+    let fl = |i| pct(acc.reg_fl[i], acc.reg_n[i]);
+    print!(
+        "  false-lock: overall {:.2}%  bass {:.2}%  mid {:.2}%  treble {:.2}%  hard {:.2}%   margin {:.4}",
+        pct(acc.false_locks, acc.n),
+        fl(0),
+        fl(1),
+        fl(2),
+        fl(3),
+        acc.margin_sum / acc.n.max(1) as f64,
+    );
+    if refine && acc.fid_n > 0 {
+        print!("   fidelity {:.2}c", acc.fid_sum / acc.fid_n as f64);
+    }
+    println!();
+}
+
+/// Human-facing validation mode (default): dataset banner, oracle + rank-study
+/// diagnostics, default-constant summary in both modes, and the pre-opt gate.
+fn report(frames: &[Frame], profiles: &[KeyProfile; 88]) {
     let ambiguous = frames.iter().filter(|f| f.ambiguous).count();
-    let scored = frames.len() - ambiguous;
     let avg_peaks: f32 =
         frames.iter().map(|f| f.peaks.len() as f32).sum::<f32>() / frames.len() as f32;
     println!("── Dataset ──");
     println!(
-        "frames {} (scored {}, ambiguous {} = {:.1}%), avg peaks/frame {:.1}, fingerprint {fp:016x}, gen {:.2?}",
+        "frames {} (scored {}, ambiguous {} = {:.1}%), avg peaks/frame {:.1}, fingerprint {:016x}",
         frames.len(),
-        scored,
+        frames.len() - ambiguous,
         ambiguous,
         pct(ambiguous, frames.len()),
         avg_peaks,
-        t0.elapsed()
+        dataset_fingerprint(frames),
     );
 
-    let mut profiles_vec = Vec::with_capacity(88);
-    for i in 0..88 {
-        profiles_vec.push(KeyProfile::new(et_freq(i), get_expected_beta(i as u8)));
-    }
-    let profiles: Box<[KeyProfile; 88]> = Box::new(profiles_vec.try_into().unwrap());
     let cfg = TwmConfig::default();
+    dense_scan_oracle(frames, profiles, &cfg);
+    stage_a_rank_study(frames, profiles, &cfg);
 
-    dense_scan_oracle(&frames, &profiles, &cfg);
-    stage_a_rank_study(&frames, &profiles, &cfg);
-
+    let scored: Vec<&Frame> = frames.iter().filter(|f| !f.ambiguous).collect();
     for refine in [false, true] {
         let t = Instant::now();
-        let rep = evaluate(&frames, &profiles, &cfg, refine);
-        println!(
-            "── {} (default constants) — {:.2?} ──",
-            if refine { "REFINED" } else { "DISCRETE" },
-            t.elapsed()
-        );
-        print_bucket("overall", &rep.overall, refine);
-        print_bucket("bass", &rep.bass, refine);
-        print_bucket("mid", &rep.mid, refine);
-        print_bucket("treble", &rep.treble, refine);
-        print_bucket("hard", &rep.hard, refine);
+        let acc = run_trial(&scored, profiles, &cfg, refine);
+        let elapsed = t.elapsed();
+        let mode = if refine { "REFINED" } else { "DISCRETE" };
+        print_summary(&format!("{mode} (default constants, K={TOP_K})"), &acc, refine);
+        println!("  (trial wall time {elapsed:.2?})");
 
-        // ── Pre-optimization gate (plan, Verification): the dataset must
-        // CONTAIN the failure mode under discrete defaults.
         if !refine {
-            let rate = pct(rep.hard.sep_losses, rep.hard.n);
-            if rep.hard.sep_losses == 0 {
-                eprintln!("PRE-OPT GATE: FAIL — no separability losses on the hard subset; the dataset does not reproduce the failure mode.");
+            let rate = pct(acc.reg_fl[3], acc.reg_n[3]);
+            if acc.reg_fl[3] == 0 {
+                eprintln!("PRE-OPT GATE: FAIL — no false locks on the hard subset; the dataset does not reproduce the failure mode.");
                 std::process::exit(1);
             }
-            println!("PRE-OPT GATE: PASS (hard-subset separability-loss rate {rate:.2}% > 0)");
+            println!("PRE-OPT GATE: PASS (hard-subset false-lock rate {rate:.2}% > 0)");
         }
+    }
+}
+
+fn main() {
+    let serve_mode = std::env::args().any(|a| a == "--serve");
+
+    let frames = generate_dataset(FIXED_SEED);
+    // Determinism gate: byte-identical regeneration (catches any nondeterminism
+    // before a multi-hour sweep trusts the dataset).
+    assert_eq!(
+        dataset_fingerprint(&frames),
+        dataset_fingerprint(&generate_dataset(FIXED_SEED)),
+        "dataset generation is non-deterministic!"
+    );
+    let profiles = build_profiles();
+
+    if serve_mode {
+        serve(&frames, &profiles);
+    } else {
+        report(&frames, &profiles);
     }
 }
