@@ -43,12 +43,29 @@ The five sanctioned crossings:
 
 ## 4. Grouped / dependent DSP parameters (UI → DSP)
 
-- **Primitive:** fixed-capacity SPSC ring buffer carrying command
-  enums (`ringbuf`).
+- **Primitive:** fixed-capacity SPSC ring buffer (`ringbuf`) carrying a
+  heap-free payload.
 - **Purpose:** change complex states that must update atomically on a
-  DSP frame boundary. Anticipated use case: the UI hands the compiled
-  `InharmonicityProfile` (or another grouped DSP configuration) back
-  to the DSP thread for live use.
+  DSP frame boundary. The UI hands a recompiled DSP template back to the
+  DSP thread for live use.
+
+### Live inharmonicity-template updates
+
+The concrete instance: the UI hands a recompiled per-key inharmonicity template
+to the live engine.
+
+- **Payload:** `pipeline::KeyProfileUpdate { key_index, profile }` — one key's
+  recompiled discovery template. Heap-free (`KeyProfile` is
+  `{f32, f32, [f32; MAX_PARTIALS], usize}`), so swapping it drops no heap data on
+  the audio thread.
+- **Producer:** `pipeline::ProfileSender`, a single-owner `ringbuf` producer held
+  in `HostHandle` (not the cloneable `PipelineHandle`).
+- **Consumer:** `AudioPipeline` drains the queue at the top of `process_cola_hop`
+  via `try_pop`, swapping each update into its live `[KeyProfile; 88]` array
+  (allocated once at startup). The engine only references that array.
+- **Template location:** `KeyProfile` and its constructors
+  (`KeyProfile::from_measurement`, `build_default_profiles`) live in `models`;
+  `pipeline` holds only the transport.
 
 ### Heap-allocation invariant
 
@@ -107,10 +124,9 @@ transitions:
   `Recording → Armed` (worker queue backpressure failure recovery).
 - **Worker:** `Processing → Idle` (computation complete).
 
-This is currently a convention-only contract (plain `.store(...,
+This is a convention-only contract (plain `.store(...,
 Ordering::Relaxed)` on each side). Hardening it to `compare_exchange`
-is tracked in the README's Work-in-Progress section; when that change
-lands, update this section to reflect the new contract.
+is tracked in the README's Work-in-Progress section.
 
 ### Heap-allocation exception for the Worker → UI path
 

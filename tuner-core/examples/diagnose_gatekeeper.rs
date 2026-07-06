@@ -7,7 +7,7 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 
-use tuner_core::algorithms::spectral::perform_fft;
+use tuner_core::algorithms::spectral::fft;
 use tuner_core::audio::{BASS_WINDOW_SIZE, HOP_SIZE, WINDOW_SIZE};
 use tuner_core::gatekeeper::{Gatekeeper, SignalState};
 use tuner_core::pipeline::ProcessingFrame;
@@ -106,7 +106,7 @@ fn main() -> Result<()> {
 
         // Perform WINDOW_SIZE FFT for Gatekeeper
         let newest_start = BASS_WINDOW_SIZE - WINDOW_SIZE;
-        perform_fft(
+        fft(
             &processing_frame.audio_buffer[newest_start..BASS_WINDOW_SIZE],
             &mut processing_frame.time_buffer[..WINDOW_SIZE],
             &mut processing_frame.frequency_buffer[..],

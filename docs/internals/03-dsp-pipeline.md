@@ -82,11 +82,17 @@ Heavy diagnostic data structures (such as arrays of `[f32; 128]` for Goertzel tr
 
 ## Sample-rate handling (transitional)
 
-The audio sample rate is currently hard-coded to 44 100 Hz in
-`Engine::new`, in `CapturePayload`, and in the constants of `audio.rs`.
-Plumbing the CPAL-negotiated rate end-to-end is tracked in the README's
-Work-in-Progress section. Until that lands, new code must not introduce
-more hard-coded references to 44 100 — read the rate from the
-`AudioPipeline` (or the constant being used as the single source of
-truth) so the migration to dynamic rates remains a single-point
+The `Engine` now carries a `sample_rate` field (set from the resolved
+stream rate in `spawn_analysis_thread`) rather than hard-coding it in
+`Engine::new`. But the rate is not yet genuinely dynamic: the live
+capture path still requests 44 100 Hz from CPAL (`open_input_stream`
+calls `with_sample_rate(SAMPLE_RATE)`, relying on the OS to resample),
+`CapturePayload` still passes a literal `44100` to the Worker, and the
+`AudioPool` buffer sizes, the COLA window, and the Gatekeeper timing
+constants are all dimensioned for 44.1 kHz. So the pipeline is not yet
+safe at other rates; enabling true dynamic-rate operation is tracked in
+the README's Work-in-Progress section. Until it lands, new code must not
+introduce more hard-coded references to 44 100 — read the rate from the
+single source of truth (the `SAMPLE_RATE` constant or the `Engine`'s
+`sample_rate` field) so the eventual migration stays a single-point
 change.

@@ -12,11 +12,11 @@
 //!   It acts as a zero-allocation data sink via `push_audio()`, orchestrating overlapping
 //!   FFT frames transparently.
 //!
-//! - [`PipelineHandle`] is kept by the frontend (GUI, WASM, etc.). It provides
-//!   read/write access to the shared atomic state via `Arc<PipelineAtomics>`.
+//! - [`PipelinePorts`] is kept by the frontend (GUI, WASM, etc.): the shareable
+//!   [`PipelineHandle`] plus the Worker→UI and UI→DSP channel endpoints.
 //!
 //! ```text
-//! AudioPipeline::new() -> (AudioPipeline, PipelineHandle)
+//! AudioPipeline::new() -> (AudioPipeline, PipelinePorts)
 //!       │                         │
 //!       ▼                         ▼
 //!   Audio Thread              GUI Thread
@@ -25,6 +25,10 @@
 use crossbeam_channel::{Receiver, Sender, bounded};
 use crossbeam_queue::ArrayQueue;
 use realfft::RealToComplex;
+use ringbuf::{
+    HeapCons, HeapProd, HeapRb,
+    traits::{Consumer, Producer, Split},
+};
 use rustfft::num_complex::Complex;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
@@ -35,6 +39,9 @@ use crate::cola::CircularFifo;
 
 use crate::engine::Engine;
 use crate::gatekeeper::Gatekeeper;
+use crate::models::{
+    InharmonicityProfile, KeyMeasurement, KeyProfile, PROFILE_PATH, build_default_profiles,
+};
 
 // ─── Memory Infrastructure ───────────────────────────────────────────────────
 
@@ -63,6 +70,97 @@ pub struct CapturePayload {
     pub noise_floor: f32,
     /// Highly accurate unified Goertzel seed for MAT (None if tracking failed)
     pub measured_f0: Option<f32>,
+}
+
+// ─── Profile Updates (Crossing #4: UI → DSP) ─────────────────────────────────
+//
+// SPSC `ringbuf` of heap-free `KeyProfileUpdate`s. The frontend pushes via
+// [`ProfileSender`]; the pipeline drains the queue and swaps templates into
+// `live_profiles` on a frame boundary. See
+// docs/internals/02-cross-thread-communication.md §4.
+
+/// **MEASURED-B DISCOVERY SEEDING — DISABLED PENDING FIX (flip to `true` to re-enable).**
+///
+/// When `true`, measured per-key inharmonicity `B` (from the persisted
+/// [`InharmonicityProfile`]) seeds the live discovery templates — at startup and on
+/// every capture/undo/load via [`ProfileSender`]. When `false`, the engine always
+/// uses the Rigaud prior for discovery (the worker still measures `B` and the UI
+/// still stores/persists/displays it — only the *discovery template* path is gated).
+///
+/// ## Why it's off
+/// The synthetic oracle-B ablation predicted a bass false-lock collapse (27%→1.5%,
+/// ADR 0006 §oracle-B). But validation on the one real instrument (2026-06-27,
+/// `test_engine_all.py --profile tuning_profile.json` over the captures) showed the
+/// **opposite**: applying the MAT-measured `B` to discovery was a net regression
+/// (74→73/87), and the highest-ratio bass keys (3/16/17 at 18–25× the prior) *broke*.
+/// Root cause (per `docs/adr/0006-...md` + `mobo-methodology.md` §8.2): on this
+/// out-of-tune upright there is **no trusted `B` reference**, and MAT appears to
+/// **over-estimate bass `B`**; the oracle was also asymmetric (only the true key got
+/// perfect `B`, whereas here impostors are boosted too). The only clean wins were
+/// *treble* keys where the prior over-estimates `B`.
+///
+/// The full pathway (conversion, crossing #4, GUI pushes) is built and tested; this
+/// flag is the single switch. **Re-enable once a second, in-tune instrument
+/// validates the measured values** (the standing gate in ADR 0006).
+pub const APPLY_MEASURED_B_TO_DISCOVERY: bool = false;
+
+/// Ring-buffer capacity for the profile-update channel.
+///
+/// One slot per piano key (88) — the upper bound for a single coherent profile
+/// refresh ([`ProfileSender::update_all`]) pushed between two DSP hops. Per-capture
+/// live updates arrive one at a time, seconds apart, so this never backs up in
+/// normal use; sizing to a full refresh means even a whole-instrument profile load
+/// is delivered without dropping a key.
+pub const PROFILE_QUEUE_CAPACITY: usize = 88;
+
+/// A single key's recompiled discovery template, in transit UI → DSP (crossing #4).
+///
+/// Heap-free (`KeyProfile` is `{f32, f32, [f32; MAX_PARTIALS], usize}`), so it is
+/// legal across the real-time boundary.
+pub struct KeyProfileUpdate {
+    /// 0–87 piano key index whose template this replaces.
+    pub key_index: u8,
+    /// The recompiled template (ET-centered, measured-`B`).
+    pub profile: KeyProfile,
+}
+
+/// Frontend-side producer for the profile-update channel (crossing #4). Lives in
+/// [`HostHandle`](crate::audio::HostHandle) and hides the `ringbuf` producer.
+pub struct ProfileSender {
+    tx: HeapProd<KeyProfileUpdate>,
+}
+
+impl ProfileSender {
+    /// Pushes the authoritative template for one key to the DSP thread.
+    ///
+    /// Pass the key's current [`KeyMeasurement`] (from the UI's `InharmonicityProfile`)
+    /// or `None`. A valid measured `B` yields a measured template; otherwise the key
+    /// is reset to its Rigaud-prior template — so undoing a capture cleanly reverts
+    /// the live engine. A full ring buffer drops the update (the next capture
+    /// re-sends, and startup-load reconciles), so this never blocks the UI.
+    pub fn update_key_profile(&mut self, key_index: u8, measurement: Option<&KeyMeasurement>) {
+        // Gated: measured B regresses discovery on the one validated instrument.
+        // See `APPLY_MEASURED_B_TO_DISCOVERY`. No-op keeps the engine on the prior.
+        if !APPLY_MEASURED_B_TO_DISCOVERY {
+            return;
+        }
+        let profile = measurement
+            .and_then(KeyProfile::from_measurement)
+            .unwrap_or_else(|| KeyProfile::prior(key_index));
+        let _ = self.tx.try_push(KeyProfileUpdate { key_index, profile });
+    }
+
+    /// Pushes the whole instrument's templates (e.g. a mid-session profile load):
+    /// every key is set from its measurement when present, else its prior.
+    pub fn update_all(&mut self, profile: &InharmonicityProfile) {
+        // See `APPLY_MEASURED_B_TO_DISCOVERY` — gated pending a second instrument.
+        if !APPLY_MEASURED_B_TO_DISCOVERY {
+            return;
+        }
+        for key in 0..88u8 {
+            self.update_key_profile(key, profile.measurements.get(&key));
+        }
+    }
 }
 
 /// Capture lifecycle state, communicated via AtomicU8.
@@ -245,13 +343,18 @@ impl Default for PipelineAtomics {
 /// reads/writes the shared [`PipelineAtomics`] for parameter and observation
 /// exchange with the frontend.
 ///
-/// Created via [`AudioPipeline::new()`], which returns both the pipeline
-/// (moved to the audio thread) and a [`PipelineHandle`] (kept by the frontend).
+/// Created via [`AudioPipeline::new()`].
 pub struct AudioPipeline {
     /// The Gatekeeper — pure DSP, evaluates signal stability.
     pub gatekeeper: Gatekeeper,
     /// The Engine — F0 detection chain
     pub engine: Engine,
+
+    /// Live per-key discovery templates, lent to `engine.process` each frame.
+    /// Allocated once; updated in place by draining `profile_rx`.
+    live_profiles: Box<[KeyProfile; 88]>,
+    /// Crossing #4 consumer for template updates; drained into `live_profiles`.
+    profile_rx: HeapCons<KeyProfileUpdate>,
 
     // Wait-free shared state
     atomics: Arc<PipelineAtomics>,
@@ -288,25 +391,19 @@ pub struct AudioPipeline {
     pub last_measured_f0: Option<f32>,
 }
 
-/// Frontend-side handle to the pipeline's shared state.
-///
-/// Returned by [`AudioPipeline::new()`] and kept by the frontend (GUI, WASM, etc.).
-/// Provides `Arc<PipelineAtomics>` for wait-free reads and writes.
+/// Frontend-side handle to the pipeline's shareable atomic state (crossing #3):
+/// wait-free config writes and runtime reads. Cloneable.
 #[derive(Clone)]
 pub struct PipelineHandle {
     /// Shared atomic state — the frontend reads runtime observations and
     /// writes configuration parameters.
     pub atomics: Arc<PipelineAtomics>,
-    /// Receiver for worker thread results.
-    pub result_rx: Receiver<crate::models::KeyMeasurement>,
 }
 
 impl Default for PipelineHandle {
     fn default() -> Self {
-        let (_, dummy_rx) = crossbeam_channel::bounded(0);
         Self {
             atomics: Arc::new(PipelineAtomics::default()),
-            result_rx: dummy_rx,
         }
     }
 }
@@ -326,15 +423,34 @@ impl std::fmt::Debug for PipelineHandle {
     }
 }
 
+/// The frontend's side of the **Split / Handle** pattern: everything
+/// [`AudioPipeline::new()`] hands back when the pipeline itself is moved to the
+/// audio thread. Transient — `spawn_analysis_thread` immediately distributes these
+/// into a [`HostHandle`](crate::audio::HostHandle).
+pub struct PipelinePorts {
+    /// Shareable atomic config/runtime view (crossing #3).
+    pub handle: PipelineHandle,
+    /// Worker → UI receiver for `KeyMeasurement` results (crossing #5).
+    pub worker_rx: Receiver<KeyMeasurement>,
+    /// UI → DSP producer for template updates (crossing #4).
+    pub profiles: ProfileSender,
+}
+
 impl AudioPipeline {
-    /// Creates a new AudioPipeline and its corresponding [`PipelineHandle`].
+    /// Creates a new AudioPipeline and the frontend's [`PipelinePorts`].
     ///
-    /// This follows the **Split / Handle pattern**: the `AudioPipeline` is moved
-    /// to the audio thread, and the `PipelineHandle` is kept by the frontend.
+    /// This follows the **Split / Handle pattern**: the `AudioPipeline` is moved to
+    /// the audio thread; the `PipelinePorts` (atomics handle + worker receiver +
+    /// profile producer) are kept by the frontend. `spawn_analysis_thread`
+    /// distributes the ports into a [`HostHandle`](crate::audio::HostHandle).
+    ///
+    /// Startup also seeds the live templates from any persisted
+    /// [`InharmonicityProfile`] at [`PROFILE_PATH`], so a previously-calibrated
+    /// instrument benefits on the very first frame.
     ///
     /// # Returns
-    /// A tuple of `(AudioPipeline, PipelineHandle)`.
-    pub fn new() -> (Self, PipelineHandle) {
+    /// `(AudioPipeline, PipelinePorts)`.
+    pub fn new() -> (Self, PipelinePorts) {
         let audio_pool = Arc::new(ArrayQueue::new(8));
         // Pre-fill pool
         for _ in 0..8 {
@@ -346,12 +462,36 @@ impl AudioPipeline {
         let gatekeeper = Gatekeeper::new(Arc::clone(&audio_pool));
         let engine = Engine::new(44100);
 
+        // Rigaud prior by default. When the measured-B path is enabled (see
+        // `APPLY_MEASURED_B_TO_DISCOVERY`), a persisted profile seeds measured keys
+        // here so a calibrated instrument is live on frame one.
+        let mut live_profiles = build_default_profiles();
+        if APPLY_MEASURED_B_TO_DISCOVERY
+            && let Ok(profile) = InharmonicityProfile::from_file(PROFILE_PATH)
+        {
+            let mut applied = 0usize;
+            for (&key, measurement) in &profile.measurements {
+                if let Some(kp) = KeyProfile::from_measurement(measurement)
+                    && let Some(slot) = live_profiles.get_mut(key as usize)
+                {
+                    *slot = kp;
+                    applied += 1;
+                }
+            }
+            eprintln!(
+                "[PIPELINE] Loaded inharmonicity profile from {PROFILE_PATH}: {applied} measured key(s) applied."
+            );
+        }
+
         let mut planner = realfft::RealFftPlanner::<f32>::new();
         let fft_instance = planner.plan_fft_forward(WINDOW_SIZE);
         let fft_bass_instance = planner.plan_fft_forward(BASS_WINDOW_SIZE);
 
         let (capture_tx, capture_rx) = bounded(2);
-        let (result_tx, result_rx) = bounded(4);
+        let (result_tx, worker_rx) = bounded(4);
+
+        // Crossing #4: SPSC profile-update channel (UI producer → DSP consumer).
+        let (profile_tx, profile_rx) = HeapRb::<KeyProfileUpdate>::new(PROFILE_QUEUE_CAPACITY).split();
 
         crate::worker::WorkerManager::new(
             Arc::clone(&audio_pool),
@@ -364,6 +504,8 @@ impl AudioPipeline {
         let pipeline = Self {
             gatekeeper,
             engine,
+            live_profiles,
+            profile_rx,
             atomics: Arc::clone(&atomics),
             audio_pool,
             cola: CircularFifo::new(BASS_WINDOW_SIZE),
@@ -385,9 +527,13 @@ impl AudioPipeline {
             last_measured_f0: None,
         };
 
-        let handle = PipelineHandle { atomics, result_rx };
+        let ports = PipelinePorts {
+            handle: PipelineHandle { atomics },
+            worker_rx,
+            profiles: ProfileSender { tx: profile_tx },
+        };
 
-        (pipeline, handle)
+        (pipeline, ports)
     }
 
     /// Pushes new raw audio samples directly into the internal COLA FIFO.
@@ -406,6 +552,16 @@ impl AudioPipeline {
 
     /// Internal helper that processes a single hop of audio data pulled from the COLA.
     fn process_cola_hop(&mut self) -> Option<FrameOutput> {
+        // ─── Step 0: Drain Profile Updates (Crossing #4) ───
+        // Apply any measured-B templates the UI pushed since the last hop, before
+        // discovery runs this frame. `try_pop` is wait-free and the swap is a plain
+        // move into the pre-allocated array — no allocation on the audio thread.
+        while let Some(update) = self.profile_rx.try_pop() {
+            if let Some(slot) = self.live_profiles.get_mut(update.key_index as usize) {
+                *slot = update.profile;
+            }
+        }
+
         // ─── Step 1: COLA & Windowing ───
 
         // Read the FULL history of audio out of the sliding queue
@@ -417,7 +573,7 @@ impl AudioPipeline {
         // Populate the frame's generic frequency buffer in place
         // The newest WINDOW_SIZE samples are at the END of the buffer
         let newest_start = BASS_WINDOW_SIZE - WINDOW_SIZE;
-        crate::algorithms::spectral::perform_fft(
+        crate::algorithms::spectral::fft(
             &self.processing_frame.audio_buffer[newest_start..BASS_WINDOW_SIZE],
             &mut self.processing_frame.time_buffer[..WINDOW_SIZE],
             &mut self.processing_frame.frequency_buffer[..],
@@ -425,7 +581,7 @@ impl AudioPipeline {
             WINDOW_SIZE,
         );
 
-        crate::algorithms::spectral::perform_fft(
+        crate::algorithms::spectral::fft(
             &self.processing_frame.audio_buffer[..BASS_WINDOW_SIZE],
             &mut self.processing_frame.time_buffer[..BASS_WINDOW_SIZE],
             &mut self.processing_frame.bass_frequency_buffer[..],
@@ -471,14 +627,14 @@ impl AudioPipeline {
         // ─── Step 4: Treble Magnitude Extraction ───
 
         let mag_count = WINDOW_SIZE / 2;
-        crate::algorithms::spectral::spectrum_to_magnitudes(
+        crate::algorithms::spectral::magnitude_spectrum(
             &self.processing_frame.frequency_buffer[..],
             WINDOW_SIZE,
             &mut self.processing_frame.treble_magnitude_buffer[..mag_count],
         );
 
         let mag_count_bass = BASS_WINDOW_SIZE / 2;
-        crate::algorithms::spectral::spectrum_to_magnitudes(
+        crate::algorithms::spectral::magnitude_spectrum(
             &self.processing_frame.bass_frequency_buffer[..],
             BASS_WINDOW_SIZE,
             &mut self.processing_frame.bass_magnitude_buffer[..mag_count_bass],
@@ -493,6 +649,7 @@ impl AudioPipeline {
 
         let pitch_result = self.engine.process(
             &mut self.processing_frame,
+            &self.live_profiles,
             is_silence,
             gate_result.is_new_onset,
             gate_result.is_transient_bypass,
@@ -679,5 +836,109 @@ impl AudioPipeline {
         }
 
         Some(frame_output)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{KeyMeasurement, NOTES, get_expected_beta};
+
+    fn measurement(key_index: u8, calculated_b: Option<f32>) -> KeyMeasurement {
+        KeyMeasurement {
+            key_index,
+            // Deliberately implausible measured_f0 — it must NOT leak into the
+            // template (ET-centered, β-only is the contract).
+            measured_f0: 9999.0,
+            partials: Vec::new(),
+            calculated_b,
+            last_captured: String::new(),
+        }
+    }
+
+    #[test]
+    fn conversion_uses_measured_b_at_et_center() {
+        let key = 5u8;
+        let kp = KeyProfile::from_measurement(&measurement(key, Some(0.002)))
+            .expect("valid B should convert");
+        // Measured B adopted…
+        assert_eq!(kp.beta, 0.002);
+        // …at the equal-temperament center, NOT the (stale) measured_f0.
+        assert_eq!(kp.f0_et, NOTES[key as usize].frequency);
+        assert_ne!(kp.f0_et, 9999.0);
+    }
+
+    #[test]
+    fn conversion_rejects_unmeasured_or_invalid_b() {
+        let key = 10u8;
+        assert!(KeyProfile::from_measurement(&measurement(key, None)).is_none());
+        assert!(KeyProfile::from_measurement(&measurement(key, Some(0.0))).is_none());
+        assert!(KeyProfile::from_measurement(&measurement(key, Some(-0.001))).is_none());
+        assert!(KeyProfile::from_measurement(&measurement(key, Some(f32::NAN))).is_none());
+        assert!(KeyProfile::from_measurement(&measurement(key, Some(f32::INFINITY))).is_none());
+    }
+
+    #[test]
+    fn profile_sender_round_trip_or_gated() {
+        let (tx, mut rx) = HeapRb::<KeyProfileUpdate>::new(PROFILE_QUEUE_CAPACITY).split();
+        let mut sender = ProfileSender { tx };
+
+        // A measured key would carry its measured B; an unmeasured key (e.g.
+        // undo-to-nothing) would reset to the Rigaud prior.
+        sender.update_key_profile(5, Some(&measurement(5, Some(0.0031))));
+        sender.update_key_profile(7, None);
+
+        if APPLY_MEASURED_B_TO_DISCOVERY {
+            let first = rx.try_pop().expect("first update queued");
+            assert_eq!(first.key_index, 5);
+            assert_eq!(first.profile.beta, 0.0031);
+            assert_eq!(first.profile.f0_et, NOTES[5].frequency);
+
+            let second = rx.try_pop().expect("second update queued");
+            assert_eq!(second.key_index, 7);
+            assert_eq!(second.profile.beta, get_expected_beta(7));
+            assert_eq!(second.profile.f0_et, NOTES[7].frequency);
+
+            assert!(rx.try_pop().is_none(), "exactly two updates were pushed");
+        } else {
+            // Gated off (default): measured B must not reach discovery at all.
+            assert!(rx.try_pop().is_none(), "gated ProfileSender must not push");
+        }
+    }
+
+    #[test]
+    fn update_all_pushes_every_key_or_gated() {
+        let (tx, mut rx) = HeapRb::<KeyProfileUpdate>::new(PROFILE_QUEUE_CAPACITY).split();
+        let mut sender = ProfileSender { tx };
+
+        let mut profile = InharmonicityProfile::default();
+        profile.measurements.insert(3, measurement(3, Some(0.0017)));
+        sender.update_all(&profile);
+
+        let mut seen = 0usize;
+        let mut key3_beta = None;
+        while let Some(u) = rx.try_pop() {
+            if u.key_index == 3 {
+                key3_beta = Some(u.profile.beta);
+            }
+            seen += 1;
+        }
+
+        if APPLY_MEASURED_B_TO_DISCOVERY {
+            // All 88 keys refreshed (measured where present, prior elsewhere),
+            // none dropped at capacity == 88.
+            assert_eq!(seen, 88);
+            assert_eq!(key3_beta, Some(0.0017));
+        } else {
+            assert_eq!(seen, 0, "gated update_all must not push");
+        }
+    }
+
+    #[test]
+    fn default_profiles_match_rigaud_prior() {
+        let profiles = build_default_profiles();
+        assert_eq!(profiles[0].beta, get_expected_beta(0));
+        assert_eq!(profiles[87].beta, get_expected_beta(87));
+        assert_eq!(profiles[40].f0_et, NOTES[40].frequency);
     }
 }

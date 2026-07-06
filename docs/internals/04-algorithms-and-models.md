@@ -30,10 +30,12 @@ file. Otherwise it belongs in the file for its group.
 
 ### Shared primitives
 
-Functions used across several algorithm files (for example
-`parabolic_interpolation_offset` in `pitch.rs`) live in their group
-file with `pub(crate)` visibility. They are not exported from the
-crate's public API.
+Functions used across several algorithm files (for example the FFT,
+`magnitude_spectrum`, `cspe`, and `jacobsen` transforms in
+`spectral.rs`, shared by the Worker, MAT, and peak extraction) live in
+their group file. Internal-only shared helpers use `pub(crate)`
+visibility; a primitive a diagnostic example or frontend needs is
+`pub`.
 
 ### Analytical vs Ad-Hoc Solutions
 
@@ -47,7 +49,7 @@ If a new heuristic or empirical constant must be introduced, it must pass strict
 - **Fragile Thresholds (Banned):** Simple magic numbers that depend on absolute amplitude, microphone gain, or specific room environments (e.g., `if magnitude < 50.0`). These break when hardware changes.
 - **Topological Constraints (Allowed):** Heuristics that fundamentally define or alter the geometric shape of the information or search space. These must be scale-invariant (e.g., dimensionless amplitude ratios $a/A_{max}$, or percentage-based frequency limits like $0.029 \times f_n$). A valid heuristic changes the _shape_ of the mathematical topology (e.g., changing an unbounded search to a bounded resonance zone, or adding an exponent to curve a linear error).
 
-When adding a new algorithm or heuristic, cite the source paper (e.g., Maher & Beauchamp 1994, Hodgkinson DAFx-09, Candan 2015, Miron 2014) in the doc-comment so the next contributor knows the theoretical basis. If a constant is empirically calibrated, document _how_ it alters the mathematical topology.
+When adding a new algorithm or heuristic, cite the source paper (e.g., Maher & Beauchamp 1994, Hodgkinson DAFx-09, Candan 2015, Short & Garcia 2006) in the doc-comment so the next contributor knows the theoretical basis — and verify the citation against the actual source (the faithfulness-audit series caught one fabricated section reference; see `docs/audits/faithfulness-audit-04-peaks.md`). If a constant is empirically calibrated, document _how_ it alters the mathematical topology. If the mechanism is ours rather than a port, say so explicitly and cite the validating ADR instead (e.g., `mask_peaks` → ADR 0002).
 
 ## `models.rs` — domain data types
 

@@ -33,7 +33,8 @@ use std::sync::atomic::Ordering;
 use std::thread::{self, JoinHandle};
 
 use crate::FrameOutput;
-use crate::pipeline::{AudioPipeline, PipelineHandle};
+use crate::models::KeyMeasurement;
+use crate::pipeline::{AudioPipeline, PipelineHandle, PipelinePorts, ProfileSender};
 
 /// The standard analysis window size (samples).
 /// Used by the Gatekeeper, Scout, and all Engine paths.
@@ -55,7 +56,10 @@ pub const HOP_SIZE: usize = WINDOW_SIZE / 2; // 1024 samples
 pub const RING_BUFFER_CAPACITY: usize = WINDOW_SIZE * 8;
 
 /// The target sample rate for the application in Hz.
-pub const SAMPLE_RATE: u32 = 44100;
+///
+/// TODO: replace with the CPAL-negotiated rate once it is plumbed through
+/// (README → Pipeline Hardening → Dynamic Sample Rate Plumbing).
+pub const SAMPLE_RATE: u32 = 44_100;
 
 /// Consumer half of the audio ring buffer.
 ///
@@ -182,6 +186,15 @@ pub struct HostHandle {
     /// configuration parameters (silence threshold, key hint, etc.).
     pub pipeline_handle: PipelineHandle,
 
+    /// Worker → UI receiver for `KeyMeasurement` results (crossing #5). Drain it
+    /// with `try_recv` in the frontend's tick loop.
+    pub worker_rx: crossbeam_channel::Receiver<KeyMeasurement>,
+
+    /// UI → DSP producer for template updates (crossing #4). After handling a
+    /// `KeyMeasurement` (or editing the profile), call `update_key_profile` to push
+    /// the recompiled template to the live engine.
+    pub profiles: ProfileSender,
+
     /// Keep the CPAL stream alive for the lifetime of the host.
     /// `None` when using `AudioSource::External`.
     _stream: Option<cpal::Stream>,
@@ -282,7 +295,12 @@ impl std::fmt::Debug for HostHandle {
 /// handle.stop();
 /// ```
 pub fn spawn_analysis_thread(source: AudioSource) -> Result<HostHandle> {
-    let (pipeline, pipeline_handle) = AudioPipeline::new();
+    let (pipeline, ports) = AudioPipeline::new();
+    let PipelinePorts {
+        handle: pipeline_handle,
+        worker_rx,
+        profiles,
+    } = ports;
 
     // Resolve the audio source — either open CPAL or use the provided consumer.
     let (stream, consumer, sample_rate) = match source {
@@ -364,6 +382,8 @@ pub fn spawn_analysis_thread(source: AudioSource) -> Result<HostHandle> {
     Ok(HostHandle {
         frame_rx: Some(tri_output),
         pipeline_handle,
+        worker_rx,
+        profiles,
         _stream: stream,
         thread_handle: Some(thread_handle),
     })

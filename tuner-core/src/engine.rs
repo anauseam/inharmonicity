@@ -11,10 +11,8 @@ use crate::algorithms::{
     twm,
 };
 use crate::audio::{BASS_WINDOW_SIZE, HOP_SIZE};
-use crate::models::{NOTES, get_expected_beta};
+use crate::models::{KeyProfile, MAX_PARTIALS};
 use crate::pipeline::ProcessingFrame;
-
-pub const MAX_PARTIALS: usize = 128;
 
 // ── Neyman-Pearson Amplitude SNR Gate ──
 // Foundation: Kay, S. M. (1998). Fundamentals of Statistical Signal Processing: Detection Theory (Vol 2), Chapter 9.
@@ -22,40 +20,6 @@ pub const MAX_PARTIALS: usize = 128;
 // Scaled for physical amplitude (Hann window energy = 0.375 * HOP_SIZE):
 // T_amp = σ * (4/HOP_SIZE) * sqrt(-(0.375 * HOP_SIZE) * ln(0.001))
 const NEYMAN_PEARSON_K: f32 = 0.201184;
-
-/// Precomputed per-key data.
-#[derive(Debug, Clone)]
-pub struct KeyProfile {
-    pub f0_et: f32,
-    pub beta: f32,
-    pub predicted_partials: [f32; MAX_PARTIALS],
-    pub valid_partial_count: usize,
-}
-
-impl KeyProfile {
-    pub fn new(f0_et: f32, beta: f32) -> Self {
-        let mut predicted_partials = [0.0; MAX_PARTIALS];
-        let mut valid_partial_count = 0;
-
-        for n in 1..=MAX_PARTIALS {
-            let n_f32 = n as f32;
-            let f_n = n_f32 * f0_et * (1.0 + beta * n_f32 * n_f32).sqrt();
-            if f_n < 22050.0 {
-                predicted_partials[n - 1] = f_n;
-                valid_partial_count += 1;
-            } else {
-                break;
-            }
-        }
-
-        Self {
-            f0_et,
-            beta,
-            predicted_partials,
-            valid_partial_count,
-        }
-    }
-}
 
 /// Result of a successful pitch detection frame.
 #[derive(Debug, Clone)]
@@ -137,7 +101,6 @@ pub struct Engine {
 
     // Shared
     pub noise_floor: f32,
-    profiles: Box<[KeyProfile; 88]>,
     peak_scratch: Box<[SpectralPeak]>,
 }
 
@@ -148,15 +111,6 @@ fn hz_to_cents(freq: f32, reference: f32) -> f32 {
 impl Engine {
     /// Creates a new Engine with default algorithms.
     pub fn new(sample_rate: u32) -> Self {
-        let mut profiles_vec = Vec::with_capacity(88);
-        for i in 0..88 {
-            let note = &NOTES[i];
-            let beta = get_expected_beta(i as u8);
-            profiles_vec.push(KeyProfile::new(note.frequency, beta));
-        }
-
-        let profiles_array: [KeyProfile; 88] = profiles_vec.try_into().unwrap();
-
         Engine {
             sample_rate,
             identified_key: None,
@@ -167,15 +121,17 @@ impl Engine {
             warmup_hops: 0,
             locked_scale: 1.0,
             noise_floor: 0.0, // updated by pipeline
-            profiles: Box::new(profiles_array),
             peak_scratch: vec![SpectralPeak::default(); 64].into_boxed_slice(),
         }
     }
 
     /// Executes the primary DSP detection loop for a single frame.
+    ///
+    /// `profiles` is the read-only per-key template table to score against.
     pub fn process(
         &mut self,
         frame: &mut ProcessingFrame,
+        profiles: &[KeyProfile; 88],
         is_silence: bool,
         is_new_onset: bool,
         is_transient_bypass: bool,
@@ -256,36 +212,35 @@ impl Engine {
             let cfg = twm::TwmConfig::default();
             // `min_error` feeds only the debug_assertions diagnostic below.
             #[cfg_attr(not(debug_assertions), allow(unused_variables))]
-            let (winning_key, temporal_gate, s_win, min_error) = if let Some(target_idx) =
-                target_note
-            {
-                // Manual Mode: bypass the 88-key scan, but still run Stage B scale
-                // refinement on the single target profile — otherwise this is the
-                // worst-seeded path (pure ET), and it is the critical one for
-                // Pitch Raise on heavily mistuned strings.
-                let (s, err) = discovery::refine_scale(
-                    active_peaks,
-                    &self.profiles[target_idx as usize],
-                    &cfg,
-                );
-                (target_idx, true, s, err)
-            } else {
-                // Auto Mode: split discovery (ADR 0005) — Stage A discrete 88-key
-                // scan, Stage B basin-clamped scale refinement of the top-3.
-                let res = discovery::discover(active_peaks, &self.profiles, &cfg, true);
-
-                // 3-Frame Consistency Gate (key-based, unchanged)
-                if res.key_index == self.consistency_key {
-                    self.stable_frames += 1;
+            let (winning_key, temporal_gate, s_win, min_error) =
+                if let Some(target_idx) = target_note {
+                    // Manual Mode: bypass the 88-key scan, but still run Stage B scale
+                    // refinement on the single target profile — otherwise this is the
+                    // worst-seeded path (pure ET), and it is the critical one for
+                    // Pitch Raise on heavily mistuned strings.
+                    let (s, err) = discovery::refine_scale(
+                        active_peaks,
+                        &profiles[target_idx as usize],
+                        &cfg,
+                    );
+                    (target_idx, true, s, err)
                 } else {
-                    self.consistency_key = res.key_index;
-                    self.stable_frames = 1;
-                }
+                    // Auto Mode: split discovery (ADR 0005) — Stage A discrete 88-key
+                    // scan, Stage B basin-clamped scale refinement of the top-3.
+                    let res = discovery::discover(active_peaks, profiles, &cfg, true);
 
-                (res.key_index, self.stable_frames >= 3, res.scale, res.error)
-            };
+                    // 3-Frame Consistency Gate (key-based, unchanged)
+                    if res.key_index == self.consistency_key {
+                        self.stable_frames += 1;
+                    } else {
+                        self.consistency_key = res.key_index;
+                        self.stable_frames = 1;
+                    }
 
-            let profile = &self.profiles[winning_key as usize];
+                    (res.key_index, self.stable_frames >= 3, res.scale, res.error)
+                };
+
+            let profile = &profiles[winning_key as usize];
 
             #[cfg(debug_assertions)]
             eprintln!(
@@ -322,7 +277,7 @@ impl Engine {
 
         // ── Tracking State ──
         let key = self.identified_key?;
-        let profile = &self.profiles[key as usize];
+        let profile = &profiles[key as usize];
         let audio_slice = &frame.audio_buffer[(BASS_WINDOW_SIZE - HOP_SIZE)..BASS_WINDOW_SIZE];
         let t_hop = HOP_SIZE as f32 / self.sample_rate as f32;
 

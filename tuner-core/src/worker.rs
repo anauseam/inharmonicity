@@ -18,10 +18,14 @@
 //! The `WorkerManager` spawns a single background thread at pipeline startup.
 //! The thread blocks on a crossbeam receiver and processes payloads as they arrive:
 //!
-//! 1. Receive a `CapturePayload` (a `Box<[f32; 66150]>` buffer + metadata)
-//! 2. Perform a high-resolution FFT on the captured audio
-//! 3. Run the 88-Key Template Matcher (Auto mode) or bounded peak search (Manual mode)
-//! 4. Run MAT to extract partials and compute the $B$ coefficient
+//! 1. Receive a `CapturePayload` (a `Box<[f32; 66150]>` buffer + metadata,
+//!    including the already-identified `target_note`)
+//! 2. Perform a high-resolution FFT on the captured audio + a one-sample-shifted
+//!    frame, and derive a CSPE super-resolution frequency map
+//! 3. Take the note identity from the payload (the Engine's discovery lock in
+//!    Auto mode, the user selection in Manual mode) — the worker does not
+//!    re-identify the note
+//! 4. Run MAT to extract partials and jointly refine ($f_0$, $B$)
 //! 5. Write diagnostic files (audio.raw + analysis.json) to disk
 //! 6. Send a `KeyMeasurement` result to the UI via crossbeam SPSC channel
 //! 7. Recycle the buffer back to the `AudioPool`
@@ -74,7 +78,12 @@ impl WorkerManager {
             // Scratch buffers
             let mut time_buffer = vec![0.0f32; max_fft_size];
             let mut frequency_buffer = vec![Complex { re: 0.0, im: 0.0 }; max_fft_size / 2 + 1];
+            // Second spectrum of the one-sample-shifted frame, for CSPE phase comparison.
+            let mut frequency_buffer_shifted =
+                vec![Complex { re: 0.0, im: 0.0 }; max_fft_size / 2 + 1];
             let mut magnitude_buffer = vec![0.0f32; max_fft_size / 2];
+            // CSPE super-resolution per-bin frequency map (parallel to magnitude_buffer).
+            let mut cspe_buffer = vec![0.0f32; max_fft_size / 2];
 
             loop {
                 match self.capture_rx.recv() {
@@ -88,7 +97,9 @@ impl WorkerManager {
                             &mut fft_instance,
                             &mut time_buffer,
                             &mut frequency_buffer,
+                            &mut frequency_buffer_shifted,
                             &mut magnitude_buffer,
+                            &mut cspe_buffer,
                         );
                     }
                     Err(_) => {
@@ -100,6 +111,7 @@ impl WorkerManager {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn process_payload(
         payload: CapturePayload,
         audio_pool: &Arc<AudioPool>,
@@ -109,7 +121,9 @@ impl WorkerManager {
         fft_instance: &mut Arc<dyn RealToComplex<f32>>,
         time_buffer: &mut [f32],
         frequency_buffer: &mut [Complex<f32>],
+        frequency_buffer_shifted: &mut [Complex<f32>],
         magnitude_buffer: &mut [f32],
+        cspe_buffer: &mut [f32],
     ) {
         // Step 1: Calculate power-of-two size
         let sample_count = payload.stable_sample_count.max(2048);
@@ -120,7 +134,7 @@ impl WorkerManager {
         }
 
         // Apply Hann window and copy to scratch
-        crate::algorithms::spectral::perform_fft(
+        crate::algorithms::spectral::fft(
             &payload.stable_buffer[..fft_size],
             &mut time_buffer[..fft_size],
             &mut frequency_buffer[..(fft_size / 2 + 1)],
@@ -128,10 +142,30 @@ impl WorkerManager {
             fft_size,
         );
 
-        crate::algorithms::spectral::spectrum_to_magnitudes(
+        crate::algorithms::spectral::magnitude_spectrum(
             &frequency_buffer[..],
             fft_size,
             &mut magnitude_buffer[..(fft_size / 2)],
+        );
+
+        // CSPE: transform the SAME frame advanced by one sample, then derive the per-bin
+        // super-resolution frequency map from the two spectra (DAFx-09 §2.3). The capture
+        // buffer holds 66150 samples and fft_size ≤ 65536, so the one-sample shift is in
+        // bounds; the Hann window zeroes the lone boundary sample regardless.
+        crate::algorithms::spectral::fft(
+            &payload.stable_buffer[1..fft_size + 1],
+            &mut time_buffer[..fft_size],
+            &mut frequency_buffer_shifted[..(fft_size / 2 + 1)],
+            fft_instance,
+            fft_size,
+        );
+
+        crate::algorithms::spectral::cspe(
+            &frequency_buffer[..],
+            &frequency_buffer_shifted[..],
+            fft_size,
+            payload.sample_rate,
+            &mut cspe_buffer[..(fft_size / 2)],
         );
 
         let measured_key_index = payload.target_note;
@@ -148,60 +182,41 @@ impl WorkerManager {
             None => f0_et,
         };
 
-        // Step 3: Run MAT via process_payload decoupled procedure
-        let mut partial_freqs_out = [0.0; 12];
-        let mut partial_ns_out = [0u32; 12];
-
-        // This calculates beta naturally
-        let mut partials = Vec::new();
-        let mut calculated_b = expected_beta;
-
-        // TODO: Remove this dynamic is_bass flag when we upgrade from Quinn to CSPE.
-        // CSPE will handle high-res peak extraction universally regardless of register.
-        let is_bass = payload.target_note < 40;
+        // Step 3: Run the MAT adjustive trajectory, which jointly refines (f0, B) and
+        // returns a measured B with a reliability score. It only fails (`None`) when the
+        // capture yields fewer than two partials — no pair to solve. Partial frequencies are
+        // read from the CSPE map, so MAT is register-agnostic (no bass/treble split).
+        let mut partial_freqs_out = [0.0; crate::algorithms::mat::MAX_PARTIALS];
+        let mut partial_ns_out = [0u32; crate::algorithms::mat::MAX_PARTIALS];
 
         let mat_res = crate::algorithms::mat::detect_pitch_mat(
-            magnitude_buffer,
+            &magnitude_buffer[..(fft_size / 2)],
+            &cspe_buffer[..(fft_size / 2)],
             payload.sample_rate,
-            actual_seed, // Unified Goertzel Seed
-            expected_beta,
-            is_bass,
+            actual_seed, // Goertzel seed for the first prediction; MAT refines it
+            // Serial growth (the paper's Fig. 3 order): uses more partials and, by the
+            // goodness-of-fit check in `validate_mat`, explains the clean low partials as well
+            // as Simultaneous while fitting the high partials it discards. Simultaneous remains
+            // the conservative fallback (one flag flip). See `MatOrder`.
+            crate::algorithms::mat::MatOrder::Serial,
             &mut partial_freqs_out,
             &mut partial_ns_out,
         );
 
-        if let Some((_, p_count)) = mat_res {
-            // Because detect_pitch_mat doesn't currently return the paired-up Beta array nicely,
-            // we will just use basic pairwise comparison ourselves here to find beta
-            // Or just store the fallback expected_beta
+        // `calculated_b` carries the measured coefficient; `b_confidence` carries its
+        // reliability. It is `None` only when MAT found no usable partials (a capture
+        // failure). The Rigaud prior is never substituted for a measured value.
+        let mut partials = Vec::new();
+        let mut calculated_b: Option<f32> = None;
+        let mut b_confidence = 0.0_f32;
+        let mut mat_f0 = actual_seed;
 
-            // To be accurate, let's just do a quick Beta combination from the extracted partial array:
-            let mut b_sum = 0.0;
-            let mut pairs = 0;
-            for i in 0..p_count {
-                for j in (i + 1)..p_count {
-                    let f_m = partial_freqs_out[i];
-                    let n_m = partial_ns_out[i];
-                    let f_n = partial_freqs_out[j];
-                    let n_n = partial_ns_out[j];
+        if let Some(est) = mat_res {
+            calculated_b = Some(est.b);
+            b_confidence = est.confidence;
+            mat_f0 = est.f0;
 
-                    let k_m = (f_m / n_m as f32).powi(2);
-                    let k_n = (f_n / n_n as f32).powi(2);
-                    let denom = k_m * (n_n as f32).powi(2) - k_n * (n_m as f32).powi(2);
-                    if denom.abs() > 1e-8 {
-                        let b = (k_n - k_m) / denom;
-                        if b > -0.001 && b < 0.01 {
-                            b_sum += b;
-                            pairs += 1;
-                        }
-                    }
-                }
-            }
-            if pairs > 0 {
-                calculated_b = b_sum / pairs as f32;
-            }
-
-            for i in 0..p_count {
+            for i in 0..est.partial_count {
                 let bin = (partial_freqs_out[i] / hz_per_bin).round() as usize;
                 let amp = if bin < magnitude_buffer.len() {
                     magnitude_buffer[bin]
@@ -227,7 +242,7 @@ impl WorkerManager {
             key_index: measured_key_index,
             measured_f0: actual_seed,
             partials,
-            calculated_b: Some(calculated_b),
+            calculated_b,
             last_captured: format!("{}", now), // Basic string timestamp
         };
 
@@ -237,6 +252,9 @@ impl WorkerManager {
             &measurement,
             fft_size,
             payload.sample_rate as f32 / fft_size as f32,
+            expected_beta,
+            b_confidence,
+            mat_f0,
         );
 
         // Step 5: Clean up and send result
@@ -259,6 +277,9 @@ impl WorkerManager {
         measurement: &KeyMeasurement,
         fft_size: usize,
         hz_per_bin: f32,
+        expected_beta: f32,
+        b_confidence: f32,
+        mat_f0: f32,
     ) {
         let (key_name, _) = crate::models::find_nearest_note_by_index(measurement.key_index);
 
@@ -286,16 +307,17 @@ impl WorkerManager {
             let mut file_full = dir.clone();
             file_full.push("audio_full_event.raw");
             if let Some(ref dbuf) = payload.full_event_buffer
-                && let Ok(mut f_full) = fs::File::create(file_full) {
-                    let slice = &dbuf[..payload.full_event_sample_count];
-                    let byte_slice: &[u8] = unsafe {
-                        std::slice::from_raw_parts(
-                            slice.as_ptr() as *const u8,
-                            std::mem::size_of_val(slice),
-                        )
-                    };
-                    let _ = f_full.write_all(byte_slice);
-                }
+                && let Ok(mut f_full) = fs::File::create(file_full)
+            {
+                let slice = &dbuf[..payload.full_event_sample_count];
+                let byte_slice: &[u8] = unsafe {
+                    std::slice::from_raw_parts(
+                        slice.as_ptr() as *const u8,
+                        std::mem::size_of_val(slice),
+                    )
+                };
+                let _ = f_full.write_all(byte_slice);
+            }
 
             // Write analysis.json
             let mut file2 = dir.clone();
@@ -314,6 +336,9 @@ impl WorkerManager {
                         "hz_per_bin": hz_per_bin,
                         "noise_floor": payload.noise_floor,
                         "calculated_b": measurement.calculated_b,
+                        "expected_beta": expected_beta,
+                        "b_confidence": b_confidence,
+                        "mat_f0": mat_f0,
                         "partials": measurement.partials,
                     }
                 });

@@ -94,8 +94,8 @@ This thread constantly consumes data from the Elastic Ring Buffer and executes a
                   ▼
     ┌──────────────────────────────┐
     │ Background Worker (Thread 3) │
-    │  High-Res FFT → Template     │
-    │  Matcher → MAT → β calc      │
+    │  High-Res FFT → CSPE map →   │
+    │  MAT → (f₀, B) calc          │
     └─────────────┬────────────────┘
                   │ crossbeam SPSC (KeyMeasurement)
                   ▼
@@ -111,7 +111,7 @@ This thread constantly consumes data from the Elastic Ring Buffer and executes a
 - **The Engine (TWM Discovery + Goertzel Phase Tracking):** A pitch detection chain that operates as an independent state machine, **synchronously reset** by the Gatekeeper's onset pulse but otherwise decoupled from the Gatekeeper's internal transient delays.
   - **Discovery Phase (State: Unlocked):** Identifies the fundamental frequency from the 8192-pt bass FFT buffer using the canonical Maher & Beauchamp (1994) Two-Way Mismatch algorithm.
     1. **Peak Extraction:** Sub-bin peaks are extracted using the Jacobsen complex-domain estimator (Candan 2015). To establish a statistical minimum magnitude for Additive White Gaussian Noise (AWGN) rejection, a dynamic Neyman-Pearson threshold (Kay 1998) is computed against the pipeline's dynamic noise floor and acts as a floor gate. _(Note: Because the piano's acoustic noise floor during an active note is vastly higher than the room's silence threshold, this AWGN boundary is mathematically sound but practically negligible in effect)._
-    2. **Peak Masking:** A two-stage masking process is applied: first, a `-30 dB` relative global magnitude floor removes absolute structural noise, followed by proportional critical band masking (Gómez 2006 / Cano 1998) to aggressively drop sympathetic tonal noise and structural intermodulation distortion.
+    2. **Peak Masking:** A two-stage masking process is applied: first, a `-30 dB` relative global magnitude floor (an adaptation of Cano 1998's 40 dB rule) removes absolute structural noise, followed by our own proportional critical-band masking heuristic — empirically validated in ADR 0002, not a port of a published method — to aggressively drop sympathetic tonal noise and structural intermodulation distortion.
     3. **TWM Scoring:** The surviving peaks are scored against 88 pre-computed inharmonicity-stretched `KeyProfile` arrays. The algorithm evaluates both forward error and reverse error with psychoacoustic frequency weighting ($f^{-0.5}$). To prevent unbounded error accumulation from distant noise, the Measured-to-Predicted error is topologically bounded using a piecewise ceiling derived from Duan et al. (2010).
     4. **Temporal Tracking:** A mathematically stateless 3-frame temporal consistency gate confirms the lock and transitions the Engine to the Tracking Phase. (Note: The historic Viterbi hidden Markov model was permanently excised because its path cost persistence caused unrecoverable sub-harmonic locks following noisy hammer strikes).
   - **Tracking Phase (State: Locked):** Once a key is locked, the engine switches to per-partial Goertzel analysis on 1024-sample segments to refine the tuning measurement.
@@ -128,10 +128,10 @@ Once the Gatekeeper detects silence, it closes the gate by sending the `is_silen
 This is a single detached worker thread spawned at pipeline construction inside `AudioPipeline::new()`. It blocks on a crossbeam receiver, waking only when a `CapturePayload` arrives.
 
 - **Action:** When the pipeline dispatches a filled capture buffer, the worker:
-  1. Performs a high-resolution power-of-two FFT on the captured audio (up to 65,536 points).
-  2. **Auto Mode** (`target_note == 255`): Runs the full 88-key Template Matcher at the worker's high-resolution FFT to identify the note, then refines _f₀_ via parabolic interpolation.
-  3. **Manual Mode**: Performs a bounded ±1 semitone peak search around the user-selected target, refining with parabolic interpolation.
-  4. Runs MAT (Median-Adjustive Trajectories) to extract partials and compute the inharmonicity coefficient ($B$) via pairwise partial combinations.
+  1. Performs a high-resolution power-of-two FFT on the captured audio (up to 65,536 points), plus a one-sample-shifted frame, and derives a CSPE (Short & Garcia 2006) super-resolution per-bin frequency map.
+  2. Takes the note **identity** from the payload — it does not re-identify the note. In **Auto Mode** that identity is the Engine's real-time TWM discovery lock (`latched_auto_key`); in **Manual Mode** it is the user-selected key.
+  3. Seeds from the Engine's Goertzel-tracked _f₀_ (or the key's Equal-Temperament frequency if the tracker never locked).
+  4. Runs MAT (Median-Adjustive Trajectories — serial trajectory growth, reading partial frequencies from the CSPE map) to jointly estimate the partials, the refined _f₀_, and the inharmonicity coefficient ($B$) via the median of pairwise partial combinations.
   5. Writes diagnostic files (`audio.raw` + `analysis.json`) to the `diagnostics/` directory.
 - **Output:** Sends a `KeyMeasurement` (containing `key_index`, `measured_f0`, extracted `partials`, and `calculated_b`) to the GUI via the `result_tx` crossbeam SPSC channel. Resets `CaptureState` to `Idle` and recycles the audio buffer back into the `AudioPool`.
 
@@ -139,7 +139,7 @@ This is a single detached worker thread spawned at pipeline construction inside 
 
 This is the graphical interface thread operating at 60 FPS.
 
-- **Action:** Consumes the high-speed stream of `FrameOutput` structures from Thread 2 via the `triple_buffer` to drive the instantaneous tuning visualizers (spectrogram, cents-deviation, keyboard). Drains `KeyMeasurement` results from the Worker via `pipeline_handle.result_rx` and inserts them into the `InharmonicityProfile`. Reads/writes configuration (e.g., silence threshold, target key) and polls runtime observations (e.g., smoothed RMS for the Envelope Viewer) via `Arc<PipelineAtomics>`.
+- **Action:** Consumes the high-speed stream of `FrameOutput` structures from Thread 2 via the `triple_buffer` to drive the instantaneous tuning visualizers (spectrogram, cents-deviation, keyboard). Drains `KeyMeasurement` results from the Worker via the `worker_rx` receiver and inserts them into the `InharmonicityProfile` (and, when measured-B discovery seeding is enabled, pushes the recompiled template back to the live engine via the `profiles` producer — crossing #4). Reads/writes configuration (e.g., silence threshold, target key) and polls runtime observations (e.g., smoothed RMS for the Envelope Viewer) via `Arc<PipelineAtomics>`.
 
 #### Cross-Thread Communication Topology
 
@@ -154,6 +154,7 @@ Because `tuner-core` enforces strict zero-allocation, wait-free real-time audio 
 | **Buffer Recycling**  | Lock-Free Object Pool    | DSP (2) ↔ Worker (3)          | Recycled `Box<[f32; 66150]>` arrays — zero allocation during capture. |
 | **Capture Lifecycle** | `AtomicU8` (baton-pass)  | UI (4) → DSP (2) → Worker (3) | `CaptureState`: Idle → Armed → Recording → Processing → Idle.         |
 | **Worker Results**    | crossbeam SPSC (bounded) | Worker (3) → UI (4)           | `KeyMeasurement` with partials, $f_0$, and $B$ coefficient.           |
+| **Template Update**   | `ringbuf` SPSC           | UI (4) → DSP (2)              | Recompiled `KeyProfile` (measured $B$) into the engine's templates.   |
 
 The channel-by-channel contract is documented in
 [02-cross-thread-communication.md](docs/internals/02-cross-thread-communication.md).
@@ -172,12 +173,12 @@ For example, to handle spectral peaks distorted by beating unisons, it's temptin
 
 The major DSP components and their foundations:
 
-- **Transient Stability Detection**: Mounir et al. (2021) NINOS2 (ℓ₁/ℓ₂ variant)
+- **Transient Stability Detection**: `ninos2` — a spectral-sparsity ratio of our own design (an $N/N_{\text{eff}}$ participation-ratio form; _not_ Mounir 2021's NINOS², per faithfulness-audit-05)
 - **Onset Detection**: Normalized Half-Wave Rectified Spectral Flux (NHWRSF) — via spectral difference
-- **Peak Extraction**: Candan (2015) Jacobsen complex-domain estimator
+- **Peak Extraction** (Discovery): Candan (2015) Jacobsen complex-domain estimator
 - **Note Discovery**: Maher & Beauchamp (1994) Two-Way Mismatch
-- **Sympathetic Noise Rejection**: Gómez (2006) / Cano (1998) SMS peak masking (`mask_peaks`), with a Duan et al. (2010) topological ceiling on the reverse TWM error term
-- **Inharmonicity**: Hodgkinson (2009) Median-Adjustive Trajectories (MAT)
+- **Sympathetic Noise Rejection**: `mask_peaks` — our own critical-band masking heuristic (empirically validated in ADR 0002; the global magnitude gate adapts Cano 1998), with a Duan et al. (2010) topological ceiling on the reverse TWM error term
+- **Inharmonicity**: Hodgkinson (2009) Median-Adjustive Trajectories (MAT) — serial trajectory growth, with Short & Garcia (2006) Complex Spectral Phase Evolution (CSPE) sub-bin refinement
 
 If the pipeline produces bad data, the fix is usually to implement the mathematically complete version of the algorithm rather than adding a clamp or a safety bound.
 
