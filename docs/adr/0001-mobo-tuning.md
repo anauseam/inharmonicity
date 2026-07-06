@@ -12,9 +12,9 @@ The canonical TWM formulation by Maher & Beauchamp (1994) relies on three empiri
 
 Maher & Beauchamp empirically selected the default values ($q=1.4, r=0.5, \rho=0.33$) based on a small dataset of brass and woodwind instruments. Pianos, however, exhibit extreme inharmonicity, missing fundamentals in the bass, and significant sympathetic resonance. Using the defaults leaves the engine vulnerable to false locks (e.g., locking to a sub-harmonic).
 
-## Multi-Objective Bayesian Optimization (MOBO)
+## Multi-Objective Optimization (NSGA-II)
 
-To adapt TWM specifically for piano acoustics, we use a Multi-Objective Bayesian Optimization (MOBO) framework.
+To adapt TWM specifically for piano acoustics, we use a multi-objective optimization framework. The optimiser is **NSGA-II** (a non-dominated-sorting genetic algorithm, via Optuna), *not* a Bayesian/Gaussian-process method. "MOBO" persists as the project shorthand (filenames, `twm_mobo.db`, etc.) for historical reasons — read it as "multi-objective optimization," with the understanding that the search is evolutionary, not Bayesian.
 
 ### Why a Synthetic Dataset?
 
@@ -33,15 +33,17 @@ _(Note: The standard ML practice is to optimize against the massive synthetic da
 
 MOBO allows us to optimize for multiple, often competing, goals simultaneously. Our primary objectives are:
 
-- **Objective A (Accuracy):** Minimize the absolute number of false-locks across the dataset.
-- **Objective B (Confidence):** Maximize the error-score distance (the margin) between the winning correct key and the second-best candidate.
+- **Objective A (Accuracy):** Minimize false-locks across the dataset — specifically the *separability* false-lock (does the true key win the all-88 argmin), which isolates the constants' ranking job from the K=3 recall path.
+- **Objective B (Confidence):** Maximize the **ordinal** confidence — the fraction of the 87 impostors the true key out-scores. This replaced an earlier *margin* formulation (distance to the second-best candidate), which the search **gamed** by driving the per-frame median toward the normaliser floor; the rank-based form is immune to that.
 
 ### The Search Process
 
-A brute-force grid search across a continuous 3D space ($q, r, \rho$) would take an immense amount of compute. MOBO solves this using a Bayesian surrogate model (like a Gaussian Process):
+A brute-force grid search across the continuous parameter space would take an immense amount of compute. NSGA-II is an evolutionary multi-objective algorithm:
 
-1. It tests a small set of random parameter combinations.
-2. It builds a probabilistic "map" predicting how changes to $q, r, \rho$ impact Accuracy and Confidence.
-3. It intelligently selects the next set of parameters to test by balancing **exploration** (searching unknown areas of the map) and **exploitation** (refining known good areas).
+1. It evaluates an initial population of parameter combinations.
+2. It ranks them by Pareto non-domination (plus a crowding-distance tie-break for diversity along the front).
+3. It evolves the next generation by selection/crossover/mutation biased toward the non-dominated set — converging the whole population toward the Pareto frontier rather than a single optimum.
 
-The output of the MOBO process is a **Pareto Frontier**—a set of optimal tradeoffs. We will select the parameter combination that provides the maximum stability for bass strings without degrading treble confidence, and hardcode those values into `tuner-core/src/algorithms/twm.rs`.
+The output is a **Pareto Frontier**—a set of optimal tradeoffs. Final constants are then chosen by **real-capture validation** over the front (not by synthetic hypervolume), and hardcoded into `tuner-core/src/algorithms/twm.rs`.
+
+> **See also.** The operational layer — harness, synthetic signal model, determinism/fingerprint, arm structure, selection protocol, and a threats-to-validity audit — lives in [`docs/design/mobo-methodology.md`](../design/mobo-methodology.md); outcomes and the (provisional) final config are in ADR 0006.

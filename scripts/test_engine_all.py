@@ -6,16 +6,24 @@ import argparse
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--refine", action="store_true", help="Enable Stage B refinement")
+    parser.add_argument("--config", default=None,
+                        help='Override TWM constants: "p q r rho lambda" (lambda may be inf)')
+    parser.add_argument("--profile", default=None,
+                        help="Path to a persisted InharmonicityProfile JSON; seeds each "
+                             "measured key's template with its measured B (ET-centered, "
+                             "validation only).")
+    parser.add_argument("--no-plot", action="store_true",
+                        help="Skip per-key plotting (faster; not needed for pass/fail)")
     args = parser.parse_args()
     base_dir = "./diagnostics"
     results = []
 
-    print("Compiling diagnose_engine (with telemetry) and diagnose_gatekeeper...")
-    subprocess.run(["cargo", "build", "--example", "diagnose_engine", "--features", "telemetry"], check=True, stdout=subprocess.DEVNULL)
-    subprocess.run(["cargo", "build", "--example", "diagnose_gatekeeper"], check=True, stdout=subprocess.DEVNULL)
+    print("Compiling diagnose_engine (with telemetry) and diagnose_gatekeeper (release)...")
+    subprocess.run(["cargo", "build", "--release", "--example", "diagnose_engine", "--features", "telemetry"], check=True, stdout=subprocess.DEVNULL)
+    subprocess.run(["cargo", "build", "--release", "--example", "diagnose_gatekeeper"], check=True, stdout=subprocess.DEVNULL)
 
-    executable_engine = "./target/debug/examples/diagnose_engine"
-    executable_gate = "./target/debug/examples/diagnose_gatekeeper"
+    executable_engine = "./target/release/examples/diagnose_engine"
+    executable_gate = "./target/release/examples/diagnose_gatekeeper"
 
     keys = sorted([d for d in os.listdir(base_dir) if d.startswith("key_")])
     mode_str = "REFINED" if args.refine else "DISCRETE"
@@ -37,10 +45,14 @@ def main():
             engine_cmd = [executable_engine, raw_file]
             if args.refine:
                 engine_cmd.append("--refine")
+            if args.config:
+                engine_cmd += ["--config", args.config]
+            if args.profile:
+                engine_cmd += ["--profile", args.profile]
             subprocess.run(engine_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-            
-            # Run the plotting script
-            subprocess.run(["python", "./scripts/plot_engine.py", key_dir], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+
+            if not args.no_plot:
+                subprocess.run(["python", "./scripts/plot_engine.py", key_dir], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
         except subprocess.CalledProcessError:
             print(f"Error running diagnostic for {key_dir_name}")
             continue

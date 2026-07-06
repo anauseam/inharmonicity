@@ -18,6 +18,26 @@ this file is purely about code shape.
   belong only on items that frontends (the GUI or a future external
   consumer) actually need.
 
+### Function names
+
+Following the Rust API guidelines (no `get_`/`calculate_`/`compute_`
+stutter — the noun already says what it is), `algorithms/` functions
+are named for the thing itself:
+
+- **A named algorithm or standard quantity → the bare name.**
+  `fft`, `cspe`, `goertzel`, `jacobsen`, `rms`, `ema`, `ninos2`,
+  `nhwrsf`. The doc-comment carries the citation and the units; the
+  name carries the identity. Do **not** prefix these with a verb.
+- **A transform that fills a buffer → a descriptive output noun.**
+  `magnitude_spectrum` (the complex modulus is not a named algorithm,
+  just a quantity, so it gets the standard DSP noun rather than a bare
+  acronym).
+- **An action on data → a verb-object.** `extract_peaks`,
+  `mask_peaks`, `score_candidate`, `discover`, `refine_scale`.
+
+When in doubt, prefer the shortest name that is unambiguous at the call
+site, and let the doc-comment do the explaining.
+
 ## Doc comments
 
 Every public item in `tuner-core` carries a `///` doc comment. For

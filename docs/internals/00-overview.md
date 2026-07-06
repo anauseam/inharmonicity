@@ -37,7 +37,7 @@ CPAL audio callback  ──ringbuf SPSC──►  Analysis thread (DSP)
                                                   │  triple_buffer (FrameOutput)
 ```
 
-Four threads, six wait-free crossings. See
+Four threads, five sanctioned wait-free crossings. See
 [02-cross-thread-communication.md](02-cross-thread-communication.md) for
 the channel-by-channel contract.
 
@@ -61,18 +61,18 @@ run async to the hot path. They may heap-allocate freely.
 
 ## File map — `tuner-core/src/`
 
-| Concern                                      | File(s)                                                                     |
-| -------------------------------------------- | --------------------------------------------------------------------------- |
-| Crate root, `FrameOutput`                    | `lib.rs`                                                                    |
-| CPAL capture, DC blocking, audio thread      | `audio.rs`                                                                  |
-| COLA overlapping-frame sliding window        | `cola.rs`                                                                   |
-| Pipeline mediator, shared atomics, AudioPool | `pipeline.rs`                                                               |
-| Signal validator (5-state)                   | `gatekeeper.rs`                                                             |
-| F0 detection (TWM + Goertzel)                | `engine.rs`                                                                 |
-| Async background worker                      | `worker.rs`                                                                 |
-| Stateless DSP math                           | `algorithms/{spectral,peaks,pitch,twm,mat,metrics,tuning,inharmonicity}.rs` |
-| Domain types and lookup tables               | `models.rs`                                                                 |
-| Developer CLI tools & testing harnesses      | `examples/`                                                                 |
+| Concern                                      | File(s)                                                                         |
+| -------------------------------------------- | ------------------------------------------------------------------------------- |
+| Crate root, `FrameOutput`                    | `lib.rs`                                                                        |
+| CPAL capture, DC blocking, audio thread      | `audio.rs`                                                                      |
+| COLA overlapping-frame sliding window        | `cola.rs`                                                                       |
+| Pipeline mediator, shared atomics, AudioPool | `pipeline.rs`                                                                   |
+| Signal validator (5-state)                   | `gatekeeper.rs`                                                                 |
+| F0 detection (TWM + Goertzel)                | `engine.rs`                                                                     |
+| Async background worker                      | `worker.rs`                                                                     |
+| Stateless DSP math                           | `algorithms/{spectral,peaks,twm,discovery,mat,metrics,tuning,inharmonicity}.rs` |
+| Domain types and lookup tables               | `models.rs`                                                                     |
+| Developer CLI tools & testing harnesses      | `examples/`                                                                     |
 
 ## File map — `tuner-gui/src/`
 
@@ -90,7 +90,7 @@ run async to the hot path. They may heap-allocate freely.
 docs/internals/
 ├── 00-overview.md                       (this file)
 ├── 01-architecture.md                   crate boundaries, ownership, Split/Handle
-├── 02-cross-thread-communication.md     the six wait-free crossings
+├── 02-cross-thread-communication.md     the five wait-free crossings
 ├── 03-dsp-pipeline.md                   hot-path constraints
 ├── 04-algorithms-and-models.md          algorithms/ vs models/ layout
 └── 05-style.md                          Rust style, allocation idioms
@@ -98,8 +98,12 @@ docs/internals/
 
 ```text
 docs/adr/
-├── 0001-mobo-tuning.md                     TWM parameter optimization methodology
-└── 0002-twm-peak-masking-validation.md     First full-compass 8/8 pass validation
+├── 0001-mobo-tuning.md                        TWM parameter optimization methodology
+├── 0002-twm-peak-masking-validation.md        First full-compass 8/8 pass validation
+├── 0003-gatekeeper-rejection-of-sfm.md        Gatekeeper: SFM rejected as a signal gate
+├── 0004-instrument-scope.md                   Instrument scope (inharmonic framework)
+├── 0005-discovery-algorithm-class.md          Discovery class: peak-domain model scoring
+└── 0006-discovery-refinement-validation.md    TWM calibration & validation (Draft, living)
 ```
 
 Each file is self-contained, and section headings are stable enough to be

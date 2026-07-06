@@ -6,10 +6,9 @@ use std::fs::{self};
 use std::path::Path;
 
 use tuner_core::algorithms::peaks::{SpectralPeak, extract_peaks};
-use tuner_core::algorithms::spectral::{perform_fft, spectrum_to_magnitudes};
+use tuner_core::algorithms::spectral::{fft, magnitude_spectrum};
 use tuner_core::audio::{BASS_WINDOW_SIZE, HOP_SIZE};
-use tuner_core::engine::KeyProfile;
-use tuner_core::models::{NOTES, get_expected_beta};
+use tuner_core::models::{KeyProfile, NOTES, get_expected_beta};
 
 #[derive(Debug)]
 struct TwmBreakdown {
@@ -194,14 +193,14 @@ fn main() -> Result<()> {
             continue;
         }
 
-        perform_fft(
+        fft(
             frame_audio,
             &mut time_buffer,
             &mut frequency_buffer,
             &fft_instance,
             BASS_WINDOW_SIZE,
         );
-        spectrum_to_magnitudes(&frequency_buffer, BASS_WINDOW_SIZE, &mut magnitude_buffer);
+        magnitude_spectrum(&frequency_buffer, BASS_WINDOW_SIZE, &mut magnitude_buffer);
 
         let count = extract_peaks(
             &magnitude_buffer,

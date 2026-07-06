@@ -454,23 +454,38 @@ impl TunerApp {
                     } else {
                         self.inharmonicity_profile.measurements.remove(&idx);
                     }
+                    // Revert the live engine template too (measured B if a prior
+                    // measurement remains, else back to the Rigaud prior).
+                    if let Some(host) = self.host_handle.as_mut() {
+                        host.profiles.update_key_profile(
+                            idx,
+                            self.inharmonicity_profile.measurements.get(&idx),
+                        );
+                    }
                     eprintln!("[MAIN] Undoing profile change at index {}", idx);
                 }
             }
             Message::SaveProfile => {
-                match self.inharmonicity_profile.to_file("tuning_profile.json") {
+                match self.inharmonicity_profile.to_file(tuner_core::models::PROFILE_PATH) {
                     Ok(_) => eprintln!("[MAIN] Tuning profile saved successfully."),
                     Err(e) => eprintln!("[MAIN] Error saving profile: {}", e),
                 }
             }
-            Message::LoadProfile => match InharmonicityProfile::from_file("tuning_profile.json") {
-                Ok(profile) => {
-                    self.inharmonicity_profile = profile;
-                    self.undo_history.clear();
-                    eprintln!("[MAIN] Tuning profile loaded successfully.");
+            Message::LoadProfile => {
+                match InharmonicityProfile::from_file(tuner_core::models::PROFILE_PATH) {
+                    Ok(profile) => {
+                        self.inharmonicity_profile = profile;
+                        self.undo_history.clear();
+                        // Sync the freshly-loaded profile into the live engine so
+                        // detection reflects it immediately (crossing #4, all keys).
+                        if let Some(host) = self.host_handle.as_mut() {
+                            host.profiles.update_all(&self.inharmonicity_profile);
+                        }
+                        eprintln!("[MAIN] Tuning profile loaded successfully.");
+                    }
+                    Err(e) => eprintln!("[MAIN] Error loading profile: {}", e),
                 }
-                Err(e) => eprintln!("[MAIN] Error loading profile: {}", e),
-            },
+            }
             // ------------------------------------------
             Message::Temperament => {
                 // Placeholder for temperament settings
@@ -677,38 +692,49 @@ impl TunerApp {
                 }
 
                 // ── Drain Result Channel from Worker ──
-                while let Ok(measurement) = self.pipeline_handle.result_rx.try_recv() {
-                    let target_idx = measurement.key_index;
+                // `worker_rx` and the `profiles` producer both live in the single-owner
+                // `HostHandle` (crossing #5 receiver / crossing #4 producer).
+                if let Some(host) = self.host_handle.as_mut() {
+                    while let Ok(measurement) = host.worker_rx.try_recv() {
+                        let target_idx = measurement.key_index;
 
-                    // Backup old data for Undo History
-                    let old_data = self
-                        .inharmonicity_profile
-                        .measurements
-                        .get(&target_idx)
-                        .cloned();
-                    self.undo_history.push_back((target_idx, old_data));
-                    if self.undo_history.len() > 100 {
-                        self.undo_history.pop_front();
-                    }
+                        // Backup old data for Undo History
+                        let old_data = self
+                            .inharmonicity_profile
+                            .measurements
+                            .get(&target_idx)
+                            .cloned();
+                        self.undo_history.push_back((target_idx, old_data));
+                        if self.undo_history.len() > 100 {
+                            self.undo_history.pop_front();
+                        }
 
-                    // Apply to profile
-                    self.inharmonicity_profile
-                        .measurements
-                        .insert(target_idx, measurement);
+                        // Apply to the authoritative profile…
+                        self.inharmonicity_profile
+                            .measurements
+                            .insert(target_idx, measurement);
 
-                    eprintln!(
-                        "[MAIN] Successfully slotted new capture data into Inharmonicity Profile at index {}",
-                        target_idx
-                    );
+                        // …then push the recompiled (measured-B) template to the live
+                        // engine via crossing #4.
+                        host.profiles.update_key_profile(
+                            target_idx,
+                            self.inharmonicity_profile.measurements.get(&target_idx),
+                        );
 
-                    // Re-arm automatically if in Auto mode
-                    if let TuningMode::Auto = self.display_data.tuning_mode {
-                        eprintln!("[MAIN] Auto-mode rearming...");
-                        self.pipeline_handle
-                            .atomics
-                            .capture_state
-                            .store(CaptureState::Armed as u8, Ordering::Relaxed);
-                        self.display_data.capture_state = CaptureState::Armed;
+                        eprintln!(
+                            "[MAIN] Successfully slotted new capture data into Inharmonicity Profile at index {}",
+                            target_idx
+                        );
+
+                        // Re-arm automatically if in Auto mode
+                        if let TuningMode::Auto = self.display_data.tuning_mode {
+                            eprintln!("[MAIN] Auto-mode rearming...");
+                            self.pipeline_handle
+                                .atomics
+                                .capture_state
+                                .store(CaptureState::Armed as u8, Ordering::Relaxed);
+                            self.display_data.capture_state = CaptureState::Armed;
+                        }
                     }
                 }
 

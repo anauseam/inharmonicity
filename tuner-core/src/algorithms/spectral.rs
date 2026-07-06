@@ -6,7 +6,7 @@
 //!
 //! ## Features
 //! - Highly-optimized Real-to-Complex FFT (RFFT) using `realfft`
-//! - Hamming windowing for zero-overlap transient preservation
+//! - Hann windowing (zero at frame boundaries; COLA at 50% overlap)
 //! - Optimized for real-time processing
 
 use once_cell::sync::Lazy;
@@ -20,7 +20,7 @@ use std::sync::Arc;
 /// to process strictly real microphone data in roughly half the computational time
 /// of a standard Complex-to-Complex FFT.
 ///
-/// 1. Hamming windowing (preserves 8% amplitude at frame boundaries)
+/// 1. Hann windowing (zero at frame boundaries; satisfies COLA at 50% overlap)
 /// 2. Forward Real-to-Complex FFT transformation
 ///
 /// DC offset removal is handled upstream by the audio stream's `dc_block` filter,
@@ -35,7 +35,7 @@ use std::sync::Arc;
 ///
 /// # Panics
 /// * If array lengths are insufficient
-pub fn perform_fft(
+pub fn fft(
     signal: &[f32],
     time_buffer: &mut [f32],
     frequency_buffer: &mut [Complex<f32>],
@@ -78,7 +78,7 @@ pub fn perform_fft(
 ///
 /// The resulting magnitudes are used for spectrogram visualisation (via the
 /// [`FrameOutput`](crate::FrameOutput) triple buffer) and for downstream DSP
-/// (TWM peak picking, XQIFFT refinement).
+/// (peak picking and sub-bin refinement).
 ///
 /// # Arguments
 /// * `spectrum` — Complex frequency spectrum from the RFFT.
@@ -87,10 +87,153 @@ pub fn perform_fft(
 ///
 /// # Panics
 /// * If `out.len() < window_size / 2`.
-pub fn spectrum_to_magnitudes(spectrum: &[Complex<f32>], window_size: usize, out: &mut [f32]) {
+pub fn magnitude_spectrum(spectrum: &[Complex<f32>], window_size: usize, out: &mut [f32]) {
     let count = window_size / 2;
     for (o, c) in out[..count].iter_mut().zip(spectrum.iter().take(count)) {
         *o = c.norm();
+    }
+}
+
+/// Complex Spectral Phase Evolution (CSPE) — super-resolution per-bin frequency estimation.
+///
+/// Reassigns every DFT bin to the true frequency of the component dominating it, by
+/// comparing the phase of the spectrum against that of the same frame advanced by one
+/// sample. For a component at angular frequency $\omega$, advancing the signal one sample
+/// multiplies its spectrum by $e^{j\omega}$, so
+///
+/// ```text
+///   spectrum · conj(spectrum_shifted) = |spectrum|² · e^{−jω}
+///   f_bin = −∠(spectrum · conj(spectrum_shifted)) · sample_rate / (2π)
+/// ```
+///
+/// The estimate is independent of the bin index and far more accurate than the DFT grid or
+/// parabolic interpolation. It is exact under any analysis window applied identically to
+/// both frames — the window's phase cancels in the conjugate product (M·M* = ‖M‖², paper
+/// Eq. 37) — provided the window confines leakage so the ±frequency interaction terms stay
+/// negligible (Eq. 36); Hann qualifies.
+///
+/// # Arguments
+/// * `spectrum` — Complex spectrum $F(s_0)$ of the analysis frame (`fft` output).
+/// * `spectrum_shifted` — Complex spectrum $F(s_1)$ of the *same* frame advanced by one
+///   sample (and windowed identically).
+/// * `window_size` — FFT window size; exactly `window_size / 2` bins are written.
+/// * `sample_rate` — Audio sample rate in Hz.
+/// * `out` — Per-bin refined frequency in Hz (parallel to `magnitude_spectrum`). Bins
+///   whose phase product yields a non-physical (≤ 0 / non-finite) frequency fall back to the
+///   bin-centre frequency.
+///
+/// # Panics
+/// * If `spectrum`, `spectrum_shifted`, or `out` is shorter than `window_size / 2`
+///   (same size contract as [`fft`] — a silent truncation would mask a caller bug).
+///
+/// # Reference
+/// Short, K. M. & Garcia, R. A. (2006). "Signal Analysis Using the Complex Spectral Phase
+/// Evolution (CSPE) Method." AES 120th Convention, Paris. Paper 6645. (Eqs. 7, 38.)
+/// As applied to inharmonic analysis in Hodgkinson et al., DAFx-09 §2.3, Eqs. 18–19.
+pub fn cspe(
+    spectrum: &[Complex<f32>],
+    spectrum_shifted: &[Complex<f32>],
+    window_size: usize,
+    sample_rate: u32,
+    out: &mut [f32],
+) {
+    let count = window_size / 2;
+    if spectrum.len() < count || spectrum_shifted.len() < count {
+        panic!("CSPE input spectra must be at least window_size / 2 bins long");
+    }
+    let hz_per_bin = sample_rate as f32 / window_size as f32;
+    let scale = sample_rate as f32 / (2.0 * std::f32::consts::PI);
+
+    // Slice-to-count up front: one bounds check here, none in the hot loop,
+    // and an undersized `out` panics instead of silently truncating the map.
+    let out = &mut out[..count];
+    for (bin, (o, (s0, s1))) in out
+        .iter_mut()
+        .zip(spectrum.iter().zip(spectrum_shifted.iter()))
+        .enumerate()
+    {
+        // ∠(F(s0) · conj(F(s1))) = −ω for a component at angular frequency ω.
+        let product = s0 * s1.conj();
+        let freq = -product.arg() * scale;
+        *o = if freq.is_finite() && freq > 0.0 {
+            freq
+        } else {
+            // Phase product degenerate (no coherent component) — keep the bin centre.
+            bin as f32 * hz_per_bin
+        };
+    }
+}
+
+/// Jacobsen sub-bin frequency estimator with Candan's window bias correction —
+/// complex-domain, single-peak refinement.
+///
+/// Given a spectral peak at integer bin `bin`, estimates the true frequency of the
+/// underlying tone from the *raw* complex DFT values of the peak and its two immediate
+/// neighbours (Candan 2015, Eq. 1):
+///
+/// ```text
+///   δ = c_N · Re( (X[m-1] − X[m+1]) / (2·X[m] − X[m-1] − X[m+1]) )
+/// ```
+///
+/// and returns the refined frequency `(bin + δ) · sample_rate / window_size` in Hz.
+/// The bins are consumed exactly as the windowed DFT produces them: the estimator is
+/// derived for raw (causal) bins and needs no phase correction — the neighbours' sign
+/// alternation is intrinsic to the formula. The window's effect is absorbed entirely by
+/// the bias-correction factor `c_N` (Eq. 12), precomputed offline for the pipeline's
+/// Hann window in [`candan_bias_correction`].
+///
+/// Used in Discovery by [`crate::algorithms::peaks::extract_peaks`], per detected peak.
+///
+/// Falls back to the plain bin-centre frequency for boundary bins (no neighbour) or a
+/// degenerate (near-zero) denominator (ours — the paper is silent on degenerate input).
+///
+/// # Reference
+/// Candan, Ç. (2015). "Fine resolution frequency estimation from three DFT samples:
+/// Case of windowed data." Signal Processing, 114, pp. 245–250.
+/// DOI: 10.1016/j.sigpro.2015.03.009 (Eqs. 1, 12.)
+/// Confirmed by Keyta & Dilaveroğlu (2025), Elektronika ir Elektrotechnika 31(3),
+/// whose whole-interval least-squares c_N (their Eq. 20) matches Eq. 12 to five
+/// decimals for the Hann window at these sizes.
+pub fn jacobsen(
+    complex_spectrum: &[Complex<f32>],
+    bin: usize,
+    window_size: usize,
+    sample_rate: u32,
+) -> f32 {
+    let hz_per_bin = sample_rate as f32 / window_size as f32;
+
+    if bin == 0 || bin + 1 >= complex_spectrum.len() {
+        return bin as f32 * hz_per_bin;
+    }
+
+    let x_prev = complex_spectrum[bin - 1];
+    let x_peak = complex_spectrum[bin];
+    let x_next = complex_spectrum[bin + 1];
+
+    let numerator = x_prev - x_next;
+    let denominator = Complex::new(2.0, 0.0) * x_peak - x_prev - x_next;
+
+    let delta = if denominator.norm_sqr() > 1e-12 {
+        candan_bias_correction(window_size) * (numerator / denominator).re
+    } else {
+        0.0
+    };
+
+    (bin as f32 + delta) * hz_per_bin
+}
+
+/// Candan 2015 Eq. 12 bias-correction factor `c_N` for the pipeline's Hann window
+/// (defined over `[0, N-1]`), precomputed offline by evaluating Eq. 12 with the
+/// window transform f_w and its derivative at 0, ±1 (derivation and numbers:
+/// docs/audits/faithfulness-audit-03-jacobsen.md). For Hann, c_N → 2 exactly as
+/// N → ∞; the finite-N values differ only in the fourth decimal.
+#[inline]
+fn candan_bias_correction(window_size: usize) -> f32 {
+    match window_size {
+        2048 => 2.001_329,
+        8192 => 2.000_332,
+        // Hann asymptotic limit — within 1.4e-3 of exact for any N ≥ 1024.
+        _ => 2.0,
     }
 }
 
@@ -110,6 +253,17 @@ static HANN_1024: Lazy<[f32; 1024]> = Lazy::new(|| {
 ///
 /// Returns `(amplitude, phase)` where the amplitude is normalized by `4/N`
 /// (Hann coherent gain = 0.5, ×2 for single-sided) to match physical time-domain units.
+///
+/// The phase carries a constant `ω(N−1)` offset relative to the DTFT phase (the
+/// standard Goertzel finalization; it vanishes only at integer bins). The offset is
+/// fixed per target frequency, so **hop-to-hop phase differences are exact** — the
+/// engine's phase-vocoder use — but the absolute phase is not the DTFT's.
+///
+/// # Reference
+/// Goertzel, G. (1958). "An Algorithm for the Evaluation of Finite Trigonometric
+/// Series." American Mathematical Monthly 65(1). Non-integer-frequency evaluation
+/// per Sysel & Rajmic (2012), EURASIP J. Adv. Signal Process. 2012:56. The Hann
+/// window and 4/N physical-units normalization are ours.
 pub fn goertzel(samples: &[f32], sample_rate: u32, target_hz: f32) -> (f32, f32) {
     if samples.len() < 1024 {
         return (0.0, 0.0);

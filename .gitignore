@@ -31,8 +31,23 @@ diagnostics/
 .agents/
 .claude/
 plan.md
+# Cross-chat work-queue scratch doc (paste-into-fresh-chat prompts). Kept local
+# only; its durable content (audit-series index, Prompt A/A′ results) lives in
+# faithfulness-audit-01-twm.md and ADR 0006.
+docs/design/next-chats-handoff.md
 
 # User-specific files
+.venv/
 docs/old
 resources/
 tuning_profile.json
+
+# MOBO sweep artifacts — regenerated at the repo root by scripts/optimize_twm.py
+/twm_mobo.db
+/twm_pareto_arm*.json
+# Archived Optuna study DBs (large binaries). The archived Pareto fronts (*.json)
+# and READMEs stay tracked: they are the evidence base ADR 0006 cites (incl. the
+# queued 77/87 candidate's parameters in run4 arm6).
+docs/mobo-archive/**/*.db
+# Python bytecode
+scripts/__pycache__/

@@ -28,9 +28,7 @@
 //! set by the standalone [`calibration`](crate::calibration) module or the GUI slider.
 //! The Gatekeeper has no knowledge of how the threshold was computed.
 
-use crate::algorithms::metrics::{
-    calculate_ema, calculate_nhwrsf, calculate_ninos2, calculate_rms,
-};
+use crate::algorithms::metrics::{ema, nhwrsf, ninos2, rms};
 use crate::audio::WINDOW_SIZE;
 use crate::pipeline::{AudioPool, ProcessingFrame};
 use std::sync::Arc;
@@ -189,7 +187,7 @@ impl Gatekeeper {
     pub fn process_frame(&mut self, frame: &ProcessingFrame) -> GateResult {
         // State 0: Calculate RMS amplitude for Silence fallback
         // Slice only the newest WINDOW_SIZE samples from the historical buffer to keep transient detection snappy
-        let rms = calculate_rms(&frame.audio_buffer[frame.audio_buffer.len() - WINDOW_SIZE..]);
+        let rms = rms(&frame.audio_buffer[frame.audio_buffer.len() - WINDOW_SIZE..]);
 
         // Evaluate signal deterioration using EMA alpha.
         // We rely purely on the slow EMA release or the next NHWRSF onset
@@ -201,7 +199,7 @@ impl Gatekeeper {
         };
 
         // Apply dynamic Exponential Moving Average
-        self.current_rms_ema = calculate_ema(rms, self.current_rms_ema, alpha);
+        self.current_rms_ema = ema(rms, self.current_rms_ema, alpha);
         let smoothed_rms = self.current_rms_ema;
 
         // State 0: Claude's Transient Guard — do not abort to Silence mid-transient.
@@ -222,14 +220,19 @@ impl Gatekeeper {
         let current_spectrum = &frame.frequency_buffer[..];
 
         // Calculate all active-state spectral metrics
-        let raw_ninos2 = calculate_ninos2(current_spectrum);
+        let raw_ninos2 = ninos2(current_spectrum);
         self.current_ninos2_raw = raw_ninos2;
-        self.current_ninos2_ema = calculate_ema(
+        self.current_ninos2_ema = ema(
             raw_ninos2,
             self.current_ninos2_ema,
             self.config.ninos2_ema_alpha,
         );
-        self.current_nhwrsf = calculate_nhwrsf(current_spectrum, &mut self.prev_spectrum[..]);
+        self.current_nhwrsf = nhwrsf(
+            current_spectrum,
+            &mut self.prev_spectrum[..],
+            WINDOW_SIZE,
+            crate::audio::SAMPLE_RATE,
+        );
 
         // State 1 & 2: Transient detection routing
         self.is_transient_bypass = self.process_transient_detection();

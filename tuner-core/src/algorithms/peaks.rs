@@ -24,11 +24,13 @@ pub struct SpectralPeak {
 /// 4. Sort peaks by magnitude descending. Store in `peaks_out`.
 ///
 /// # Arguments
-/// * `magnitudes` — Linear magnitude spectrum (output of `spectrum_to_magnitudes`).
+/// * `magnitudes` — Linear magnitude spectrum (output of `magnitude_spectrum`).
 /// * `complex_spectrum` — Complex frequency spectrum from the RFFT.
 /// * `sample_rate` — Audio sample rate in Hz.
 /// * `fft_size` — FFT window size (e.g. 8192).
-/// * `min_magnitude` — Absolute minimum linear magnitude threshold for a peak to be considered.
+/// * `min_magnitude` — Absolute minimum linear magnitude threshold for a peak to be
+///   considered. (Discovery passes a Neyman–Pearson AWGN false-alarm threshold
+///   computed per frame — see the Kay 1998 derivation in `engine.rs`.)
 /// * `peaks_out` — Mutable slice to write peaks into.
 ///
 /// # Returns
@@ -50,8 +52,6 @@ pub fn extract_peaks(
         return 0; // Empty spectrum or invalid threshold
     }
 
-    let hz_per_bin = sample_rate as f32 / fft_size as f32;
-
     let mut temp_peaks = [SpectralPeak::default(); 128];
     let mut num_found = 0;
 
@@ -60,32 +60,9 @@ pub fn extract_peaks(
         let mag = magnitudes[i];
 
         if mag > noise_floor && mag > magnitudes[i - 1] && mag > magnitudes[i + 1] {
-            // Jacobsen estimator (Candan 2015 — optimal for Hann windows)
-            // Citation: Candan, Ç. (2015). Signal Processing, 114, 245-250.
-            // DOI: 10.1016/j.sigpro.2015.03.009
-            // Our Hann window is defined from [0, N-1], which is a time-shift of N/2
-            // relative to the zero-centered window [-N/2, N/2-1] assumed by the estimator.
-            // By the Fourier Shift Theorem, we must multiply bin `m` by e^(j*pi*m) = (-1)^m
-            // to correct the phase before applying the complex formula.
-            let sign_prev = if (i - 1) % 2 == 0 { 1.0 } else { -1.0 };
-            let sign_peak = if i % 2 == 0 { 1.0 } else { -1.0 };
-            let sign_next = if (i + 1) % 2 == 0 { 1.0 } else { -1.0 };
-
-            let x_prev = complex_spectrum[i - 1] * sign_prev;
-            let x_peak = complex_spectrum[i] * sign_peak;
-            let x_next = complex_spectrum[i + 1] * sign_next;
-
-            let numerator = x_prev - x_next;
-            let denominator = Complex::new(2.0, 0.0) * x_peak - x_prev - x_next;
-
-            let delta = if denominator.norm_sqr() > 1e-12 {
-                (numerator / denominator).re
-            } else {
-                0.0
-            };
-
-            let interpolated_bin = i as f32 + delta;
-            let frequency = interpolated_bin * hz_per_bin;
+            // Sub-bin refinement via the complex-domain Jacobsen estimator (Candan 2015).
+            let frequency =
+                crate::algorithms::spectral::jacobsen(complex_spectrum, i, fft_size, sample_rate);
 
             if frequency > 0.0 && num_found < temp_peaks.len() {
                 temp_peaks[num_found] = SpectralPeak {
@@ -112,24 +89,40 @@ pub fn extract_peaks(
     count
 }
 
-/// ── Gómez (2006) Peak Masking & SMS Dynamic Range ────────────────
+/// ── Peak Masking & Dynamic-Range Gate (OURS — empirically validated) ─────
 /// Filters out acoustic side-lobes, sympathetic resonance, and intermodulation
 /// distortion that cause TWM to sub-harmonically false-lock.
+///
+/// # Provenance (faithfulness-audit-04)
+/// This is the codebase's own heuristic, NOT a paper port — validated on real
+/// captures in ADR 0002 (2026-05-28: replaced the failed geometric gate; 8/8
+/// keys, zero false locks; known limitation: environments with SNR ≲ 30 dB).
+/// * The **global dynamic-range gate** adapts Cano (1998) §4.3, which accepts
+///   only peaks "less than 40 dB below the highest peak"; we ship the stricter
+///   −30 dB that ADR 0002 validated.
+/// * The **dominance masking** (a louder peak suppresses smaller peaks within
+///   a proportional band) is ours; the 20 % bandwidth matches the textbook
+///   critical-band approximation (CB ≈ 0.2·f above ~500 Hz) — inspiration,
+///   not a port. No masking procedure exists in Gómez (2006) or Cano (1998);
+///   do not re-cite them for it (see faithfulness-audit-04).
 ///
 /// # Preconditions
 /// The `peaks` slice must contain no more than 64 elements. If it is larger,
 /// it will be artificially truncated to 64 to fit the internal tracking array.
 ///
 /// # Reference
-/// 1. Gómez, E. (2006). "Tonal Description of Music Audio Signals." PhD Thesis, MTG - Universitat Pompeu Fabra. Section 3.1.2.2.
-/// 2. Cano, P. (1998). "Fundamental Frequency Estimation in the SMS Analysis". DAFX.
-/// (Note: University theses and DAFx conference proceedings typically do not issue DOIs).
+/// 1. ADR 0002 (`docs/adr/0002-twm-peak-masking-validation.md`) — the
+///    empirical basis for the mechanism and the −30 dB values.
+/// 2. Cano, P. (1998). "Fundamental Frequency Estimation in the SMS Analysis."
+///    DAFx-98, §4.3 — the dynamic-range rule the global gate adapts
+///    (`resources/engine/CAN65.PS.pdf`).
 ///
 /// # Algorithm
-/// Peaks are evaluated in descending amplitude order. First, any
-/// peak outside the 40 dB dynamic range of the global maximum is discarded (Cano).
-/// Then, a dominant peak masks any smaller peak that falls within its proportional
-/// critical band if the smaller peak is below a relative masking threshold (Gómez).
+/// Peaks are evaluated in descending amplitude order. First, any peak more
+/// than 30 dB below the global maximum is discarded (Cano's 40 dB rule,
+/// tightened per ADR 0002). Then, a dominant peak masks any smaller peak that
+/// falls within its proportional critical band if the smaller peak is below a
+/// relative masking threshold.
 pub fn mask_peaks(peaks: &mut [SpectralPeak]) -> usize {
     if peaks.is_empty() {
         return 0;
@@ -145,17 +138,17 @@ pub fn mask_peaks(peaks: &mut [SpectralPeak]) -> usize {
     let mut masked = [false; 64];
     let global_max = active_peaks[0].magnitude;
 
-    // Canonical Gómez/Essentia Defaults & SMS dynamic range
-    const GLOBAL_THRESHOLD_DB: f32 = 0.0316; // -30 dB from global max
-    const MASK_THRESHOLD_DB: f32 = 0.0316; // -30 dB relative to masker
-    const MASK_BANDWIDTH_PROPORTION: f32 = 0.20; // 20% proportional bandwidth
+    // OUR constants, ADR 0002-validated (not from Gómez/Cano — see doc-comment).
+    const GLOBAL_THRESHOLD_DB: f32 = 0.0316; // −30 dB from global max (Cano §4.3 proposes 40 dB; ADR 0002 validated 30)
+    const MASK_THRESHOLD_DB: f32 = 0.0316; // −30 dB relative to masker
+    const MASK_BANDWIDTH_PROPORTION: f32 = 0.20; // ≈ textbook critical band (CB ≈ 0.2·f above ~500 Hz)
 
     for i in 0..k {
         if masked[i] {
             continue;
         }
 
-        // Absolute structural threshold (SMS Rule): -40 dB from the global maximum.
+        // Global dynamic-range gate: −30 dB from the frame's maximum (ADR 0002).
         // Prevents the engine from analyzing isolated microscopic acoustic room noise.
         if active_peaks[i].magnitude < global_max * GLOBAL_THRESHOLD_DB {
             continue;

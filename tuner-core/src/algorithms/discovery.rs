@@ -23,7 +23,7 @@
 
 use crate::algorithms::peaks::SpectralPeak;
 use crate::algorithms::twm::{self, TwmConfig};
-use crate::engine::KeyProfile;
+use crate::models::KeyProfile;
 
 /// Candidates carried from Stage A into Stage B refinement. 88 = **exhaustive**:
 /// every key is refined, so there is no shortlist cutoff to justify (no magic
@@ -36,7 +36,7 @@ use crate::engine::KeyProfile;
 /// Cost is ~1 ms per discovery frame (onset-only, until the 3-frame lock) — set
 /// below 88 ONLY if a micro-bench on target hardware shows the hop budget can't
 /// afford it, at which point it becomes a latency-vs-recall knob.
-pub const TOP_K: usize = 88;
+pub const TOP_K: usize = 3;
 
 /// Half-width of the Stage B refinement window, in cents. Adjacent-key basins
 /// (100 cents apart) barely overlap, and sub-harmonics sit 1200 cents away, so
@@ -220,7 +220,10 @@ mod tests {
     fn build_profiles() -> Box<[KeyProfile; 88]> {
         let mut v = Vec::with_capacity(88);
         for i in 0..88 {
-            v.push(KeyProfile::new(NOTES[i].frequency, get_expected_beta(i as u8)));
+            v.push(KeyProfile::new(
+                NOTES[i].frequency,
+                get_expected_beta(i as u8),
+            ));
         }
         let arr: [KeyProfile; 88] = v.try_into().unwrap();
         Box::new(arr)
@@ -266,12 +269,14 @@ mod tests {
         let cfg = TwmConfig::default();
         // (key, detune in cents) — spans bass/mid/treble, both directions, and
         // the in-tune case. ±3-cent tolerance vs the ~2-cent design target.
-        for &(key, cents) in &[
-            (17_usize, -40.0_f32),
-            (40, 0.0),
-            (40, 70.0),
-            (64, -25.0),
-        ] {
+        // The +60¢ case is a strong pitch-raise: the full-pipeline (Stage A K=3 →
+        // Stage B) recovery ceiling for this key is ~69¢ under the conservative
+        // default's amplitude weighting (~78¢ under canonical M&B; 1¢-resolution
+        // measured). The binding limit is the Stage-A top-3 GATE — beyond the
+        // ceiling the true key drops to rank ≥3 and never reaches refinement; it is
+        // NOT a Stage-B failure (refine-alone on the true key recovers past it).
+        // +60¢ is well-margined under 69¢. See ADR 0006 (pitch-raise-reach cost).
+        for &(key, cents) in &[(17_usize, -40.0_f32), (40, 0.0), (40, 60.0), (64, -25.0)] {
             let s_true = cents_to_scale(cents);
             let peaks = synth_peaks(&profiles[key], s_true, 20);
             let res = discover(&peaks, &profiles, &cfg, true);

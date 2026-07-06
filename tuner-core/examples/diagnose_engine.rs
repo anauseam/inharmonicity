@@ -9,30 +9,108 @@ use std::path::Path;
 use crossbeam_queue::ArrayQueue;
 use std::sync::Arc;
 use tuner_core::algorithms::peaks::{SpectralPeak, extract_peaks};
-use tuner_core::algorithms::spectral::{perform_fft, spectrum_to_magnitudes};
+use tuner_core::algorithms::spectral::{fft, magnitude_spectrum};
 use tuner_core::audio::{BASS_WINDOW_SIZE, HOP_SIZE, WINDOW_SIZE};
-use tuner_core::engine::{Engine, KeyProfile};
+use tuner_core::engine::Engine;
 use tuner_core::gatekeeper::Gatekeeper;
-use tuner_core::models::{NOTES, get_expected_beta};
+use tuner_core::models::{KeyProfile, NOTES, get_expected_beta};
 use tuner_core::pipeline::ProcessingFrame;
 
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     let mut file_path = String::new();
     let mut refine = false;
+    let mut use_stretch = false;
+    let mut profile_path: Option<String> = None;
+    let mut cfg = tuner_core::algorithms::twm::TwmConfig::default();
 
-    for arg in args.iter().skip(1) {
-        if arg == "--refine" {
-            refine = true;
-        } else if !arg.starts_with("--") {
-            file_path = arg.clone();
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--refine" => refine = true,
+            // EXPERIMENT (test #1): sum the forward error instead of averaging (/N).
+            "--sum-forward" => cfg.sum_forward = true,
+            // EXPERIMENT (test #2a): stretched (Railsback) template reference.
+            "--stretch" => use_stretch = true,
+            // EXPERIMENT (n-kernel): forward-error B-deadzone scaling c.
+            "--b-deadzone" => {
+                i += 1;
+                cfg.b_deadzone = args
+                    .get(i)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(cfg.b_deadzone);
+            }
+            // EXPERIMENT (Duan non-peak): per-hallucinated-partial penalty.
+            "--nonpeak" => {
+                i += 1;
+                cfg.nonpeak_penalty = args
+                    .get(i)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(cfg.nonpeak_penalty);
+            }
+            // EXPERIMENT (Emiya smoothness): matched-partial amplitude-incoherence penalty.
+            "--smoothness" => {
+                i += 1;
+                cfg.smoothness_penalty = args
+                    .get(i)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(cfg.smoothness_penalty);
+            }
+            // `--config "p q r rho lambda"` (one space-separated arg; lambda may be `inf`).
+            // Lets the real-capture harness score MOBO candidate constants without
+            // recompiling the hardcoded default.
+            "--config" => {
+                i += 1;
+                let parts: Vec<&str> = args
+                    .get(i)
+                    .map(|s| s.split_whitespace().collect())
+                    .unwrap_or_default();
+                if parts.len() == 5 {
+                    cfg = tuner_core::algorithms::twm::TwmConfig {
+                        p: parts[0].parse().unwrap_or(cfg.p),
+                        q: parts[1].parse().unwrap_or(cfg.q),
+                        r: parts[2].parse().unwrap_or(cfg.r),
+                        rho: parts[3].parse().unwrap_or(cfg.rho),
+                        lambda_penalty: parts[4].parse().unwrap_or(cfg.lambda_penalty),
+                        ..cfg
+                    };
+                } else {
+                    return Err(anyhow!("--config needs 5 floats: \"p q r rho lambda\""));
+                }
+            }
+            // VALIDATION: seed each measured key's discovery template with its
+            // measured B from a persisted InharmonicityProfile (via the same
+            // `KeyProfile::from_measurement` the live pipeline uses). Lets the
+            // real-capture harness confirm the oracle-B bass false-lock drop.
+            "--profile" => {
+                i += 1;
+                profile_path = args.get(i).cloned();
+            }
+            a if !a.starts_with("--") => file_path = a.to_string(),
+            _ => {}
         }
+        i += 1;
     }
 
     if file_path.is_empty() {
-        println!("Usage: cargo run --example diagnose_engine -- <path_to_audio.raw> [--refine]");
+        println!(
+            "Usage: cargo run --example diagnose_engine -- <path_to_audio.raw> [--refine] [--config \"p q r rho lambda\"]"
+        );
         return Ok(());
     }
+    eprintln!(
+        "[CONFIG] p={} q={} r={} rho={} lambda={} b_deadzone={} nonpeak={} sum_forward={} stretch={} refine={}",
+        cfg.p,
+        cfg.q,
+        cfg.r,
+        cfg.rho,
+        cfg.lambda_penalty,
+        cfg.b_deadzone,
+        cfg.nonpeak_penalty,
+        cfg.sum_forward,
+        use_stretch,
+        refine
+    );
 
     let path = Path::new(&file_path);
     let parent_dir = path.parent().unwrap_or(Path::new(""));
@@ -103,15 +181,45 @@ fn main() -> Result<()> {
     let mut engine = Engine::new(44100);
     engine.noise_floor = noise_floor;
 
-    // Reconstruct KeyProfiles directly since they are private in Engine
+    // Reconstruct KeyProfiles directly since they are private in Engine.
+    // EXPERIMENT (test #2a): with --stretch, center each template on the expected
+    // Railsback-stretched pitch instead of raw ET (discovery scoring only).
+    let stretch = tuner_core::models::railsback_stretch_curve();
     let mut profiles_vec = Vec::with_capacity(88);
     for i in 0..88 {
         let note = &NOTES[i];
         let beta = get_expected_beta(i as u8);
-        profiles_vec.push(KeyProfile::new(note.frequency, beta));
+        let f0 = if use_stretch {
+            note.frequency * 2.0_f32.powf(stretch[i] / 1200.0)
+        } else {
+            note.frequency
+        };
+        profiles_vec.push(KeyProfile::new(f0, beta));
     }
 
-    let profiles_array: [KeyProfile; 88] = profiles_vec.try_into().unwrap();
+    let mut profiles_array: [KeyProfile; 88] = profiles_vec.try_into().unwrap();
+
+    // VALIDATION (--profile): overwrite each measured key's template with its
+    // measured-B template (the live pipeline's exact ET-centered, β-only mapping).
+    // This drives BOTH the per-frame `discover()` CSV and `engine.process` below,
+    // so bass false-locks can be compared against the prior-only baseline.
+    if let Some(p) = &profile_path {
+        match tuner_core::models::InharmonicityProfile::from_file(p) {
+            Ok(profile) => {
+                let mut applied = 0usize;
+                for (&key, m) in &profile.measurements {
+                    if let Some(kp) = KeyProfile::from_measurement(m)
+                        && let Some(slot) = profiles_array.get_mut(key as usize)
+                    {
+                        *slot = kp;
+                        applied += 1;
+                    }
+                }
+                eprintln!("[PROFILE] Applied measured B for {applied} key(s) from {p}");
+            }
+            Err(e) => return Err(anyhow!("--profile: cannot read {p}: {e}")),
+        }
+    }
 
     // Setup output files
     let path = Path::new(&file_path);
@@ -156,7 +264,7 @@ fn main() -> Result<()> {
         let rms = (sum_sq / BASS_WINDOW_SIZE as f32).sqrt();
         let dbfs = 20.0 * rms.log10();
 
-        perform_fft(
+        fft(
             frame_audio,
             &mut time_buffer,
             &mut frequency_buffer,
@@ -164,7 +272,7 @@ fn main() -> Result<()> {
             BASS_WINDOW_SIZE,
         );
 
-        spectrum_to_magnitudes(&frequency_buffer, BASS_WINDOW_SIZE, &mut magnitude_buffer);
+        magnitude_spectrum(&frequency_buffer, BASS_WINDOW_SIZE, &mut magnitude_buffer);
 
         // Dump spectrum (first ~5000Hz to save space, ~928 bins)
         let hz_per_bin = sample_rate as f32 / BASS_WINDOW_SIZE as f32;
@@ -180,7 +288,7 @@ fn main() -> Result<()> {
         // Run Gatekeeper
         processing_frame.audio_buffer[..BASS_WINDOW_SIZE].copy_from_slice(frame_audio);
         let newest_start = BASS_WINDOW_SIZE - WINDOW_SIZE;
-        perform_fft(
+        fft(
             &processing_frame.audio_buffer[newest_start..BASS_WINDOW_SIZE],
             &mut processing_frame.time_buffer[..WINDOW_SIZE],
             &mut processing_frame.frequency_buffer[..],
@@ -217,19 +325,24 @@ fn main() -> Result<()> {
             note_name = "BYPASS";
             s_win_cents = 0.0;
         } else {
-            let cfg = tuner_core::algorithms::twm::TwmConfig::default();
-            let res = tuner_core::algorithms::discovery::discover(active_peaks, &profiles_array, &cfg, refine);
-            
+            let res = tuner_core::algorithms::discovery::discover(
+                active_peaks,
+                &profiles_array,
+                &cfg,
+                refine,
+            );
+
             winning_key = res.key_index;
             e_win = res.error;
             profile = &profiles_array[winning_key as usize];
             note_name = &NOTES[winning_key as usize].name;
-            s_win_cents = if refine { 1200.0 * res.scale.log2() } else { 0.0 };
+            s_win_cents = if refine {
+                1200.0 * res.scale.log2()
+            } else {
+                0.0
+            };
 
-            println!(
-                "TWM Lock: {} ({:.1})",
-                note_name, e_win
-            );
+            println!("TWM Lock: {} ({:.1})", note_name, e_win);
         }
 
         // Print terminal block
@@ -264,6 +377,7 @@ fn main() -> Result<()> {
         let is_silence = gate_result.state == tuner_core::gatekeeper::SignalState::Silence;
         let pitch_result = engine.process(
             &mut processing_frame,
+            &profiles_array,
             is_silence,
             gate_result.is_new_onset,
             gate_result.is_transient_bypass,

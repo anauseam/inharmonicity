@@ -7,7 +7,7 @@ fn single_peak_extraction() {
     let sample_rate = 44100;
     let fft_size = 2048;
 
-    // Create a peak at bin 10 (approx 215 Hz, so below crossover, uses Quinn)
+    // Create a peak at bin 10 (approx 215 Hz).
     magnitudes[9] = 0.5;
     magnitudes[10] = 1.0;
     magnitudes[11] = 0.5;

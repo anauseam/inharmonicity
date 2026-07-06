@@ -13,20 +13,22 @@ able to consume the crate as-is.
 
 `tuner-gui` depends on `tuner-core`. The reverse never holds.
 
-The GUI interacts with the core through exactly four channels:
+The GUI interacts with the core through exactly five channels:
 
-1. `AudioPipeline::new()` returns `(AudioPipeline, PipelineHandle)` — the
-   Split / Handle pattern. The GUI keeps the handle; the audio thread
+1. `AudioPipeline::new()` returns `(AudioPipeline, PipelinePorts)` — the
+   Split / Handle pattern. The GUI keeps the ports; the audio thread
    takes the pipeline.
-2. `PipelineHandle.atomics` — wait-free reads of `RuntimeAtomics` and
-   wait-free writes of `ConfigAtomics`, plus the `CaptureState`
-   lifecycle atomic.
-3. `PipelineHandle.result_rx` — a crossbeam SPSC receiver for
+2. `PipelinePorts.handle.atomics` — wait-free reads of `RuntimeAtomics`
+   and wait-free writes of `ConfigAtomics`, plus the `CaptureState`
+   lifecycle atomic. (`handle` is the cloneable `PipelineHandle`.)
+3. `PipelinePorts.worker_rx` — a crossbeam SPSC receiver for
    `KeyMeasurement` results coming back from the Worker thread.
-4. A `triple_buffer` carrying the live, continuous `FrameOutput` from
+4. `PipelinePorts.profiles` — a `ringbuf` SPSC producer for pushing
+   recompiled `KeyProfile` templates back into the live engine (UI → DSP).
+5. A `triple_buffer` carrying the live, continuous `FrameOutput` from
    the DSP thread to the GUI for visualization.
 
-Anything that doesn't fit one of these four shapes is a sign that the
+Anything that doesn't fit one of these five shapes is a sign that the
 boundary is being violated.
 
 ## Pipeline ownership (Split / Handle pattern)
@@ -36,11 +38,14 @@ boundary is being violated.
 capture-accumulation state. It is moved to the audio thread and is the
 only thing that mutates the pipeline's internal state.
 
-`PipelineHandle` is the GUI's only window into shared state. It carries
-`Arc<PipelineAtomics>` and the `result_rx` receiver — nothing more.
+`PipelinePorts` is the GUI's window into the running pipeline. It carries
+the cloneable `PipelineHandle` (`Arc<PipelineAtomics>`), the Worker → UI
+`worker_rx` receiver, and the UI → DSP `profiles` producer — nothing more.
+The single-owner endpoints (`worker_rx`, `profiles`) are kept out of the
+cloneable handle; `spawn_analysis_thread` folds the ports into a `HostHandle`.
 
 A frontend contributor calls `AudioPipeline::new()`, gets a
-`PipelineHandle`, and never needs to know about Gatekeeper internals,
+`PipelinePorts`, and never needs to know about Gatekeeper internals,
 EMA calculations, or lock management.
 
 ## DSP components are pure
@@ -83,6 +88,7 @@ already calls). Bypassing it — for example, having `audio.rs` call into
 - **Views compose widgets.** `main_view.rs` and `settings_view.rs`
   arrange widgets into layouts; they do not implement DSP.
 - **`app.rs` is the state hub.** All application state, message
-  handling, and thread management live there. DSP logic that has
-  historically leaked into `app.rs` is being migrated into
-  `tuner-core` — new code should not add to that backlog.
+  handling, and thread management live there. It holds **no DSP** —
+  signal processing lives entirely in `tuner-core`; `app.rs` only reads
+  per-hop telemetry (`FrameOutput`) and worker results and writes config
+  atomics. Keep it that way: DSP logic does not belong in `app.rs`.
