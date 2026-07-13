@@ -179,6 +179,9 @@ The major DSP components and their foundations:
 - **Note Discovery**: Maher & Beauchamp (1994) Two-Way Mismatch
 - **Sympathetic Noise Rejection**: `mask_peaks` — our own critical-band masking heuristic (empirically validated in ADR 0002; the global magnitude gate adapts Cano 1998), with a Duan et al. (2010) topological ceiling on the reverse TWM error term
 - **Inharmonicity**: Hodgkinson (2009) Median-Adjustive Trajectories (MAT) — serial trajectory growth, with Short & Garcia (2006) Complex Spectral Phase Evolution (CSPE) sub-bin refinement
+- **Tuning curve** (cold path): Rigaud, David & Daudet (2013) parametric inharmonicity-and-tuning model — the $B_\xi$ fit and the $\rho_\varphi$ octave-type curve; Giordano (2015) sensory-dissonance octave-width recipe (Plomp–Levelt roughness in the Sethares parametrization) as the perceptual layer; Whittaker (1923) / Eilers (2003) smoother for the per-key residual
+
+Each of those is one file named for the one method it implements (`rigaud.rs`, `giordano.rs`, `whittaker.rs`), composed by `curves.rs` — the same shape `discovery.rs` has over `twm.rs`, and for the same reason: a cited method stays pure and auditable in its own file, and the orchestrator is where they are combined.
 
 If the pipeline produces bad data, the fix is usually to implement the mathematically complete version of the algorithm rather than adding a clamp or a safety bound.
 
@@ -262,6 +265,14 @@ The pipeline is statically locked to a 44,100 Hz sample rate. This is not just a
 - **Math Constants**: Parameters like EMA smoothing alphas (`rms_ema_alpha = 0.1`) and the Gatekeeper's timing thresholds are calibrated against 44.1kHz timing and frequency bin widths.
 
 Attempting to change the sample rate dynamically would require migrating away from fixed-size arrays to dynamic allocations on the audio hot-path, breaking the core real-time guarantees. While we currently rely on the host OS audio daemon (e.g., PipeWire or CoreAudio) to resample native hardware inputs down to 44.1kHz, this is strictly a temporary stopgap. Full dynamic sample rate support is planned for the future, but it requires a complex architectural overhaul; shipping a robust, working pipeline at a fixed rate remains the immediate priority.
+
+### The `synth` module is cold-path (curve auralization, no audio-out stream)
+
+`tuner_core::synth` renders a computed `TuningCurve` to audio by **offline additive resynthesis** — placing each key's measured partials at the curve's target frequencies and summing them. Its purpose is _auralization_: hearing how a candidate stretch sounds before tuning a piano to it, since there is no ground-truth-free "best" curve (octave, fifth, and twelfth beats are mutually incompatible objectives — it is a listening judgment). Today the `auralize` example drives it to render a loudness-matched A/B set of WAVs.
+
+This module is deliberately **not part of the real-time system**. It runs on none of the four threads above, touches no shared pipeline state, allocates freely, and owns **no audio stream** — it returns a `Vec<f32>` (or writes a WAV) and hands the level policy to the caller. It sits alongside the cold-path curve math, not the hot path; the four-thread model and the zero-allocation invariants are unaffected by it.
+
+Playback through a speaker — the future GUI "hear the curve" feature — is a **separate, deferred** piece. When it is built, the audio **output** stream will live in `tuner_core::audio` (the single CPAL boundary), **not** in the GUI: `tuner-core` is headless and the GUI speaks only the five channels above. That stream is the mirror image of the capture crossing — a CPAL output callback (the real-time _consumer_) fills a `&mut [f32]` from a lock-free ring buffer whose _producer_ is the cold synth — so it is a documented **sixth cross-thread crossing**, exposed as an opt-in handle like `spawn_analysis_thread`, subject to the same wait-free/no-allocation callback discipline as the input path. Duplex (playing synthesized notes while the tuner is listening) is intentionally out of scope; capture and playback never run at once.
 
 ## Pointers
 

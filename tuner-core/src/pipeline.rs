@@ -37,11 +37,13 @@ use crate::FrameOutput;
 use crate::audio::{BASS_WINDOW_SIZE, HOP_SIZE, WINDOW_SIZE};
 use crate::cola::CircularFifo;
 
+use crate::algorithms::spectral;
 use crate::engine::Engine;
-use crate::gatekeeper::Gatekeeper;
+use crate::gatekeeper::{Gatekeeper, SignalState};
 use crate::models::{
     InharmonicityProfile, KeyMeasurement, KeyProfile, PROFILE_PATH, build_default_profiles,
 };
+use crate::worker::WorkerManager;
 
 // ─── Memory Infrastructure ───────────────────────────────────────────────────
 
@@ -70,6 +72,11 @@ pub struct CapturePayload {
     pub noise_floor: f32,
     /// Highly accurate unified Goertzel seed for MAT (None if tracking failed)
     pub measured_f0: Option<f32>,
+    /// Capture provenance: `true` when the key identity came from the
+    /// auto-discovery latch rather than a user-named target. Recorded on
+    /// [`crate::models::KeyMeasurement`] — the tuning curve trusts manual
+    /// captures only (ADR 0006 item 3).
+    pub captured_in_auto: bool,
 }
 
 // ─── Profile Updates (Crossing #4: UI → DSP) ─────────────────────────────────
@@ -270,8 +277,7 @@ pub fn store_option_f32(atom: &AtomicU32, val: Option<f32>) {
 /// UI-editable configuration parameters. The audio thread reads only.
 ///
 /// Each field is an individual [`AtomicU32`] or [`AtomicU8`] — wait-free reads with zero
-/// risk of priority inversion or lock contention. Replaces the former
-/// `Arc<Mutex<ConfigState>>`.
+/// risk of priority inversion or lock contention.
 pub struct ConfigAtomics {
     /// Minimum RMS amplitude required to exit the `Silence` state.
     pub silence_threshold: AtomicU32,
@@ -413,12 +419,9 @@ impl std::fmt::Debug for PipelineHandle {
         f.debug_struct("PipelineHandle")
             .field(
                 "silence_threshold",
-                &crate::pipeline::load_f32(&self.atomics.config.silence_threshold),
+                &load_f32(&self.atomics.config.silence_threshold),
             )
-            .field(
-                "rms_ema",
-                &crate::pipeline::load_f32(&self.atomics.runtime.current_rms_ema),
-            )
+            .field("rms_ema", &load_f32(&self.atomics.runtime.current_rms_ema))
             .finish()
     }
 }
@@ -491,9 +494,10 @@ impl AudioPipeline {
         let (result_tx, worker_rx) = bounded(4);
 
         // Crossing #4: SPSC profile-update channel (UI producer → DSP consumer).
-        let (profile_tx, profile_rx) = HeapRb::<KeyProfileUpdate>::new(PROFILE_QUEUE_CAPACITY).split();
+        let (profile_tx, profile_rx) =
+            HeapRb::<KeyProfileUpdate>::new(PROFILE_QUEUE_CAPACITY).split();
 
-        crate::worker::WorkerManager::new(
+        WorkerManager::new(
             Arc::clone(&audio_pool),
             Arc::clone(&atomics),
             capture_rx,
@@ -573,7 +577,7 @@ impl AudioPipeline {
         // Populate the frame's generic frequency buffer in place
         // The newest WINDOW_SIZE samples are at the END of the buffer
         let newest_start = BASS_WINDOW_SIZE - WINDOW_SIZE;
-        crate::algorithms::spectral::fft(
+        spectral::fft(
             &self.processing_frame.audio_buffer[newest_start..BASS_WINDOW_SIZE],
             &mut self.processing_frame.time_buffer[..WINDOW_SIZE],
             &mut self.processing_frame.frequency_buffer[..],
@@ -581,7 +585,7 @@ impl AudioPipeline {
             WINDOW_SIZE,
         );
 
-        crate::algorithms::spectral::fft(
+        spectral::fft(
             &self.processing_frame.audio_buffer[..BASS_WINDOW_SIZE],
             &mut self.processing_frame.time_buffer[..BASS_WINDOW_SIZE],
             &mut self.processing_frame.bass_frequency_buffer[..],
@@ -627,14 +631,14 @@ impl AudioPipeline {
         // ─── Step 4: Treble Magnitude Extraction ───
 
         let mag_count = WINDOW_SIZE / 2;
-        crate::algorithms::spectral::magnitude_spectrum(
+        spectral::magnitude_spectrum(
             &self.processing_frame.frequency_buffer[..],
             WINDOW_SIZE,
             &mut self.processing_frame.treble_magnitude_buffer[..mag_count],
         );
 
         let mag_count_bass = BASS_WINDOW_SIZE / 2;
-        crate::algorithms::spectral::magnitude_spectrum(
+        spectral::magnitude_spectrum(
             &self.processing_frame.bass_frequency_buffer[..],
             BASS_WINDOW_SIZE,
             &mut self.processing_frame.bass_magnitude_buffer[..mag_count_bass],
@@ -642,7 +646,7 @@ impl AudioPipeline {
 
         // ─── Step 5: Pitch Detection (Engine) ───
 
-        let is_silence = gate_result.state == crate::gatekeeper::SignalState::Silence;
+        let is_silence = gate_result.state == SignalState::Silence;
         if gate_result.is_new_onset {
             self.last_measured_f0 = None;
         }
@@ -660,7 +664,7 @@ impl AudioPipeline {
 
         let current_capture_state = self.atomics.capture_state.load(Ordering::Relaxed);
 
-        if gate_result.state == crate::gatekeeper::SignalState::Silence {
+        if gate_result.state == SignalState::Silence {
             self.capture_onset_pending = false;
             // Proactively recover diagnostic buffer on false transients
             if current_capture_state == CaptureState::Armed as u8 {
@@ -697,7 +701,7 @@ impl AudioPipeline {
             }
 
             if self.capture_onset_pending
-                && gate_result.state == crate::gatekeeper::SignalState::Stable
+                && gate_result.state == SignalState::Stable
                 && let Some(buf) = self.audio_pool.pop()
             {
                 self.capture_onset_pending = false;
@@ -744,7 +748,7 @@ impl AudioPipeline {
                 self.capture_count += to_copy;
 
                 let done = self.capture_count == 66150;
-                let decayed = gate_result.state == crate::gatekeeper::SignalState::Silence;
+                let decayed = gate_result.state == SignalState::Silence;
 
                 if done || decayed {
                     let target_note = self.atomics.config.target_note.load(Ordering::Relaxed);
@@ -766,6 +770,7 @@ impl AudioPipeline {
                             sample_rate: 44100,
                             noise_floor: load_f32(&self.atomics.config.silence_threshold),
                             measured_f0: self.last_measured_f0,
+                            captured_in_auto: target_note == 255,
                         };
                         self.full_event_count = 0; // Clear state after dispatch
 
@@ -853,6 +858,7 @@ mod tests {
             partials: Vec::new(),
             calculated_b,
             last_captured: String::new(),
+            captured_in_auto: true,
         }
     }
 

@@ -132,7 +132,13 @@ fn main() {
     let mut planner = RealFftPlanner::<f32>::new();
     let r2c = planner.plan_fft_forward(N);
     let mut time_buf = vec![0.0f32; N];
-    let mut spec = vec![Complex { re: 0.0f32, im: 0.0 }; N / 2 + 1];
+    let mut spec = vec![
+        Complex {
+            re: 0.0f32,
+            im: 0.0
+        };
+        N / 2 + 1
+    ];
 
     // per metric: per register, (sum_auc, count, min_auc, n_below_95)
     const M: usize = 6;
@@ -207,7 +213,13 @@ fn main() {
             };
             let class = class.filter(|_| metrics::rms(&audio[cursor..cursor + N]) >= rms_floor);
             if let Some(class) = class {
-                spectral::fft(&audio[cursor..cursor + N], &mut time_buf, &mut spec, &r2c, N);
+                spectral::fft(
+                    &audio[cursor..cursor + N],
+                    &mut time_buf,
+                    &mut spec,
+                    &r2c,
+                    N,
+                );
                 let ours = metrics::ninos2(&spec);
                 let f = faithful_ninos2(&spec);
                 for (m, v) in [
@@ -249,7 +261,9 @@ fn main() {
         }
     }
 
-    println!("keys used: {keys_used}   (AUC oriented per metric; 1.0 = perfect transient/steady separation)");
+    println!(
+        "keys used: {keys_used}   (AUC oriented per metric; 1.0 = perfect transient/steady separation)"
+    );
     println!(
         "{:<20} {:>21} {:>21} {:>21}",
         "metric", "bass mean/min(<.95)", "mid mean/min(<.95)", "treble mean/min(<.95)"
@@ -259,6 +273,12 @@ fn main() {
             let (s, c, mn, nb) = agg[m][r];
             format!("{:.4}/{:.3} ({})", s / c as f64, mn, nb)
         };
-        println!("{:<20} {:>21} {:>21} {:>21}", names[m], cell(0), cell(1), cell(2));
+        println!(
+            "{:<20} {:>21} {:>21} {:>21}",
+            names[m],
+            cell(0),
+            cell(1),
+            cell(2)
+        );
     }
 }

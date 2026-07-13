@@ -139,8 +139,8 @@ fn synth_spectrum(
     // Per-string fundamentals (string 0 at f0; others detuned within ±spread/2).
     let mut f0_s = [cond.f0; 3];
     for f0_string in f0_s.iter_mut().take(cond.n_strings).skip(1) {
-        *f0_string =
-            cond.f0 * 2f32.powf(rng.range(-cond.spread_cents / 2.0, cond.spread_cents / 2.0) / 1200.0);
+        *f0_string = cond.f0
+            * 2f32.powf(rng.range(-cond.spread_cents / 2.0, cond.spread_cents / 2.0) / 1200.0);
     }
 
     // Sum the inharmonic series for every string. Each (string, partial) sinusoid gets a random
@@ -280,7 +280,11 @@ fn run_mat(mags: &[f32], cspe: &[f32], seed_f0: f32, order: MatOrder) -> Run {
             confidence: est.confidence,
             partials: est.partial_count,
             max_n: ns[..est.partial_count].iter().copied().max().unwrap_or(0),
-            self_resid_ppm: self_residual_ppm(&est, &freqs[..est.partial_count], &ns[..est.partial_count]),
+            self_resid_ppm: self_residual_ppm(
+                &est,
+                &freqs[..est.partial_count],
+                &ns[..est.partial_count],
+            ),
             ok: true,
         },
         None => Run::default(),
@@ -331,8 +335,15 @@ fn summarize(runs: &[Run], true_b: f32, true_f0: f32) -> Stat {
     let mut parts: Vec<f32> = ok.iter().map(|r| r.partials as f32).collect();
     let mut maxn: Vec<f32> = ok.iter().map(|r| r.max_n as f32).collect();
     let mut sresid: Vec<f32> = ok.iter().map(|r| r.self_resid_ppm).collect();
-    let mut f0err: Vec<f32> = ok.iter().map(|r| 100.0 * (r.f0 - true_f0).abs() / true_f0).collect();
-    let within = ok.iter().filter(|r| (r.b - true_b).abs() / true_b <= 0.20).count() as f32 / ok.len() as f32;
+    let mut f0err: Vec<f32> = ok
+        .iter()
+        .map(|r| 100.0 * (r.f0 - true_f0).abs() / true_f0)
+        .collect();
+    let within = ok
+        .iter()
+        .filter(|r| (r.b - true_b).abs() / true_b <= 0.20)
+        .count() as f32
+        / ok.len() as f32;
     Stat {
         n_ok: ok.len(),
         med_b: median(&mut bs),
@@ -354,7 +365,9 @@ fn run_cell(cond: Cond, seeds: usize, salt: u64) -> (Stat, Stat) {
 }
 
 fn run_cell_seeded(cond: Cond, seeds: usize, salt: u64, seed_f0: f32) -> (Stat, Stat) {
-    let nthreads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let nthreads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
     let chunk = seeds.div_ceil(nthreads).max(1);
     let (ser, sim): (Vec<Run>, Vec<Run>) = std::thread::scope(|sc| {
         let handles: Vec<_> = (0..seeds)
@@ -390,7 +403,10 @@ fn run_cell_seeded(cond: Cond, seeds: usize, salt: u64, seed_f0: f32) -> (Stat, 
         }
         (ser, sim)
     });
-    (summarize(&ser, cond.b, cond.f0), summarize(&sim, cond.b, cond.f0))
+    (
+        summarize(&ser, cond.b, cond.f0),
+        summarize(&sim, cond.b, cond.f0),
+    )
 }
 
 // ─────────────────────────── Reporting ───────────────────────────
@@ -399,32 +415,68 @@ fn sweep_header(title: &str) {
     println!("\n── {title} ──");
     println!(
         "{:>5} {:>9} | {:>8} {:>7} {:>6} {:>5} {:>4} {:>4} {:>8} {:>6} | {:>8} {:>7} {:>6} {:>5} {:>4} {:>4} {:>8} {:>6}",
-        "B×pr", "true_B",
-        "B_ser", "rat/tru", "in20%", "conf", "pt", "maxn", "self_ppm", "f0e%",
-        "B_sim", "rat/tru", "in20%", "conf", "pt", "maxn", "self_ppm", "f0e%",
+        "B×pr",
+        "true_B",
+        "B_ser",
+        "rat/tru",
+        "in20%",
+        "conf",
+        "pt",
+        "maxn",
+        "self_ppm",
+        "f0e%",
+        "B_sim",
+        "rat/tru",
+        "in20%",
+        "conf",
+        "pt",
+        "maxn",
+        "self_ppm",
+        "f0e%",
     );
 }
 
 fn sweep_row(ratio_to_prior: f32, true_b: f32, ser: &Stat, sim: &Stat) {
     let cell = |s: &Stat| {
         if s.n_ok == 0 {
-            format!("{:>8} {:>7} {:>6} {:>5} {:>4} {:>4} {:>8} {:>6}", "None", "-", "-", "-", "-", "-", "-", "-")
+            format!(
+                "{:>8} {:>7} {:>6} {:>5} {:>4} {:>4} {:>8} {:>6}",
+                "None", "-", "-", "-", "-", "-", "-", "-"
+            )
         } else {
             format!(
                 "{:>8.2e} {:>7.2} {:>5.0}% {:>5.2} {:>4.0} {:>4.0} {:>8.0} {:>6.2}",
-                s.med_b, s.med_ratio_to_true, 100.0 * s.within_20, s.med_conf,
-                s.med_partials, s.med_max_n, s.med_self_ppm, s.med_f0_err_pct,
+                s.med_b,
+                s.med_ratio_to_true,
+                100.0 * s.within_20,
+                s.med_conf,
+                s.med_partials,
+                s.med_max_n,
+                s.med_self_ppm,
+                s.med_f0_err_pct,
             )
         }
     };
-    println!("{:>5.1} {:>9.2e} | {} | {}", ratio_to_prior, true_b, cell(ser), cell(sim));
+    println!(
+        "{:>5.1} {:>9.2e} | {} | {}",
+        ratio_to_prior,
+        true_b,
+        cell(ser),
+        cell(sim)
+    );
 }
 
 fn main() {
-    println!("MAT (f₀, B) ground-truth recovery — FFT {FFT_SIZE} ({:.3} Hz/bin), SNR {SNR_DB} dB, SR {SAMPLE_RATE}",
-        SAMPLE_RATE as f32 / FFT_SIZE as f32);
-    println!("Columns per order: med recovered_B, med(recovered/true), %within±20%, med conf, med partials, med max-n, med self-fit residual (ppm), med |f0 err|%.");
-    println!("Mis-association signature = low self_ppm but rat/tru far from 1.0 (self-consistent yet wrong).");
+    println!(
+        "MAT (f₀, B) ground-truth recovery — FFT {FFT_SIZE} ({:.3} Hz/bin), SNR {SNR_DB} dB, SR {SAMPLE_RATE}",
+        SAMPLE_RATE as f32 / FFT_SIZE as f32
+    );
+    println!(
+        "Columns per order: med recovered_B, med(recovered/true), %within±20%, med conf, med partials, med max-n, med self-fit residual (ppm), med |f0 err|%."
+    );
+    println!(
+        "Mis-association signature = low self_ppm but rat/tru far from 1.0 (self-consistent yet wrong)."
+    );
 
     let seeds = 24;
 
@@ -435,7 +487,13 @@ fn main() {
         let f0 = NOTES[key].frequency;
         let prior = get_expected_beta(key as u8);
         let alpha = if key < 27 { 0.6 } else { 1.1 };
-        let n_strings = if key < 8 { 1 } else if key < 26 { 2 } else { 3 };
+        let n_strings = if key < 8 {
+            1
+        } else if key < 26 {
+            2
+        } else {
+            3
+        };
         let cond = Cond {
             f0,
             b: prior,
@@ -457,12 +515,22 @@ fn main() {
     let ratios = [1.0f32, 2.0, 3.0, 5.0, 7.0, 10.0, 14.0, 18.0, 22.0, 25.0];
 
     // ── Experiment 2: B sweep, full partials ──
-    println!("\n========== EXPERIMENT 2 — B sweep, FULL partials (no missing fundamental) ==========");
+    println!(
+        "\n========== EXPERIMENT 2 — B sweep, FULL partials (no missing fundamental) =========="
+    );
     for &(key, name) in &sweep_keys {
         let f0 = NOTES[key].frequency;
         let prior = get_expected_beta(key as u8);
-        let n_strings = if key < 8 { 1 } else if key < 26 { 2 } else { 3 };
-        sweep_header(&format!("{name} (f0 {f0:.2} Hz, prior B {prior:.2e}), full partials"));
+        let n_strings = if key < 8 {
+            1
+        } else if key < 26 {
+            2
+        } else {
+            3
+        };
+        sweep_header(&format!(
+            "{name} (f0 {f0:.2} Hz, prior B {prior:.2e}), full partials"
+        ));
         for &ratio in &ratios {
             let cond = Cond {
                 f0,
@@ -480,12 +548,22 @@ fn main() {
     }
 
     // ── Experiment 3: B sweep, missing fundamental (THE key one) ──
-    println!("\n========== EXPERIMENT 3 — B sweep, MISSING FUNDAMENTAL (partials 1–3 attenuated) ==========");
+    println!(
+        "\n========== EXPERIMENT 3 — B sweep, MISSING FUNDAMENTAL (partials 1–3 attenuated) =========="
+    );
     for &(key, name) in &sweep_keys {
         let f0 = NOTES[key].frequency;
         let prior = get_expected_beta(key as u8);
-        let n_strings = if key < 8 { 1 } else if key < 26 { 2 } else { 3 };
-        sweep_header(&format!("{name} (f0 {f0:.2} Hz, prior B {prior:.2e}), missing fundamental + sympathetic decoy"));
+        let n_strings = if key < 8 {
+            1
+        } else if key < 26 {
+            2
+        } else {
+            3
+        };
+        sweep_header(&format!(
+            "{name} (f0 {f0:.2} Hz, prior B {prior:.2e}), missing fundamental + sympathetic decoy"
+        ));
         for &ratio in &ratios {
             let cond = Cond {
                 f0,
@@ -505,12 +583,16 @@ fn main() {
     // ── Experiment 4: Parallel-string stress ──
     // Upper-bass key with 2 unison strings, wide spread → high-n divergence into resolved /
     // beating clusters (DAFx-09 Conclusion/§4). D2 (key 17) is one of the real broken keys.
-    println!("\n========== EXPERIMENT 4 — Parallel-string stress (2 strings, 12¢ spread, high-n divergence) ==========");
+    println!(
+        "\n========== EXPERIMENT 4 — Parallel-string stress (2 strings, 12¢ spread, high-n divergence) =========="
+    );
     {
         let key = 17usize;
         let f0 = NOTES[key].frequency;
         let prior = get_expected_beta(key as u8);
-        sweep_header(&format!("D2 (f0 {f0:.2} Hz, prior B {prior:.2e}), 2 strings @ 12¢, full partials"));
+        sweep_header(&format!(
+            "D2 (f0 {f0:.2} Hz, prior B {prior:.2e}), 2 strings @ 12¢, full partials"
+        ));
         for &ratio in &[1.0f32, 3.0, 7.0, 14.0, 25.0] {
             let cond = Cond {
                 f0,
@@ -547,13 +629,17 @@ fn main() {
     // A0, high B (18×), good seed: fully remove partials 1..=k. The graded gen_frame model only
     // touches 1–3; this pushes further to find where the trajectory loses its anchor and the
     // surviving partials get mis-numbered (the worst real bass hazard, taken past the model).
-    println!("\n========== EXPERIMENT 5 — Deep missing-fundamental (drop partials 1..=k), A0 B=18×prior ==========");
+    println!(
+        "\n========== EXPERIMENT 5 — Deep missing-fundamental (drop partials 1..=k), A0 B=18×prior =========="
+    );
     {
         let key = 0usize;
         let f0 = NOTES[key].frequency;
         let prior = get_expected_beta(key as u8);
         let true_b = prior * 18.0;
-        sweep_header(&format!("A0 (true B {true_b:.2e}, good seed); 'B×pr' column shows k = lowest present partial − 1"));
+        sweep_header(&format!(
+            "A0 (true B {true_b:.2e}, good seed); 'B×pr' column shows k = lowest present partial − 1"
+        ));
         for &k in &[0u32, 3, 5, 6, 8, 10, 12] {
             let cond = Cond {
                 f0,
@@ -577,13 +663,17 @@ fn main() {
     // WITH the missing fundamental and WITHOUT it, to isolate whether the hazard is the missing
     // fundamental or purely the seed. (A wrong-octave seed is what the Goertzel tracker can
     // report when the true fundamental is absent.)
-    println!("\n========== SEED SENSITIVITY — A0, B=18×prior (maps the octave-mis-association cliff) ==========");
+    println!(
+        "\n========== SEED SENSITIVITY — A0, B=18×prior (maps the octave-mis-association cliff) =========="
+    );
     {
         let key = 0usize;
         let f0 = NOTES[key].frequency;
         let prior = get_expected_beta(key as u8);
         let true_b = prior * 18.0;
-        let seed_mults = [0.5f32, 0.75, 0.9, 0.94, 0.97, 1.0, 1.03, 1.06, 1.1, 1.25, 1.5, 1.75, 2.0];
+        let seed_mults = [
+            0.5f32, 0.75, 0.9, 0.94, 0.97, 1.0, 1.03, 1.06, 1.1, 1.25, 1.5, 1.75, 2.0,
+        ];
         for &missing in &[true, false] {
             let cond = Cond {
                 f0,
@@ -607,5 +697,7 @@ fn main() {
     }
 
     println!("\n(Interpretation: see the writeup. ±20% band is the accuracy gate; rat/tru≈1 with");
-    println!(" the diagonal tracked up to 25× ⇒ deep-bass readings trustworthy ⇒ Prompt 3 founded.)");
+    println!(
+        " the diagonal tracked up to 25× ⇒ deep-bass readings trustworthy ⇒ Prompt 3 founded.)"
+    );
 }

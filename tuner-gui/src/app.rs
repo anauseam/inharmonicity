@@ -17,9 +17,8 @@ use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
 use tuner_core::{
     FrameOutput,
-    algorithms::tuning,
     audio::{self, AudioSource, HostHandle},
-    models::{InharmonicityProfile, KeyMeasurement},
+    models::{self, InharmonicityProfile, KeyMeasurement},
     pipeline::{CaptureState, PipelineHandle, load_f32, store_f32},
 };
 
@@ -449,6 +448,30 @@ impl TunerApp {
             }
             Message::UndoLastCapture => {
                 if let Some((idx, old_data)) = self.undo_history.pop_back() {
+                    // The capture being undone is the profile's current entry.
+                    // Its diagnostic dump is per-capture (timestamped dir, so
+                    // repeat captures are retained) — an undone capture is the
+                    // user declaring it bad, and offline tools glob every
+                    // diagnostics/key_* dir, so the dump must go with it.
+                    if let Some(bad) = self.inharmonicity_profile.measurements.get(&idx) {
+                        let (key_name, _) =
+                            tuner_core::models::find_nearest_note_by_index(bad.key_index);
+                        let dir = std::path::PathBuf::from("diagnostics").join(format!(
+                            "key_{:03}_{}_{}",
+                            bad.key_index, key_name, bad.last_captured
+                        ));
+                        if dir.is_dir() {
+                            match std::fs::remove_dir_all(&dir) {
+                                Ok(()) => eprintln!(
+                                    "[MAIN] Removed diagnostics of undone capture: {}",
+                                    dir.display()
+                                ),
+                                Err(e) => {
+                                    eprintln!("[MAIN] Could not remove {}: {e}", dir.display())
+                                }
+                            }
+                        }
+                    }
                     if let Some(m) = old_data {
                         self.inharmonicity_profile.measurements.insert(idx, m);
                     } else {
@@ -466,7 +489,10 @@ impl TunerApp {
                 }
             }
             Message::SaveProfile => {
-                match self.inharmonicity_profile.to_file(tuner_core::models::PROFILE_PATH) {
+                match self
+                    .inharmonicity_profile
+                    .to_file(tuner_core::models::PROFILE_PATH)
+                {
                     Ok(_) => eprintln!("[MAIN] Tuning profile saved successfully."),
                     Err(e) => eprintln!("[MAIN] Error saving profile: {}", e),
                 }
@@ -633,23 +659,43 @@ impl TunerApp {
                     // 1. Independent Decoupling of Scalar Data
                     // Assign values individually. If one drops out (e.g. confidence),
                     // we still display the others.
-                    self.display_data.last_frequency = frame.detected_frequency;
-                    self.display_data.last_confidence = frame.confidence;
-                    self.display_data.last_cents = frame.cents_deviation;
+                    //
+                    // Non-finite scalars degrade to "no reading" here — the
+                    // canvas layer tessellates path coordinates and lyon
+                    // asserts on non-finite values, so one bad DSP frame must
+                    // never reach a widget. Log it (a producer emitting
+                    // NaN/∞ is a bug worth chasing), don't crash a tuning
+                    // session over it.
+                    let finite = |v: Option<f32>| v.filter(|x| x.is_finite());
+                    if frame.detected_frequency.is_some_and(|v| !v.is_finite())
+                        || frame.cents_deviation.is_some_and(|v| !v.is_finite())
+                        || frame.confidence.is_some_and(|v| !v.is_finite())
+                    {
+                        eprintln!(
+                            "[MAIN] Dropped non-finite frame scalar(s): f={:?} cents={:?} conf={:?}",
+                            frame.detected_frequency, frame.cents_deviation, frame.confidence
+                        );
+                    }
+                    self.display_data.last_frequency = finite(frame.detected_frequency);
+                    self.display_data.last_confidence = finite(frame.confidence);
+                    self.display_data.last_cents = finite(frame.cents_deviation);
 
                     if let Some(idx) = frame.note_index {
                         self.display_data.last_note_index = Some(idx);
                     }
 
-                    if let Some(cents) = frame.cents_deviation {
+                    if let Some(cents) = self.display_data.last_cents {
                         // Update smoothing buffer
                         let cents_for_smoothing = match self.display_data.tuning_mode {
                             TuningMode::Auto => Some(cents),
-                            TuningMode::Manual { target_freq, .. } => frame
-                                .detected_frequency
-                                .map(|f| tuning::calculate_cents_deviation(f, target_freq)),
+                            TuningMode::Manual { target_freq, .. } => self
+                                .display_data
+                                .last_frequency
+                                .map(|f| models::calculate_cents_deviation(f, target_freq)),
                         };
-                        if let Some(c) = cents_for_smoothing {
+                        // The manual-mode recomputation can itself go
+                        // non-finite (e.g. an unset/zero target) — same rule.
+                        if let Some(c) = cents_for_smoothing.filter(|c| c.is_finite()) {
                             self.display_data.smoothing_buffer.push(c);
                             if self.display_data.smoothing_buffer.len() > SMOOTHING_FACTOR {
                                 self.display_data.smoothing_buffer.remove(0);

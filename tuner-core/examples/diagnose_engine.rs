@@ -8,11 +8,12 @@ use std::path::Path;
 
 use crossbeam_queue::ArrayQueue;
 use std::sync::Arc;
-use tuner_core::algorithms::peaks::{SpectralPeak, extract_peaks};
+use tuner_core::algorithms::peaks::extract_peaks;
 use tuner_core::algorithms::spectral::{fft, magnitude_spectrum};
 use tuner_core::audio::{BASS_WINDOW_SIZE, HOP_SIZE, WINDOW_SIZE};
 use tuner_core::engine::Engine;
 use tuner_core::gatekeeper::Gatekeeper;
+use tuner_core::models::SpectralPeak;
 use tuner_core::models::{KeyProfile, NOTES, get_expected_beta};
 use tuner_core::pipeline::ProcessingFrame;
 

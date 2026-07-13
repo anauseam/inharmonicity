@@ -348,7 +348,7 @@ fn create_partials_panel(
 // fn create_inharmonicity_graph_panel(
 //     data: &crate::AppDisplayData,
 //     // --- MODIFIED: Accept profile as a reference ---
-//     profile: &tuner_core::inharmonicity::InharmonicityProfile,
+//     profile: &tuner_core::rigaud::InharmonicityProfile,
 // ) -> Option<Element<'static, crate::Message>> {
 //     if !data.inharmonicity_graph_visible {
 //         return None;

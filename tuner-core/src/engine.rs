@@ -6,12 +6,12 @@
 
 use crate::algorithms::{
     discovery,
-    peaks::{self, SpectralPeak, extract_peaks},
+    peaks::{self, extract_peaks},
     spectral::goertzel,
     twm,
 };
 use crate::audio::{BASS_WINDOW_SIZE, HOP_SIZE};
-use crate::models::{KeyProfile, MAX_PARTIALS};
+use crate::models::{KeyProfile, MAX_PARTIALS, SpectralPeak};
 use crate::pipeline::ProcessingFrame;
 
 // ── Neyman-Pearson Amplitude SNR Gate ──
@@ -218,11 +218,8 @@ impl Engine {
                     // refinement on the single target profile — otherwise this is the
                     // worst-seeded path (pure ET), and it is the critical one for
                     // Pitch Raise on heavily mistuned strings.
-                    let (s, err) = discovery::refine_scale(
-                        active_peaks,
-                        &profiles[target_idx as usize],
-                        &cfg,
-                    );
+                    let (s, err) =
+                        discovery::refine_scale(active_peaks, &profiles[target_idx as usize], &cfg);
                     (target_idx, true, s, err)
                 } else {
                     // Auto Mode: split discovery (ADR 0005) — Stage A discrete 88-key
@@ -315,7 +312,15 @@ impl Engine {
 
             let t_amp = self.noise_floor * NEYMAN_PEARSON_K;
 
-            let weight = if amplitude < t_amp {
+            // A physical partial has a positive, finite frequency. On a
+            // spurious deep-bass lock the tracker free-runs on noise and the
+            // adaptive target can walk toward DC until f_target − 21.5 Hz
+            // (the unwrap half-range) crosses zero; such an f_inst is not a
+            // partial reading. Gating it to weight 0 both keeps it out of
+            // the result (a negative f_inst reached hz_to_cents as NaN and
+            // panicked the GUI canvas, observed 2026-07-10) and stops the
+            // target adaptation that lets the walk continue.
+            let weight = if amplitude < t_amp || !(f_inst.is_finite() && f_inst > 0.0) {
                 0.0
             } else {
                 amplitude * amplitude

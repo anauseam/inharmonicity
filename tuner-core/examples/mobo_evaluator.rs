@@ -31,9 +31,10 @@
 use std::time::Instant;
 
 use tuner_core::algorithms::discovery::{self, TOP_K};
-use tuner_core::algorithms::peaks::{SpectralPeak, mask_peaks};
+use tuner_core::algorithms::peaks::mask_peaks;
 use tuner_core::algorithms::twm::{self, TwmConfig};
 use tuner_core::models::KeyProfile;
+use tuner_core::models::SpectralPeak;
 use tuner_core::models::get_expected_beta;
 
 const FIXED_SEED: u64 = 0x1AB4_2026_0612_5EED;

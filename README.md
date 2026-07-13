@@ -26,8 +26,11 @@ inharmonicity/
 │   │   │   ├── twm.rs              # Canonical Two-Way Mismatch (Primary F0 discovery)
 │   │   │   ├── mat.rs              # Median-Adjustive Trajectories — faithful serial (f₀,B) estimator w/ CSPE
 │   │   │   ├── metrics.rs          # RMS, EMA, NHWRSF, NINOS2 signal metrics
-│   │   │   ├── tuning.rs           # Cent deviation, inharmonicity-compensated frequencies
-│   │   │   └── inharmonicity.rs    # Deprecated B-fit; reserved for the future inharmonic tuning curve
+│   │   │   ├── discovery.rs        # Split discovery search (Stage A 88-key scan → Stage B refine)
+│   │   │   ├── curves.rs           # Tuning-curve engines (a)–(d) — orchestrates the three leaves below
+│   │   │   ├── rigaud.rs           # Rigaud parametric inharmonicity + tuning model (B_ξ fit, ρ_φ, F₀)
+│   │   │   ├── giordano.rs         # Giordano sensory-dissonance octave-width recipe (Plomp–Levelt/Sethares)
+│   │   │   └── whittaker.rs        # Whittaker smoother + shared banded LS solver
 │   │   ├── cola.rs                 # CircularFifo — COLA circular FIFO for overlapping frame analysis
 │   │   ├── models.rs               # Domain types: Note, Partial, KeyMeasurement, KeyProfile, profiles
 │   │   ├── pipeline.rs             # AudioPipeline mediator — Dual-FFT unconditional execution
@@ -35,6 +38,7 @@ inharmonicity/
 │   │   ├── gatekeeper.rs           # 5-state signal validator (DSP only, no shared state)
 │   │   ├── worker.rs               # Background worker for heavy offline DSP
 │   │   ├── audio.rs                # CPAL audio capture, stream management, DC blocking
+│   │   ├── synth.rs                # Offline additive resynthesis of a tuning curve → audio (cold-path, no audio stream)
 │   │   └── lib.rs                  # Crate root
 │   └── Cargo.toml
 ├── tuner-gui/                      # Iced-based GUI frontend
@@ -103,6 +107,8 @@ The pipeline also manages the **`WorkerManager`** (`worker.rs`), which owns a si
 > | `gatekeeper.rs` — 5-state signal validator (pure DSP) | ✅ Mature |
 > | `pipeline.rs` — AudioPipeline orchestrator + shared state | 🟢 Stable |
 > | `worker.rs` — background (f₀, B) measurement (single thread) | 📐 Provisional |
+> | `curves.rs` + `rigaud.rs`/`giordano.rs`/`whittaker.rs` — tuning-curve engines (a)–(d) | 📐 Provisional |
+> | `synth.rs` — offline curve → audio resynthesis (cold-path, no audio stream) | 🧩 Extensible |
 > | `peaks.rs` — Jacobsen sub-bin peak extraction | 🧩 Extensible |
 > | `app.rs` — GUI state hub | 🚧 In Development |
 > | `engine.rs` — TWM discovery + Goertzel phase tracking | 🔬 R&D |
@@ -110,7 +116,7 @@ The pipeline also manages the **`WorkerManager`** (`worker.rs`), which owns a si
 >
 > **Legend** — ✅ **Mature**: solved, unlikely to change · 🟢 **Stable**: complete for its role · 📐 **Provisional**: functional now, but a specific required feature isn't built on it yet — v1 isn't done until it is · 🧩 **Extensible**: works today, could grow, no commitment either way · 🚧 **In Development**: functional, more features actively coming · 🔬 **R&D**: algorithm still being developed and validated. (The two "done" tiers follow the PyPI convention where Mature ranks above Stable.)
 >
-> Reading the table: the **Gatekeeper** (onset/stability detection) is essentially done. The **pipeline** is complete as the DSP orchestrator — the last structural piece is a hook to integrate the inharmonic-curve calculation once it exists. The **Worker** measures (f₀, B) today, but the curve solver it must also host is a required v1 feature, not yet built. **Peaks** works and hosts the codebase's one empirical gate (every attempt to replace it with a smarter detector has so far lost to it) — a future improvement, not a commitment. **app.rs** is functional, with more widgets to come (e.g. the strobe tuner). The **Engine** and **twm** are the open research front: automatic TWM discovery locks reliably but is not finished — bass is inharmonicity-limited and gated on a second instrument (see [`docs/adr/0006-discovery-refinement-validation.md`](docs/adr/0006-discovery-refinement-validation.md)).
+> Reading the table: the **Gatekeeper** (onset/stability detection) is essentially done. The **pipeline** is complete as the DSP orchestrator — the last structural piece is a hook to integrate the inharmonic-curve calculation. The **Worker** measures (f₀, B) today. The **curve layer** is built (four engines, cold-path, ADRs 0007–0009) but not yet wired to a user-facing surface — that is the manual-mode strobe UI, and until a piano has actually been tuned to a curve it stays Provisional. **Peaks** works and hosts the codebase's one empirical gate (every attempt to replace it with a smarter detector has so far lost to it) — a future improvement, not a commitment. **app.rs** is functional, with more widgets to come (e.g. the strobe tuner). The **Engine** and **twm** are the open research front: automatic TWM discovery locks reliably but is not finished — bass is inharmonicity-limited and gated on a second instrument (see [`docs/adr/0006-discovery-refinement-validation.md`](docs/adr/0006-discovery-refinement-validation.md)). **synth** renders a computed tuning curve to audio for the offline auralization A/B (the `auralize` tool) — it is **entirely cold-path, never on a real-time thread, and owns no audio stream**; a live "hear the curve" playback surface (a future GUI feature) is deferred (see [Project Work in Progress](#project-work-in-progress)).
 
 ## Iced 0.14.0 UI
 
@@ -154,7 +160,7 @@ See [tuner-gui](tuner-gui/README.md) for more information.
 - **TWM Parameter Optimization — second-instrument validation**: The canonical Two-Way Mismatch constants ($q=1.4, r=0.5, \rho=0.33$) were calibrated by Maher & Beauchamp for general audio. A Multi-Objective Bayesian Optimization (MOBO) framework was built and run to retune them for piano inharmonicity against a generative synthetic dataset; the adopted `TwmConfig::default()` is the resulting conservative tuned set ($p=0.5, q=3.88, r=1.426, \rho=0.298, \lambda=18$), with the canonical values kept only as the math-regression guard. The open item is validation on a **second instrument** — the current results rest on one piano ($n=1$). Methodology: [`docs/adr/0001-mobo-tuning.md`](docs/adr/0001-mobo-tuning.md); findings and threats-to-validity: [`docs/adr/0006-discovery-refinement-validation.md`](docs/adr/0006-discovery-refinement-validation.md).
 - **TWM Bass-Lock Bias (Sub-Harmonic Locks)**: Real-world testing shows the engine occasionally locks to extreme bass candidates (e.g. D#4 → A#0, F#3 → A0, D2 → E1). This is a fundamental TWM scoring problem: because A#0's harmonic series is so dense across the mid-range spectrum, many mid-range peaks accidentally align with its predicted partials, and the $f^{-0.5}$ weighting makes those alignments very cheap. While the excision of the Viterbi module removed the "stickiness" of these false locks, the fundamental scoring bias remains. MOBO retuning and several structural penalty terms (deadzone, Duan non-peak, Emiya smoothness) were tried and did not resolve it (ADR 0006): the residual is a *wrong-inharmonicity ($B$) template* problem in the bass — the fixed Rigaud prior mis-shapes the deep-bass templates — which scoring constants cannot fix. The lever is a per-key $B$ measurement applied only to its own key's template, gated on validation with a second, in-tune instrument.
 - **Per-Bin Noise Floor Estimation**: The Neyman-Pearson Amplitude SNR gate relies on a global, broadband noise floor (`self.noise_floor`) calculated during silence. Real acoustic noise is colored (1/f pink noise, HVAC hum, soundboard modes). This global scalar can inadvertently pass noise at bass frequencies (where 1/f noise is loudest) or inappropriately kill real signals at treble frequencies. A future architectural fix should calculate and maintain a *per-bin* (or per-octave) noise baseline by actively tracking the Goertzel magnitude of tuning curve targets during Gatekeeper silence periods.
-- **Inharmonic Curve Calculation**: A solver to calculate the optimal tuning stretch (inharmonic curve) for the entire piano so that the harmonics of the bass align with the fundamentals of the treble. It runs offline (worker/GUI side) over the persisted profile — the cross-thread profile transfer it depends on is already in place — so the remaining work is the solver itself: a faithful port of a published stretch / beat-minimization method, not yet built.
+- **Inharmonic Curve Calculation — built, not yet wired to the UI**: The tuning-curve layer is implemented as four cold-path engines in `algorithms/curves.rs` — (a) Rigaud-pure, (b) per-key + Whittaker smoothing, (c) Giordano sensory-dissonance-calibrated octave type, (d) weighted multi-interval least squares — composing `rigaud.rs`, `giordano.rs`, and `whittaker.rs`. Design note: [`docs/design/tuning-curve-design.md`](docs/design/tuning-curve-design.md); review and validation: ADRs [0007](docs/adr/0007-tuning-curve-regularization-geometry.md), [0008](docs/adr/0008-giordano-layer-fidelity-derived-weights.md), [0009](docs/adr/0009-repeat-capture-noise-decomposition.md). There is no ground-truth-free "best" curve (octave/fifth/twelfth beats are mutually incompatible objectives), so engine selection is a listening judgment — the `auralize` tool renders each candidate to audio for that A/B. **Remaining work is the user-facing surface**: the manual-mode strobe UI that tunes each key against its own partials.
 - **Measured-B Discovery Seeding (built, gated OFF)**: The pathway that seeds the live discovery templates with the Worker's measured per-key $B$ — over the sanctioned UI → DSP `ringbuf` channel (crossing #4) — is fully implemented but disabled by default via the `pipeline::APPLY_MEASURED_B_TO_DISCOVERY` flag. Real-capture validation on the one available instrument showed it *regresses* lock accuracy (the highest-ratio bass keys, with measured $B$ at 18–25× the prior, broke), consistent with the measured bass $B$ being over-estimated on an out-of-tune upright with no reference to check it against. Flip the flag to re-enable once a second, in-tune instrument validates the measurement. Full write-up: [`docs/adr/0006-discovery-refinement-validation.md`](docs/adr/0006-discovery-refinement-validation.md).
 
 ### Worker TODOs
@@ -166,6 +172,7 @@ See [tuner-gui](tuner-gui/README.md) for more information.
 
 - **Diagnostics Importer**: Build a mechanism in the GUI to directly import an offline-generated `analysis.json` into the `InharmonicityProfile`. This serves as a developer/diagnostic tool to allow us to easily load test outputs from our offline CLI harnesses into the GUI for visual inspection and graph plotting.
 - **Persist calibration values into the profile**: The GUI calibration module computes the silence / noise-floor threshold, the NHWRSF onset threshold, and the NINOS2 stability threshold, but these currently live only in the runtime config atomics (`atomics.config.*`) and are lost on restart. Persist them into the saved profile (the GUI owns the profile — `tuner-core` is DSP-only) so loading a profile restores its calibration, not just its per-key $B$ measurements.
+- **Curve auralization playback**: `tuner_core::synth` already renders a tuning curve to audio offline (the `auralize` example writes WAVs; it is **cold-path — not on any real-time thread and owning no audio stream**). A live "hear the curve" control in the GUI (e.g. in the main view or settings) needs an audio **output** stream. Per the headless-core rule ([`docs/internals/01-architecture.md`](docs/internals/01-architecture.md)), that stream belongs in `tuner_core::audio` as a documented **sixth cross-thread crossing** — a CPAL output callback (the real-time *consumer*) filling a lock-free ring buffer whose *producer* is the cold synth, the mirror of the capture crossing — exposed as an opt-in handle like `spawn_analysis_thread`; it is **never** owned by the GUI. Deferred until the manual-mode tuning UI is built; duplex (playing while the tuner listens) is deliberately out of scope.
 
 ### Known Issues
 
@@ -235,6 +242,13 @@ To test the core DSP algorithms offline without launching the GUI, standalone Ca
 
   ```bash
   cargo run --release --example validate_mat
+  ```
+
+- **`auralize`**: Renders each candidate tuning curve (engines a–d plus the ρ stretch presets) to a WAV by **offline additive resynthesis** (`tuner_core::synth`), so you can *listen* and pick the best-sounding stretch before tuning a piano to it — there is no ground-truth-free "best" curve, only a perceptual A/B. It is **cold-path and offline**: it opens no audio device (it writes loudness-matched WAV files you play in any media player) and never touches the real-time pipeline. It consumes the regenerated per-key partials as the timbre (averaging repeat captures to denoise), places each measured partial at the curve's target via the raw measured $B$, and prints a beat-rate sanity screen.
+
+  ```bash
+  cargo run --release --example regenerate_partials -- diagnostics > p2.json
+  cargo run --release --example auralize -- p2.json --out auralize_out
   ```
 
 ### License & Contact

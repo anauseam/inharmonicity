@@ -1,4 +1,5 @@
-use crate::algorithms::peaks::{SpectralPeak, extract_peaks};
+use crate::algorithms::peaks::extract_peaks;
+use crate::models::SpectralPeak;
 use rustfft::num_complex::Complex;
 
 #[test]
