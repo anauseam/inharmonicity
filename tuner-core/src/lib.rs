@@ -22,6 +22,7 @@
 //! | [`pipeline`] | AudioPipeline mediator, shared state types, memory pools |
 //! | [`engine`] | F0 Engine — 3-Stage Matched Filter pitch detection |
 //! | [`gatekeeper`] | 5-state signal validator (pure DSP, no shared state) |
+//! | [`synth`] | Offline additive resynthesis of a tuning curve to audio (cold-path) |
 //! | [`worker`] | Background worker for heavy offline DSP |
 
 /// Stateless DSP building blocks: spectral transforms, pitch detection, signal metrics, and tuning math.
@@ -38,6 +39,9 @@ pub mod gatekeeper;
 pub mod models;
 /// AudioPipeline mediator: orchestrates DSP components, owns shared state, memory pools.
 pub mod pipeline;
+/// Offline additive resynthesis of a [`models::TuningCurve`] to audio samples
+/// (cold-path, thread-free — no audio stream; the caller plays or saves).
+pub mod synth;
 /// Background worker manager for heavy offline DSP (MAT, Beta calculation).
 pub mod worker;
 

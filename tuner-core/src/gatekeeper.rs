@@ -29,7 +29,7 @@
 //! The Gatekeeper has no knowledge of how the threshold was computed.
 
 use crate::algorithms::metrics::{ema, nhwrsf, ninos2, rms};
-use crate::audio::WINDOW_SIZE;
+use crate::audio::{SAMPLE_RATE, WINDOW_SIZE};
 use crate::pipeline::{AudioPool, ProcessingFrame};
 use std::sync::Arc;
 
@@ -231,7 +231,7 @@ impl Gatekeeper {
             current_spectrum,
             &mut self.prev_spectrum[..],
             WINDOW_SIZE,
-            crate::audio::SAMPLE_RATE,
+            SAMPLE_RATE,
         );
 
         // State 1 & 2: Transient detection routing

@@ -18,7 +18,6 @@ cpal = { workspace = true }
 # Add other dependencies for math, etc.
 rustfft = { workspace = true }
 realfft = { workspace = true }
-linreg = "0.2.0"
 once_cell = "1.21.3"
 
 # For profile saving and loading

@@ -30,8 +30,12 @@
 //! 6. Send a `KeyMeasurement` result to the UI via crossbeam SPSC channel
 //! 7. Recycle the buffer back to the `AudioPool`
 
+use crate::algorithms::{
+    mat::{self, MAX_PARTIALS, MatOrder},
+    spectral,
+};
 use crate::audio::BASS_WINDOW_SIZE;
-use crate::models::{KeyMeasurement, Partial};
+use crate::models::{self, KeyMeasurement, NOTES, Partial};
 use crate::pipeline::{AudioPool, CapturePayload, CaptureState, PipelineAtomics};
 use crossbeam_channel::{Receiver, Sender};
 use realfft::RealToComplex;
@@ -41,6 +45,14 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+
+/// Relative band around the named key's ET frequency inside which the live
+/// tracker's seed is trusted for MAT. **Ours, from validation**: the joint
+/// (f0, B) association recovers known B to < 1 % only when seeded within
+/// ±10 % of the true fundamental (`examples/mat_b_recovery.rs`); honest
+/// mistuning of the named key is far smaller (a whole semitone is 5.9 %),
+/// so anything outside the basin is tracker garbage, not signal.
+pub const MAT_SEED_TOLERANCE: f32 = 0.10;
 
 /// Manages the lifecycle of the background worker thread.
 ///
@@ -134,7 +146,7 @@ impl WorkerManager {
         }
 
         // Apply Hann window and copy to scratch
-        crate::algorithms::spectral::fft(
+        spectral::fft(
             &payload.stable_buffer[..fft_size],
             &mut time_buffer[..fft_size],
             &mut frequency_buffer[..(fft_size / 2 + 1)],
@@ -142,7 +154,7 @@ impl WorkerManager {
             fft_size,
         );
 
-        crate::algorithms::spectral::magnitude_spectrum(
+        spectral::magnitude_spectrum(
             &frequency_buffer[..],
             fft_size,
             &mut magnitude_buffer[..(fft_size / 2)],
@@ -152,7 +164,7 @@ impl WorkerManager {
         // super-resolution frequency map from the two spectra (DAFx-09 §2.3). The capture
         // buffer holds 66150 samples and fft_size ≤ 65536, so the one-sample shift is in
         // bounds; the Hann window zeroes the lone boundary sample regardless.
-        crate::algorithms::spectral::fft(
+        spectral::fft(
             &payload.stable_buffer[1..fft_size + 1],
             &mut time_buffer[..fft_size],
             &mut frequency_buffer_shifted[..(fft_size / 2 + 1)],
@@ -160,7 +172,7 @@ impl WorkerManager {
             fft_size,
         );
 
-        crate::algorithms::spectral::cspe(
+        spectral::cspe(
             &frequency_buffer[..],
             &frequency_buffer_shifted[..],
             fft_size,
@@ -171,14 +183,33 @@ impl WorkerManager {
         let measured_key_index = payload.target_note;
         let hz_per_bin = payload.sample_rate as f32 / fft_size as f32;
 
-        let f0_et = crate::models::NOTES[measured_key_index as usize].frequency;
-        let expected_beta = crate::models::get_expected_beta(measured_key_index);
+        let f0_et = NOTES[measured_key_index as usize].frequency;
+        let expected_beta = models::get_expected_beta(measured_key_index);
 
         // If the real-time Goertzel Engine successfully tracked the note, use its highly
         // accurate frequency as the seed. Otherwise, fall back to the mathematically
         // perfect Equal Temperament frequency for this key.
+        //
+        // Plausibility gate (MAT_SEED_TOLERANCE): the tracker seed is trusted
+        // only within ±10 % of the named key's ET. MAT's joint (f0, B)
+        // association is validated to recover B only when the seed lies
+        // within ±10 % of the true fundamental (`examples/mat_b_recovery.rs`),
+        // and a genuine strike of the named key deviates from ET by tuning
+        // error only (a whole semitone is 5.9 %) — so a seed outside the
+        // basin can only be tracker garbage, not a valid reading. Observed
+        // 2026-07-10: the deep-bass tracker walked onto low-frequency rumble
+        // and seeded A0 (27.5 Hz) captures at 5–16 Hz, mis-associating the
+        // entire partial comb; the untrusted-seed case now falls back to ET
+        // exactly as when tracking fails outright.
         let actual_seed = match payload.measured_f0 {
-            Some(tracked_f0) => tracked_f0,
+            Some(tracked) if (tracked / f0_et - 1.0).abs() <= MAT_SEED_TOLERANCE => tracked,
+            Some(tracked) => {
+                eprintln!(
+                    "[WORKER] Tracker seed {tracked:.2} Hz implausible for key {measured_key_index} \
+                     (ET {f0_et:.2} Hz) — seeding MAT from ET"
+                );
+                f0_et
+            }
             None => f0_et,
         };
 
@@ -186,10 +217,10 @@ impl WorkerManager {
         // returns a measured B with a reliability score. It only fails (`None`) when the
         // capture yields fewer than two partials — no pair to solve. Partial frequencies are
         // read from the CSPE map, so MAT is register-agnostic (no bass/treble split).
-        let mut partial_freqs_out = [0.0; crate::algorithms::mat::MAX_PARTIALS];
-        let mut partial_ns_out = [0u32; crate::algorithms::mat::MAX_PARTIALS];
+        let mut partial_freqs_out = [0.0; MAX_PARTIALS];
+        let mut partial_ns_out = [0u32; MAX_PARTIALS];
 
-        let mat_res = crate::algorithms::mat::detect_pitch_mat(
+        let mat_res = mat::detect_pitch_mat(
             &magnitude_buffer[..(fft_size / 2)],
             &cspe_buffer[..(fft_size / 2)],
             payload.sample_rate,
@@ -198,7 +229,7 @@ impl WorkerManager {
             // goodness-of-fit check in `validate_mat`, explains the clean low partials as well
             // as Simultaneous while fitting the high partials it discards. Simultaneous remains
             // the conservative fallback (one flag flip). See `MatOrder`.
-            crate::algorithms::mat::MatOrder::Serial,
+            MatOrder::Serial,
             &mut partial_freqs_out,
             &mut partial_ns_out,
         );
@@ -244,6 +275,7 @@ impl WorkerManager {
             partials,
             calculated_b,
             last_captured: format!("{}", now), // Basic string timestamp
+            captured_in_auto: payload.captured_in_auto,
         };
 
         // Step 4: Write Diagnostic Dump
@@ -281,11 +313,20 @@ impl WorkerManager {
         b_confidence: f32,
         mat_f0: f32,
     ) {
-        let (key_name, _) = crate::models::find_nearest_note_by_index(measurement.key_index);
+        let (key_name, _) = models::find_nearest_note_by_index(measurement.key_index);
 
-        // Use measurement's organically resolved key_index
+        // Use measurement's organically resolved key_index. The capture
+        // timestamp suffix makes every capture its own directory, so
+        // repeat captures of one key are all retained (the repeat-capture
+        // noise-decomposition experiment consumes them; a fixed per-key
+        // name silently overwrote earlier dumps). Offline tools discover
+        // dumps by the `key_` prefix and read the key identity from
+        // analysis.json, so the suffix is transparent to them.
         let mut dir = PathBuf::from("diagnostics");
-        dir.push(format!("key_{:03}_{}", measurement.key_index, key_name));
+        dir.push(format!(
+            "key_{:03}_{}_{}",
+            measurement.key_index, key_name, measurement.last_captured
+        ));
 
         if fs::create_dir_all(&dir).is_ok() {
             // Write audio.raw

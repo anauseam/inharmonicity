@@ -5,13 +5,8 @@
 
 use rustfft::num_complex::Complex;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub struct SpectralPeak {
-    /// True frequency in Hz (sub-bin interpolated via the Jacobsen estimator (Candan 2015)).
-    pub frequency: f32,
-    /// Linear magnitude at this peak.
-    pub magnitude: f32,
-}
+use crate::algorithms::spectral;
+use crate::models::SpectralPeak;
 
 /// Extracts all significant spectral peaks from a magnitude spectrum with sub-bin
 /// interpolated frequencies using the complex-domain Jacobsen estimator.
@@ -61,8 +56,7 @@ pub fn extract_peaks(
 
         if mag > noise_floor && mag > magnitudes[i - 1] && mag > magnitudes[i + 1] {
             // Sub-bin refinement via the complex-domain Jacobsen estimator (Candan 2015).
-            let frequency =
-                crate::algorithms::spectral::jacobsen(complex_spectrum, i, fft_size, sample_rate);
+            let frequency = spectral::jacobsen(complex_spectrum, i, fft_size, sample_rate);
 
             if frequency > 0.0 && num_found < temp_peaks.len() {
                 temp_peaks[num_found] = SpectralPeak {
@@ -114,8 +108,7 @@ pub fn extract_peaks(
 /// 1. ADR 0002 (`docs/adr/0002-twm-peak-masking-validation.md`) — the
 ///    empirical basis for the mechanism and the −30 dB values.
 /// 2. Cano, P. (1998). "Fundamental Frequency Estimation in the SMS Analysis."
-///    DAFx-98, §4.3 — the dynamic-range rule the global gate adapts
-///    (`resources/engine/CAN65.PS.pdf`).
+///    DAFx-98, §4.3 — the dynamic-range rule the global gate adapts.
 ///
 /// # Algorithm
 /// Peaks are evaluated in descending amplitude order. First, any peak more

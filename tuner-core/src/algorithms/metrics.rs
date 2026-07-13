@@ -91,7 +91,7 @@ pub fn ema(current_val: f32, previous_ema: f32, alpha: f32) -> f32 {
 /// that is room rumble beneath A0, above is percussive/air noise), derived at
 /// runtime from the FFT configuration; (b) the normalization by the current
 /// frame's total magnitude, which makes the flux dimensionless and
-/// scale-invariant (hardware/gain-agnostic per docs/internals/04) — the
+/// scale-invariant (hardware/gain-agnostic) — the
 /// papers' SF is unnormalized (LSF gets robustness from a log instead).
 ///
 /// # Arguments
@@ -172,7 +172,7 @@ pub fn nhwrsf(
 /// tonal steady state is due to Mounir et al.; the *measure* here is ours,
 /// not their NINOS². The deviations are deliberate for a *tonality gate*
 /// rather than an onset ODF: linear magnitudes over ALL bins, no energy
-/// factor (scale-invariance is required — see docs/internals/04), high =
+/// factor (the gate must be level-independent), high =
 /// tonal. A/B against the faithful variants (`examples/sparsity_ab.rs`)
 /// showed the two are complementary by register; any swap is gated on
 /// instrument #2. (The function name is historical.)
@@ -186,7 +186,7 @@ pub fn nhwrsf(
 ///
 /// # References
 /// * Hurley, N. & Rickard, S. (2009). "Comparing Measures of Sparsity."
-///   IEEE Trans. Inf. Theory 55(10). (The ℓ₁/ℓ₂ family; PDF in resources/gatekeeper.)
+///   IEEE Trans. Inf. Theory 55(10). (The ℓ₁/ℓ₂ family.)
 /// * Mounir, M., Karsmakers, P., van Waterschoot, T. (2021). EURASIP JASMP
 ///   2021:30. (Inspiration: sparsity-based note-phase segmentation.)
 pub fn ninos2(spectrum: &[rustfft::num_complex::Complex<f32>]) -> f32 {

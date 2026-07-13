@@ -12,14 +12,17 @@
 //! 1898: 80¢ — no reach cost; ADR 0006 "Corrections" item 2).
 
 use tuner_core::algorithms::discovery;
-use tuner_core::algorithms::peaks::SpectralPeak;
 use tuner_core::algorithms::twm::TwmConfig;
+use tuner_core::models::SpectralPeak;
 use tuner_core::models::{KeyProfile, NOTES, get_expected_beta};
 
 fn build_profiles() -> Box<[KeyProfile; 88]> {
     let mut v = Vec::with_capacity(88);
     for i in 0..88 {
-        v.push(KeyProfile::new(NOTES[i].frequency, get_expected_beta(i as u8)));
+        v.push(KeyProfile::new(
+            NOTES[i].frequency,
+            get_expected_beta(i as u8),
+        ));
     }
     Box::new(<[KeyProfile; 88]>::try_from(v).ok().unwrap())
 }
@@ -63,7 +66,10 @@ fn main() {
 
     let mut configs: Vec<(String, TwmConfig)> = vec![
         ("canonical M&B (q=1.4 r=0.5 rho=0.33)".into(), canonical),
-        ("conservative default (q=3.88 r=1.426 rho=0.298)".into(), TwmConfig::default()),
+        (
+            "conservative default (q=3.88 r=1.426 rho=0.298)".into(),
+            TwmConfig::default(),
+        ),
     ];
 
     // Candidates piped in as "name q r rho" lines via argv pairs: name q r rho ...

@@ -1,11 +1,9 @@
 //! # Two-Way Mismatch (TWM)
 //!
-//! Replaces legacy discrete template matching with continuous, sub-bin precision
-//! scoring using the Maher & Beauchamp (1994) distance-sum formulation.
-//! This stateless module provides robust fundamental frequency discovery.
+//! Continuous, sub-bin-precision fundamental-frequency scoring via the
+//! Maher & Beauchamp (1994) distance-sum formulation. Stateless.
 
-use crate::algorithms::peaks::SpectralPeak;
-use crate::models::KeyProfile;
+use crate::models::{KeyProfile, SpectralPeak};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TwmConfig {

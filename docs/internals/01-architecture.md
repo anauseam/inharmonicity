@@ -31,6 +31,25 @@ The GUI interacts with the core through exactly five channels:
 Anything that doesn't fit one of these five shapes is a sign that the
 boundary is being violated.
 
+## Cold-path modules and the future audio-out crossing
+
+Not every `tuner-core` module is on a real-time thread. `synth` (offline
+additive resynthesis of a `TuningCurve` to audio — the auralization tool) is
+**cold-path**: it runs on no pipeline thread, holds no shared state, and owns
+**no audio stream**. It returns a `Vec<f32>` (or writes a WAV); the caller
+sets the level and plays or saves it. It is inert with respect to the
+real-time rules above.
+
+Speaker **playback** is a separate, currently-unbuilt concern. When it is
+added (the GUI "hear the curve" feature), the CPAL **output** stream will live
+in `audio` — the single CPAL boundary — **not** in the GUI, because the core is
+headless and the GUI speaks only the five channels above. It is the mirror of
+crossing #1: the output callback is the real-time _consumer_ filling a
+`&mut [f32]`, fed by a lock-free ring buffer whose _producer_ is the cold
+`synth`. That is a sanctioned **sixth crossing**, exposed as an opt-in handle
+like `spawn_analysis_thread` and subject to the same wait-free callback
+discipline. It is deferred; duplex (playback during capture) is out of scope.
+
 ## Pipeline ownership (Split / Handle pattern)
 
 `AudioPipeline` owns the real-time DSP components: `Gatekeeper`,

@@ -47,11 +47,12 @@ use realfft::{RealFftPlanner, RealToComplex};
 use rustfft::num_complex::Complex;
 
 use tuner_core::algorithms::discovery::{self, TOP_K};
-use tuner_core::algorithms::peaks::{SpectralPeak, extract_peaks, mask_peaks};
+use tuner_core::algorithms::peaks::{extract_peaks, mask_peaks};
 use tuner_core::algorithms::spectral::{fft, magnitude_spectrum};
 use tuner_core::algorithms::twm::{self, TwmConfig};
 use tuner_core::audio::{BASS_WINDOW_SIZE, HOP_SIZE, WINDOW_SIZE};
 use tuner_core::gatekeeper::{Gatekeeper, SignalState};
+use tuner_core::models::SpectralPeak;
 use tuner_core::models::{KeyProfile, NOTES, get_expected_beta};
 use tuner_core::pipeline::ProcessingFrame;
 
@@ -93,7 +94,12 @@ struct JointCfg {
     nb: usize,
 }
 
-const BASELINE: JointCfg = JointCfg { label: "fixed-β (baseline)", n_sigma: 0.0, gamma: 0.0, nb: 1 };
+const BASELINE: JointCfg = JointCfg {
+    label: "fixed-β (baseline)",
+    n_sigma: 0.0,
+    gamma: 0.0,
+    nb: 1,
+};
 
 /// The policies compared. Baseline first; then the **tight, shippable** candidates
 /// (±1–2 σ_B, the prompt's design point) at varied regularizer strength; then **wide
@@ -105,12 +111,42 @@ const BASELINE: JointCfg = JointCfg { label: "fixed-β (baseline)", n_sigma: 0.0
 fn joint_configs() -> Vec<JointCfg> {
     vec![
         BASELINE,
-        JointCfg { label: "joint nσ=1 γ=2", n_sigma: 1.0, gamma: 2.0, nb: 9 },
-        JointCfg { label: "joint nσ=2 γ=2", n_sigma: 2.0, gamma: 2.0, nb: 13 },
-        JointCfg { label: "joint nσ=2 γ=0 (unreg)", n_sigma: 2.0, gamma: 0.0, nb: 13 },
-        JointCfg { label: "joint nσ=2 γ=8 (strong)", n_sigma: 2.0, gamma: 8.0, nb: 13 },
-        JointCfg { label: "WIDE nσ=20 γ=0 (≤23×)", n_sigma: 20.0, gamma: 0.0, nb: 25 },
-        JointCfg { label: "WIDE nσ=20 γ=2 (reg)", n_sigma: 20.0, gamma: 2.0, nb: 25 },
+        JointCfg {
+            label: "joint nσ=1 γ=2",
+            n_sigma: 1.0,
+            gamma: 2.0,
+            nb: 9,
+        },
+        JointCfg {
+            label: "joint nσ=2 γ=2",
+            n_sigma: 2.0,
+            gamma: 2.0,
+            nb: 13,
+        },
+        JointCfg {
+            label: "joint nσ=2 γ=0 (unreg)",
+            n_sigma: 2.0,
+            gamma: 0.0,
+            nb: 13,
+        },
+        JointCfg {
+            label: "joint nσ=2 γ=8 (strong)",
+            n_sigma: 2.0,
+            gamma: 8.0,
+            nb: 13,
+        },
+        JointCfg {
+            label: "WIDE nσ=20 γ=0 (≤23×)",
+            n_sigma: 20.0,
+            gamma: 0.0,
+            nb: 25,
+        },
+        JointCfg {
+            label: "WIDE nσ=20 γ=2 (reg)",
+            n_sigma: 20.0,
+            gamma: 2.0,
+            nb: 25,
+        },
     ]
 }
 
@@ -146,7 +182,14 @@ fn refine_joint(
     cfg: &TwmConfig,
     jc: &JointCfg,
 ) -> Joint {
-    let mut best = Joint { scale: 1.0, beta: beta_prior, raw: f32::MAX, reg: f32::MAX, d: 0.0, pinned: false };
+    let mut best = Joint {
+        scale: 1.0,
+        beta: beta_prior,
+        raw: f32::MAX,
+        reg: f32::MAX,
+        d: 0.0,
+        pinned: false,
+    };
     let nb = jc.nb.max(1);
     // β is searched in LOG space (the prior model is exponential; log-symmetry keeps the
     // bound positive even for wide probes that reach the real bass 7–25×). Half-width
@@ -169,7 +212,14 @@ fn refine_joint(
         }
         let reg = raw + jc.gamma * d * d;
         if reg < best.reg {
-            best = Joint { scale, beta, raw, reg, d, pinned: nb > 1 && (t.abs() >= 1.0 - 1e-4) };
+            best = Joint {
+                scale,
+                beta,
+                raw,
+                reg,
+                d,
+                pinned: nb > 1 && (t.abs() >= 1.0 - 1e-4),
+            };
         }
     }
     best
@@ -196,7 +246,12 @@ fn discover_joint(
     jc: &JointCfg,
 ) -> JointDiscovery {
     let top = discovery::stage_a(peaks, profiles, cfg);
-    let mut best = JointDiscovery { key_index: top[0].0 as u8, scale: 1.0, beta: profiles[top[0].0].beta, reg: f32::MAX };
+    let mut best = JointDiscovery {
+        key_index: top[0].0 as u8,
+        scale: 1.0,
+        beta: profiles[top[0].0].beta,
+        reg: f32::MAX,
+    };
     if top[0].1 == f32::MAX {
         return best;
     }
@@ -204,9 +259,21 @@ fn discover_joint(
         if stage_err == f32::MAX {
             continue;
         }
-        let j = refine_joint(peaks, profiles[k].f0_et, profiles[k].beta, sigma_b(k), cfg, jc);
+        let j = refine_joint(
+            peaks,
+            profiles[k].f0_et,
+            profiles[k].beta,
+            sigma_b(k),
+            cfg,
+            jc,
+        );
         if j.reg < best.reg {
-            best = JointDiscovery { key_index: k as u8, scale: j.scale, beta: j.beta, reg: j.reg };
+            best = JointDiscovery {
+                key_index: k as u8,
+                scale: j.scale,
+                beta: j.beta,
+                reg: j.reg,
+            };
         }
     }
     best
@@ -221,7 +288,12 @@ fn discover_joint(
 /// octave-up template predicts nothing near the true note's *odd* partials, so those
 /// measured peaks charge `Err_{m-p}`. A `debug_assert` guards against drift from the
 /// canonical scorer.
-fn score_split(peaks: &[SpectralPeak], profile: &KeyProfile, scale: f32, cfg: &TwmConfig) -> (f32, f32) {
+fn score_split(
+    peaks: &[SpectralPeak],
+    profile: &KeyProfile,
+    scale: f32,
+    cfg: &TwmConfig,
+) -> (f32, f32) {
     let valid_count = profile.valid_partial_count;
     if valid_count == 0 || peaks.is_empty() {
         return (f32::MAX, f32::MAX);
@@ -399,7 +471,8 @@ fn synth_piano(rng: &mut Rng) -> Piano {
     }
     for a in [36usize, 24, 12, 0] {
         let r = rho(a + 12);
-        f0[a] = f0[a + 12] / (2.0 * ((1.0 + b[a] * 4.0 * r * r) / (1.0 + b[a + 12] * r * r)).sqrt());
+        f0[a] =
+            f0[a + 12] / (2.0 * ((1.0 + b[a] * 4.0 * r * r) / (1.0 + b[a + 12] * r * r)).sqrt());
     }
     for a in [0usize, 12, 24, 36, 48, 60, 72, 84] {
         f1[a] = f0[a] * (1.0 + b[a]).sqrt();
@@ -420,7 +493,10 @@ fn synth_piano(rng: &mut Rng) -> Piano {
     for k in 0..88 {
         stretch_cents[k] = 1200.0 * (f1[k] / et_freq(k)).log2();
     }
-    Piano { b_curve, stretch_cents }
+    Piano {
+        b_curve,
+        stretch_cents,
+    }
 }
 
 #[allow(dead_code)] // `d_cents`/`hard` carried for parity with gen_frame; not all read here
@@ -455,7 +531,10 @@ fn emit_partial_cluster(rng: &mut Rng, freqs: &[f32], amps: &[f32], out: &mut Ve
         if mag > 1e-6 && wsum > 0.0 {
             let freq = fsum / wsum + 0.2 * rng.normal();
             if freq > 10.0 {
-                out.push(SpectralPeak { frequency: freq, magnitude: mag });
+                out.push(SpectralPeak {
+                    frequency: freq,
+                    magnitude: mag,
+                });
             }
         }
         i = j + 1;
@@ -484,7 +563,13 @@ fn gen_frame(rng: &mut Rng, piano: &Piano, key: usize, hard: bool) -> Frame {
     let df_rel = 2f32.powf(d_cents / 1200.0) - 1.0;
     let b_actual = (b_note * (1.0 - 2.0 * df_rel)).max(1e-7);
     let f0 = et_freq(key) * 2f32.powf(d_cents / 1200.0);
-    let n_strings = if key < 8 { 1 } else if key < 26 { 2 } else { 3 };
+    let n_strings = if key < 8 {
+        1
+    } else if key < 26 {
+        2
+    } else {
+        3
+    };
     let v = rng.f32();
     let spread = 15.0 * v * v;
     let mut offsets = [0.0f32; 3];
@@ -495,7 +580,11 @@ fn gen_frame(rng: &mut Rng, piano: &Piano, key: usize, hard: bool) -> Frame {
     for s in 0..n_strings {
         f0_s[s] = f0 * 2f32.powf(offsets[s] / 1200.0);
     }
-    let alpha_env = if key < 27 { rng.range(0.4, 0.9) } else { rng.range(0.8, 1.6) };
+    let alpha_env = if key < 27 {
+        rng.range(0.4, 0.9)
+    } else {
+        rng.range(0.8, 1.6)
+    };
 
     let mut raw: Vec<SpectralPeak> = Vec::with_capacity(96);
     let mut n = 1usize;
@@ -534,21 +623,30 @@ fn gen_frame(rng: &mut Rng, piano: &Piano, key: usize, hard: bool) -> Frame {
                 break;
             }
             let db = rng.range(-35.0, -20.0);
-            raw.push(SpectralPeak { frequency: f + 0.2 * rng.normal(), magnitude: a_max * 10f32.powf(db / 20.0) });
+            raw.push(SpectralPeak {
+                frequency: f + 0.2 * rng.normal(),
+                magnitude: a_max * 10f32.powf(db / 20.0),
+            });
         }
     }
     let n_noise = 3 + (rng.f32() * 12.0) as usize;
     for _ in 0..n_noise {
         let f = 25.0 * (9000.0f32 / 25.0).powf(rng.f32());
         let db = rng.range(-45.0, -25.0) - 6.0 * (f / 1000.0).max(1.0).log2();
-        raw.push(SpectralPeak { frequency: f, magnitude: a_max * 10f32.powf(db / 20.0) });
+        raw.push(SpectralPeak {
+            frequency: f,
+            magnitude: a_max * 10f32.powf(db / 20.0),
+        });
     }
     if key >= 55 && rng.chance(0.35) {
         let n_attack = 30 + (rng.f32() * 40.0) as usize;
         for _ in 0..n_attack {
             let f = 50.0 * (4000.0f32 / 50.0).powf(rng.f32());
             let db = rng.range(-40.0, -22.0);
-            raw.push(SpectralPeak { frequency: f, magnitude: a_max * 10f32.powf(db / 20.0) });
+            raw.push(SpectralPeak {
+                frequency: f,
+                magnitude: a_max * 10f32.powf(db / 20.0),
+            });
         }
     }
 
@@ -557,7 +655,14 @@ fn gen_frame(rng: &mut Rng, piano: &Piano, key: usize, hard: bool) -> Frame {
     let valid = mask_peaks(&mut raw);
     raw.truncate(valid);
 
-    Frame { key: key as u8, d_cents, ambiguous, hard, b_actual, peaks: raw }
+    Frame {
+        key: key as u8,
+        d_cents,
+        ambiguous,
+        hard,
+        b_actual,
+        peaks: raw,
+    }
 }
 
 fn generate_dataset(seed: u64) -> Vec<Frame> {
@@ -597,9 +702,9 @@ struct SynthAcc {
     sep_fl: [usize; 3],
     // ── bass octave / sub-harmonic impostor wins (production K=3) ──
     bass_n: usize,
-    bass_oct_up_win: usize,   // winner == key+12
-    bass_twelfth_win: usize,  // winner == key+19
-    bass_oct_dn_win: usize,   // winner == key-12 (sub-harmonic)
+    bass_oct_up_win: usize,  // winner == key+12
+    bass_twelfth_win: usize, // winner == key+19
+    bass_oct_dn_win: usize,  // winner == key-12 (sub-harmonic)
     // ── octave forward/reverse margin (octave-up minus true), bass frames ──
     // positive margin ⇒ octave is penalized (good). Measured at each policy's own
     // refined (scale,β) for the true key and the key+12 template.
@@ -636,8 +741,15 @@ impl SynthAcc {
     }
 }
 
-fn eval_synthetic(scored: &[&Frame], profiles: &[KeyProfile; 88], cfg: &TwmConfig, jc: &JointCfg) -> SynthAcc {
-    let nthreads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+fn eval_synthetic(
+    scored: &[&Frame],
+    profiles: &[KeyProfile; 88],
+    cfg: &TwmConfig,
+    jc: &JointCfg,
+) -> SynthAcc {
+    let nthreads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
     let chunk = scored.len().div_ceil(nthreads).max(1);
     std::thread::scope(|s| {
         let handles: Vec<_> = scored
@@ -660,7 +772,13 @@ fn eval_synthetic(scored: &[&Frame], profiles: &[KeyProfile; 88], cfg: &TwmConfi
     })
 }
 
-fn process_synth_frame(f: &Frame, profiles: &[KeyProfile; 88], cfg: &TwmConfig, jc: &JointCfg, acc: &mut SynthAcc) {
+fn process_synth_frame(
+    f: &Frame,
+    profiles: &[KeyProfile; 88],
+    cfg: &TwmConfig,
+    jc: &JointCfg,
+    acc: &mut SynthAcc,
+) {
     let key = f.key as usize;
     let reg = reg_of(key);
     acc.reg_n[reg] += 1;
@@ -674,7 +792,14 @@ fn process_synth_frame(f: &Frame, profiles: &[KeyProfile; 88], cfg: &TwmConfig, 
     let mut best_reg = f32::MAX;
     let mut argmin = 0usize;
     for k in 0..88 {
-        let j = refine_joint(&f.peaks, profiles[k].f0_et, profiles[k].beta, sigma_b(k), cfg, jc);
+        let j = refine_joint(
+            &f.peaks,
+            profiles[k].f0_et,
+            profiles[k].beta,
+            sigma_b(k),
+            cfg,
+            jc,
+        );
         if j.reg < best_reg {
             best_reg = j.reg;
             argmin = k;
@@ -683,7 +808,14 @@ fn process_synth_frame(f: &Frame, profiles: &[KeyProfile; 88], cfg: &TwmConfig, 
     acc.sep_fl[reg] += (argmin != key) as usize;
 
     // Regularizer pull on the TRUE key.
-    let jt = refine_joint(&f.peaks, profiles[key].f0_et, profiles[key].beta, sigma_b(key), cfg, jc);
+    let jt = refine_joint(
+        &f.peaks,
+        profiles[key].f0_et,
+        profiles[key].beta,
+        sigma_b(key),
+        cfg,
+        jc,
+    );
     acc.pull_n[reg] += 1;
     acc.pull_absd_sum[reg] += jt.d.abs() as f64;
     acc.pull_pinned[reg] += jt.pinned as usize;
@@ -705,7 +837,14 @@ fn process_synth_frame(f: &Frame, profiles: &[KeyProfile; 88], cfg: &TwmConfig, 
         }
         // Forward/reverse margin: octave-up minus true at each policy's refined template.
         if key + 12 < 88 {
-            let jo = refine_joint(&f.peaks, profiles[key + 12].f0_et, profiles[key + 12].beta, sigma_b(key + 12), cfg, jc);
+            let jo = refine_joint(
+                &f.peaks,
+                profiles[key + 12].f0_et,
+                profiles[key + 12].beta,
+                sigma_b(key + 12),
+                cfg,
+                jc,
+            );
             let true_prof = KeyProfile::new(profiles[key].f0_et, jt.beta);
             let oct_prof = KeyProfile::new(profiles[key + 12].f0_et, jo.beta);
             let (tf, tr) = score_split(&f.peaks, &true_prof, jt.scale, cfg);
@@ -720,7 +859,11 @@ fn process_synth_frame(f: &Frame, profiles: &[KeyProfile; 88], cfg: &TwmConfig, 
 }
 
 fn pct(num: usize, den: usize) -> f32 {
-    if den == 0 { 0.0 } else { 100.0 * num as f32 / den as f32 }
+    if den == 0 {
+        0.0
+    } else {
+        100.0 * num as f32 / den as f32
+    }
 }
 
 fn report_synthetic(frames: &[Frame], profiles: &[KeyProfile; 88], cfg: &TwmConfig) {
@@ -742,17 +885,27 @@ fn report_synthetic(frames: &[Frame], profiles: &[KeyProfile; 88], cfg: &TwmConf
     for f in scored.iter().filter(|f| !f.peaks.is_empty()).take(2000) {
         let lib = discovery::discover(&f.peaks, profiles, cfg, true).key_index;
         let base = discover_joint(&f.peaks, profiles, cfg, &BASELINE).key_index;
-        assert_eq!(lib, base, "baseline parity broke: discover() vs discover_joint(BASELINE)");
+        assert_eq!(
+            lib, base,
+            "baseline parity broke: discover() vs discover_joint(BASELINE)"
+        );
         checked += 1;
     }
-    println!("(baseline-parity check: discover_joint(BASELINE) == discover() on {checked} frames ✓)");
+    println!(
+        "(baseline-parity check: discover_joint(BASELINE) == discover() on {checked} frames ✓)"
+    );
 
     let configs = joint_configs();
-    let accs: Vec<(JointCfg, SynthAcc)> =
-        configs.iter().map(|jc| (*jc, eval_synthetic(&scored, profiles, cfg, jc))).collect();
+    let accs: Vec<(JointCfg, SynthAcc)> = configs
+        .iter()
+        .map(|jc| (*jc, eval_synthetic(&scored, profiles, cfg, jc)))
+        .collect();
 
     println!("\n── Production K=3 false-lock by register (the headline) ──");
-    println!("  {:<26} {:>8} {:>8} {:>8} {:>8}", "policy", "bass", "mid", "treble", "TOTAL");
+    println!(
+        "  {:<26} {:>8} {:>8} {:>8} {:>8}",
+        "policy", "bass", "mid", "treble", "TOTAL"
+    );
     for (jc, a) in &accs {
         let tot_fl = a.prod_fl[0] + a.prod_fl[1] + a.prod_fl[2];
         let tot_n = a.reg_n[0] + a.reg_n[1] + a.reg_n[2];
@@ -767,7 +920,10 @@ fn report_synthetic(frames: &[Frame], profiles: &[KeyProfile; 88], cfg: &TwmConf
     }
 
     println!("\n── Separability (all-88 argmin) false-lock by register ──");
-    println!("  {:<26} {:>8} {:>8} {:>8}", "policy", "bass", "mid", "treble");
+    println!(
+        "  {:<26} {:>8} {:>8} {:>8}",
+        "policy", "bass", "mid", "treble"
+    );
     for (jc, a) in &accs {
         println!(
             "  {:<26} {:>7.2}% {:>7.2}% {:>7.2}%",
@@ -778,8 +934,13 @@ fn report_synthetic(frames: &[Frame], profiles: &[KeyProfile; 88], cfg: &TwmConf
         );
     }
 
-    println!("\n── Bass octave / sub-harmonic impostor WINS (production K=3; the decisive test) ──");
-    println!("  {:<26} {:>10} {:>10} {:>10}  (of {} bass frames)", "policy", "oct-up+12", "12th+19", "sub-12", accs[0].1.bass_n);
+    println!(
+        "\n── Bass octave / sub-harmonic impostor WINS (production K=3; the decisive test) ──"
+    );
+    println!(
+        "  {:<26} {:>10} {:>10} {:>10}  (of {} bass frames)",
+        "policy", "oct-up+12", "12th+19", "sub-12", accs[0].1.bass_n
+    );
     for (jc, a) in &accs {
         println!(
             "  {:<26} {:>9} {:>9} {:>9}",
@@ -789,16 +950,27 @@ fn report_synthetic(frames: &[Frame], profiles: &[KeyProfile; 88], cfg: &TwmConf
 
     println!("\n── Octave discriminator: mean margin (octave-up − true), bass frames ──");
     println!("  positive ⇒ octave penalized. fwd collapse + rev rescue is the predicted pattern.");
-    println!("  {:<26} {:>12} {:>12} {:>12}", "policy", "fwd-margin", "ρ·rev-margin", "total");
+    println!(
+        "  {:<26} {:>12} {:>12} {:>12}",
+        "policy", "fwd-margin", "ρ·rev-margin", "total"
+    );
     for (jc, a) in &accs {
         let n = a.oct_marg_n.max(1) as f64;
         let fwd = a.oct_fwd_marg_sum / n;
         let rev = a.oct_rev_marg_sum / n;
-        println!("  {:<26} {:>12.4} {:>12.4} {:>12.4}", jc.label, fwd, rev, fwd + rev);
+        println!(
+            "  {:<26} {:>12.4} {:>12.4} {:>12.4}",
+            jc.label,
+            fwd,
+            rev,
+            fwd + rev
+        );
     }
 
     println!("\n── Regularizer effective pull on the TRUE key, by register ──");
-    println!("  mean|d| in σ_B units (bound = n_σ), %pinned at bound, mean β_chosen/prior vs β_true/prior.");
+    println!(
+        "  mean|d| in σ_B units (bound = n_σ), %pinned at bound, mean β_chosen/prior vs β_true/prior."
+    );
     for (jc, a) in &accs {
         if jc.n_sigma == 0.0 {
             continue;
@@ -893,7 +1065,11 @@ fn process_real_key(
 
     let sum_w2 = 0.375 * BASS_WINDOW_SIZE as f32;
     let p_bin = noise_floor * noise_floor * sum_w2;
-    let min_magnitude = if p_bin > 0.0 { (-p_bin * 0.001_f32.ln()).sqrt() } else { 0.0 };
+    let min_magnitude = if p_bin > 0.0 {
+        (-p_bin * 0.001_f32.ln()).sqrt()
+    } else {
+        0.0
+    };
 
     let audio_pool = Arc::new(crossbeam_queue::ArrayQueue::new(1));
     let mut gatekeeper = Gatekeeper::new(audio_pool);
@@ -914,7 +1090,13 @@ fn process_real_key(
         let frame_audio = &audio[cursor..cursor + BASS_WINDOW_SIZE];
 
         // Bass FFT → magnitudes → peaks (diagnose_engine path).
-        fft(frame_audio, &mut time, &mut freq, r2c_bass, BASS_WINDOW_SIZE);
+        fft(
+            frame_audio,
+            &mut time,
+            &mut freq,
+            r2c_bass,
+            BASS_WINDOW_SIZE,
+        );
         magnitude_spectrum(&freq, BASS_WINDOW_SIZE, &mut mags);
 
         // Gatekeeper FFT (newest WINDOW_SIZE samples).
@@ -930,7 +1112,14 @@ fn process_real_key(
         let gate = gatekeeper.process_frame(&pf);
 
         if gate.state == SignalState::Stable && !gate.is_transient_bypass {
-            let count = extract_peaks(&mags, &freq, 44100, BASS_WINDOW_SIZE, min_magnitude, &mut peak_scratch);
+            let count = extract_peaks(
+                &mags,
+                &freq,
+                44100,
+                BASS_WINDOW_SIZE,
+                min_magnitude,
+                &mut peak_scratch,
+            );
             let k = count.min(64);
             let active = &mut peak_scratch[..k];
             let valid = mask_peaks(active);
@@ -981,20 +1170,36 @@ fn report_real(profiles: &[KeyProfile; 88], cfg: &TwmConfig) {
         .collect();
     dirs.sort_by_key(|(k, _)| *k);
 
-    println!("\n==================== REAL CAPTURES (diagnose_engine path, 3-frame lock) ====================");
-    println!("validation-only — n=1 cannot select. Reference: fixed-β baseline (the 74/87 program).");
+    println!(
+        "\n==================== REAL CAPTURES (diagnose_engine path, 3-frame lock) ===================="
+    );
+    println!(
+        "validation-only — n=1 cannot select. Reference: fixed-β baseline (the 74/87 program)."
+    );
 
     let mut bass_oct = vec![0usize; configs.len()];
     let mut results: Vec<RealKeyResult> = Vec::new();
     for (key, dir) in &dirs {
-        if let Some(r) = process_real_key(dir, *key, profiles, cfg, &configs, &r2c_bass, &r2c_gate, &mut bass_oct) {
+        if let Some(r) = process_real_key(
+            dir,
+            *key,
+            profiles,
+            cfg,
+            &configs,
+            &r2c_bass,
+            &r2c_gate,
+            &mut bass_oct,
+        ) {
             results.push(r);
         }
     }
 
     // Per-policy totals and per-register pass counts.
     println!("\n── Lock pass counts (correct 3-frame lock) ──");
-    println!("  {:<26} {:>10} {:>8} {:>8} {:>8}", "policy", "TOTAL/n", "bass", "mid", "treble");
+    println!(
+        "  {:<26} {:>10} {:>8} {:>8} {:>8}",
+        "policy", "TOTAL/n", "bass", "mid", "treble"
+    );
     let n_total = results.len();
     for (ci, jc) in configs.iter().enumerate() {
         let mut pass = 0;
@@ -1011,10 +1216,14 @@ fn report_real(profiles: &[KeyProfile; 88], cfg: &TwmConfig) {
         println!(
             "  {:<26} {:>7}/{:<3} {:>3}/{:<3} {:>3}/{:<3} {:>3}/{:<3}",
             jc.label,
-            pass, n_total,
-            reg_pass[0], reg_n[0],
-            reg_pass[1], reg_n[1],
-            reg_pass[2], reg_n[2],
+            pass,
+            n_total,
+            reg_pass[0],
+            reg_n[0],
+            reg_pass[1],
+            reg_n[1],
+            reg_pass[2],
+            reg_n[2],
         );
     }
 
@@ -1042,9 +1251,19 @@ fn report_real(profiles: &[KeyProfile; 88], cfg: &TwmConfig) {
             }
         }
         let name = |ks: &[usize]| -> String {
-            ks.iter().map(|&k| NOTES[k].name.clone()).collect::<Vec<_>>().join(",")
+            ks.iter()
+                .map(|&k| NOTES[k].name.clone())
+                .collect::<Vec<_>>()
+                .join(",")
         };
-        println!("  {:<26} fixed {:>2} [{}]  broke {:>2} [{}]", jc.label, fixed.len(), name(&fixed), broke.len(), name(&broke));
+        println!(
+            "  {:<26} fixed {:>2} [{}]  broke {:>2} [{}]",
+            jc.label,
+            fixed.len(),
+            name(&fixed),
+            broke.len(),
+            name(&broke)
+        );
     }
 }
 

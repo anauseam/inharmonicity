@@ -5,9 +5,10 @@ use std::env;
 use std::fs::{self};
 use std::path::Path;
 
-use tuner_core::algorithms::peaks::{SpectralPeak, extract_peaks};
+use tuner_core::algorithms::peaks::extract_peaks;
 use tuner_core::algorithms::spectral::{fft, magnitude_spectrum};
 use tuner_core::audio::{BASS_WINDOW_SIZE, HOP_SIZE};
+use tuner_core::models::SpectralPeak;
 use tuner_core::models::{KeyProfile, NOTES, get_expected_beta};
 
 #[derive(Debug)]

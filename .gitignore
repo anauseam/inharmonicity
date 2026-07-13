@@ -26,6 +26,12 @@ README.html
 
 # Diagnostics
 diagnostics/
+# Archived per-instrument capture sets (raw captures + regenerable curve
+# reports/plots) — kept on disk, never committed, same as diagnostics/.
+diagnostics_piano_1/
+
+# Auralization renders (examples/auralize.rs output — large regenerable WAVs)
+auralize_out/
 
 # AI-related files
 .agents/

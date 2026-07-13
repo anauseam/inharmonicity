@@ -80,8 +80,11 @@ impl<Message> canvas::Program<Message> for CentMeter {
                 Stroke::default().with_width(2.0).with_color(Color::WHITE),
             );
 
-            // Draw needle
-            if let Some(c) = self.cents {
+            // Draw needle. Last-resort finite guard: `clamp` PROPAGATES NaN
+            // (needle_pos would stay NaN) and lyon asserts on non-finite
+            // path coordinates — a canvas must never panic the app, whatever
+            // upstream feeds it.
+            if let Some(c) = self.cents.filter(|c| c.is_finite()) {
                 let clamped_cents = c.clamp(-METER_RANGE, METER_RANGE);
                 let needle_pos = (clamped_cents + METER_RANGE) / (2.0 * METER_RANGE) * bounds.width;
 

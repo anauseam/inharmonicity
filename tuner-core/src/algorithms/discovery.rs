@@ -21,9 +21,8 @@
 //! refined residuals show systematic B-structure, promote refinement to a joint
 //! (f0, B) search; do not patch the scale model piecemeal.
 
-use crate::algorithms::peaks::SpectralPeak;
 use crate::algorithms::twm::{self, TwmConfig};
-use crate::models::KeyProfile;
+use crate::models::{KeyProfile, SpectralPeak};
 
 /// Candidates carried from Stage A into Stage B refinement. 88 = **exhaustive**:
 /// every key is refined, so there is no shortlist cutoff to justify (no magic
@@ -143,15 +142,14 @@ pub fn refine_scale(peaks: &[SpectralPeak], profile: &KeyProfile, cfg: &TwmConfi
 /// Full split discovery over one frame.
 ///
 /// Stage A scans all 88 keys at `scale = 1.0`, keeping the top-`TOP_K` candidates
-/// (fixed-size insertion; ties keep the lower key, matching the legacy argmin).
-/// With `refine = false` the result is exactly the legacy discrete behavior.
-/// With `refine = true`, Stage B refines each candidate and the minimum refined
-/// error wins. Cost: 88 + ~18·TOP_K ≈ 142 `score_candidate` calls per frame,
-/// discovery frames only.
+/// (fixed-size insertion; ties keep the lower key). With `refine = false` the
+/// result is exactly the discrete 88-key argmin. With `refine = true`, Stage B
+/// refines each candidate and the minimum refined error wins. Cost:
+/// 88 + ~18·TOP_K ≈ 142 `score_candidate` calls per frame, discovery frames only.
 /// Stage A only: the coarse 88-key scan at `scale = 1.0`, returning the top-K
-/// `(key, error)` candidates ascending by error (ties keep the lower key,
-/// matching the legacy argmin). Exposed for the MOBO evaluator's Stage A recall
-/// metric; `discover` is built on this same function.
+/// `(key, error)` candidates ascending by error (ties keep the lower key).
+/// Exposed for the MOBO evaluator's Stage A recall metric; `discover` is built
+/// on this same function.
 pub fn stage_a(
     peaks: &[SpectralPeak],
     profiles: &[KeyProfile; 88],
@@ -181,7 +179,7 @@ pub fn discover(
     // ── Stage A: coarse 88-key scan, top-K collection ──
     let top = stage_a(peaks, profiles, cfg);
 
-    // Discrete mode, or nothing scoreable at all: legacy behavior.
+    // Discrete mode, or nothing scoreable at all: the plain argmin.
     if !refine || top[0].1 == f32::MAX {
         return DiscoveryResult {
             key_index: top[0].0 as u8,
@@ -241,7 +239,7 @@ mod tests {
     }
 
     #[test]
-    fn discrete_mode_matches_legacy_argmin() {
+    fn discrete_mode_matches_argmin() {
         let profiles = build_profiles();
         let cfg = TwmConfig::default();
         for &(key, s) in &[(0_usize, 1.0_f32), (17, 0.977), (42, 1.02), (87, 1.0)] {
