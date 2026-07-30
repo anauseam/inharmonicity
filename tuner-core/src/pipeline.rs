@@ -34,7 +34,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 use crate::FrameOutput;
-use crate::audio::{BASS_WINDOW_SIZE, HOP_SIZE, WINDOW_SIZE};
+use crate::audio::{BASS_WINDOW_SIZE, HOP_SIZE, SAMPLE_RATE, WINDOW_SIZE};
 use crate::cola::CircularFifo;
 
 use crate::algorithms::spectral;
@@ -43,7 +43,8 @@ use crate::gatekeeper::{Gatekeeper, SignalState};
 use crate::models::{
     InharmonicityProfile, KeyMeasurement, KeyProfile, PROFILE_PATH, build_default_profiles,
 };
-use crate::worker::WorkerManager;
+use crate::strobe::{Strobe, StrobeRefUpdate};
+use crate::worker::{WorkerJob, WorkerManager, WorkerOutput};
 
 // ─── Memory Infrastructure ───────────────────────────────────────────────────
 
@@ -120,6 +121,46 @@ pub const APPLY_MEASURED_B_TO_DISCOVERY: bool = false;
 /// is delivered without dropping a key.
 pub const PROFILE_QUEUE_CAPACITY: usize = 88;
 
+/// Ring-buffer capacity for the strobe-reference channel (UI → DSP, the
+/// second crossing-#4 instance).
+///
+/// Updates arrive only on key change / re-lock — user-rate events, orders of
+/// magnitude slower than the hop rate — and the pipeline drains to the
+/// newest update each hop (stale reference sets are worthless). Two slots
+/// absorb a same-tick change pair; on a full buffer the UI simply re-sends
+/// next tick.
+pub const STROBE_REF_QUEUE_CAPACITY: usize = 2;
+
+/// Capacity of the capture-dispatch channel (DSP → Worker, crossing #5).
+///
+/// The real backpressure ceiling is the [`AudioPool`] (8 buffers, each payload
+/// borrowing up to 2 → ≤ 4 payloads outstanding); this channel is subordinate.
+/// Captures are serialised at the source (a note is held ~1.5 s and the worker
+/// finishes well within that), so at most one capture is genuinely in flight.
+/// Two = one being processed + one just-completed slot before the `try_send`
+/// backpressure path (`Recording → Armed` recovery) trips.
+pub const CAPTURE_QUEUE_CAPACITY: usize = 2;
+
+/// Capacity of the worker-result channel (Worker → UI, crossing #5).
+///
+/// The UI drains it every ~16 ms (60 FPS) and the worker `try_send`s (dropping
+/// on full — a lost result is only a missed display update, recoverable by
+/// re-capture). Four is generous slack over the ≤ 1 result the serialised
+/// capture cadence can leave pending, so a drop is effectively impossible. The
+/// channel is shared with the curve-bundle result ([`WorkerOutput`]), but
+/// bundles are coalesced and infrequent (one per settled edit), so four still
+/// holds for the combined traffic.
+pub const WORKER_RESULT_QUEUE_CAPACITY: usize = 4;
+
+/// Capacity of the worker-job channel (UI → Worker, crossing #6).
+///
+/// Latest-wins: a queued job superseded by a newer profile edit is worthless,
+/// so a single slot suffices — the UI re-requests from its `curve_dirty` flag
+/// if a send finds the slot full, and the worker coalesces to the newest job
+/// on receipt. One in-flight compute + this one pending slot is the whole
+/// pipeline depth a curve recompute ever needs.
+pub const WORKER_JOB_QUEUE_CAPACITY: usize = 1;
+
 /// A single key's recompiled discovery template, in transit UI → DSP (crossing #4).
 ///
 /// Heap-free (`KeyProfile` is `{f32, f32, [f32; MAX_PARTIALS], usize}`), so it is
@@ -167,6 +208,24 @@ impl ProfileSender {
         for key in 0..88u8 {
             self.update_key_profile(key, profile.measurements.get(&key));
         }
+    }
+}
+
+/// Frontend-side producer for the strobe-reference channel (the second
+/// crossing-#4 instance: grouped UI → DSP parameters applied on a frame
+/// boundary). Lives in [`HostHandle`](crate::audio::HostHandle) and hides
+/// the `ringbuf` producer.
+pub struct StrobeSender {
+    tx: HeapProd<StrobeRefUpdate>,
+}
+
+impl StrobeSender {
+    /// Pushes a new reference set for the strobe (key change /
+    /// re-lock; `count: 0` clears the strobe). Returns `false` when the ring
+    /// is full — the caller re-sends on its next tick, the same retry
+    /// pattern as the curve-job dirty flag.
+    pub fn set_refs(&mut self, update: StrobeRefUpdate) -> bool {
+        self.tx.try_push(update).is_ok()
     }
 }
 
@@ -222,6 +281,12 @@ pub struct ProcessingFrame {
 
     /// Pre-allocated 4096-bin magnitude scratch buffer strictly for Stage 2 (Bass localization)
     pub bass_magnitude_buffer: Box<[f32]>,
+}
+
+impl Default for ProcessingFrame {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ProcessingFrame {
@@ -361,6 +426,12 @@ pub struct AudioPipeline {
     live_profiles: Box<[KeyProfile; 88]>,
     /// Crossing #4 consumer for template updates; drained into `live_profiles`.
     profile_rx: HeapCons<KeyProfileUpdate>,
+    /// The strobe phase-comparator (Path A) — runs every hop while
+    /// references are set, independent of the engine's note lock.
+    strobe: Strobe,
+    /// Crossing-#4-instance consumer for strobe reference updates; drained
+    /// (newest wins) into the strobe each hop.
+    strobe_rx: HeapCons<StrobeRefUpdate>,
 
     // Wait-free shared state
     atomics: Arc<PipelineAtomics>,
@@ -433,10 +504,17 @@ impl std::fmt::Debug for PipelineHandle {
 pub struct PipelinePorts {
     /// Shareable atomic config/runtime view (crossing #3).
     pub handle: PipelineHandle,
-    /// Worker → UI receiver for `KeyMeasurement` results (crossing #5).
-    pub worker_rx: Receiver<KeyMeasurement>,
+    /// Worker → UI receiver for `WorkerOutput` results — `KeyMeasurement`
+    /// measurements and `CurveBundle` curve recomputes (crossing #5).
+    pub worker_rx: Receiver<WorkerOutput>,
+    /// UI → Worker sender for background jobs (crossing #6). Latest-wins;
+    /// see [`WORKER_JOB_QUEUE_CAPACITY`].
+    pub worker_job_tx: Sender<WorkerJob>,
     /// UI → DSP producer for template updates (crossing #4).
     pub profiles: ProfileSender,
+    /// UI → DSP producer for strobe reference updates (crossing #4's second
+    /// instance).
+    pub strobe_refs: StrobeSender,
 }
 
 impl AudioPipeline {
@@ -490,17 +568,26 @@ impl AudioPipeline {
         let fft_instance = planner.plan_fft_forward(WINDOW_SIZE);
         let fft_bass_instance = planner.plan_fft_forward(BASS_WINDOW_SIZE);
 
-        let (capture_tx, capture_rx) = bounded(2);
-        let (result_tx, worker_rx) = bounded(4);
+        // Crossing #5, DSP → Worker: capture dispatch (`CapturePayload`).
+        let (capture_tx, capture_rx) = bounded(CAPTURE_QUEUE_CAPACITY);
+        // Crossing #5, Worker → UI: results (`WorkerOutput` — measurements + curves).
+        let (result_tx, worker_rx) = bounded(WORKER_RESULT_QUEUE_CAPACITY);
+        // Crossing #6, UI → Worker: background jobs (`WorkerJob` — curve recomputes).
+        let (worker_job_tx, worker_job_rx) = bounded(WORKER_JOB_QUEUE_CAPACITY);
 
         // Crossing #4: SPSC profile-update channel (UI producer → DSP consumer).
         let (profile_tx, profile_rx) =
             HeapRb::<KeyProfileUpdate>::new(PROFILE_QUEUE_CAPACITY).split();
 
+        // Crossing #4, second instance: strobe reference updates (UI → DSP).
+        let (strobe_tx, strobe_rx) =
+            HeapRb::<StrobeRefUpdate>::new(STROBE_REF_QUEUE_CAPACITY).split();
+
         WorkerManager::new(
             Arc::clone(&audio_pool),
             Arc::clone(&atomics),
             capture_rx,
+            worker_job_rx,
             result_tx,
         )
         .start_workers();
@@ -510,6 +597,8 @@ impl AudioPipeline {
             engine,
             live_profiles,
             profile_rx,
+            strobe: Strobe::new(SAMPLE_RATE),
+            strobe_rx,
             atomics: Arc::clone(&atomics),
             audio_pool,
             cola: CircularFifo::new(BASS_WINDOW_SIZE),
@@ -534,7 +623,9 @@ impl AudioPipeline {
         let ports = PipelinePorts {
             handle: PipelineHandle { atomics },
             worker_rx,
+            worker_job_tx,
             profiles: ProfileSender { tx: profile_tx },
+            strobe_refs: StrobeSender { tx: strobe_tx },
         };
 
         (pipeline, ports)
@@ -564,6 +655,16 @@ impl AudioPipeline {
             if let Some(slot) = self.live_profiles.get_mut(update.key_index as usize) {
                 *slot = update.profile;
             }
+        }
+
+        // Strobe references: drain to the newest update — a superseded
+        // reference set is worthless (the key changed again mid-hop).
+        let mut strobe_update = None;
+        while let Some(update) = self.strobe_rx.try_pop() {
+            strobe_update = Some(update);
+        }
+        if let Some(update) = strobe_update {
+            self.strobe.retarget(update);
         }
 
         // ─── Step 1: COLA & Windowing ───
@@ -623,12 +724,14 @@ impl AudioPipeline {
 
         // Pure DSP — Gatekeeper evaluates signal stability and returns result
         let gate_result = self.gatekeeper.process_frame(&self.processing_frame);
+        let is_silence = gate_result.state == SignalState::Silence;
+        let is_stable = gate_result.state == SignalState::Stable;
 
         // Sync runtime observations to shared atomics for framework consumers
         store_f32(&self.atomics.runtime.current_rms_ema, gate_result.rms_ema);
         store_f32(&self.atomics.runtime.current_nhwrsf, gate_result.nhwrsf);
 
-        // ─── Step 4: Treble Magnitude Extraction ───
+        // ─── Step 4: Magnitude Extraction ───
 
         let mag_count = WINDOW_SIZE / 2;
         spectral::magnitude_spectrum(
@@ -646,18 +749,26 @@ impl AudioPipeline {
 
         // ─── Step 5: Pitch Detection (Engine) ───
 
-        let is_silence = gate_result.state == SignalState::Silence;
         if gate_result.is_new_onset {
             self.last_measured_f0 = None;
         }
 
         let pitch_result = self.engine.process(
-            &mut self.processing_frame,
+            &self.processing_frame,
             &self.live_profiles,
             is_silence,
+            is_stable,
             gate_result.is_new_onset,
             gate_result.is_transient_bypass,
             target_note,
+        );
+
+        // ─── Step 5b: Strobe & Coarse Readout ───
+
+        let strobe_result = self.strobe.process(
+            &self.processing_frame,
+            self.gatekeeper.config.silence_threshold,
+            is_silence,
         );
 
         // ─── Step 6: Capture Accumulation & Worker Dispatch ───
@@ -825,19 +936,23 @@ impl AudioPipeline {
         frame_output.ninos2 = gate_result.ninos2_ema;
         frame_output.is_silence = is_silence;
 
+        // Strobe telemetry — unconditional: the band must render (frozen or
+        // spinning) whether or not the engine holds a note lock.
+        frame_output.strobe_angle = strobe_result.angle;
+        frame_output.strobe_gated = strobe_result.gated;
+        frame_output.strobe_count = strobe_result.count;
+        frame_output.coarse_hz = strobe_result.coarse_hz;
+
         if let Some(result) = pitch_result {
             frame_output.detected_frequency = result.measured_f0;
             frame_output.confidence = None;
             frame_output.note_index = Some(result.key_index);
-            frame_output.cents_deviation = result.cents_deviation;
 
-            // Populate strobe arrays (limit to 12 for GUI rendering)
-            let strobe_count = result.partial_count.min(12);
-            frame_output.partial_freqs[..strobe_count]
-                .copy_from_slice(&result.partial_freqs[..strobe_count]);
-            frame_output.partial_ns[..strobe_count]
-                .copy_from_slice(&result.partial_ns[..strobe_count]);
-            frame_output.partial_count = strobe_count;
+            // Populate live tracked partials (cap at buffer capacity for rendering)
+            let n = result.partial_count.min(frame_output.tracked_freqs.len());
+            frame_output.tracked_freqs[..n].copy_from_slice(&result.partial_freqs[..n]);
+            frame_output.tracked_ns[..n].copy_from_slice(&result.partial_ns[..n]);
+            frame_output.tracked_count = n;
         }
 
         Some(frame_output)
@@ -848,6 +963,7 @@ impl AudioPipeline {
 mod tests {
     use super::*;
     use crate::models::{KeyMeasurement, NOTES, get_expected_beta};
+    use crate::strobe::MAX_STROBE_REFS;
 
     fn measurement(key_index: u8, calculated_b: Option<f32>) -> KeyMeasurement {
         KeyMeasurement {
@@ -937,6 +1053,92 @@ mod tests {
             assert_eq!(key3_beta, Some(0.0017));
         } else {
             assert_eq!(seen, 0, "gated update_all must not push");
+        }
+    }
+
+    /// Step 5b end to end: push a reference set over crossing #4, stream a
+    /// detuned sine, and read `coarse_hz` back out of `FrameOutput`. Covers the
+    /// whole wiring — drain, retain, coarse-target resolution, dual-window
+    /// selection, and the crossing-#2 widen — which the unit tests on
+    /// `peaks::coarse_read` cannot reach.
+    #[test]
+    fn coarse_readout_reaches_frame_output() {
+        let (mut pipeline, mut ports) = AudioPipeline::new();
+
+        // A4's fundamental as the reference; the string is 3 Hz sharp (≈ +12 ¢),
+        // inside the ±100 ¢ search band and outside the strobe band's ±18 Hz.
+        let f_ref = 440.0f32;
+        let f_live = 443.0f32;
+        let mut refs = [0.0f32; MAX_STROBE_REFS];
+        refs[0] = f_ref;
+        assert!(ports.strobe_refs.set_refs(StrobeRefUpdate {
+            count: 1,
+            refs,
+            coarse_index: 1,
+            spacing_hz: f_ref,
+        }));
+
+        // Two seconds of audio, one hop at a time — enough for the gatekeeper to
+        // leave Silence and for the COLA buffer to fill.
+        let mut readings = Vec::new();
+        let mut n = 0u64;
+        // f64 phase from an absolute sample index: an f32 accumulator loses
+        // enough precision over two seconds to detune the *test signal*.
+        let step = 2.0 * std::f64::consts::PI * f_live as f64 / SAMPLE_RATE as f64;
+        let mut hop = [0.0f32; HOP_SIZE];
+        for _ in 0..(2 * SAMPLE_RATE as usize / HOP_SIZE) {
+            for s in hop.iter_mut() {
+                *s = 0.2 * (step * n as f64).sin() as f32;
+                n += 1;
+            }
+            if let Some(frame) = pipeline.push_audio(&hop)
+                && let Some(hz) = frame.coarse_hz
+            {
+                readings.push(hz);
+            }
+        }
+
+        assert!(
+            readings.len() > 20,
+            "a sustained tone at the reference must read on most hops, got {}",
+            readings.len()
+        );
+        // Skip the COLA fill-in: until 8192 samples have arrived the long window
+        // analyses a zero-padded fragment, whose leakage biases the refiner. Real
+        // captures pay the same cost for the same 8 hops.
+        let settled = BASS_WINDOW_SIZE / HOP_SIZE;
+        let worst = readings[settled..]
+            .iter()
+            .map(|hz| (hz - f_live).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            worst < 0.05,
+            "coarse read must land on the live partial, worst error {worst:.3} Hz"
+        );
+    }
+
+    /// Silence withholds the coarse read: the CFAR null is broadband noise, so a
+    /// number taken from room rumble would be colored noise dressed as a partial.
+    #[test]
+    fn coarse_readout_withheld_in_silence() {
+        let (mut pipeline, mut ports) = AudioPipeline::new();
+        let mut refs = [0.0f32; MAX_STROBE_REFS];
+        refs[0] = 440.0;
+        assert!(ports.strobe_refs.set_refs(StrobeRefUpdate {
+            count: 1,
+            refs,
+            coarse_index: 1,
+            spacing_hz: 440.0,
+        }));
+
+        let hop = [0.0f32; HOP_SIZE];
+        for _ in 0..(SAMPLE_RATE as usize / HOP_SIZE) {
+            if let Some(frame) = pipeline.push_audio(&hop) {
+                assert!(
+                    frame.coarse_hz.is_none(),
+                    "silence must publish no coarse reading"
+                );
+            }
         }
     }
 

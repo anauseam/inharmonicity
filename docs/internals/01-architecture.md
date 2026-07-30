@@ -13,22 +13,34 @@ able to consume the crate as-is.
 
 `tuner-gui` depends on `tuner-core`. The reverse never holds.
 
-The GUI interacts with the core through exactly five channels:
+The GUI interacts with the core through exactly six channels. **"Crossing #N"
+always refers to the canonical numbering in
+[`02-cross-thread-communication.md`](02-cross-thread-communication.md)** —
+this list is *not* numbered the same way (it enumerates the GUI's
+interaction points, which include construction and exclude the CPAL→DSP
+crossing the GUI never touches):
 
 1. `AudioPipeline::new()` returns `(AudioPipeline, PipelinePorts)` — the
    Split / Handle pattern. The GUI keeps the ports; the audio thread
-   takes the pipeline.
+   takes the pipeline. (Construction, not a runtime crossing.)
 2. `PipelinePorts.handle.atomics` — wait-free reads of `RuntimeAtomics`
    and wait-free writes of `ConfigAtomics`, plus the `CaptureState`
    lifecycle atomic. (`handle` is the cloneable `PipelineHandle`.)
-3. `PipelinePorts.worker_rx` — a crossbeam SPSC receiver for
-   `KeyMeasurement` results coming back from the Worker thread.
-4. `PipelinePorts.profiles` — a `ringbuf` SPSC producer for pushing
+   Crossing #3.
+3. `PipelinePorts.worker_rx` — a crossbeam SPSC receiver for `WorkerOutput`
+   coming back from the Worker: `Measurement` results per capture and
+   `Curve` bundles per recompute (one enum stream). The Worker → UI leg
+   of crossing #5.
+4. `PipelinePorts.worker_job_tx` — a crossbeam SPSC sender for `WorkerJob`
+   background requests to the Worker (UI → Worker; today curve recomputes).
+   Crossing #6.
+5. `PipelinePorts.profiles` — a `ringbuf` SPSC producer for pushing
    recompiled `KeyProfile` templates back into the live engine (UI → DSP).
-5. A `triple_buffer` carrying the live, continuous `FrameOutput` from
-   the DSP thread to the GUI for visualization.
+   Crossing #4.
+6. A `triple_buffer` carrying the live, continuous `FrameOutput` from
+   the DSP thread to the GUI for visualization. Crossing #2.
 
-Anything that doesn't fit one of these five shapes is a sign that the
+Anything that doesn't fit one of these six shapes is a sign that the
 boundary is being violated.
 
 ## Cold-path modules and the future audio-out crossing
@@ -43,19 +55,19 @@ real-time rules above.
 Speaker **playback** is a separate, currently-unbuilt concern. When it is
 added (the GUI "hear the curve" feature), the CPAL **output** stream will live
 in `audio` — the single CPAL boundary — **not** in the GUI, because the core is
-headless and the GUI speaks only the five channels above. It is the mirror of
+headless and the GUI speaks only the six channels above. It is the mirror of
 crossing #1: the output callback is the real-time _consumer_ filling a
 `&mut [f32]`, fed by a lock-free ring buffer whose _producer_ is the cold
-`synth`. That is a sanctioned **sixth crossing**, exposed as an opt-in handle
+`synth`. That is a sanctioned **seventh crossing**, exposed as an opt-in handle
 like `spawn_analysis_thread` and subject to the same wait-free callback
 discipline. It is deferred; duplex (playback during capture) is out of scope.
 
 ## Pipeline ownership (Split / Handle pattern)
 
 `AudioPipeline` owns the real-time DSP components: `Gatekeeper`,
-`Engine`, the COLA `CircularFifo`, the `AudioPool`, and the inline
-capture-accumulation state. It is moved to the audio thread and is the
-only thing that mutates the pipeline's internal state.
+`Engine`, the `Strobe`, the COLA `CircularFifo`, the `AudioPool`,
+and the inline capture-accumulation state. It is moved to the audio
+thread and is the only thing that mutates the pipeline's internal state.
 
 `PipelinePorts` is the GUI's window into the running pipeline. It carries
 the cloneable `PipelineHandle` (`Arc<PipelineAtomics>`), the Worker → UI
@@ -75,12 +87,69 @@ buffers and a state machine) but they expose their results by value:
 
 - `Gatekeeper::process_frame` returns a `GateResult`.
 - `Engine::process` returns an `Option<PitchResult>`.
+- `Strobe::process` returns a `StrobeResult`.
 
 The `AudioPipeline` reads these return values and syncs observations
 back to the shared atomics. Nothing else does.
 
 This convention means the components are unit-testable in isolation and
 the data flow is auditable from a single file (`pipeline.rs`).
+
+### The processing chain is sacred
+
+The hot path has exactly one processing chain, with two outputs (the
+authoritative step-by-step, with every step's consumers, is the per-hop
+sequence table in [`03-dsp-pipeline.md`](03-dsp-pipeline.md)):
+
+```text
+CPAL callback ─► ringbuf ─► COLA/FFT front-end ─► Gatekeeper ─► Engine ─┬─► FrameOutput ─► GUI
+  (DC block)                (Gatekeeper + discovery inputs)             │
+                                                                        └─► capture limb ─► Worker (MAT) ─► KeyMeasurement
+```
+
+`Gatekeeper` decides whether the hop's signal is usable; `Engine` is
+the **single center of real-time pitch DSP** — discovery, tracking,
+manual-mode targeting; the **Worker** is the single home of
+asynchronous high-resolution measurement, kept off-thread precisely so
+the Engine stays unpolluted. The FFT front-end and the capture limb
+are chain stages too — the Gatekeeper's transient metrics read the
+treble spectrum, discovery reads the bass magnitudes, and the capture
+limb produces the measurements the product is built on. Inserting a
+new **stage** anywhere in this chain — anything a chain component
+would depend on, anything that transforms the data flowing between
+them, anything whose removal would change gating, detection, or
+measurement — is a foundational change to the architecture. It needs
+its own design note, review against this file and
+[`02`](02-cross-thread-communication.md), and ADR-grade justification.
+The default answer is **no**.
+
+Not everything inside `process_cola_hop` is a chain stage, though. The
+hop also hosts **taps**: parallel observers that read the hop's audio
+or the components' outputs and produce telemetry without sitting in
+the chain's data path. Today there are three: the treble-magnitude
+extraction for the spectrogram, the diagnostic history pre-roll, and
+the `Strobe` (step 5b — fixed-reference beat phase and coarse spectral
+readout, ADR 0011). The test for a tap is **deletability**: removing it
+must leave gating, detection, and measurement bit-identical, because
+nothing in the chain consumes its output — the `Strobe` reads a *target*
+the UI nominated, never the engine's tracker, and writes only
+`FrameOutput`. (The capture accumulator is *not* a tap by this test —
+it is the measurement limb.)
+
+Adding a tap is still an architecture-level change — lighter than a
+stage, far heavier than a function:
+
+- it follows the purity conventions above (own file, results by value,
+  no knowledge of atomics or the GUI) and is called only from
+  `process_cola_hop`;
+- it must satisfy the deletability test — a "tap" the chain starts
+  depending on has become a stage, and gets the stage-level bar;
+- any new UI ↔ DSP data flow maps onto an existing crossing charter in
+  `02` (a new payload instance, a wider `FrameOutput`) rather than a
+  new channel shape — a genuinely new crossing needs `02` §6's reuse
+  test and its own documented charter;
+- `00`'s diagram and file map, this file's ownership list, and `02`'s
+  affected crossing sections are updated in the same change.
 
 ## `process_cola_hop` is the single DSP entry point
 
@@ -91,10 +160,12 @@ Every audio hop runs exactly one function:
 2. Runs the `Gatekeeper` for signal validation; receives a `GateResult`.
 3. Runs the `Engine` for F0 detection when the Gatekeeper approves the
    signal.
-4. Syncs observations back to the shared atomics and produces a
+4. Runs the `Strobe` for fixed-reference beat phase and coarse spectral
+   readout; receives a `StrobeResult`.
+5. Syncs observations back to the shared atomics and produces a
    `FrameOutput` for the GUI's `triple_buffer`.
-5. Manages capture accumulation: `Armed → Recording → dispatch to
-Worker` via `CaptureState`.
+6. Manages capture accumulation: `Armed → Recording → dispatch to
+   Worker` via `CaptureState`.
 
 New DSP behaviour goes inside this function (or in a component it
 already calls). Bypassing it — for example, having `audio.rs` call into

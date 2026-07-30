@@ -2,6 +2,24 @@ import os
 import subprocess
 import pandas as pd
 import argparse
+from collections import Counter, deque
+
+
+def mofn_lock(winners, m, n):
+    """First key to win >= m of the last n winners (deque(maxlen=n)); identical
+    to validate_config.py / replay_lock_rules.py and the engine's
+    record_stable_winner. m = n = 3 reproduces the old 3-consecutive rule."""
+    win = deque(maxlen=n)
+    counts = Counter()
+    for w in winners:
+        if len(win) == n:
+            counts[win[0]] -= 1
+        win.append(w)
+        counts[w] += 1
+        if counts[w] >= m:
+            return w
+    return None
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -14,8 +32,16 @@ def main():
                              "validation only).")
     parser.add_argument("--no-plot", action="store_true",
                         help="Skip per-key plotting (faster; not needed for pass/fail)")
+    parser.add_argument("--base", default="./diagnostics",
+                        help="capture dir holding key_* subdirs (default ./diagnostics)")
+    parser.add_argument("--lock-m", type=int, default=7,
+                        help="M-of-N lock: votes required (default 7; ADR 0010 refined)")
+    parser.add_argument("--lock-n", type=int, default=8,
+                        help="M-of-N lock: window length (default 8; 3/3 = old rule)")
     args = parser.parse_args()
-    base_dir = "./diagnostics"
+    if not args.lock_m > args.lock_n // 2:
+        parser.error("--lock-m must exceed --lock-n/2 (majority => unique winner)")
+    base_dir = args.base
     results = []
 
     print("Compiling diagnose_engine (with telemetry) and diagnose_gatekeeper (release)...")
@@ -27,7 +53,8 @@ def main():
 
     keys = sorted([d for d in os.listdir(base_dir) if d.startswith("key_")])
     mode_str = "REFINED" if args.refine else "DISCRETE"
-    print(f"Found {len(keys)} keys. Running Engine diagnostics ({mode_str} mode)...")
+    print(f"Found {len(keys)} keys. Running Engine diagnostics ({mode_str} mode, "
+          f"lock={args.lock_m}-of-{args.lock_n}, base={base_dir})...")
 
     for key_dir_name in keys:
         expected_key = int(key_dir_name.split("_")[1])
@@ -91,24 +118,14 @@ def main():
             results.append({"key": key_dir_name, "locked_key": -1, "status": "FAIL_NEVER_STABLE", "p1_alive": p1_alive_frames, "p1_dead": p1_dead_frames, "median_s_win": 0.0})
             continue
             
-        locked_key = -1
-        consistency_count = 0
-        current_candidate = -1
-        
-        for idx, row in stable_df.iterrows():
-            winner = int(row['key_idx'])
-            if winner == current_candidate:
-                consistency_count += 1
-            else:
-                current_candidate = winner
-                consistency_count = 1
-                
-            if consistency_count >= 3:
-                locked_key = current_candidate
-                break
-                
+        # M-of-N binary-integration lock (ADR 0010) over the stable-frame
+        # winner sequence — same rule as validate_config.py and the engine.
+        stable_winners = [int(row['key_idx']) for _, row in stable_df.iterrows()]
+        locked = mofn_lock(stable_winners, args.lock_m, args.lock_n)
+        locked_key = -1 if locked is None else locked
+
         if locked_key == -1:
-            results.append({"key": key_dir_name, "locked_key": -1, "status": "FAIL_NO_3_FRAME_LOCK", "p1_alive": p1_alive_frames, "p1_dead": p1_dead_frames, "median_s_win": median_s_win})
+            results.append({"key": key_dir_name, "locked_key": -1, "status": "FAIL_NO_LOCK", "p1_alive": p1_alive_frames, "p1_dead": p1_dead_frames, "median_s_win": median_s_win})
         elif locked_key != expected_key:
             results.append({"key": key_dir_name, "locked_key": locked_key, "status": f"FAIL_WRONG_KEY (Expected {expected_key})", "p1_alive": p1_alive_frames, "p1_dead": p1_dead_frames, "median_s_win": median_s_win})
         else:
@@ -132,7 +149,7 @@ def main():
         for _, row in failures.iterrows():
             print(f"  {row['key']}: {row['status']} (Locked on: {row['locked_key']}) s_win: {row['median_s_win']:+.1f}c")
     else:
-        print("\nSUCCESS! All 88 keys achieved a perfect 3-frame stability lock on the correct fundamental!")
+        print(f"\nSUCCESS! All 88 keys achieved a {args.lock_m}-of-{args.lock_n} stability lock on the correct fundamental!")
 
     print("\n--- REFINED SCALE SUMMARY ---")
     if args.refine:

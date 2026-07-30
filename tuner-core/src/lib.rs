@@ -39,6 +39,9 @@ pub mod gatekeeper;
 pub mod models;
 /// AudioPipeline mediator: orchestrates DSP components, owns shared state, memory pools.
 pub mod pipeline;
+/// Fixed-reference strobe phase-comparator bank (Path A of the manual-mode
+/// strobe): DSP-side beat-phase accumulation against curve targets.
+pub mod strobe;
 /// Offline additive resynthesis of a [`models::TuningCurve`] to audio samples
 /// (cold-path, thread-free — no audio stream; the caller plays or saves).
 pub mod synth;
@@ -76,15 +79,34 @@ pub struct FrameOutput {
     pub detected_frequency: Option<f32>,
     /// Detection confidence (0.0–1.0). Currently unused by MAT, returning None.
     pub confidence: Option<f32>,
-    /// Deviation from nearest equal-temperament note in cents (positive = sharp).
-    pub cents_deviation: Option<f32>,
-    /// Real-time partial frequencies for multi-ring strobe visualization.
-    /// Valid entries: `[0..partial_count]`.
-    pub partial_freqs: [f32; 12],
-    /// Harmonic index (n) for each partial. Parallel to `partial_freqs`.
-    pub partial_ns: [u32; 12],
-    /// Number of valid entries in `partial_freqs` / `partial_ns`.
-    pub partial_count: usize,
+    /// Real-time partial frequencies tracked by the engine for visual telemetry.
+    /// Valid entries: `[0..tracked_count]`.
+    pub tracked_freqs: [f32; 12],
+    /// Harmonic index (n) for each partial. Parallel to `tracked_freqs`.
+    pub tracked_ns: [u32; 12],
+    /// Number of valid entries in `tracked_freqs` / `tracked_ns`.
+    pub tracked_count: usize,
+    /// Strobe-bank accumulated beat phase per reference (cycles, [0, 1)) —
+    /// index = partial n − 1 of the strobed key. Accumulated DSP-side
+    /// (strobe design R2) so this lossy buffer cannot corrupt the count.
+    /// Valid entries: `[0..strobe_count]`.
+    pub strobe_angle: [f32; 12],
+    /// Per-reference D3 amplitude gate (`true` = below floor, angle held).
+    /// Parallel to `strobe_angle`.
+    pub strobe_gated: [bool; 12],
+    /// Number of valid strobe references (0 = no key being strobed).
+    pub strobe_count: usize,
+    /// Coarse readout: the measured frequency (Hz) of the strobed key's coarse
+    /// partial, read straight off the magnitude spectrum
+    /// (`algorithms::peaks::coarse_read`) at the partial the
+    /// [`strobe::StrobeRefUpdate`] nominated. `None` when the reference is not
+    /// set, the signal is `Silence`, or nothing there clears the local noise.
+    ///
+    /// The wide-range half of the readout pair: unlike `strobe_angle` it does
+    /// not alias past ±21.5 Hz, and unlike `detected_frequency` it needs no note
+    /// lock — so it is what remains readable during a pitch raise. Absolute Hz,
+    /// not cents: the frontend owns the reference the number is shown against.
+    pub coarse_hz: Option<f32>,
 }
 
 impl Default for FrameOutput {
@@ -99,10 +121,13 @@ impl Default for FrameOutput {
             note_index: None,
             detected_frequency: None,
             confidence: None,
-            cents_deviation: None,
-            partial_freqs: [0.0; 12],
-            partial_ns: [0; 12],
-            partial_count: 0,
+            tracked_freqs: [0.0; 12],
+            tracked_ns: [0; 12],
+            tracked_count: 0,
+            strobe_angle: [0.0; 12],
+            strobe_gated: [true; 12],
+            strobe_count: 0,
+            coarse_hz: None,
         }
     }
 }
@@ -116,8 +141,8 @@ impl std::fmt::Debug for FrameOutput {
             .field("note_index", &self.note_index)
             .field("detected_frequency", &self.detected_frequency)
             .field("confidence", &self.confidence)
-            .field("cents_deviation", &self.cents_deviation)
-            .field("partial_count", &self.partial_count)
+            .field("tracked_count", &self.tracked_count)
+            .field("coarse_hz", &self.coarse_hz)
             .finish()
     }
 }

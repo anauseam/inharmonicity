@@ -6,7 +6,7 @@
 //! | Submodule | Domain | Returns |
 //! |---|---|---|
 //! | [`spectral`] | Time ↔ frequency transforms | Complex spectra, magnitudes, CSPE freqs |
-//! | [`peaks`] | Peak extraction (Jacobsen sub-bin) + masking | [`models::SpectralPeak`] lists |
+//! | [`peaks`] | Peak extraction + masking; bounded CFAR-gated coarse read | [`models::SpectralPeak`] lists, coarse frequency |
 //! | [`mat`] | MAT adjustive (f₀, B) estimator | Frequency (Hz), B, partials |
 //! | [`twm`] | Two-Way Mismatch scoring | TWM error (Hz) |
 //! | [`discovery`] | Split discovery search (ADR 0005) | Key index, scale, error |

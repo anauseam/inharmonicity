@@ -28,6 +28,38 @@ function or in a component it already calls. Calling into `Engine` or
 `audio.rs` or from the GUI) bypasses the shared-state syncing step at
 the end of the hop and breaks observability.
 
+## The per-hop sequence (authoritative)
+
+`process_cola_hop`, step by step, with each step's actual consumers.
+**Chain** steps carry data a later chain step depends on; the **capture
+limb** is the chain's asynchronous measurement branch; **taps** are
+parallel observers whose removal leaves gating, detection, and
+measurement bit-identical. The change bar for each class is defined in
+[`01-architecture.md`](01-architecture.md) — this table is the ground
+truth it judges against.
+
+| # | Step | Feeds | Class |
+| --- | --- | --- | --- |
+| 0 | Drain crossing-#4 rings: profile templates (apply all), strobe references (newest wins) | Engine templates; Strobe | chain input / tap input |
+| 1 | COLA `read_window` (8192) → treble FFT (newest 2048) + bass FFT (8192), hop acknowledge | Gatekeeper (treble complex spectrum), Engine + Strobe (audio) | **chain** |
+| 1b | History-buffer accumulation (newest hop) | diagnostic pre-roll only | tap |
+| 2 | Read config atomics: thresholds, noise floor, `target_note` (crossing #3) | Gatekeeper, Engine, Strobe gate | chain input |
+| 3 | **Gatekeeper** → `GateResult` (5-state machine: RMS/EMA on the time signal, NHWRSF + NINOS² on the treble spectrum); observations synced to runtime atomics | pipeline control flow, Engine resets, capture baton | **chain** |
+| 4 | Bass magnitude spectrum | **Engine discovery** | **chain** |
+| 4 | Treble magnitude spectrum | spectrogram (`FrameOutput`) only | tap |
+| 5 | **Engine** → `Option<PitchResult>`: silence/transient resets → discovery (Stage-A discrete scoring over the bass magnitudes, M-of-N acquisition lock, tracker seeding) or tracking (adaptive Goertzel bank, NP gate, EMA) | telemetry, capture latch | **chain** |
+| 5b | **Strobe** → `StrobeResult`: fixed-reference beat phase and bounded CFAR-gated coarse spectral readout at the nominated reference partial (skipped during `Silence`) | `FrameOutput` only | tap |
+| 6 | Capture accumulation & dispatch — the `CaptureState` baton: onset pre-roll → `Recording` on Stable → 1.5 s or decay → dispatch gate → `CapturePayload` to the Worker (crossing #5), with backpressure recovery | Worker → MAT → `KeyMeasurement` → profile | **capture limb** (chain branch) |
+| 7 | `FrameOutput` assembly: treble magnitudes, gate telemetry, pitch fields when locked, strobe fields + `coarse_hz` unconditionally → triple buffer (crossing #2) | GUI | out |
+
+Two things this table encodes that a "stream → gate → engine" sketch
+hides: the windowing/FFT front-end is itself a chain stage (the
+Gatekeeper's transient metrics read the treble spectrum; discovery reads
+the bass magnitudes), and the chain has **two outputs** — the continuous
+`FrameOutput` telemetry and the asynchronous capture limb through the
+Worker, which produces the `KeyMeasurement`s the entire product is built
+on. Neither output may be treated as a tap.
+
 ## Allocation discipline
 
 On the hot path:
@@ -37,8 +69,9 @@ On the hot path:
 - No `clone()` on heap-owning types (`Vec`, `Box<[T]>`, `String`).
   `Arc::clone` is fine because it is just an atomic increment.
 - All scratch buffers used inside the hop are owned by the pipeline
-  (`ProcessingFrame`), the components (`Gatekeeper`, `Engine`), or the
-  COLA buffer — allocated once at startup via `Box<[T]>`.
+  (`ProcessingFrame`), the components (`Gatekeeper`, `Engine`, and
+  `Strobe` — which owns its step-5b `coarse_scratch` CFAR reference
+  cells), or the COLA buffer — allocated once at startup via `Box<[T]>`.
 - Algorithms accept `&[T]` / `&mut [T]` slices for input and output;
   they do not allocate their own working space.
 

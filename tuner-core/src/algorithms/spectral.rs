@@ -237,14 +237,41 @@ fn candan_bias_correction(window_size: usize) -> f32 {
     }
 }
 
+/// Signature shared by the fixed-length Goertzel evaluators ([`goertzel`],
+/// [`goertzel_bass`]): `(samples, sample_rate, target_hz) → (amplitude, phase)`.
+/// Callers that select a window length at runtime (engine tracker, strobe
+/// bank) hold one of these per register.
+pub type GoertzelFn = fn(&[f32], u32, f32) -> (f32, f32);
+
+/// The Neyman–Pearson amplitude threshold coefficient for an `n`-sample
+/// Hann-windowed Goertzel: `T_amp = noise_floor · K(n)` with
+/// `K(n) = (4/n)·√(0.375·n·ln(1/P_fa))`, P_fa = 0.001 — the Kay 1998
+/// (*Detection Theory*, Ch. 9; Rayleigh tail) magnitude threshold scaled by
+/// the [`goertzel`] `4/n` physical-units normalization and the unnormalized
+/// Hann window energy `Σw² = 0.375·n`. At n = 1024 this reproduces the
+/// engine's historical `NEYMAN_PEARSON_K = 0.201184` exactly (pinned by
+/// test in `strobe.rs`); K ∝ 1/√n, so the 4096-sample window's threshold is
+/// half that — the processing gain a longer window buys.
+pub fn neyman_pearson_k(n: usize) -> f32 {
+    (4.0 / n as f32) * (0.375 * n as f32 * 1000f32.ln()).sqrt()
+}
+
 /// Precomputed Hann window for the 1024-sample Goertzel hop.
-static HANN_1024: Lazy<[f32; 1024]> = Lazy::new(|| {
-    let mut window = [0.0; 1024];
-    for i in 0..1024 {
-        window[i] = 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / 1023.0).cos());
+static HANN_1024: Lazy<[f32; 1024]> = Lazy::new(hann::<1024>);
+
+/// Precomputed Hann window for the long deep-bass strobe Goertzel (R3):
+/// main-lobe half-width 2·fs/N ≈ ±21.5 Hz at 44.1 kHz, below A0's ≈27.5 Hz
+/// partial spacing, so a neighboring partial no longer sits inside the lobe.
+static HANN_4096: Lazy<[f32; 4096]> = Lazy::new(hann::<4096>);
+
+/// Periodic-form Hann coefficients for a length-`N` analysis window.
+fn hann<const N: usize>() -> [f32; N] {
+    let mut window = [0.0; N];
+    for (i, w) in window.iter_mut().enumerate() {
+        *w = 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / (N as f32 - 1.0)).cos());
     }
     window
-});
+}
 
 /// Hann-windowed non-integer Goertzel algorithm.
 ///
@@ -265,12 +292,32 @@ static HANN_1024: Lazy<[f32; 1024]> = Lazy::new(|| {
 /// per Sysel & Rajmic (2012), EURASIP J. Adv. Signal Process. 2012:56. The Hann
 /// window and 4/N physical-units normalization are ours.
 pub fn goertzel(samples: &[f32], sample_rate: u32, target_hz: f32) -> (f32, f32) {
-    if samples.len() < 1024 {
+    goertzel_windowed(samples, sample_rate, target_hz, &*HANN_1024)
+}
+
+/// [`goertzel`] over the last `window.len()` samples of `samples` with an
+/// arbitrary precomputed window — the strobe bank's deep-bass path evaluates
+/// a 4096-sample window ([`goertzel_bass`]) where the 1024 main lobe would
+/// swallow the neighboring partial (R3). Window length ≠ hop: callers still
+/// evaluate every hop, so the update rate is unchanged. Same normalization
+/// and phase contract as [`goertzel`].
+///
+/// `pub` so the offline window-length diagnostics (`examples/pitch_ground_truth.rs`)
+/// can sweep lengths the shipping code does not instantiate; shipping callers
+/// use the two fixed-length wrappers.
+pub fn goertzel_windowed(
+    samples: &[f32],
+    sample_rate: u32,
+    target_hz: f32,
+    window: &[f32],
+) -> (f32, f32) {
+    let n = window.len();
+    if samples.len() < n {
         return (0.0, 0.0);
     }
 
-    let k = (1024.0 * target_hz) / sample_rate as f32;
-    let omega = (2.0 * std::f32::consts::PI * k) / 1024.0;
+    let k = (n as f32 * target_hz) / sample_rate as f32;
+    let omega = (2.0 * std::f32::consts::PI * k) / n as f32;
     let cosine = omega.cos();
     let sine = omega.sin();
     let coeff = 2.0 * cosine;
@@ -278,7 +325,10 @@ pub fn goertzel(samples: &[f32], sample_rate: u32, target_hz: f32) -> (f32, f32)
     let mut q1 = 0.0_f32;
     let mut q2 = 0.0_f32;
 
-    for (&sample, &w) in samples.iter().take(1024).zip(HANN_1024.iter()) {
+    // The freshest `n` samples — for the engine's 1024-hop slice this is the
+    // whole slice (its caller already passes exactly one hop).
+    let start = samples.len() - n;
+    for (&sample, &w) in samples[start..].iter().zip(window.iter()) {
         let q0 = coeff * q1 - q2 + (sample * w);
         q2 = q1;
         q1 = q0;
@@ -290,8 +340,17 @@ pub fn goertzel(samples: &[f32], sample_rate: u32, target_hz: f32) -> (f32, f32)
     let magnitude = (real * real + imag * imag).sqrt();
     let phase = imag.atan2(real);
 
-    // Normalize by 4.0 / 1024.0 to correct for windowing and single-sided spectrum
-    let amplitude = magnitude * 4.0 / 1024.0;
+    // Normalize by 4/N to correct for windowing and single-sided spectrum.
+    let amplitude = magnitude * 4.0 / n as f32;
 
     (amplitude, phase)
+}
+
+/// [`goertzel`] with the 4096-sample Hann window — the deep-bass strobe
+/// resolution path (R3). Evaluates the freshest 4096 samples of `samples`.
+/// `pub` so the offline strobe-replay diagnostic (`examples/strobe_replay.rs`)
+/// can A/B the two window lengths on captured bass audio; the shipping caller
+/// is [`crate::strobe::Strobe`].
+pub fn goertzel_bass(samples: &[f32], sample_rate: u32, target_hz: f32) -> (f32, f32) {
+    goertzel_windowed(samples, sample_rate, target_hz, &*HANN_4096)
 }

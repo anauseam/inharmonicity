@@ -36,8 +36,10 @@
 //! 3. W. A. Sethares, "Local consonance and the relationship between timbre
 //!    and scale", JASA 94(3):1218–1228 (1993).
 
-/// Sethares/Giordano roughness constants (Giordano Eqs. 4–6). Giordano's
-/// values, adopted verbatim (design note defaults #13.1); Gràcia &
+/// Sethares/Giordano roughness constants (Giordano Eqs. 3–4 and the
+/// accompanying text; originally Sethares 1993 Eqs. 1–4, where d* = 0.24
+/// derives from the Eq-1 fit and s₁/s₂ from his least-squares interpolation).
+/// Giordano's values, adopted verbatim (design note defaults #13.1); Gràcia &
 /// Sanz-Perela's min-loudness/b_2=5.7 variant noted there and not used.
 pub const B1: f64 = 3.5;
 /// See [`B1`].
@@ -50,7 +52,7 @@ pub const S1: f64 = 0.021;
 pub const S2: f64 = 19.0;
 
 /// Plomp–Levelt pure-tone dissonance of two sine components at `f_a`, `f_b`
-/// Hz (Giordano Eqs. 4–6; unit peak, dimensionless). Zero at unison,
+/// Hz (Giordano Eqs. 3–4; unit peak, dimensionless). Zero at unison,
 /// maximal near a quarter critical bandwidth, asymptotically zero for wide
 /// separation.
 pub fn pure_tone_dissonance(f_a: f64, f_b: f64) -> f64 {
@@ -75,12 +77,17 @@ fn normalize_power(partials: &[(f64, f64)]) -> Option<Vec<(f64, f64)>> {
 
 /// Total sensory dissonance between two notes' partial lists
 /// (`(frequency_hz, amplitude)` pairs): amplitude-product-weighted
-/// Plomp–Levelt roughness summed over all **cross** partial pairs, each note
-/// normalized to equal total power.
+/// Plomp–Levelt roughness summed over all **cross** partial pairs
+/// (Giordano Eqs. 5–6, the "amplitude product" model), each note
+/// normalized to equal total power (his §VI.C).
 ///
-/// Cross pairs only, per the design note (§3.2): the intra-note terms of
-/// Giordano's full two-tone sum are (near-)invariant under the interval scan
-/// and cannot move the argmin materially, so the scan objective omits them.
+/// Cross pairs only is **Giordano's own construction**: his Eq. 5 sums tone
+/// 1's partials against tone 2's and explicitly omits self-dissonance as
+/// immaterial to locating a two-tone minimum (the intra-note terms exist
+/// only in Sethares' fuller 1993 Eq.-6 form). The design note (§3.2) makes
+/// the same argument quantitatively: intra-note terms are (near-)invariant
+/// under the interval scan. Giordano's ½ prefactor is dropped — a constant
+/// scale, inert for the argmin and for downstream weight ratios.
 pub fn dissonance(lower: &[(f64, f64)], upper: &[(f64, f64)]) -> f64 {
     let (Some(lo), Some(up)) = (normalize_power(lower), normalize_power(upper)) else {
         return 0.0;

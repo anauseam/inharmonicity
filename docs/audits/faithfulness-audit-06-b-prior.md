@@ -2,6 +2,10 @@
 
 **Series:** Prompt B faithfulness audits (status table in `faithfulness-audit-01-twm.md`), item 6 of 8.
 **Date:** 2026-07-04.
+**Renamed 2026-07-15** from `faithfulness-audit-06-rigaud.md`: this audit covers
+the *Discovery B prior* (`get_expected_beta`) against Rigaud 2013's model form;
+the wave-2 audit of `algorithms/rigaud.rs` (the tuning-curve port of the same
+paper) now owns the "rigaud" name (`faithfulness-audit-09-rigaud.md`).
 **Source of truth:** Rigaud, F., David, B. & Daudet, L. (2013). "A parametric
 model and estimation techniques for the inharmonicity and tuning of the
 piano." JASA 133(5), 3107–3118 — primary source read

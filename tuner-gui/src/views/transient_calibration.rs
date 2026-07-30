@@ -78,7 +78,7 @@ pub fn create_transient_calibration_panel(
                 current_val,
                 crate::Message::NhwrsfThresholdChanged
             )
-            .step(0.001)
+            .step(0.001_f32)
             .width(Fill),
             text("2.0").size(14),
         ]

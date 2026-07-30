@@ -188,6 +188,22 @@ const BAND_HALFWIDTH_F0_FRAC_SERIAL: f32 = 0.25;
 
 /// Floor on the band half-width in bins, so the window stays resolvable for sub-bin
 /// interpolation even when $f_0/4$ is sub-bin (deep bass at large FFT sizes).
+///
+/// Ours — the paper states no floor — though the value is not arbitrary: §2.4's
+/// own worked example band is exactly 4 bins (faithfulness-audit-07).
+///
+/// When it engages depends on the capture, because the Worker sizes its FFT to
+/// the captured sample count (largest power of two, capped at 2¹⁶). At a full
+/// 1.5 s capture that is 65536 — a 0.67 Hz bin, where `f_0/4` is already 10 bins
+/// at A0 and the floor is inert. A capture cut short by early silence drops the
+/// FFT an octave at a time, and by 2¹⁴ (2.7 Hz bins) the 4-bin floor is 10.8 Hz
+/// against an `f_0/4` of 6.9 Hz at A0 — so in the deep bass it **is** the term
+/// that sets the band on short captures. That is the case it exists for.
+///
+/// It is **not** the same constant as `peaks::COARSE_SPAN_MIN_BINS` despite the
+/// shared value and shape: that one lives at 8192/2048 where a bin is 5.4/21.5 Hz,
+/// and it is only safe there because of a neighbour cap this band has no
+/// equivalent of (ADR 0011 §6). Do not factor them together.
 const BAND_HALFWIDTH_MIN_BINS: f32 = 4.0;
 
 /// Pair count at which the confidence's evidence term saturates. Below it, confidence is

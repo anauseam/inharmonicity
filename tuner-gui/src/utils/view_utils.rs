@@ -21,6 +21,7 @@ pub fn initialize_done_timer() {
 /// - Off: Gray button with "Off" text
 /// - Armed: Gold button with "Capture" text  
 /// - Done: Green button with "Done" text (shows for 3 seconds)
+///
 /// This provides clear visual feedback for the measurement process.
 ///
 /// # Arguments

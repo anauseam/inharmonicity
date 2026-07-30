@@ -69,5 +69,10 @@ single-file size.
 - **A new domain type** (something that needs to be serialized, displayed,
   or stored in a profile) → `models.rs`.
 - **State that lives across hops** (filter memory, running counters,
-  state-machine variables) → a field on `Engine`, `Gatekeeper`, or the
-  pipeline itself, _not_ in `algorithms/`.
+  state-machine variables) → a field on an existing component
+  (`Engine`, `Gatekeeper`, `Strobe`) or the pipeline itself, _not_
+  in `algorithms/`. A concern that fits no existing component gets its
+  own component file — an architecture-level change; see the review
+  requirements in [`01-architecture.md`](01-architecture.md). The
+  stateless math it calls still belongs in `algorithms/` (the
+  `Strobe` / `spectral::goertzel_windowed` split is the pattern).

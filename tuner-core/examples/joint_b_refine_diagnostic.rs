@@ -70,7 +70,7 @@ fn reg_of(key: usize) -> usize {
 }
 /// Per-note relative B scatter σ_B — OUR calibration constants, the same values
 /// `gen_frame` draws the synthetic per-note B with (mis-cited to "Rigaud Fig. 3"
-/// pre-audit; see docs/audits/faithfulness-audit-06-rigaud.md). The ±n·σ_B
+/// pre-audit; see docs/audits/faithfulness-audit-06-b-prior.md). The ±n·σ_B
 /// refinement bound is expressed in these units so the search window matches the
 /// prior's own uncertainty model.
 fn sigma_b(key: usize) -> f32 {
@@ -791,15 +791,8 @@ fn process_synth_frame(
     // Separability: refine EVERY key jointly, argmin by regularized error.
     let mut best_reg = f32::MAX;
     let mut argmin = 0usize;
-    for k in 0..88 {
-        let j = refine_joint(
-            &f.peaks,
-            profiles[k].f0_et,
-            profiles[k].beta,
-            sigma_b(k),
-            cfg,
-            jc,
-        );
+    for (k, p) in profiles.iter().enumerate() {
+        let j = refine_joint(&f.peaks, p.f0_et, p.beta, sigma_b(k), cfg, jc);
         if j.reg < best_reg {
             best_reg = j.reg;
             argmin = k;
@@ -976,11 +969,11 @@ fn report_synthetic(frames: &[Frame], profiles: &[KeyProfile; 88], cfg: &TwmConf
             continue;
         }
         println!("  {}", jc.label);
-        for r in 0..3 {
+        for (r, name) in REG_NAMES.iter().enumerate() {
             let n = a.pull_n[r].max(1) as f64;
             println!(
                 "    {:<7} mean|d|={:>4.2}σ  pinned={:>5.1}%  β_chosen/prior={:>5.2}×  (β_true/prior={:>5.2}×)",
-                REG_NAMES[r],
+                name,
                 a.pull_absd_sum[r] / n,
                 pct(a.pull_pinned[r], a.pull_n[r]),
                 a.pull_bratio_sum[r] / n,
@@ -1032,6 +1025,7 @@ fn read_raw_f32(path: &std::path::Path) -> Option<Vec<f32>> {
     Some(out)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_real_key(
     dir: &std::path::Path,
     key: usize,
@@ -1040,7 +1034,7 @@ fn process_real_key(
     configs: &[JointCfg],
     r2c_bass: &Arc<dyn RealToComplex<f32>>,
     r2c_gate: &Arc<dyn RealToComplex<f32>>,
-    bass_oct: &mut Vec<usize>,
+    bass_oct: &mut [usize],
 ) -> Option<RealKeyResult> {
     // noise_floor from analysis.json (same as diagnose_engine).
     let mut noise_floor = 0.0f32;

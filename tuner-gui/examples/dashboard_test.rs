@@ -9,7 +9,8 @@ use iced::{Element, Length, Subscription, Theme};
 
 mod shared;
 use tuner_core::pipeline::CaptureState;
-use tuner_gui::app::{AppDisplayData, TuningMode};
+use tuner_core::{FrameOutput, models};
+use tuner_gui::app::{AppDisplayData, Instrument, TuningMode};
 use tuner_gui::views::main_view::create_widget_area;
 
 pub fn main() -> iced::Result {
@@ -59,7 +60,16 @@ impl DashboardTest {
             cent_meter_visible: true,
             key_select_visible: true,
             partials_visible: true,
+            curve_plot_visible: true,
+            strobe_visible: true,
             settings_view_visible: false,
+            curve_select_visible: false,
+            curve_detail: None,
+            selected_engine: tuner_gui::app::EngineChoice::MultiBalanced,
+            strobe: tuner_gui::app::StrobeState::default(),
+            reference_mode: Default::default(),
+            strobe_lock_view: None,
+            relock_confirm_open: false,
             settings_data: tuner_gui::app::SettingsDisplayData {
                 rms: tuner_gui::app::NoiseFloorSettings {
                     history: std::collections::VecDeque::new(),
@@ -82,7 +92,9 @@ impl DashboardTest {
                     current_threshold: 10.0,
                 },
             },
+            instrument_select_visible: false,
             tuning_mode: TuningMode::Auto,
+            instrument: Instrument::Piano,
             measurement_mode_active: false,
             capture_state: CaptureState::Idle,
             undo_target_note: None,
@@ -107,7 +119,7 @@ impl DashboardTest {
                     && rx.update()
                 {
                     let result = rx.read().clone();
-                    if let Some(cents) = result.cents_deviation {
+                    if let Some(cents) = et_cents(&result) {
                         self.display_data.smoothing_buffer.push(cents);
                         if self.display_data.smoothing_buffer.len() > 5 {
                             self.display_data.smoothing_buffer.remove(0);
@@ -120,7 +132,7 @@ impl DashboardTest {
                     self.display_data.last_note_index = result.note_index;
                     self.display_data.last_frequency = result.detected_frequency;
                     self.display_data.last_confidence = result.confidence;
-                    self.display_data.last_cents = result.cents_deviation;
+                    self.display_data.last_cents = et_cents(&result);
                 }
             }
             LocalMessage::IgnoreWidgetMessage(_msg) => {
@@ -135,7 +147,10 @@ impl DashboardTest {
         // Create the widget area using the extracted layout function.
         // It returns an Element<'static, tuner_gui::Message>, so we MUST map
         // those messages to our LocalMessage enum.
-        let content = create_widget_area(&self.display_data).map(LocalMessage::IgnoreWidgetMessage);
+        // No worker in this sandbox — the curve panel renders its
+        // "Computing…" placeholder.
+        let content =
+            create_widget_area(&self.display_data, None).map(LocalMessage::IgnoreWidgetMessage);
 
         container(content)
             .width(Length::Fill)
@@ -152,4 +167,18 @@ impl DashboardTest {
     fn theme(&self) -> Theme {
         Theme::Dark
     }
+}
+
+/// Cents from the nearest equal-temperament note — the deviation this demo
+/// displays. Computed here because the core ships the measured frequency and
+/// leaves the choice of reference to the consumer.
+fn et_cents(frame: &FrameOutput) -> Option<f32> {
+    let f = frame
+        .detected_frequency
+        .filter(|v| v.is_finite() && *v > 0.0)?;
+    let key = frame.note_index?;
+    Some(models::calculate_cents_deviation(
+        f,
+        models::NOTES[key as usize].frequency,
+    ))
 }

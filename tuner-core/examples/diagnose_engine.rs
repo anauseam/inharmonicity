@@ -374,12 +374,18 @@ fn main() -> Result<()> {
             );
         }
 
-        // Run full engine to get Goertzel Phase Tracking results
+        // Run full engine to get Goertzel Phase Tracking results.
+        // This harness drives the engine in manual mode (`Some(winning_key)`) so
+        // the M-of-N acquisition lock is bypassed — the per-frame winner it
+        // writes to peaks.csv is the raw `discover()` output, and the lock rule
+        // is replayed offline by validate_config.py / replay_lock_rules.py.
         let is_silence = gate_result.state == tuner_core::gatekeeper::SignalState::Silence;
+        let is_stable = gate_result.state == tuner_core::gatekeeper::SignalState::Stable;
         let pitch_result = engine.process(
-            &mut processing_frame,
+            &processing_frame,
             &profiles_array,
             is_silence,
+            is_stable,
             gate_result.is_new_onset,
             gate_result.is_transient_bypass,
             Some(winning_key),

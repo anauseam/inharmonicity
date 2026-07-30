@@ -156,16 +156,28 @@ pub fn nhwrsf(
 /// sparse enough for a high-quality capture.
 ///
 /// # Formula and formal identity
-///   S = N × (∑ |X_k|²) / (∑ |X_k|)²  =  N / N_eff
+///   S = N × (∑ |X_k|²) / (∑ |X_k|)²  =  N / N_eff  =  N × (ℓ²/ℓ¹)²
 ///
-/// where N_eff = (‖X‖₁/‖X‖₂)² is the **Cauchy–Schwarz effective support
-/// size** (a lower bound on ‖X‖₀) — equivalently the **participation ratio**
-/// of the normalized magnitude distribution, whose reciprocal is the
-/// Herfindahl–Hirschman/Simpson concentration index. It is a member of the
-/// ℓ₁/ℓ₂ sparsity family analyzed in Hurley & Rickard (2009) and is affinely
-/// related to Hoyer (2004) sparseness. Endpoints: 1-sparse → N; flat → ≈ 1
-/// (exactly len/(len−1) ≈ 1.001, since the DC bin is excluded from the sums
-/// but counted in N).
+/// where ℓ²/ℓ¹ = ‖X‖₂/‖X‖₁ is the sparsity measure **defined** in Hurley &
+/// Rickard (2009), Table I (restated in the proof of their Theorem 4.1),
+/// and N_eff = (‖X‖₁/‖X‖₂)² is the **Cauchy–Schwarz effective support
+/// size** (‖X‖₁² ≤ ‖X‖₀·‖X‖₂² ⇒ N_eff ≤ ‖X‖₀) — equivalently the
+/// **participation ratio** (Bell & Dean 1970) of the ℓ¹-normalized
+/// magnitude distribution, whose reciprocal is the
+/// Herfindahl–Hirschman/Simpson concentration index. At fixed N, S is a
+/// strictly increasing transform of ℓ²/ℓ¹. Against Hurley & Rickard's six
+/// sparsity criteria, S satisfies **all six**: D1 Robin Hood, D2 Scaling,
+/// P1 Bill Gates carry over from their Theorems 4.1/A.5 (strict monotone
+/// transform at fixed N); the ×N factor makes S exactly clone-invariant
+/// (D4) and strictly zero-padding-increasing (P2), the two criteria bare
+/// ℓ²/ℓ¹ fails; D3 Rising Tide holds by direct derivation (their Table III
+/// mis-marks ℓ²/ℓ¹ on D3 — proof in the faithfulness-audit-05 addendum).
+/// Hoyer (2004, §3.1) sparseness, (√N − ‖X‖₁/‖X‖₂)/(√N − 1), is an affine
+/// function of the same ℓ¹/ℓ² ratio (H&R: "a normalized version of the
+/// ℓ²/ℓ¹ measure") and hence strictly monotone in S at fixed N — related,
+/// but not affine in S. Endpoints: 1-sparse → N; flat → ≈ 1 (exactly
+/// len/(len−1) ≈ 1.001, since the DC bin is excluded from the sums but
+/// counted in N).
 ///
 /// # Provenance (OURS, Mounir-inspired — faithfulness-audit-05)
 /// The *idea* that spectral sparsity separates a note's transient from its
@@ -186,7 +198,14 @@ pub fn nhwrsf(
 ///
 /// # References
 /// * Hurley, N. & Rickard, S. (2009). "Comparing Measures of Sparsity."
-///   IEEE Trans. Inf. Theory 55(10). (The ℓ₁/ℓ₂ family.)
+///   IEEE Trans. Inf. Theory 55(10), 4723–4741. Table I (ℓ²/ℓ¹
+///   definition), Theorems 4.1/A.5 (Robin Hood / Bill Gates), Table III
+///   (criteria comparison). arXiv:0811.4706 in `resources/gatekeeper/`.
+/// * Hoyer, P. O. (2004). "Non-negative Matrix Factorization with
+///   Sparseness Constraints." JMLR 5, 1457–1469, §3.1 (the sparseness
+///   definition — unnumbered display). PDF in `resources/curve/`.
+/// * Bell, R. J. & Dean, P. (1970). "Atomic vibrations in vitreous
+///   silica." Discuss. Faraday Soc. 50, 55–61. (Participation ratio.)
 /// * Mounir, M., Karsmakers, P., van Waterschoot, T. (2021). EURASIP JASMP
 ///   2021:30. (Inspiration: sparsity-based note-phase segmentation.)
 pub fn ninos2(spectrum: &[rustfft::num_complex::Complex<f32>]) -> f32 {

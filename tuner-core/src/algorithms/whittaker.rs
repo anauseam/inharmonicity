@@ -12,9 +12,9 @@
 //! the second-difference matrix. The second-difference (curvature) penalty is
 //! the design note's definition of smoothness (§5): any straight trend passes
 //! free, only bending is charged. λ is selected by Eilers' fast
-//! leave-one-out cross-validation (his Eq. 10: the LOO residual is
-//! (y_i - ẑ_i)/(1 - h_{ii}) with h_{ii} the smoother-matrix
-//! diagonal), which is statistical model selection — categorically distinct
+//! leave-one-out cross-validation (his Eq. 11: the LOO residual is
+//! (y_i - ẑ_i)/(1 - h_{ii}), with h_{ii} the diagonal of the Eq.-10
+//! hat matrix), which is statistical model selection — categorically distinct
 //! from tuning on the validation captures (design note §5, defaults #4).
 //!
 //! [`BandedSystem`] is a general symmetric positive-definite banded normal-equation
@@ -209,10 +209,17 @@ pub fn smooth(y: &[f64], w: &[f64], lambda: f64) -> Option<Vec<f64>> {
 
 /// Eilers' fast leave-one-out cross-validation score for one λ:
 /// CV = ∑_{w_i > 0} w_i · ((y_i − ẑ_i)/(1 − h_ii))²,
-/// where h_{ii} = [(W + λ Dᵀ D)⁻¹]_{ii} w_i is the smoother
-/// hat diagonal (Eilers 2003, Eq. 10). Returns `None` on a singular system
-/// or when some h_{ii} = 1 (a point the smoother reproduces exactly cannot
-/// be cross-validated).
+/// where h_{ii} = [(W + λ Dᵀ D)⁻¹]_{ii} w_i is the diagonal of the hat
+/// matrix H = (W + λ Dᵀ D)⁻¹ W (Eilers 2003 Eq. 10) and the fast LOO
+/// residual (y_i − ẑ_i)/(1 − h_ii) is his Eq. 11. The identity is exact
+/// for a general diagonal W, not only Eilers' 0/1 missing-data weights
+/// (leaving point i out is the rank-one update M − w_i·e_i·e_iᵀ;
+/// Sherman–Morrison gives the same 1/(1 − h_ii) inflation — pinned by the
+/// brute-force test including heterogeneous weights). Weighting the
+/// *score* by w_i is **ours** (Eilers' Eq. 9 scores unweighted): LOO
+/// residuals are scored in the same weighted metric the smoother
+/// minimizes. Returns `None` on a singular system or when some h_{ii} = 1
+/// (a point the smoother reproduces exactly cannot be cross-validated).
 pub fn cv(y: &[f64], w: &[f64], lambda: f64) -> Option<f64> {
     let all: Vec<bool> = w.iter().map(|&x| x > 0.0).collect();
     cv_masked(y, w, lambda, &all)
@@ -252,7 +259,9 @@ pub fn cv_masked(y: &[f64], w: &[f64], lambda: f64, cv_mask: &[bool]) -> Option<
 }
 
 /// The λ grid for automatic selection: half-decade steps over
-/// 10^(-2) … 10^(8). In cents²-per-curvature² units on an 88-key grid this
+/// 10^(-2) … 10^(8) — Eilers' own search practice ("the logarithm of λ was
+/// varied in steps of 0.5 on a linear grid"; his Fig. 10 profile spans the
+/// same 10⁻²…10⁸). In cents²-per-curvature² units on an 88-key grid this
 /// spans "follow every point" to "affine residual"; the endpoints are
 /// deliberately beyond both useful extremes so the CV minimum is interior in
 /// practice.
@@ -437,6 +446,28 @@ mod tests {
         assert!(
             (fast - brute).abs() < 1e-6 * (1.0 + brute),
             "fast {fast} brute {brute}"
+        );
+
+        // The identity is exact for a general diagonal W, not only 0/1
+        // weights (rank-one update / Sherman–Morrison): re-check with
+        // heterogeneous weights and one missing point.
+        let mut wh: Vec<f64> = (0..n).map(|i| 0.25 + (i % 5) as f64 * 0.5).collect();
+        wh[4] = 0.0;
+        let fast_w = cv(&y, &wh, lambda).expect("cv weighted");
+        let mut brute_w = 0.0;
+        for i in 0..n {
+            if wh[i] <= 0.0 {
+                continue;
+            }
+            let mut wi = wh.clone();
+            wi[i] = 0.0;
+            let z = smooth(&y, &wi, lambda).expect("solve");
+            let r = y[i] - z[i];
+            brute_w += wh[i] * r * r;
+        }
+        assert!(
+            (fast_w - brute_w).abs() < 1e-6 * (1.0 + brute_w),
+            "weighted: fast {fast_w} brute {brute_w}"
         );
     }
 

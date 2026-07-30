@@ -42,7 +42,7 @@ pub fn create_ninos2_calibration_panel(data: &AppDisplayData) -> Element<'static
                 current_val,
                 crate::Message::NinosThresholdChanged
             )
-            .step(0.1)
+            .step(0.1_f32)
             .width(Fill),
             text("15.0").size(14),
         ]

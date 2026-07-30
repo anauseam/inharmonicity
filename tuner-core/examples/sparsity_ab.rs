@@ -15,6 +15,7 @@
 //!     RMS floor — so fast-decaying treble contributes only frames where the
 //!     note is still sounding (a fixed time window would otherwise label the
 //!     noise floor as "steady", biasing the comparison).
+//!
 //! Per key and metric, compute the AUC (Mann–Whitney) of steady-vs-transient
 //! separation, oriented so 1.0 = perfect in each metric's own direction (ours:
 //! steady HIGH; Mounir ODFs: transient HIGH). Threshold-free, scale-free.

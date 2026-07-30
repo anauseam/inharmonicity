@@ -122,7 +122,9 @@ impl BXi {
 /// coarse-to-fine grid search (the objective is 2-D, piecewise-smooth, and
 /// cold-path — no solver dependency is warranted). Search domain
 /// s_B ∈ [-0.20, 0], y_B ∈ [-14, -2] brackets every physical piano
-/// (typical values: paper init (-0.089, -7); this upright (-0.050, -6.3)).
+/// (typical values: paper init (-0.089, -7) — §III.A.3.b prints s_B as
+/// +8.9e-2, a sign typo: Fig. 1(a)'s bass asymptote falls with m;
+/// this upright (-0.050, -6.3)).
 pub fn fit_b_xi(points: &[(f64, f64)]) -> Option<BXi> {
     if points.len() < 2 || points.iter().any(|&(_, b)| b <= 0.0 || !b.is_finite()) {
         return None;
@@ -175,8 +177,8 @@ pub struct RhoPhi {
 }
 
 impl RhoPhi {
-    /// The paper's "typical" octave-type parameters (§III.B.3 / Algorithm 1
-    /// initialization: κ = 3.5, m_0 = 60, α = 25).
+    /// The paper's "typical" octave-type parameters (§III.A.3.b
+    /// Initialization, cf. Algorithm 1: κ = 3.5, m_0 = 60, α = 25).
     pub const TYPICAL: RhoPhi = RhoPhi {
         kappa: 3.5,
         m0: 60.0,
