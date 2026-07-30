@@ -254,7 +254,7 @@ fn emit_partial_cluster(
 fn gen_frame(rng: &mut Rng, piano: &Piano, key: usize, hard: bool) -> Frame {
     // OUR synthetic-calibration constants and split point (mis-cited to "Rigaud
     // Fig. 3" pre-audit; the paper contains no scatter statistics — see
-    // docs/audits/faithfulness-audit-06-rigaud.md).
+    // docs/audits/faithfulness-audit-06-b-prior.md).
     let sigma_b = if key <= 50 { 0.157 } else { 0.116 };
     let b_note = (piano.b_curve[key] * (1.0 + sigma_b * rng.normal())).max(1e-7);
 
@@ -668,8 +668,8 @@ fn process_frame(
     acc.n += 1;
     acc.false_locks += false_lock as usize; // separability K=88 (diagnostic)
     acc.prod_false_locks += prod_false_lock as usize; // production K=3 = OPTIMIZED objA
-    for i in 0..4 {
-        acc.prod_fl_k[i] += prod_fl_k[i] as usize; // K∈{2,3,4,5} robustness diagnostic
+    for (a, &fl) in acc.prod_fl_k.iter_mut().zip(prod_fl_k.iter()) {
+        *a += fl as usize; // K∈{2,3,4,5} robustness diagnostic
     }
     acc.margin_sum += ordinal; // objB accumulator (ordinal)
     acc.raw_margin_sum += (best_imp - true_err) as f64;
@@ -847,8 +847,8 @@ fn b_oracle_diagnostic(frames: &[Frame], profiles: &[KeyProfile; 88], cfg: &TwmC
                         let oe = discovery::refine_scale(&f.peaks, &oracle, cfg).1;
                         let mut amo = 0usize;
                         let mut best = f32::MAX;
-                        for k in 0..88 {
-                            let e = if k == key { oe } else { errs[k] };
+                        for (k, &err) in errs.iter().enumerate() {
+                            let e = if k == key { oe } else { err };
                             if e < best {
                                 best = e;
                                 amo = k;

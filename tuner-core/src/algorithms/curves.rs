@@ -962,7 +962,7 @@ type IntervalSolve = (Vec<f64>, Vec<f64>);
 ///
 /// `lambda`: `Some` to fix the smoothness weight; `None` selects it by
 /// leave-one-row-out CV (the penalized-WLS fast-LOO identity, the same
-/// Eilers Eq.-10 form `whittaker::cv` uses) with the
+/// Eilers Eqs.-10/11 form `whittaker::cv` uses) with the
 /// one-standard-error rule (ESL §7.10) over the smoothing module's λ
 /// grid — model selection, not benchmark tuning; see the selection block
 /// for why GCV was retired with the derived weights.
@@ -1041,7 +1041,7 @@ pub fn multi_interval(
         }
     }
     // Unit-mean weight gauge: the derived weights are defined up to a
-    // common scale (a global factor is absorbed into λ, which GCV
+    // common scale (a global factor is absorbed into λ, which the CV
     // re-selects), so normalize to mean 1 — keeps the shared λ grid
     // interior and the reversion pseudo-rows' w₀ = 4λ/ℓ⁴ commensurate
     // with the data rows. A gauge convention, not a free parameter.
@@ -1086,16 +1086,14 @@ pub fn multi_interval(
         // Prior-reversion pseudo-rows: x_k = 0 at w₀ = 4λ/ℓ⁴ where no data
         // speaks (excluded from the CV scores below — prior, not data).
         let w0 = reversion_weight(lambda);
-        for k in 0..88 {
-            if !has_data[k]
-                && let Some(ck) = col(k)
-            {
+        for (k, &spoken_for) in has_data.iter().enumerate() {
+            if !spoken_for && let Some(ck) = col(k) {
                 sys.add_row(&[ck], &[1.0], 0.0, w0);
             }
         }
     };
     // Fast leave-one-row-out CV per data row (the penalized-WLS identity,
-    // same form as `whittaker::cv` / Eilers 2003 Eq. 10):
+    // same form as `whittaker::cv` / Eilers 2003 Eqs. 10–11):
     // score_i = w_i·(r_i/(1 − h_ii))² with leverage
     // h_ii = w_i·aᵢᵀA⁻¹aᵢ. Returns `None` when some row is reproduced
     // exactly (h_ii → 1 — cannot be cross-validated).
@@ -1184,10 +1182,196 @@ pub fn multi_interval(
     finish(cents, basis.flags, params.d_g)
 }
 
+/// The **fallback** displayed strobe partial `n*` per key: the D5 register
+/// rule instantiated as the default of TuneLab's editable "Table of Partials"
+/// — 6th partial in the low bass, then 4th, then 2nd, then the fundamental
+/// from A4 up (its documented last switch). The interior boundaries follow
+/// the aural octave-type registers the same tools encode (6:3 bass / 4:2
+/// tenor / 2:1 toward the treble).
+///
+/// Used where amplitude-informed selection ([`select_display_partials`])
+/// can't run: a key with no measurement, and every key when no profile-based
+/// curve exists (prior-only curve, or a non-piano in ET mode).
+///
+/// The treble entry is derived, not just precedented: the n = 1 target is
+/// identically B-immune (R4 — f₁ anchors the target chain), so ADR 0009's ×8
+/// treble σ_lnB cannot move it. Conversely selection cannot fix deep-bass
+/// window leakage (R3) — that is the long-window strobe Goertzel's job.
+pub fn default_display_partials() -> [u8; 88] {
+    let mut table = [1u8; 88];
+    for (key, n) in table.iter_mut().enumerate() {
+        *n = match key {
+            0..=26 => 6,  // A0–B2: bass — weak fundamental, 6:3 register
+            27..=38 => 4, // C3–B3: tenor — 4:2 register
+            39..=47 => 2, // C4–G#4: low treble — 2:1 register
+            _ => 1,       // A4–C8: fundamental — B-immune target (R4)
+        };
+    }
+    table
+}
+
+/// The window of partials the amplitude search may pick from, per key — the
+/// D5 octave-type range, the same register provenance as
+/// [`default_display_partials`] widened from a single value to a band. Its
+/// shape is what R4's δcents(n) ≈ 866·B·(n²−1)·σ_lnB justifies: the treble is
+/// pinned to the fundamental (any n > 1 target jumps with ADR 0009's ×8 treble
+/// σ_lnB), while the bass opens up because bass B is tiny (δcents < 0.1 ¢ even
+/// at n = 8), so sustained amplitude can safely choose within it.
+fn register_window(key: usize) -> (u32, u32) {
+    match key {
+        0..=26 => (4, 8),  // bass — 6:3 register
+        27..=38 => (2, 4), // tenor — 4:2 register
+        39..=47 => (1, 2), // low treble — 2:1 register
+        _ => (1, 1),       // treble — fundamental only (B-immune)
+    }
+}
+
+/// Per-key displayed strobe partial `n*`, **amplitude-informed** where the key
+/// carries a measurement — CyberTuner's "Smart Partials" (strobe design §6.3,
+/// R5): within the key's D5 [`register_window`], the loudest **sustained**
+/// partial. Our capture is the post-attack Golden Window (design §6.2), so the
+/// measured amplitudes *are* the sustained ones — the correct "which partial
+/// is strong while you tune" basis. A key with no measurement (and every key
+/// when no profile-based curve exists) keeps its [`default_display_partials`]
+/// value.
+///
+/// Computed at curve time and carried in the [`crate::worker::CurveBundle`] so
+/// it locks with the curve (D6/R8) — never recomputed per key at read time, or
+/// a capture landing mid-pass would shift the band's partial under the lock.
+pub fn select_display_partials(input: &CurveInput) -> [u8; 88] {
+    let mut out = default_display_partials();
+    for (key, slot) in out.iter_mut().enumerate() {
+        let Some(data) = input.keys[key].as_ref() else {
+            continue; // unmeasured → keep the register default
+        };
+        let (lo, hi) = register_window(key);
+        // Loudest measured partial inside the register window. total_cmp
+        // orders the f64 amplitudes total-ly (no NaN branch needed — measured
+        // amplitudes are finite). Window with no measured partial (sparse
+        // capture) leaves the register default in place.
+        if let Some((n, _, _)) = data
+            .partials
+            .iter()
+            .filter(|(n, _, _)| *n >= lo && *n <= hi)
+            .max_by(|a, b| a.2.total_cmp(&b.2))
+        {
+            *slot = *n as u8;
+        }
+    }
+    out
+}
+
+/// First key at which the coarse read moves to the fundamental. Below it the
+/// n = 1 partial is too weak to admit: measured availability collapses to 32 %
+/// at F1 and 0 % at G1, and B1 reads 10.7 ¢ off at 81 %. It is clean from C#2
+/// up, and the n = 4 side is clean across keys 8–20, so the two overlap — a
+/// handover zone, not a knife edge (ADR 0011).
+const COARSE_READ_FUNDAMENTAL_KEY: usize = 16;
+
+/// Per-key **coarse-read partial** `n*` — which partial the wide-range
+/// magnitude read centres on. Deliberately *not*
+/// [`default_display_partials`]: the strobe band and the coarse number answer
+/// different questions, so the same key can use different partials for each.
+///
+/// **Ours, measured** (ADR 0011). Two instruments agree on a fixed n\* = 4 in
+/// the bass: on the piano n\* = 5 is the only strict all-pass, but a guitar's
+/// E2 fails hard on 5 (jitter 13.8 ¢) and passes on 4. Two tiebreaks point the
+/// same way — cold-start bias grows as (n²−1) with an unmeasured `B` (5 ¢ at
+/// n = 4 vs 8 ¢ at n = 5), and picking the per-key margin argmax instead rides
+/// systematically high (B0 +7.5 ¢ vs +0.7 ¢ fixed).
+///
+/// Per-*hop* selection is refuted, not merely unbuilt: switching partials steps
+/// the displayed number by 866·ΔB·n², measured at 20 ¢+, so it would need
+/// hysteresis constants and partial-identity plumbing to the GUI to buy nothing.
+///
+/// Above [`COARSE_READ_FUNDAMENTAL_KEY`] this returns 1, so every guitar string
+/// (key ≥ 19) reads on the fundamental — coherent with ET mode, which publishes
+/// only the fundamental reference.
+pub fn coarse_read_partial(key_index: u8) -> u8 {
+    if (key_index as usize) < COARSE_READ_FUNDAMENTAL_KEY {
+        4
+    } else {
+        1
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::models::{InharmonicityProfile, KeyMeasurement, Partial};
+
+    /// §6.4/R5 fallback display-partial table: values from the TuneLab default
+    /// set, monotone non-increasing across the compass, fundamental from A4
+    /// (key 48) up.
+    #[test]
+    fn test_default_display_partials() {
+        let t = default_display_partials();
+        assert!(t.iter().all(|n| [1, 2, 4, 6].contains(n)));
+        assert!(
+            t.windows(2).all(|w| w[0] >= w[1]),
+            "register rule must be monotone toward the treble"
+        );
+        assert_eq!(t[0], 6, "deep bass tunes on the 6th partial");
+        assert!(
+            t[48..].iter().all(|&n| n == 1),
+            "A4 and above tune on the fundamental"
+        );
+    }
+
+    /// Smart-Partials (§6.3, R5): a measured key picks the loudest partial
+    /// inside its register window; partials outside the window are ignored
+    /// however loud; an unmeasured key keeps the default; treble is pinned to
+    /// the fundamental (window [1, 1]).
+    #[test]
+    fn test_select_display_partials() {
+        let mut input = CurveInput::default();
+        // A0 (key 0), window [4, 8]: n = 7 is the loudest *in-window* partial.
+        // n = 1 (amp 100) is below the window and n = 9 (amp 50) above it, so
+        // both are ignored despite being louder — the window is the stability
+        // guard (R4).
+        input.keys[0] = Some(CurveKeyData {
+            b: 4e-4,
+            f0: 27.5,
+            partials: vec![
+                (1, 27.5, 100.0),
+                (4, 110.0, 3.0),
+                (6, 165.0, 8.0),
+                (7, 192.0, 20.0),
+                (9, 247.0, 50.0),
+            ],
+        });
+        // A5 (key 60), window [1, 1]: a loud 2nd partial must not pull the
+        // treble band off the fundamental.
+        input.keys[60] = Some(CurveKeyData {
+            b: 6e-3,
+            f0: 880.0,
+            partials: vec![(1, 880.0, 5.0), (2, 1760.0, 50.0)],
+        });
+        let t = select_display_partials(&input);
+        let fallback = default_display_partials();
+        assert_eq!(t[0], 7, "bass picks the loudest partial within [4, 8]");
+        assert_eq!(t[60], 1, "treble is pinned to the fundamental");
+        assert_eq!(t[10], fallback[10], "unmeasured bass key keeps the default");
+        assert_eq!(
+            t[48], fallback[48],
+            "unmeasured treble key keeps the default"
+        );
+    }
+
+    /// ADR-0010 coarse-read partial: fixed n\* = 4 through the handover key,
+    /// fundamental above it — and independent of the *display* table, whose
+    /// bass entry is 6.
+    #[test]
+    fn test_coarse_read_partial() {
+        assert_eq!(coarse_read_partial(0), 4, "A0 reads on the 4th partial");
+        assert_eq!(coarse_read_partial(15), 4, "C2 is the last n* = 4 key");
+        assert_eq!(coarse_read_partial(16), 1, "C#2 hands over to n = 1");
+        assert_eq!(coarse_read_partial(87), 1);
+        // Every guitar string sits above the handover.
+        assert!((19..=88).all(|k| coarse_read_partial(k as u8) == 1));
+        // The two tables are answering different questions.
+        assert_ne!(coarse_read_partial(0), default_display_partials()[0]);
+    }
 
     /// Synthetic trusted profile: exact stiff-string partials from a smooth
     /// physical B(m) (the medium default), manual provenance.

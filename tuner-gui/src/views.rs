@@ -1,3 +1,4 @@
+pub mod curve_select;
 pub mod main_view;
 pub mod ninos2_calibration;
 pub mod rms_calibration;

@@ -197,8 +197,85 @@ mis-citation stories in `mask_peaks`/`jacobsen`). Trimmed to
 constraint-statements + pointers; the histories live here and in audits
 03/04. Tests unchanged (28/28).
 
+## Addendum (2026-07-15, wave 2 / Prompt B′ item 1) — ℓ²/ℓ¹ citation pinning
+
+**Motivation.** The 2026-07-04 fix relabeled `ninos2` as ours and cited
+Hurley & Rickard family-level ("the ℓ₁/ℓ₂ family"), leaving three identity
+claims asserted rather than source-verified. Concern raised by the user:
+does H&R actually *define* the ℓ²/ℓ¹ measure, or only mention it? Sources
+read: `resources/gatekeeper/0811.4706v2.pdf` (= IEEE TIT 55(10), Oct 2009)
+and `resources/curve/hoyer04a.pdf` (Hoyer 2004, JMLR 5).
+
+### Addendum findings
+
+**1. H&R DO define the measure — the concern is dispelled.** Table I
+("Commonly used sparsity measures…") defines the ℓ²/ℓ¹ entry as
+√(∑ⱼcⱼ²)/∑ⱼcⱼ = ‖c‖₂/‖c‖₁ (over non-negative coefficients — ours are
+magnitudes), and the definition is restated in-text in the proof of
+Theorem 4.1. Citation now pinned to Table I + Thm 4.1. Exact relation:
+**S = N·(ℓ²/ℓ¹)²** — at fixed N a strictly increasing transform of the H&R
+measure.
+
+**2. Criteria profile derived — S satisfies all six H&R criteria.**
+H&R's Table III row for ℓ²/ℓ¹: D1 (Robin Hood) ✓, D2 (Scaling) ✓,
+P1 (Bill Gates) ✓; D3 (Rising Tide), D4 (Cloning), P2 (Babies) ✗. For
+S = N·(ℓ²/ℓ¹)²:
+
+| Criterion | S | Source |
+| --- | --- | --- |
+| D1 Robin Hood | ✓ | H&R Thm 4.1 + strict monotone transform at fixed N |
+| D2 Scaling | ✓ | ℓ²/ℓ¹ scale-invariant; N unchanged |
+| D3 Rising Tide | ✓ | direct derivation below (H&R's ✗ is their error — finding 3) |
+| D4 Cloning | ✓ | m-fold clone: S = mN·(m∑c²)/(m∑c)² = N·∑c²/(∑c)² — exact invariance; the ×N factor is precisely what repairs bare ℓ²/ℓ¹'s D4 failure |
+| P1 Bill Gates | ✓ | H&R Thm A.5 + monotone transform |
+| P2 Babies | ✓ | appending a zero: sums unchanged, N → N+1 ⇒ S strictly increases |
+
+**3. H&R Theorem A.4 (ℓ²/ℓ¹ fails D3) is WRONG — an internal
+inconsistency in the paper.** Their own Theorem A.19 proves Hoyer
+satisfies D3, and Hoyer = (√N − ℓ¹/ℓ²)/(√N−1) is a strictly increasing
+function of ℓ²/ℓ¹ at fixed N (their own observation: "a normalized version
+of the ℓ²/ℓ¹ measure"). D3 changes no dimensions, so a strict monotone
+transform preserves it both ways — the two table entries cannot differ.
+Direct derivation (s₁ = ∑c, s₂ = ∑c², α > 0): squaring
+√(s₂+2αs₁+Nα²)/(s₁+Nα) < √s₂/s₁ and clearing reduces to
+2s₁(s₁²−Ns₂) < Nα(Ns₂−s₁²); Cauchy–Schwarz gives Ns₂−s₁² > 0 for
+non-constant c (the constant case is excluded by H&R's own D3 definition),
+so it reads −2s₁ < Nα — always true. **ℓ²/ℓ¹ satisfies D3.** Thm A.4's
+algebra mis-handles the division by (s₁²−Ns₂) < 0 (it also asserts
+s₁² > s₂, true, where the relevant comparison is against Ns₂). Numeric
+spot-check: [1,3,5] → +0.5: 0.6573 → 0.6371 (decreases, as D3 wants).
+No published erratum found (web search 2026-07-15). Consequence for the
+record: the doc-comment cites Table III for the *inherited* checks only and
+flags the D3 entry with a pointer here.
+
+**4. "Affinely related to Hoyer (2004)" was imprecise.** Hoyer §3.1
+(unnumbered display), sparseness(x) = (√n − ‖x‖₁/‖x‖₂)/(√n − 1), is affine
+in the ℓ¹/ℓ² *ratio*, and therefore strictly monotone — but **not affine**
+— in S at fixed N. Wording fixed.
+
+**5. Participation-ratio lineage pinned.** N_eff = 1/∑qⱼ² with
+qⱼ = |Xⱼ|/∑|X| is the participation ratio of the ℓ¹-normalized magnitude
+distribution — primary source Bell & Dean 1970 (Discuss. Faraday Soc. 50,
+55–61; verified: the paper introduces the participation ratio for
+vibrational-mode localization). Reciprocal-Herfindahl/Simpson identity kept
+as a stated synonym (algebra, not a port). Cauchy–Schwarz bound direction
+verified: ‖X‖₁² ≤ ‖X‖₀·‖X‖₂² ⇒ N_eff ≤ ‖X‖₀ — "lower bound on ‖X‖₀" as a
+support estimate is correct as written.
+
+### Applied (same session)
+
+`ninos2` doc-comment rewritten: formula line extended with = N·(ℓ²/ℓ¹)²;
+Table I/Thm 4.1 pinned as the definition source; six-criteria statement with
+per-criterion provenance; Hoyer relation re-worded (affine in the ratio,
+monotone-not-affine in S); References block now lists H&R (with tables/
+theorems and pages), Hoyer §3.1, Bell & Dean 1970, Mounir (inspiration).
+No behavior change (comment-only); the `ninos2 → spectral_sparsity` rename
+stays deferred per item 4 above.
+
 ## Audit series status
 
-Item 5 complete (this doc). Running table: `faithfulness-audit-01-twm.md`.
+Item 5 complete (this doc), **including the wave-2 addendum** (2026-07-15).
+Running table: `faithfulness-audit-01-twm.md`.
 Next: item 6, `models.rs::get_expected_beta` vs Rigaud (PDF in
-`resources/moba/`); then 7 (MAT re-check), 8 (Goertzel).
+`resources/moba/`); then 7 (MAT re-check), 8 (Goertzel). Wave 2 continues
+with audits 09–12 (curve modules).

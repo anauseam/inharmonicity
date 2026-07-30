@@ -4,16 +4,25 @@
 //! noise floor baseline natively within the GUI tick loop, removing the
 //! need to spawn separate CPAL audio streams.
 
+use tuner_core::audio::HOP_RATE_HZ;
+
 /// The multiplier applied to the absolute maximum RMS value recorded.
 pub const DEFAULT_NOISE_MULTIPLIER: f32 = 1.5;
 
-/// Number of buffers to ignore before taking measurements to avoid interface pops.
-/// Extended to 45 hops (~1 sec) to outlast the EMA decay of initial interface artifacts.
-pub const WARMUP_FRAMES: u32 = 45;
+/// How long to ignore input before measuring, so the measurement outlasts the
+/// EMA decay of the interface's start-up artifacts.
+const WARMUP_SECS: f32 = 1.0;
 
-/// The total number of audio hops to measure the noise floor.
-/// 86 hops at ~43Hz = ~2 seconds.
-pub const CALIBRATION_FRAMES: u32 = 86;
+/// How long to measure the noise floor for.
+const CALIBRATION_SECS: f32 = 2.0;
+
+/// Buffers ignored before measuring — [`WARMUP_SECS`] at the hop cadence. Both
+/// of these are durations wearing frame counts; deriving them keeps the intent
+/// intact if the hop size or sample rate moves.
+pub const WARMUP_FRAMES: u32 = (WARMUP_SECS * HOP_RATE_HZ) as u32;
+
+/// Hops measured — [`CALIBRATION_SECS`] at the hop cadence.
+pub const CALIBRATION_FRAMES: u32 = (CALIBRATION_SECS * HOP_RATE_HZ) as u32;
 
 /// Processes a single GUI tick during the startup or manual RMS noise calibration.
 ///

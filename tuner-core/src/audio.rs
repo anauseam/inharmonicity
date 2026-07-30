@@ -33,8 +33,8 @@ use std::sync::atomic::Ordering;
 use std::thread::{self, JoinHandle};
 
 use crate::FrameOutput;
-use crate::models::KeyMeasurement;
-use crate::pipeline::{AudioPipeline, PipelineHandle, PipelinePorts, ProfileSender};
+use crate::pipeline::{AudioPipeline, PipelineHandle, PipelinePorts, ProfileSender, StrobeSender};
+use crate::worker::{CurveJob, WorkerJob, WorkerOutput};
 
 /// The standard analysis window size (samples).
 /// Used by the Gatekeeper, Scout, and all Engine paths.
@@ -46,6 +46,13 @@ pub const BASS_WINDOW_SIZE: usize = WINDOW_SIZE * 4; // 8192 samples
 /// Hop size for overlapping frame analysis (50% overlap of WINDOW_SIZE).
 /// Each hop triggers a new FFT + pipeline frame.
 pub const HOP_SIZE: usize = WINDOW_SIZE / 2; // 1024 samples
+
+/// Frames the DSP produces per second — one per hop, ≈ 43.07 Hz.
+///
+/// Anything whose intent is a *duration* but whose unit is frames should be
+/// expressed against this rather than written as a count: a bare count silently
+/// changes meaning if [`HOP_SIZE`] or [`SAMPLE_RATE`] moves.
+pub const HOP_RATE_HZ: f32 = SAMPLE_RATE as f32 / HOP_SIZE as f32;
 
 /// Capacity of the lock-free ring buffer between the CPAL capture thread and
 /// the analysis thread, in samples.
@@ -70,7 +77,20 @@ pub type AudioConsumer = ringbuf::HeapCons<f32>;
 
 /// DC blocking filter coefficient.
 ///
-/// α = 0.995 → ~3.5 Hz cutoff at 44.1 kHz — well below A0 (27.5 Hz).
+/// For `y[n] = x[n] − x[n−1] + α·y[n−1]` the −3 dB corner is `(1−α)·fs/2π`, so
+/// **α = 0.995 is a 35 Hz corner at 44.1 kHz** — *above* A0, not below it. It
+/// costs −4.2 dB at A0's 27.5 Hz fundamental, −3.9 at A#0, −3.3 at C1, −2.4 at
+/// E1, and is inaudible from A2 up (−0.4 dB).
+///
+/// **Do not raise α to move the corner below A0.** It gains 2–4 dB on a bass
+/// fundamental that stays under `mask_peaks`' −30 dB gate regardless (the deficit
+/// is acoustic, 24–45 dB), while the CFAR reference cells that set the coarse
+/// read's local noise estimate sit in this band — its deep-bass lower flank clamps
+/// at bin 1 — so the threshold rises 1–3 dB and the readout measurably worsens:
+/// availability 93.3 → 87.4 %, |e| 0.70 → 1.85 ¢. If the bottom octave is ever
+/// worth recovering, the lever is the filter's **order**, not α; the measured
+/// trade and the conditions that would justify it are in `ARCHITECTURE.md`,
+/// "The DC blocker's corner sits at 35 Hz, above A0".
 const DC_BLOCK_ALPHA: f32 = 0.995;
 
 // ─── Shared CPAL Stream Setup ────────────────────────────────────────────────
@@ -186,14 +206,24 @@ pub struct HostHandle {
     /// configuration parameters (silence threshold, key hint, etc.).
     pub pipeline_handle: PipelineHandle,
 
-    /// Worker → UI receiver for `KeyMeasurement` results (crossing #5). Drain it
-    /// with `try_recv` in the frontend's tick loop.
-    pub worker_rx: crossbeam_channel::Receiver<KeyMeasurement>,
+    /// Worker → UI receiver for `WorkerOutput` results (crossing #5): a
+    /// `KeyMeasurement` per capture, a `CurveBundle` per curve recompute. Drain
+    /// it with `try_recv` in the frontend's tick loop.
+    pub worker_rx: crossbeam_channel::Receiver<WorkerOutput>,
+
+    /// UI → Worker sender for background jobs (crossing #6). Use the typed
+    /// `send_*_job` methods rather than touching this directly — they keep the
+    /// crossbeam types out of the frontend crate.
+    worker_job_tx: crossbeam_channel::Sender<WorkerJob>,
 
     /// UI → DSP producer for template updates (crossing #4). After handling a
     /// `KeyMeasurement` (or editing the profile), call `update_key_profile` to push
     /// the recompiled template to the live engine.
     pub profiles: ProfileSender,
+
+    /// UI → DSP producer for strobe reference updates (crossing #4's second
+    /// instance). Push on key change / re-lock; `count: 0` clears the bank.
+    pub strobe_refs: StrobeSender,
 
     /// Keep the CPAL stream alive for the lifetime of the host.
     /// `None` when using `AudioSource::External`.
@@ -204,6 +234,16 @@ pub struct HostHandle {
 }
 
 impl HostHandle {
+    /// Enqueues a curve-compute job for the Worker (crossing #6). Non-blocking,
+    /// latest-wins: returns `true` if the job was
+    /// accepted, `false` if the single job slot was full (the worker is still
+    /// computing the previous bundle) — the caller keeps its `curve_dirty`
+    /// flag set and retries on the next tick. A disconnected worker also
+    /// returns `false` (the job is silently dropped).
+    pub fn send_curve_job(&self, job: CurveJob) -> bool {
+        self.worker_job_tx.try_send(WorkerJob::Curve(job)).is_ok()
+    }
+
     /// Signals the analysis thread to stop and waits for it to finish.
     ///
     /// This must be called before dropping the handle to ensure the audio
@@ -289,8 +329,6 @@ impl std::fmt::Debug for HostHandle {
 /// let frame = handle.frame_rx.as_mut().unwrap().read();
 /// println!("RMS: {}", frame.rms_ema);
 ///
-
-///
 /// // Clean shutdown
 /// handle.stop();
 /// ```
@@ -299,7 +337,9 @@ pub fn spawn_analysis_thread(source: AudioSource) -> Result<HostHandle> {
     let PipelinePorts {
         handle: pipeline_handle,
         worker_rx,
+        worker_job_tx,
         profiles,
+        strobe_refs,
     } = ports;
 
     // Resolve the audio source — either open CPAL or use the provided consumer.
@@ -383,7 +423,9 @@ pub fn spawn_analysis_thread(source: AudioSource) -> Result<HostHandle> {
         frame_rx: Some(tri_output),
         pipeline_handle,
         worker_rx,
+        worker_job_tx,
         profiles,
+        strobe_refs,
         _stream: stream,
         thread_handle: Some(thread_handle),
     })

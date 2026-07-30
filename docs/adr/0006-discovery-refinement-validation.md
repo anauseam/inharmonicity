@@ -843,6 +843,47 @@ validation-only, nothing adopted).
   whenever it is picked up — prototype-and-price only; M/N must not be
   finalized on n=1.
 
+- **[2026-07-19] Item 5 update — the offline M-of-N replay has been EXECUTED,
+  and the support gate is met on two instruments.** Full record:
+  [`ADR 0010`](0010-m-of-n-lock-rule-replay.md); protocol (pre-registered):
+  `sequential-detection-design.md` "Replay protocol". Headlines: piano-2's 595
+  repeat dumps were replayed as the second lock-accuracy instrument (baselines,
+  first on record: discrete 533/595, refined 530/595 — same ~7 pp plurality
+  headroom as piano-1, the early-wrong-lock mechanism transfers). Concordant
+  plateau recommendations: **refined (M=7, N=8)** — piano-1 77→**81** (= its
+  strict plurality ceiling), piano-2 530→**568** (+44/−6); **discrete (M=8,
+  N=8)** — piano-1 76→**82** (+6/0), piano-2 533→**561** (+35/−7). Median
+  added latency 4–5 stable frames (~100 ms), inside the user's ≤0.5 s budget.
+  The n=1 finalization concern above is answered by the two-instrument
+  concordance protocol (broad plateaus, no isolated spikes). Deep-bass fixes
+  materialized as Task 3 predicted (piano-1 refined 001/002 fixed); the
+  stable-wrong core (000 dead tie, 010/012) stays failed as pre-registered —
+  still the B-limited class. Next step is a hot-path design note (acquisition
+  **plus** lock-release semantics — the replay is acquisition-only); nothing
+  built, MSPRT stays gated.
+
+- **[2026-07-20] Item 5 IMPLEMENTED (v1, acquisition-only) — Prompt M.** The
+  M-of-N rule now ships in the hot path: `Engine::process`'s auto discovery
+  path replaces the 3-consecutive counter with `Engine::record_stable_winner`
+  (a fixed N-slot ring buffer of Stable-frame winners; lock the first key to
+  reach M votes), refined default **(M, N) = (7, 8)**. Votes accrue on
+  gatekeeper-Stable frames only (the engine now takes an `is_stable` flag) and
+  reset on onset/silence/bypass — the exact semantics the replay validated. The
+  Python lock replicas (`validate_config.py`, `test_engine_all.py`) were updated
+  to the same rule (`--lock-m/--lock-n`, defaults 7/8; 3/3 reproduces the old
+  rule) and reproduce ADR 0010 as the known-answer gate: refined 3/3→77, 7/8→81
+  on `diagnostics_piano_1` (failure set 000/003/005/010/012/086 exactly);
+  discrete 8/8→82; piano-2 cache 568/561. Release/re-lock hysteresis is the
+  deferred second design (ADR 0010 Limitations); the stable-wrong core stays
+  failed. Not committed by the implementing chat.
+  **End-to-end engine validation (2026-07-22):** the Python replicas validate the
+  *rule*, but `diagnose_engine` drives manual mode, so the *shipped auto path* was
+  separately checked by `examples/validate_engine_lock.rs` — it drives the real
+  `Engine::process` in auto mode (`target_note = None`) over the captures with the
+  live gatekeeper flags and records the first `identified_key` latch. Result:
+  **81/87, failures 000/003/005/010/012/086, b21/m33/t27 — identical to the replica
+  and this ADR.** The integration is measured, not just argued.
+
 ### Provisional conclusion: structural bolt-ons failed, but were NOT co-tuned
 
 All three structural enhancements, **tested as bolt-ons with frozen base constants**,

@@ -1,8 +1,21 @@
 # Decision-level sequential detection — design note (exploratory, build nothing)
 
-**Status:** exploratory, **not built** — written per the ADR 0006 item-5 decision gate
-(the flicker-vs-stable diagnostic found real headroom, so the evidence-accumulation
-idea is not closed; per the gate, this note frames it faithfully and nothing more).
+**Status:** **implemented-v1 (2026-07-20, Prompt M)** — the acquisition-only
+M-of-N lock now ships in the hot path (`Engine::record_stable_winner`, refined
+default (M, N) = (7, 8)); the release/re-lock hysteresis half is deliberately
+deferred to a second design (see ADR 0010 Limitations). This note is retained as
+the derivation trail. Path to here: written per the ADR 0006 item-5 decision gate
+(the flicker-vs-stable diagnostic found real headroom, so the evidence-
+accumulation idea was not closed); **[2026-07-19] Gate 2 (offline M-of-N replay)
+executed** — protocol in the "Replay protocol" section below, results in
+`docs/adr/0010-m-of-n-lock-rule-replay.md`; **[2026-07-20] hot-path implementation
+landed** (engine + the `validate_config.py` / `test_engine_all.py` known-answer
+replicas, `--lock-m/--lock-n`, defaults 7/8); **[2026-07-22] gate 3 (score-level
+fusion / MSPRT) empirically refuted and CLOSED** via a one-off offline probe —
+see "Score-level fusion: tested and refuted" below (method + numbers retained
+there; the probe itself was not kept). The decision-level lever is
+now fully explored: M-of-N is the shipped win; score fusion has no headroom; the
+residuals are B-limited, not decision-limited.
 
 **⚠️ [2026-07-05] The measured problem below predates the jacobsen peak-estimator
 fix (`faithfulness-audit-03-jacobsen.md`) — the exact key lists are stale.**
@@ -109,6 +122,135 @@ sequential-detection rules, not bespoke assemblies:
 3. MSPRT/score-averaging only if M-of-N's winner votes prove insufficient (the
    2 genuine-flicker keys are the only class that would justify it) — and only with
    a published likelihood bridge, not a bespoke score transform.
+   **→ Gate 3 CLOSED (2026-07-22, empirically refuted): see below.**
+
+## Score-level fusion: tested and refuted (2026-07-22)
+
+Before investing in a likelihood bridge, the cheap version of gate 3 was run
+directly by a one-off offline probe (not retained — this section is the record):
+all 88 keys were scored per stable frame (via `twm::score_candidate` — the same
+atomic scorer discovery uses) and fused across the stable window two ways —
+**mean-score** (lowest mean TWM error) and **rank-score** (lowest Borda rank-sum,
+a magnitude-robust control). Both are compared to plurality (winner-voting) —
+reconstructable from this description if ever needed — against folder-name
+ground truth, on both
+instruments and in discrete and refined scoring. Correctness gate: the discrete
+plurality lands on the ADR 0010 ceiling — P1 **83/87** (strict = loose, exact)
+and P2 **575/595** = the ties-as-pass ceiling (strict is 573; the probe's
+tie-break resolves 2 tied captures toward the true key). Landing precisely on the
+loose ceiling confirms the recomputed winner sequences are faithful.
+
+**The discrete run is the primary evidence.** Score fusion is only well-defined
+at the discrete level, because a full comparable 88-key score vector exists every
+frame there; production's refined path refines only the top-3, so a refined
+"score to average" for all 88 does not exist in the real algorithm. The `--refine`
+run below refines all 88 as a stress test — but that lets distant impostors cheat
+a favorable scale, so its plurality baseline is artifact-depressed (P1 75 vs the
+production 81 ceiling) and its apparent "fixes" are mostly recoveries of that
+self-inflicted damage (P1 refined mean-score "fixes" 016/018/027 — mid-bass keys
+the artifact broke — none of them the B-limited residuals).
+
+| | P1 discrete | P1 refined | P2 discrete | P2 refined |
+| --- | --- | --- | --- | --- |
+| plurality (vote) | 83 | 75* | 575 | 566* |
+| mean-score | 81 | 74 | 563 | 559 |
+| rank-score | 70 | 69 | 527 | 542 |
+
+`*` refined plurality is below production's top-3-refined ceiling (81/578)
+because the probe refines all 88 candidates, letting distant impostors cheat a
+favorable scale — a probe artifact; the fusion-vs-vote comparison is unaffected
+(both use the same scores). Discrete plurality: 83 is strict; 575 is ties-as-pass
+(573 strict).
+
+**Verdict — score-level fusion has no headroom here, so this branch is closed.**
+In the primary (discrete) test, fusion is strictly worse and fixes exactly zero.
+Across all four configurations it never nets a win over voting (mean net −1 to −7;
+rank strictly worse), and in every mode **the stable-wrong residuals 000/010/012
+are never fixed** (the only refined "fixes" are mid-bass artifact recoveries).
+The mechanism is diagnostic: bass/mid are saturated (fusion neither helps nor
+hurts), and the loss is entirely in the **treble**, where high partials die
+intermittently — the true key wins the *plurality* of frames but has scattered
+catastrophic frames that any temporal *average* (mean or rank) lets poison it,
+while voting is immune because it only counts wins. This both vindicates M-of-N
+(a voting rule) as the correct temporal integrator for this signal and warns
+that a full MSPRT — which also integrates per-frame evidence — would inherit the
+same treble vulnerability unless its likelihood model explicitly down-weights
+dead-partial frames. Given two simple fusions regressing on two instruments in
+both modes, and the residuals being independently B-limited (ADR 0006 item 5),
+the burden of proof for the heavy likelihood-bridge version is not met. **Do not
+reopen without a specific new reason** (e.g. a future instrument whose residuals
+are shown to be genuine flicker, not stable-wrong/B-limited).
+
+## Replay protocol (decided 2026-07-19 — gate 2 executed)
+
+All parameters below were fixed **before any sweep surface was computed** (the
+selection criterion is baked into `scripts/replay_lock_rules.py`'s defaults);
+the three user decisions (latency budget, data protocol, execution scope) are
+on record from 2026-07-19. Results: `docs/adr/0010-m-of-n-lock-rule-replay.md`.
+
+**Rule under test.** M-of-N binary integration (Schwartz 1956; Shnidman 1998)
+over the *stable-frame winner sequence* — the identical merge
+`validate_config.py` uses (`peaks.csv` `key_idx` × `gatekeeper.csv`
+`state_name == "Stable"`, frame order). At stable index *t* the window is the
+last min(*t*+1, N) winners (partially filled at the start, so clean evidence
+still locks early); lock fires at the first *t* where some key holds ≥ M votes.
+**M > N/2 required** — majority makes the winner unique per frame, no tie rule
+needed. M = N = 3 reduces *exactly* to the production 3-consecutive rule and is
+the harness-correctness gate.
+
+**Grid & budget.** Full surface N ∈ 3..43, M ∈ ⌊N/2⌋+1..N, computed for the
+record; **selection is restricted to N ≤ 21** (user decision: ≈ 0.49 s
+worst-case added latency at the 23.2 ms stable-frame hop; the current rule
+commits ≈ 70 ms after stability). Added latency is reported in stable frames;
+the ms conversion assumes contiguous stability (approximate — the gatekeeper
+can interleave non-Stable frames).
+
+**Datasets & config.** Piano-1 = `diagnostics_piano_1/` (87 keys × 1 capture);
+piano-2 = `diagnostics/` (595 repeat dumps, 88 keys, ≥ 5 each; folder-name
+ground truth, wrong-strike dumps already discarded — the audio is genuine even
+where early `analysis.json` files are not, and the replay consumes only audio).
+CSVs regenerated fresh under the shipped `TwmConfig::default()` (telemetry
+build, mirroring `validate_config.py`); both discovery modes (discrete,
+refined) swept independently, refined = the production-weighted mode. No
+constants sweep (Prompt A′: no candidate beats the default).
+
+**Metrics per (M, N, mode, instrument).** Pass (lock == folder key) total +
+per register (bass ≤ 26 / mid 27–59 / treble ≥ 60); fail mode (wrong lock vs
+no-lock); fixed/broken lists vs the M = N = 3 baseline; added-latency
+median/p95/max over keys both rules lock correctly. Piano-2 additionally:
+per-key dump-consistency (a key's repeats should agree; mixed outcomes are
+reported, and per-dump counting is the primary score).
+
+**Pre-registered selection criterion (two-instrument concordance).** Per mode:
+plateau₁ = pairs within **1 key** of the piano-1 surface max (N ≤ 21);
+plateau₂ = pairs within **7 dumps** of the piano-2 max (≈ 1 key-equivalent —
+595/88 ≈ 6.8 repeats per key); candidate region = plateau₁ ∩ plateau₂.
+Nonempty ⇒ recommend min N, then min M (lowest latency, most
+interruption-tolerant), and require the recommendation's grid neighbors to sit
+in or within one key of the region (no isolated spikes — the t1898 lesson).
+Empty ⇒ no transferable rule at this budget; record and close per the gates
+below.
+
+**Harness-correctness gates (both passed 2026-07-19).** (1) M = N = 3
+reproduces `validate_config.py` exactly on piano-1: discrete 76/87
+(b21/m33/t22) and refined 77/87 (b20/m33/t24) with the A′ failure lists
+key-for-key. (2) The full-window plurality ceiling recomputed from the cache
+matches A′'s gross ceilings (discrete 83; refined 81 strict — key 000's dead
+tie appears exactly as A′ recorded it).
+
+**Outcome gates.** *Support*: a concordant (M, N) improves or holds the total
+on **both** instruments with ≥ 2 net fixes on at least one and no register
+collapse ⇒ status here moves to "replay supports M-of-N"; the hot-path design
+note is the next step, still nothing built without user approval. Known
+non-targets stay non-targets: the two genuine-flicker keys and the refined
+000/001 near-tie races are outside what plain winner votes can fix. *Refute*:
+no concordant pair beats both baselines within budget ⇒ close the M-of-N
+branch in ADR 0006 item 5. Either way **MSPRT stays gated** behind its
+likelihood-bridge problem — this replay neither authorizes nor needs it.
+
+**Artifacts.** Harness: `scripts/replay_lock_rules.py` (kept — standing,
+stdlib-only). Caches/surfaces: `replay_cache/` (gitignored, regenerable).
+Results record: ADR 0010. Nothing committed (standing rule).
 
 ## References
 

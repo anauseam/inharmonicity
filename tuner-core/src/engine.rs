@@ -7,19 +7,22 @@
 use crate::algorithms::{
     discovery,
     peaks::{self, extract_peaks},
-    spectral::goertzel,
-    twm,
+    spectral, twm,
 };
 use crate::audio::{BASS_WINDOW_SIZE, HOP_SIZE};
 use crate::models::{KeyProfile, MAX_PARTIALS, SpectralPeak};
 use crate::pipeline::ProcessingFrame;
 
-// ── Neyman-Pearson Amplitude SNR Gate ──
-// Foundation: Kay, S. M. (1998). Fundamentals of Statistical Signal Processing: Detection Theory (Vol 2), Chapter 9.
-// For a target false-alarm probability P_fa = 0.001 (0.1%), the threshold is derived from the Rayleigh tail.
-// Scaled for physical amplitude (Hann window energy = 0.375 * HOP_SIZE):
-// T_amp = σ * (4/HOP_SIZE) * sqrt(-(0.375 * HOP_SIZE) * ln(0.001))
-const NEYMAN_PEARSON_K: f32 = 0.201184;
+// ── M-of-N Acquisition Lock (Binary Integration) ──
+// Discovery locks the first key to win ≥ M of the last N Stable-frame scans —
+// the binary-integration / coincidence procedure (Schwartz 1956, IRE Trans. IT
+// 2(4); Shnidman 1998, IEEE Trans. AES 34(3)). M > N/2 guarantees at most one
+// key can hold ≥ M votes, so only the frame's own winner is ever tested.
+// (M, N) = (7, 8) is the refined-path production pick; provenance and the full
+// (M, N) latency/accuracy tradeoff (e.g. the cheaper (5, 6) ≈ 46 ms vs ≈ 93 ms)
+// are in docs/adr/0010-m-of-n-lock-rule-replay.md.
+const LOCK_VOTES_M: usize = 7;
+const LOCK_WINDOW_N: usize = 8;
 
 /// Result of a successful pitch detection frame.
 #[derive(Debug, Clone)]
@@ -27,7 +30,6 @@ pub struct PitchResult {
     /// 0–87 key index of the identified note.
     pub key_index: u8,
     /// Physical fundamental frequency (Partial 1), tracked via Goertzel phase vocoder. Returns None if Partial 1 is dead.
-    pub cents_deviation: Option<f32>,
     /// Absolute physical fundamental frequency (Partial 1) in Hz. Returns None if Partial 1 is dead.
     pub measured_f0: Option<f32>,
     /// Per-partial instantaneous frequency (Hz). Valid entries: [0..partial_count].
@@ -57,7 +59,6 @@ impl Default for PitchResult {
     fn default() -> Self {
         Self {
             key_index: 0,
-            cents_deviation: None,
             measured_f0: None,
             partial_freqs: [0.0; MAX_PARTIALS],
             partial_cents: [0.0; MAX_PARTIALS],
@@ -89,8 +90,12 @@ pub struct Engine {
 
     // Discovery State
     pub identified_key: Option<u8>,
-    pub consistency_key: u8,
-    pub stable_frames: u8,
+    /// Ring buffer of the last `LOCK_WINDOW_N` Stable-frame discovery winners
+    /// (key indices), with its fill length and write cursor — the M-of-N lock
+    /// window (see [`Engine::record_stable_winner`]).
+    lock_window: [u8; LOCK_WINDOW_N],
+    lock_window_len: usize,
+    lock_window_head: usize,
 
     // Tracking state
     tracking_targets: [f32; MAX_PARTIALS],
@@ -98,6 +103,13 @@ pub struct Engine {
     warmup_hops: u8,
     /// Winning Stage B scale (s_win) of the current lock; 1.0 when unlocked.
     locked_scale: f32,
+    /// R3 for the tracker: `true` while the locked key's partial spacing
+    /// (≈ f₀, proxied by the f₁ seed) sits inside the 1024-sample Hann main
+    /// lobe (half-width 2·fs/1024 ≈ 86 Hz), selecting the 4096-sample
+    /// Goertzel window for every partial of the key. Same derivation and
+    /// boundary as [`crate::strobe::Strobe`]'s long-window rule; window
+    /// length ≠ hop, so the ±21.5 Hz phase-unwrap range is unchanged.
+    long_window: bool,
 
     // Shared
     pub noise_floor: f32,
@@ -114,31 +126,74 @@ impl Engine {
         Engine {
             sample_rate,
             identified_key: None,
-            consistency_key: 0,
-            stable_frames: 0,
+            lock_window: [0; LOCK_WINDOW_N],
+            lock_window_len: 0,
+            lock_window_head: 0,
             tracking_targets: [0.0; MAX_PARTIALS],
             partial_trackers: [PartialTracker::default(); MAX_PARTIALS],
             warmup_hops: 0,
             locked_scale: 1.0,
+            long_window: false,
             noise_floor: 0.0, // updated by pipeline
             peak_scratch: vec![SpectralPeak::default(); 64].into_boxed_slice(),
         }
     }
 
+    /// Records a Stable-frame discovery winner into the M-of-N window and
+    /// returns whether `key` has reached the lock threshold.
+    ///
+    /// Binary integration (Schwartz 1956; Shnidman 1998; ADR 0010): lock the
+    /// first key to win ≥ `LOCK_VOTES_M` of the last `LOCK_WINDOW_N` Stable
+    /// frames. The window is a fixed ring buffer — the oldest vote is
+    /// overwritten once it is full — so a partially-filled window lets clean
+    /// evidence lock after `M` straight frames. Only Stable frames call this: a
+    /// non-Stable interruption casts no vote and leaves the window intact
+    /// ([`reset_lock_window`](Self::reset_lock_window) clears it on a new
+    /// onset). `M > N/2` guarantees at most one key can hold ≥ `M` votes, so
+    /// testing the just-recorded key alone is exact.
+    fn record_stable_winner(&mut self, key: u8) -> bool {
+        self.lock_window[self.lock_window_head] = key;
+        self.lock_window_head = (self.lock_window_head + 1) % LOCK_WINDOW_N;
+        if self.lock_window_len < LOCK_WINDOW_N {
+            self.lock_window_len += 1;
+        }
+        // Until the buffer is full the head advances in lockstep with the fill
+        // length, so the valid votes are always the first `len` slots. N ≤ 8 ⇒
+        // this linear count is trivially cheap and allocation-free.
+        let votes = self.lock_window[..self.lock_window_len]
+            .iter()
+            .filter(|&&k| k == key)
+            .count();
+        votes >= LOCK_VOTES_M
+    }
+
+    /// Clears the M-of-N lock window (new onset / silence / transient bypass).
+    /// Only the fill length and cursor are reset; slots past `len` are never
+    /// read.
+    #[inline]
+    fn reset_lock_window(&mut self) {
+        self.lock_window_len = 0;
+        self.lock_window_head = 0;
+    }
+
     /// Executes the primary DSP detection loop for a single frame.
     ///
     /// `profiles` is the read-only per-key template table to score against.
+    // Gate state is passed as decomposed booleans (not the gatekeeper's
+    // `GateResult`) to keep the engine decoupled from `crate::gatekeeper`.
+    #[allow(clippy::too_many_arguments)]
     pub fn process(
         &mut self,
-        frame: &mut ProcessingFrame,
+        frame: &ProcessingFrame,
         profiles: &[KeyProfile; 88],
         is_silence: bool,
+        is_stable: bool,
         is_new_onset: bool,
         is_transient_bypass: bool,
         target_note: Option<u8>,
     ) -> Option<PitchResult> {
         if is_silence {
-            self.stable_frames = 0;
+            self.reset_lock_window();
             self.identified_key = None;
             self.partial_trackers = [PartialTracker::default(); MAX_PARTIALS];
             self.locked_scale = 1.0;
@@ -146,13 +201,13 @@ impl Engine {
         }
 
         if is_transient_bypass {
-            self.stable_frames = 0;
+            self.reset_lock_window();
             self.identified_key = None;
             return None;
         }
 
         if is_new_onset {
-            self.stable_frames = 0;
+            self.reset_lock_window();
             self.identified_key = None;
         }
 
@@ -169,6 +224,15 @@ impl Engine {
 
         // ── Discovery State ──
         if self.identified_key.is_none() {
+            // Auto-mode M-of-N votes accrue on Stable frames only (ADR 0010
+            // window semantics): a non-Stable frame casts no vote and — crucially
+            // — must not clear the accumulated window, so skip the Stage-A scan
+            // entirely until the gatekeeper is Stable again. Manual mode (an
+            // explicit target) is acquisition-immediate and unaffected.
+            if target_note.is_none() && !is_stable {
+                return None;
+            }
+
             // ── Gaussian Noise Filter (Detection Theory) ─────────────────────
             // Computes a Neyman-Pearson threshold for Additive White Gaussian Noise.
             // Foundation: Kay, S. M. (1998) Fundamentals of Statistical Signal Processing.
@@ -212,7 +276,7 @@ impl Engine {
             let cfg = twm::TwmConfig::default();
             // `min_error` feeds only the debug_assertions diagnostic below.
             #[cfg_attr(not(debug_assertions), allow(unused_variables))]
-            let (winning_key, temporal_gate, s_win, min_error) =
+            let (winning_key, lock_acquired, s_win, min_error) =
                 if let Some(target_idx) = target_note {
                     // Manual Mode: bypass the 88-key scan, but still run Stage B scale
                     // refinement on the single target profile — otherwise this is the
@@ -226,26 +290,25 @@ impl Engine {
                     // scan, Stage B basin-clamped scale refinement of the top-3.
                     let res = discovery::discover(active_peaks, profiles, &cfg, true);
 
-                    // 3-Frame Consistency Gate (key-based, unchanged)
-                    if res.key_index == self.consistency_key {
-                        self.stable_frames += 1;
-                    } else {
-                        self.consistency_key = res.key_index;
-                        self.stable_frames = 1;
-                    }
+                    // M-of-N binary-integration lock (ADR 0010): count this
+                    // Stable-frame winner into the N-window; lock the first key
+                    // to reach M votes. `s_win`/`error` come from the winning
+                    // frame's own scan — because M > N/2, the key that crosses
+                    // the threshold is always this frame's `res.key_index`.
+                    let locked = self.record_stable_winner(res.key_index);
 
-                    (res.key_index, self.stable_frames >= 3, res.scale, res.error)
+                    (res.key_index, locked, res.scale, res.error)
                 };
 
             let profile = &profiles[winning_key as usize];
 
             #[cfg(debug_assertions)]
             eprintln!(
-                "[ENGINE] Consistency Gate: peaks={}, key_idx={}, f0={:.1}, min_error={:.2}",
+                "[ENGINE] Discovery Gate: peaks={}, key_idx={}, f0={:.1}, min_error={:.2}",
                 valid_count, winning_key, profile.f0_et, min_error
             );
 
-            if temporal_gate {
+            if lock_acquired {
                 // Lock
                 #[cfg(debug_assertions)]
                 eprintln!(
@@ -256,6 +319,14 @@ impl Engine {
                 self.identified_key = Some(winning_key);
                 self.warmup_hops = 0;
                 self.locked_scale = s_win;
+                // Long window iff the 1024-sample main-lobe half-width
+                // (2·fs/1024) exceeds the partial spacing, proxied by the
+                // refined f₁ seed (spacing ≈ f₀ ≤ f₁ for every partial pair
+                // of the key) — the strobe bank's R3 rule applied to the
+                // tracker (its absence was Prompt N Defect 1: guitar E2's
+                // 2nd partial inside the lobe read ±47 ¢ of jitter).
+                self.long_window =
+                    profile.predicted_partials[0] * s_win * 1024.0 < 2.0 * self.sample_rate as f32;
 
                 let limit = profile.valid_partial_count.min(MAX_PARTIALS);
                 for i in 0..limit {
@@ -275,7 +346,15 @@ impl Engine {
         // ── Tracking State ──
         let key = self.identified_key?;
         let profile = &profiles[key as usize];
-        let audio_slice = &frame.audio_buffer[(BASS_WINDOW_SIZE - HOP_SIZE)..BASS_WINDOW_SIZE];
+        // The evaluator reads the freshest `window` samples of the full COLA
+        // buffer; the hop cadence (and hence the ±21.5 Hz unwrap range) is
+        // set by the caller, not the window length.
+        let audio_slice = &frame.audio_buffer[..BASS_WINDOW_SIZE];
+        let (eval, np_k): (spectral::GoertzelFn, f32) = if self.long_window {
+            (spectral::goertzel_bass, spectral::neyman_pearson_k(4096))
+        } else {
+            (spectral::goertzel, spectral::neyman_pearson_k(1024))
+        };
         let t_hop = HOP_SIZE as f32 / self.sample_rate as f32;
 
         let mut live_partials = 0;
@@ -286,7 +365,7 @@ impl Engine {
 
         for i in 0..profile.valid_partial_count.min(MAX_PARTIALS) {
             let f_target = self.tracking_targets[i];
-            let (amplitude, phase_current) = goertzel(audio_slice, self.sample_rate, f_target);
+            let (amplitude, phase_current) = eval(audio_slice, self.sample_rate, f_target);
             let tracker = &mut self.partial_trackers[i];
 
             if self.warmup_hops == 0 {
@@ -310,7 +389,9 @@ impl Engine {
             let f_inst = f_target + delta_phi / (2.0 * core::f32::consts::PI * t_hop);
             tracker.prev_phase = phase_current;
 
-            let t_amp = self.noise_floor * NEYMAN_PEARSON_K;
+            // Kay 1998 Neyman–Pearson amplitude gate at the active window
+            // length (see `spectral::neyman_pearson_k` for the derivation).
+            let t_amp = self.noise_floor * np_k;
 
             // A physical partial has a positive, finite frequency. On a
             // spurious deep-bass lock the tracker free-runs on noise and the
@@ -378,7 +459,6 @@ impl Engine {
         // and the tuner naturally falls back to the strobe display.
         for i in 0..live_partials {
             if result.partial_ns[i] == 1 {
-                result.cents_deviation = Some(result.partial_cents[i]);
                 result.measured_f0 = Some(result.partial_freqs[i]);
                 break;
             }
@@ -387,5 +467,100 @@ impl Engine {
         result.partial_count = live_partials;
 
         Some(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+
+    /// Reference M-of-N rule — a direct port of `eval_rule` in
+    /// `scripts/replay_lock_rules.py`, the harness the ADR 0010 numbers were
+    /// measured with. Returns `(key, index)` of the first lock, or `None`.
+    fn ref_eval(seq: &[u8], m: usize, n: usize) -> Option<(u8, usize)> {
+        let mut win: VecDeque<u8> = VecDeque::with_capacity(n);
+        for (t, &w) in seq.iter().enumerate() {
+            if win.len() == n {
+                win.pop_front();
+            }
+            win.push_back(w);
+            if win.iter().filter(|&&k| k == w).count() >= m {
+                return Some((w, t));
+            }
+        }
+        None
+    }
+
+    /// Feed a winner sequence through the engine's ring-buffer voter as if every
+    /// frame were Stable, returning where it first locks.
+    fn engine_lock(seq: &[u8]) -> Option<(u8, usize)> {
+        let mut e = Engine::new(44100);
+        for (t, &w) in seq.iter().enumerate() {
+            if e.record_stable_winner(w) {
+                return Some((w, t));
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn m_of_n_matches_reference_rule() {
+        // Battery covering: clean lock, one-dissenter tolerance, alternating
+        // no-lock, the eviction boundary (a vote that ages out of the window),
+        // a mid-sequence key change, and short/empty inputs.
+        let seqs: &[&[u8]] = &[
+            &[],
+            &[5],
+            &[5, 5, 5, 5, 5, 5, 5],                // 7 straight → locks
+            &[5, 5, 5, 5, 5, 5],                   // only 6 → never locks
+            &[1, 2, 1, 2, 1, 5, 5, 5, 5, 5, 5, 5], // clean run after churn
+            &[0, 1, 0, 1, 0, 1, 0, 1, 0, 1],       // alternating → never (needs 7 of 8)
+            &[5, 5, 5, 5, 5, 5, 9, 5],             // 7 of the last 8 → one dissenter tolerated
+            &[9, 5, 5, 5, 5, 5, 5, 5],             // leading dissenter then 7 straight
+            &[5, 5, 5, 9, 5, 5, 5, 5, 5],          // gap inside the run
+            &[3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4],    // winner switches, then locks on 4
+        ];
+        for seq in seqs {
+            assert_eq!(
+                engine_lock(seq),
+                ref_eval(seq, LOCK_VOTES_M, LOCK_WINDOW_N),
+                "engine and reference rule disagree on {seq:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn vote_ages_out_of_full_window() {
+        // Votes that fall outside the last N frames must not count. Six fives,
+        // then N alternating fillers (which never themselves reach M) evict
+        // every five from the window, so a fresh run of M fives is needed to
+        // lock — the six pre-eviction fives no longer contribute.
+        let mut e = Engine::new(44100);
+        for _ in 0..(LOCK_VOTES_M - 1) {
+            assert!(!e.record_stable_winner(5));
+        }
+        for i in 0..LOCK_WINDOW_N {
+            let filler = if i % 2 == 0 { 9 } else { 8 };
+            assert!(!e.record_stable_winner(filler));
+        }
+        for _ in 0..(LOCK_VOTES_M - 1) {
+            assert!(!e.record_stable_winner(5));
+        }
+        assert!(e.record_stable_winner(5)); // Mth five of the fresh run → lock
+    }
+
+    #[test]
+    fn reset_clears_accumulated_votes() {
+        let mut e = Engine::new(44100);
+        for _ in 0..(LOCK_VOTES_M - 1) {
+            assert!(!e.record_stable_winner(5));
+        }
+        e.reset_lock_window();
+        // Post-reset, the full M straight frames are required again.
+        for _ in 0..(LOCK_VOTES_M - 1) {
+            assert!(!e.record_stable_winner(5));
+        }
+        assert!(e.record_stable_winner(5));
     }
 }

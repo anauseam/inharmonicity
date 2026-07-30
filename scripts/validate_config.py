@@ -2,25 +2,46 @@
 """Score a TWM constant set against the real diagnostic captures — pass/fail per
 key, dependency-free (stdlib csv only; no pandas/matplotlib).
 
-Replicates test_engine_all.py's lock logic exactly: merge gatekeeper + engine
-per frame, keep only 'Stable' frames, then declare a lock when the per-frame
-winning key (`key_idx`) repeats for 3 consecutive stable frames, and compare to
-the folder-name ground truth. This is the Phase 5 real-data gate.
+Replicates the engine's lock logic exactly: merge gatekeeper + engine per frame,
+keep only 'Stable' frames, then apply the M-of-N (binary-integration) lock rule
+— lock the first key to win >= M of the last N stable-frame winners (`key_idx`),
+Schwartz 1956 / Shnidman 1998 — and compare to the folder-name ground truth.
+This is the Phase 5 real-data gate. The shipped rule is (M, N) = (7, 8) for the
+refined path (ADR 0010); `--lock-m 3 --lock-n 3` reproduces the old
+3-consecutive rule. The rule here is identical to `replay_lock_rules.py`'s
+`eval_rule` and `Engine::record_stable_winner`.
 
 Usage:
   python3 scripts/validate_config.py [--refine] [--config "p q r rho lambda"]
+                                     [--base DIR] [--lock-m 7] [--lock-n 8]
 """
 import argparse
 import csv
 import os
 import subprocess
+from collections import Counter, deque
 
-BASE = "./diagnostics"
 ENGINE = "./target/release/examples/diagnose_engine"
 GATE = "./target/release/examples/diagnose_gatekeeper"
 
 
-def lock_for_key(key_dir, refine, config, sum_forward, stretch, b_deadzone, nonpeak, smoothness):
+def mofn_lock(winners, m, n):
+    """First key to win >= m of the last n winners (deque(maxlen=n)); identical
+    to replay_lock_rules.py eval_rule and the engine's record_stable_winner.
+    m > n/2 => at most one key can hold >= m votes. Returns the key or None."""
+    win = deque(maxlen=n)
+    counts = Counter()
+    for w in winners:
+        if len(win) == n:
+            counts[win[0]] -= 1
+        win.append(w)
+        counts[w] += 1
+        if counts[w] >= m:
+            return w
+    return None
+
+
+def lock_for_key(key_dir, refine, config, sum_forward, stretch, b_deadzone, nonpeak, smoothness, m, n):
     raw = os.path.join(key_dir, "audio_full_event.raw")
     if not os.path.exists(raw):
         raw = os.path.join(key_dir, "audio.raw")
@@ -55,22 +76,17 @@ def lock_for_key(key_dir, refine, config, sum_forward, stretch, b_deadzone, nonp
     with open(peaks_csv) as f:
         winner = {int(r["frame"]): int(r["key_idx"]) for r in csv.DictReader(f)}
 
-    # Stable frames, in frame order (the merge + state_name=='Stable' filter).
-    stable = [(fr, winner[fr]) for fr in sorted(winner)
+    # Stable-frame winner sequence, in frame order (merge + 'Stable' filter).
+    stable = [winner[fr] for fr in sorted(winner)
               if state.get(fr) == "Stable"]
     if not stable:
         return ("FAIL_NEVER_STABLE", -1)
 
-    # 3-frame consistency on the winning key.
-    cand, count = -1, 0
-    for _, w in stable:
-        if w == cand:
-            count += 1
-        else:
-            cand, count = w, 1
-        if count >= 3:
-            return ("LOCK", cand)
-    return ("FAIL_NO_3_FRAME_LOCK", -1)
+    # M-of-N binary-integration lock on the winning key.
+    locked = mofn_lock(stable, m, n)
+    if locked is None:
+        return ("FAIL_NO_LOCK", -1)
+    return ("LOCK", locked)
 
 
 def main():
@@ -87,18 +103,27 @@ def main():
                     help="EXPERIMENT: Duan non-peak per-hallucinated-partial penalty (0=off)")
     ap.add_argument("--smoothness", type=float, default=0.0,
                     help="EXPERIMENT: Emiya matched-partial amplitude-incoherence penalty (0=off)")
+    ap.add_argument("--base", default="./diagnostics",
+                    help="capture dir holding key_* subdirs (default ./diagnostics)")
+    ap.add_argument("--lock-m", type=int, default=7,
+                    help="M-of-N lock: votes required (default 7; ADR 0010 refined)")
+    ap.add_argument("--lock-n", type=int, default=8,
+                    help="M-of-N lock: window length (default 8; 3/3 = old rule)")
     args = ap.parse_args()
+    if not args.lock_m > args.lock_n // 2:
+        ap.error("--lock-m must exceed --lock-n/2 (majority => unique winner)")
 
     for ex, feats in [(ENGINE, ["--features", "telemetry"]), (GATE, [])]:
         tgt = ex.split("/")[-1]
         subprocess.run(["cargo", "build", "--release", "--example", tgt] + feats,
                        check=True, stdout=subprocess.DEVNULL)
 
-    keys = sorted(d for d in os.listdir(BASE) if d.startswith("key_"))
+    keys = sorted(d for d in os.listdir(args.base) if d.startswith("key_"))
     mode = "REFINED" if args.refine else "DISCRETE"
     sf = " | SUM-FORWARD" if args.sum_forward else ""
     st = " | STRETCH" if args.stretch else ""
-    print(f"{mode} | config={args.config or 'DEFAULT'}{sf}{st} | {len(keys)} keys")
+    print(f"{mode} | config={args.config or 'DEFAULT'}{sf}{st} | "
+          f"lock={args.lock_m}-of-{args.lock_n} | base={args.base} | {len(keys)} keys")
 
     npass = 0
     fails = []
@@ -106,7 +131,7 @@ def main():
     reg = [[0, 0], [0, 0], [0, 0]]
     for kd in keys:
         expected = int(kd.split("_")[1])
-        res = lock_for_key(os.path.join(BASE, kd), args.refine, args.config, args.sum_forward, args.stretch, args.b_deadzone, args.nonpeak, args.smoothness)
+        res = lock_for_key(os.path.join(args.base, kd), args.refine, args.config, args.sum_forward, args.stretch, args.b_deadzone, args.nonpeak, args.smoothness, args.lock_m, args.lock_n)
         if res is None:
             continue
         status, locked = res

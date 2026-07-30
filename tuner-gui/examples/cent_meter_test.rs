@@ -1,4 +1,5 @@
 use iced::{Element, Subscription, Task};
+use tuner_core::{FrameOutput, models};
 use tuner_gui::widgets::cent_meter::CentMeterDisplay;
 
 // Import our shared testing utilities
@@ -48,7 +49,7 @@ impl CentMeterViewer {
                     && rx.update()
                 {
                     let result = rx.read().clone();
-                    if let Some(cents) = result.cents_deviation {
+                    if let Some(cents) = et_cents(&result) {
                         self.smoothing_buffer.push(cents);
                         if self.smoothing_buffer.len() > 5 {
                             self.smoothing_buffer.remove(0);
@@ -65,7 +66,7 @@ impl CentMeterViewer {
 
     fn view(&self) -> Element<'_, LocalMessage> {
         let smoothed_cents = if self.smoothing_buffer.is_empty() {
-            self.last_analysis.as_ref().and_then(|a| a.cents_deviation)
+            self.last_analysis.as_ref().and_then(et_cents)
         } else {
             let sum: f32 = self.smoothing_buffer.iter().sum();
             Some(sum / self.smoothing_buffer.len() as f32)
@@ -100,4 +101,18 @@ impl CentMeterViewer {
         // Run updates at 60 FPS
         iced::time::every(std::time::Duration::from_millis(16)).map(|_| LocalMessage::Tick)
     }
+}
+
+/// Cents from the nearest equal-temperament note — the deviation this demo
+/// displays. Computed here because the core ships the measured frequency and
+/// leaves the choice of reference to the consumer.
+fn et_cents(frame: &FrameOutput) -> Option<f32> {
+    let f = frame
+        .detected_frequency
+        .filter(|v| v.is_finite() && *v > 0.0)?;
+    let key = frame.note_index?;
+    Some(models::calculate_cents_deviation(
+        f,
+        models::NOTES[key as usize].frequency,
+    ))
 }

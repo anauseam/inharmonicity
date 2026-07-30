@@ -53,7 +53,7 @@ The four threads:
 
 This thread is the high-speed hardware ingestor and signal conditioner.
 
-- **Action:** Continuously captures raw audio from the microphone at 44,100 Hz. Each sample passes through a `DcBlocker` (single-pole high-pass IIR, α = 0.995, ~3.5 Hz cutoff) to remove hardware-dependent DC offset, then is pushed into the Elastic Ring Buffer. This guarantees every downstream consumer sees a zero-mean signal regardless of microphone, audio interface, or OS driver.
+- **Action:** Continuously captures raw audio from the microphone at 44,100 Hz. Each sample passes through a `DcBlocker` (single-pole high-pass IIR, α = 0.995 — a **35 Hz** corner, `(1−α)·fs/2π`, which sits above A0 and costs −4.2 dB of its fundamental; measured as the right trade against sub-35 Hz rumble, see the Known Issues entry) to remove hardware-dependent DC offset, then is pushed into the Elastic Ring Buffer. This guarantees every downstream consumer sees a zero-mean signal regardless of microphone, audio interface, or OS driver.
 - **Rule:** This thread performs zero allocations and no analysis. The DC blocker is the only computation — one multiply and two additions per sample — and is classified as signal _conditioning_, not signal analysis. Its job is to guarantee pristine, zero-mean data throughput.
 
 #### Thread 2: The Audio Processing Pipeline
@@ -113,7 +113,7 @@ This thread constantly consumes data from the Elastic Ring Buffer and executes a
     1. **Peak Extraction:** Sub-bin peaks are extracted using the Jacobsen complex-domain estimator (Candan 2015). To establish a statistical minimum magnitude for Additive White Gaussian Noise (AWGN) rejection, a dynamic Neyman-Pearson threshold (Kay 1998) is computed against the pipeline's dynamic noise floor and acts as a floor gate. _(Note: Because the piano's acoustic noise floor during an active note is vastly higher than the room's silence threshold, this AWGN boundary is mathematically sound but practically negligible in effect)._
     2. **Peak Masking:** A two-stage masking process is applied: first, a `-30 dB` relative global magnitude floor (an adaptation of Cano 1998's 40 dB rule) removes absolute structural noise, followed by our own proportional critical-band masking heuristic — empirically validated in ADR 0002, not a port of a published method — to aggressively drop sympathetic tonal noise and structural intermodulation distortion.
     3. **TWM Scoring:** The surviving peaks are scored against 88 pre-computed inharmonicity-stretched `KeyProfile` arrays. The algorithm evaluates both forward error and reverse error with psychoacoustic frequency weighting ($f^{-0.5}$). To prevent unbounded error accumulation from distant noise, the Measured-to-Predicted error is topologically bounded using a piecewise ceiling derived from Duan et al. (2010).
-    4. **Temporal Tracking:** A mathematically stateless 3-frame temporal consistency gate confirms the lock and transitions the Engine to the Tracking Phase. (Note: The historic Viterbi hidden Markov model was permanently excised because its path cost persistence caused unrecoverable sub-harmonic locks following noisy hammer strikes).
+    4. **Temporal Tracking:** The lock is confirmed by **M-of-N binary integration** over the per-frame discovery winner on _stable_ frames — the first key to win ≥ M of the last N stable frames latches (refined default 7-of-8; Schwartz 1956 / Shnidman 1998, validated on two instruments in ADR 0010). This is a bounded, allocation-free window that outlasts the attack transient a first-to-win race could otherwise lock onto; confirmation transitions the Engine to the Tracking Phase. (Note: The historic Viterbi hidden Markov model was permanently excised because its path cost persistence caused unrecoverable sub-harmonic locks following noisy hammer strikes).
   - **Tracking Phase (State: Locked):** Once a key is locked, the engine switches to per-partial Goertzel analysis on 1024-sample segments to refine the tuning measurement.
     1. **Phase Vocoder:** Phase differences between consecutive hops are unwrapped to yield instantaneous frequency estimates (McAulay & Quatieri 1986).
     2. **Amplitude SNR Gate:** A Neyman-Pearson threshold (derived from a Generalized Likelihood Ratio Test) compares the Goertzel unnormalized magnitude against the noise floor. Partials that fail this threshold are rejected as noise.
@@ -125,21 +125,22 @@ Once the Gatekeeper detects silence, it closes the gate by sending the `is_silen
 
 #### Thread 3: The Background Worker
 
-This is a single detached worker thread spawned at pipeline construction inside `AudioPipeline::new()`. It blocks on a crossbeam receiver, waking only when a `CapturePayload` arrives.
+This is a single detached worker thread spawned at pipeline construction inside `AudioPipeline::new()`. It blocks on a `select!` over two inputs — capture buffers from the DSP thread and background jobs from the UI — waking when either arrives. **Captures are serviced first** (measurement latency is user-facing mid-session); background jobs run only when no capture is pending.
 
-- **Action:** When the pipeline dispatches a filled capture buffer, the worker:
+- **Action (capture):** When the pipeline dispatches a filled capture buffer, the worker:
   1. Performs a high-resolution power-of-two FFT on the captured audio (up to 65,536 points), plus a one-sample-shifted frame, and derives a CSPE (Short & Garcia 2006) super-resolution per-bin frequency map.
   2. Takes the note **identity** from the payload — it does not re-identify the note. In **Auto Mode** that identity is the Engine's real-time TWM discovery lock (`latched_auto_key`); in **Manual Mode** it is the user-selected key.
   3. Seeds from the Engine's Goertzel-tracked _f₀_ (or the key's Equal-Temperament frequency if the tracker never locked).
   4. Runs MAT (Median-Adjustive Trajectories — serial trajectory growth, reading partial frequencies from the CSPE map) to jointly estimate the partials, the refined _f₀_, and the inharmonicity coefficient ($B$) via the median of pairwise partial combinations.
   5. Writes diagnostic files (`audio.raw` + `analysis.json`) to the `diagnostics/` directory.
-- **Output:** Sends a `KeyMeasurement` (containing `key_index`, `measured_f0`, extracted `partials`, and `calculated_b`) to the GUI via the `result_tx` crossbeam SPSC channel. Resets `CaptureState` to `Idle` and recycles the audio buffer back into the `AudioPool`.
+- **Action (curve job):** When the UI requests a tuning-curve recompute (`WorkerJob::Curve`, carrying a trust-filtered `CurveInput` snapshot), the worker runs all curve engines and returns a `CurveBundle`. This lives on the worker because engine (c)'s Giordano dissonance scans alone take ~1.3 s — far too slow for the GUI thread. Jobs are latest-wins (a `generation` counter drops superseded bundles); the read-only snapshot means a curve recompute can never race the profile a `KeyMeasurement` writes.
+- **Output:** Sends a `WorkerOutput` back to the GUI over one shared result channel — `Measurement(KeyMeasurement)` (partials, $f_0$, $B$) per capture, `Curve(Box<CurveBundle>)` per recompute. After a capture it resets `CaptureState` to `Idle` and recycles the audio buffer into the `AudioPool`; curve jobs touch neither the baton nor the pool.
 
 #### Thread 4: The UI Thread (The Visual Renderer)
 
 This is the graphical interface thread operating at 60 FPS.
 
-- **Action:** Consumes the high-speed stream of `FrameOutput` structures from Thread 2 via the `triple_buffer` to drive the instantaneous tuning visualizers (spectrogram, cents-deviation, keyboard). Drains `KeyMeasurement` results from the Worker via the `worker_rx` receiver and inserts them into the `InharmonicityProfile` (and, when measured-B discovery seeding is enabled, pushes the recompiled template back to the live engine via the `profiles` producer — crossing #4). Reads/writes configuration (e.g., silence threshold, target key) and polls runtime observations (e.g., smoothed RMS for the Envelope Viewer) via `Arc<PipelineAtomics>`.
+- **Action:** Consumes the high-speed stream of `FrameOutput` structures from Thread 2 via the `triple_buffer` to drive the instantaneous tuning visualizers (spectrogram, cents-deviation, keyboard). Drains `WorkerOutput` results from the Worker via the `worker_rx` receiver: a `Measurement` is inserted into the `InharmonicityProfile` (and, when measured-B discovery seeding is enabled, pushes the recompiled template back to the live engine via the `profiles` producer — crossing #4); a `Curve` bundle is stashed in UI state to drive the curve display. On any trusted-set edit (capture merge, undo, profile load) it enqueues a `WorkerJob::Curve` for the Worker to recompute the curve off-thread (recompute-on-load; the curve is never persisted). Reads/writes configuration (e.g., silence threshold, target key) and polls runtime observations (e.g., smoothed RMS for the Envelope Viewer) via `Arc<PipelineAtomics>`.
 
 #### Cross-Thread Communication Topology
 
@@ -153,8 +154,10 @@ Because `tuner-core` enforces strict zero-allocation, wait-free real-time audio 
 | **Capture Dispatch**  | crossbeam SPSC (bounded) | DSP (2) → Worker (3)          | `CapturePayload` containing pooled audio buffer + metadata.           |
 | **Buffer Recycling**  | Lock-Free Object Pool    | DSP (2) ↔ Worker (3)          | Recycled `Box<[f32; 66150]>` arrays — zero allocation during capture. |
 | **Capture Lifecycle** | `AtomicU8` (baton-pass)  | UI (4) → DSP (2) → Worker (3) | `CaptureState`: Idle → Armed → Recording → Processing → Idle.         |
-| **Worker Results**    | crossbeam SPSC (bounded) | Worker (3) → UI (4)           | `KeyMeasurement` with partials, $f_0$, and $B$ coefficient.           |
+| **Worker Results**    | crossbeam SPSC (bounded) | Worker (3) → UI (4)           | `WorkerOutput`: `Measurement(KeyMeasurement)` per capture, `Curve(CurveBundle)` per recompute. |
+| **Worker Jobs**       | crossbeam SPSC (bounded) | UI (4) → Worker (3)           | `WorkerJob`: curve-recompute requests (`CurveInput` snapshot, latest-wins). |
 | **Template Update**   | `ringbuf` SPSC           | UI (4) → DSP (2)              | Recompiled `KeyProfile` (measured $B$) into the engine's templates.   |
+| **Strobe References** | `ringbuf` SPSC           | UI (4) → DSP (2)              | `StrobeRefUpdate` (curve targets + coarse partial) into the `Strobe`. Second instance of the Template-Update crossing class, not a new channel. |
 
 The channel-by-channel contract is documented in
 [02-cross-thread-communication.md](docs/internals/02-cross-thread-communication.md).
@@ -180,6 +183,8 @@ The major DSP components and their foundations:
 - **Sympathetic Noise Rejection**: `mask_peaks` — our own critical-band masking heuristic (empirically validated in ADR 0002; the global magnitude gate adapts Cano 1998), with a Duan et al. (2010) topological ceiling on the reverse TWM error term
 - **Inharmonicity**: Hodgkinson (2009) Median-Adjustive Trajectories (MAT) — serial trajectory growth, with Short & Garcia (2006) Complex Spectral Phase Evolution (CSPE) sub-bin refinement
 - **Tuning curve** (cold path): Rigaud, David & Daudet (2013) parametric inharmonicity-and-tuning model — the $B_\xi$ fit and the $\rho_\varphi$ octave-type curve; Giordano (2015) sensory-dissonance octave-width recipe (Plomp–Levelt roughness in the Sethares parametrization) as the perceptual layer; Whittaker (1923) / Eilers (2003) smoother for the per-key residual
+- **Strobe display** (`strobe.rs`, a pipeline _tap_, not a chain stage): a fixed-reference Goertzel bank that accumulates per-partial beat phase against the curve targets on the DSP thread — a software strobe (Goertzel 1958 finalization giving exact hop-to-hop phase, audit-08), deep-bass references on a 4096-sample window (R3)
+- **Coarse spectral readout** (`peaks::coarse_read`, folded into the strobe): a bounded, ordered-statistic CFAR-gated magnitude search at the nominated reference partial — the strobe's out-of-range fallback when the phase band aliases (ADR 0011)
 
 Each of those is one file named for the one method it implements (`rigaud.rs`, `giordano.rs`, `whittaker.rs`), composed by `curves.rs` — the same shape `discovery.rs` has over `twm.rs`, and for the same reason: a cited method stays pure and auditable in its own file, and the orchestrator is where they are combined.
 
@@ -266,13 +271,53 @@ The pipeline is statically locked to a 44,100 Hz sample rate. This is not just a
 
 Attempting to change the sample rate dynamically would require migrating away from fixed-size arrays to dynamic allocations on the audio hot-path, breaking the core real-time guarantees. While we currently rely on the host OS audio daemon (e.g., PipeWire or CoreAudio) to resample native hardware inputs down to 44.1kHz, this is strictly a temporary stopgap. Full dynamic sample rate support is planned for the future, but it requires a complex architectural overhaul; shipping a robust, working pipeline at a fixed rate remains the immediate priority.
 
+### The DC blocker's corner sits at 35 Hz, above A0
+
+The input conditioner is a one-pole high-pass with α = 0.995, whose −3 dB corner
+is `(1−α)·fs/2π` ≈ **35 Hz**. That is *above* A0's 27.5 Hz fundamental, which it
+attenuates by 4.2 dB (3.3 dB at C1, 1.5 at A1, 0.4 by A2). For a tuner that
+sets out to capture the whole bass register that looks wrong, so it was measured
+rather than argued, and the corner is kept.
+
+- **Restoring a 3.5 Hz corner (α = 0.9995) buys nothing and costs accuracy.** The
+  bass fundamental gains 2–4 dB but remains 24–41 dB below the note's strongest
+  partial — still under the −30 dB masking gate on the same 7 of 9 bass keys, so
+  discovery sees no new partials. The missing bass fundamental is acoustic, not
+  filter-induced. Meanwhile the CFAR reference cells that set the coarse readout's
+  local noise estimate include this band (its deep-bass lower flank clamps at bin
+  1), so the threshold rises 1–3 dB while the read's own reference partial at
+  110 Hz gains nothing: measured, coarse availability falls 93.3 % → 87.4 % and
+  error worsens 0.70 ¢ → 1.85 ¢.
+- **A steeper filter is the better lever, and still not worth it.** Order — not α
+  — is the axis that escapes the trade: a 3rd-order Butterworth at 25 Hz recovers
+  2.4 dB at A0 while admitting slightly *less* rumble, for 9 µs per 23 ms callback
+  (0.04 % of one core), which is affordable. It was rejected on outcome: MAT's
+  measured `B` moves by a median of **0.00 %** across 87 keys, and the coarse read
+  by +0.3 points of availability. MAT tracks 30+ partials and the deep-bass
+  fundamental was never in its fit, so the filter only shapes spectrum the
+  estimator already ignores.
+
+**What would reopen it.** A consumer that actually uses the bottom octave's
+fundamental — the per-bin/per-octave noise floor under the README's Engine TODOs,
+or an instrument that genuinely radiates it (both validation pianos are uprights,
+the weak case). If that happens, change the **order**, not α, and note three
+things: cascaded biquads are needed rather than one pole; conditioning at
+`fc/fs ≈ 5.7e-4` puts the poles at radius ≈ 0.9965, where f32 direct-form I is
+marginal (use transposed direct-form II or f64 state); and more filter state
+multiplies the single-state stereo defect in the README's Known Issues.
+
+Re-validating any change is possible **without re-recording**: the one-pole
+inverts exactly (`x[n] = y[n] + x[n−1] − α·y[n−1]`, round-tripping to 1e-15
+relative in f64 on real captures), so a candidate filter can be applied to the
+existing capture sets by inverting this one first.
+
 ### The `synth` module is cold-path (curve auralization, no audio-out stream)
 
 `tuner_core::synth` renders a computed `TuningCurve` to audio by **offline additive resynthesis** — placing each key's measured partials at the curve's target frequencies and summing them. Its purpose is _auralization_: hearing how a candidate stretch sounds before tuning a piano to it, since there is no ground-truth-free "best" curve (octave, fifth, and twelfth beats are mutually incompatible objectives — it is a listening judgment). Today the `auralize` example drives it to render a loudness-matched A/B set of WAVs.
 
 This module is deliberately **not part of the real-time system**. It runs on none of the four threads above, touches no shared pipeline state, allocates freely, and owns **no audio stream** — it returns a `Vec<f32>` (or writes a WAV) and hands the level policy to the caller. It sits alongside the cold-path curve math, not the hot path; the four-thread model and the zero-allocation invariants are unaffected by it.
 
-Playback through a speaker — the future GUI "hear the curve" feature — is a **separate, deferred** piece. When it is built, the audio **output** stream will live in `tuner_core::audio` (the single CPAL boundary), **not** in the GUI: `tuner-core` is headless and the GUI speaks only the five channels above. That stream is the mirror image of the capture crossing — a CPAL output callback (the real-time _consumer_) fills a `&mut [f32]` from a lock-free ring buffer whose _producer_ is the cold synth — so it is a documented **sixth cross-thread crossing**, exposed as an opt-in handle like `spawn_analysis_thread`, subject to the same wait-free/no-allocation callback discipline as the input path. Duplex (playing synthesized notes while the tuner is listening) is intentionally out of scope; capture and playback never run at once.
+Playback through a speaker — the future GUI "hear the curve" feature — is a **separate, deferred** piece. When it is built, the audio **output** stream will live in `tuner_core::audio` (the single CPAL boundary), **not** in the GUI: `tuner-core` is headless and the GUI speaks only the six channels above. That stream is the mirror image of the capture crossing — a CPAL output callback (the real-time _consumer_) fills a `&mut [f32]` from a lock-free ring buffer whose _producer_ is the cold synth — so it is a documented **seventh cross-thread crossing**, exposed as an opt-in handle like `spawn_analysis_thread`, subject to the same wait-free/no-allocation callback discipline as the input path. Duplex (playing synthesized notes while the tuner is listening) is intentionally out of scope; capture and playback never run at once.
 
 ## Pointers
 

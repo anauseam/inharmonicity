@@ -28,7 +28,9 @@ README.html
 diagnostics/
 # Archived per-instrument capture sets (raw captures + regenerable curve
 # reports/plots) — kept on disk, never committed, same as diagnostics/.
-diagnostics_piano_1/
+# No underscore before the index: the sets on disk are named both
+# `diagnostics_piano_1` and `diagnostics_piano2`.
+diagnostics_piano*/
 
 # Auralization renders (examples/auralize.rs output — large regenerable WAVs)
 auralize_out/
@@ -37,6 +39,8 @@ auralize_out/
 .agents/
 .claude/
 plan.md
+CLAUDE.md
+
 # Cross-chat work-queue scratch doc (paste-into-fresh-chat prompts). Kept local
 # only; its durable content (audit-series index, Prompt A/A′ results) lives in
 # faithfulness-audit-01-twm.md and ADR 0006.
@@ -46,7 +50,8 @@ docs/design/next-chats-handoff.md
 .venv/
 docs/old
 resources/
-tuning_profile.json
+tuning_profile.json*
+READMEBYME.
 
 # MOBO sweep artifacts — regenerated at the repo root by scripts/optimize_twm.py
 /twm_mobo.db
@@ -57,3 +62,7 @@ tuning_profile.json
 docs/mobo-archive/**/*.db
 # Python bytecode
 scripts/__pycache__/
+# M-of-N lock-rule replay caches (scripts/replay_lock_rules.py — regenerable)
+replay_cache/
+# Draft commit message (review scratch; point `git commit -F` at it, don't track)
+/COMMIT_MSG.txt
