@@ -1,12 +1,12 @@
 //! # MOBO Evaluator — Synthetic Dataset Generator + Discovery Fitness Harness
 //!
-//! Phase 3 of `.agents/claude_implementation_plan.md` (ADR 0001 methodology,
+//! Phase 3 of the MOBO parameter-tuning effort (ADR 0001 methodology,
 //! ADR 0005 split discovery). Generates the fixed-seed synthetic piano dataset
 //! entirely in the peak domain (no FFT — peak *detection* is a different
 //! problem), applies the production `mask_peaks` selection exactly once, and
 //! evaluates the shared `discovery` search against ground truth.
 //!
-//! Physics grounding (all constants cited in `.agents/claude_implementation_plan.md`):
+//! Physics grounding (sources cited inline below and in ADR 0001):
 //! - Partial model f_n = n·f0·√(1+Bn²), B from the Rigaud two-bridge curve the
 //!   engine already uses (`get_expected_beta`), treble bridge fixed across
 //!   pianos, bass bridge piano-dependent.       [Rigaud, David, Daudet DAFx-11]

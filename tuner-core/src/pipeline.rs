@@ -525,9 +525,10 @@ impl AudioPipeline {
     /// profile producer) are kept by the frontend. `spawn_analysis_thread`
     /// distributes the ports into a [`HostHandle`](crate::audio::HostHandle).
     ///
-    /// Startup also seeds the live templates from any persisted
-    /// [`InharmonicityProfile`] at [`PROFILE_PATH`], so a previously-calibrated
-    /// instrument benefits on the very first frame.
+    /// Startup also seeds the live templates from a persisted
+    /// [`InharmonicityProfile`] at [`PROFILE_PATH`] — but only when
+    /// [`APPLY_MEASURED_B_TO_DISCOVERY`] is enabled. It is `false` by default
+    /// (see that flag), so the engine runs on the Rigaud prior.
     ///
     /// # Returns
     /// `(AudioPipeline, PipelinePorts)`.

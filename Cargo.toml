@@ -5,9 +5,11 @@ members = [
 ]
 resolver = "2" # Use the modern feature resolver
 
-# Workspace version
+# Workspace version. Pre-first-release: the project has never shipped a binary,
+# so the number tracks progress toward the initial alpha rather than a released
+# line. Cargo requires SemVer, hence `-alpha` rather than " alpha".
 [workspace.package]
-version = "0.4.1"
+version = "0.1.0-alpha"
 
 # Define common dependencies for the workspace to ensure version consistency
 [workspace.dependencies]

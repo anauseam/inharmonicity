@@ -155,7 +155,7 @@ mismatch. Closed.
 
 ### 3.4 Scrutiny records folded into this design
 
-- **Gemini deep-research report (audited, adopt-nothing):** its coincidence
+- **External deep-research report (audited, adopt-nothing):** its coincidence
   residual re-derives to the stiff-string equation (= already ours via Rigaud);
   its weight values are unsourced free knobs (rejected); its smoothness term
   penalizes Hz-curvature — fails scale-invariance (weights C8 over A0 by

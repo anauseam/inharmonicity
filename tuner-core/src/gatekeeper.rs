@@ -202,7 +202,7 @@ impl Gatekeeper {
         self.current_rms_ema = ema(rms, self.current_rms_ema, alpha);
         let smoothed_rms = self.current_rms_ema;
 
-        // State 0: Claude's Transient Guard — do not abort to Silence mid-transient.
+        // State 0: Transient Guard — do not abort to Silence mid-transient.
         // A weak note's RMS can dip below the silence threshold during the mechanical
         // strike itself. If transient_active is true, we know a transient is actively
         // resolving and we ride it out.
