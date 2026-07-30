@@ -77,6 +77,10 @@ estimator accuracy work, not `measured_f0`.
 **Release builds.** DSP must be exercised with `--release`; debug builds drop
 audio and change availability figures.
 
+**The harnesses that read these sets**, and the on-disk format of a single
+capture, are documented in
+[`tuner-core/examples/README.md`](../../tuner-core/examples/README.md).
+
 ## Where the numbers ended up
 
 - ADR 0006 — discovery/TWM lock accuracy, the measured-B gate (piano #1).

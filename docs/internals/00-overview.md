@@ -98,7 +98,8 @@ docs/internals/
 ├── 03-dsp-pipeline.md                   hot-path constraints
 ├── 04-algorithms-and-models.md          algorithms/ vs models/ layout
 ├── 05-style.md                          Rust style, allocation idioms
-└── 06-capture-sets.md                   the validation data: what it is, how to consume it
+├── 06-capture-sets.md                   the validation data: what it is, how to consume it
+└── suspected-issues.md                  unreproduced hazards and the defensive code for them
 ```
 
 ```text
@@ -111,7 +112,9 @@ docs/adr/
 ├── 0006-discovery-refinement-validation.md    TWM calibration & validation (Draft, living)
 ├── 0007-tuning-curve-regularization-geometry.md  Curve engines: boundary reversion & gauge
 ├── 0008-giordano-layer-fidelity-derived-weights.md  Engine (c)/(d): derived weights, 1-SE rule
-└── 0009-repeat-capture-noise-decomposition.md Repeat-capture σ model; ln-B shrinkage
+├── 0009-repeat-capture-noise-decomposition.md Repeat-capture σ model; ln-B shrinkage
+├── 0010-m-of-n-lock-rule-replay.md            M-of-N acquisition lock; two-instrument replay
+└── 0011-coarse-spectral-readout.md            Strobe coarse readout: CFAR gate, n* selection
 ```
 
 Each file is self-contained, and section headings are stable enough to be

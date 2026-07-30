@@ -10,23 +10,28 @@ don't have to reverse-engineer them.
 
 ## Why this exists
 
-Piano strings are not perfect harmonic oscillators. Real strings have
-non-zero stiffness, so partials are stretched away from integer
-multiples of the fundamental by an inharmonicity coefficient $B$. The
-deviation is small in the treble and very large in the bass and high
-treble; the resulting "stretch curve" is what gives a properly tuned
-piano its rich, locked-in sound. Equal-temperament chromatic tuners
-ignore $B$ entirely — they're built for stringed instruments whose
-partials line up cleanly on harmonic ratios. Tuning a piano with one
-produces an instrument that is mathematically in tune and musically
-wrong.
+Real strings are not perfect harmonic oscillators. Non-zero stiffness
+stretches their partials away from integer multiples of the fundamental
+by an inharmonicity coefficient $B$ — present on any stringed instrument
+(a guitar included), and most dramatic on a piano, where it is small in
+the mid-treble and very large in the bass and high treble. On a piano
+the resulting "stretch curve" is what gives a properly tuned instrument
+its rich, locked-in sound. Equal-temperament chromatic tuners ignore $B$
+entirely — they assume partials line up cleanly on harmonic ratios — so
+tuning a piano with one produces an instrument that is mathematically in
+tune and musically wrong.
 
-`inharmonicity` is a tuning tool that treats $B$ as a first-class
-measurement. The application captures a 1.5-second sample of each
-struck key, extracts the partials, fits a stretched-string model, and
-records the per-key $B$ in an `InharmonicityProfile` that drives the
-real-time tuning display. The result is a tuner that produces a
-musically correct piano rather than a chromatically correct one.
+`inharmonicity` treats $B$ as a first-class measurement. It captures a
+~1.5-second sample of each struck string, extracts the partials, fits a
+stretched-string model, and records the per-key $B$ in an
+`InharmonicityProfile` that drives the tuning display. The measurement,
+the strobe, and an ET reference mode (pure equal temperament, no stretch
+curve) are instrument-agnostic, but the **current focus is the piano**, where the
+inharmonicity-compensated tuning curve (a piano-specific model: Rigaud
+dual-bridge $B_\xi$, octave types, Railsback stretch across the 88-key
+compass) matters most, and where all discovery/TWM validation has been
+done. The result is a tuner that produces a musically correct instrument
+rather than a chromatically correct one.
 
 ## System Overview
 
@@ -80,7 +85,11 @@ This thread constantly consumes data from the Elastic Ring Buffer and executes a
     │ [4] RELEASE             │                 │     (Goertzel Phase     │
     └────────────┬────────────┘                 │         Vocoder)        │
                  │                              └────────────┬────────────┘
-                 │                                           │
+                 │                              ┌────────────▼────────────┐
+                 │                              │ Strobe  (tap, step 5b)  │
+                 │                              │  reads hop + curve refs │
+                 │                              │  adds strobe fields     │
+                 │                              └────────────┬────────────┘
                  ▼                                           ▼
           RuntimeAtomics                                FrameOutput
                                                      (→ triple_buffer)
@@ -122,6 +131,8 @@ This thread constantly consumes data from the Elastic Ring Buffer and executes a
 - **Output:** Pushes a `FrameOutput` structure every hop, containing the treble magnitude spectrum, sub-cent accurate $f_0$, and real-time partial frequencies to the UI thread via a wait-free `triple_buffer`.
 
 Once the Gatekeeper detects silence, it closes the gate by sending the `is_silence` flag to the Engine to force an immediate state reset and prevent pitch detection from running on background noise.
+
+The **Strobe** is drawn in its hop position (step 5b, after the Engine) but is a parallel _tap_, not a stage: it reads the hop's audio plus the UI-pushed curve references, and it and the Engine write `FrameOutput` independently. It consumes nothing from the Engine and nothing downstream consumes it — removing it leaves gating, detection, and measurement bit-identical (the authoritative per-hop step list is [`docs/internals/03-dsp-pipeline.md`](docs/internals/03-dsp-pipeline.md); the stage-vs-tap rule is [`01-architecture.md`](docs/internals/01-architecture.md)).
 
 #### Thread 3: The Background Worker
 

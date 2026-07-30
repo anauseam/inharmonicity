@@ -18,8 +18,7 @@ use std::collections::BTreeMap;
 /// Derived from [`crate::audio::SAMPLE_RATE`]: the one spot where `models` reaches up
 /// into `audio` (which already depends on `models`), forming a small `models ↔ audio`
 /// cycle. Accepted for now — the crate already has intra-crate cycles. A future refactor
-/// extracts the shared DSP/stream constants into a leaf module (tracked in the README's
-/// Project Work in Progress).
+/// extracts the shared DSP/stream constants into a leaf module (tracked in `TODO.md`).
 const NYQUIST_HZ: f32 = crate::audio::SAMPLE_RATE as f32 / 2.0;
 
 /// Maximum number of partials modeled per key.

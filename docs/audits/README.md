@@ -72,3 +72,38 @@ wrong mechanism corrected (3 sites), 1 symbol drift fixed (`T_sq` → the paper'
 Parity re-verified from both sides after the removal (100.0000 %, Δf = 0,
 36,523 hops/size) and realized AWGN P_fa 0.00097 → 0.00102 against nominal 0.001
 with the per-band structure unchanged.
+
+## Running a new audit
+
+The method below is what waves 1–3 used. It is recorded here because the
+project will keep adding cited algorithms, and the audits' value came from
+being *specific* — one algorithm per session, primary source open, equation by
+equation. A single "audit everything" pass would not have found the jacobsen
+bug.
+
+**Scope one algorithm per session.** Take the implementation and its primary
+source; do not batch.
+
+**Classify every deviation** as one of three, and say which for each finding:
+
+- **(a) faithful** — matches the paper.
+- **(b) deliberate documented adaptation** — justified in the doc-comment;
+  verify the justification, don't just note that one exists.
+- **(c) undocumented deviation / bespoke addition** — flag it, then either
+  document it (with its provenance and validating ADR) or remove it.
+
+**Findings first, fixes second.** Produce the findings list before changing
+anything; apply fixes only on the author's go-ahead. Most fixes turn out to be
+citation- or comment-level, but do not assume that — wave 1's real bug
+(`jacobsen`) was in confidently-written code, and wave 3 deleted a constant.
+
+**Quote the source, not a text dump.** Anything that lands in the audit must be
+read from the PDF; OCR extractions drift, and a paper's own errata matter (three
+are on record across the waves).
+
+**Prove behaviour is unchanged** where it should be: run the relevant harness
+before and after and record that the output is byte-identical, or record the
+delta and why it is correct.
+
+**Deliverables:** a new `faithfulness-audit-NN-<subject>.md` in this folder, a
+row in audit 01's running status table, and a row in the wave table above.
