@@ -123,10 +123,16 @@ pub fn open_input_stream(capacity: usize) -> Result<(cpal::Stream, AudioConsumer
     eprintln!("Using audio input device: {:?}", device.description()?);
 
     let configs = device.supported_input_configs()?.collect::<Vec<_>>();
-    let supported_config = find_supported_config(configs, SAMPLE_RATE)
-        .ok_or_else(|| anyhow!("No suitable f32 input format found"))?;
+    let supported_config = find_supported_config(configs, SAMPLE_RATE).ok_or_else(|| {
+        anyhow!("No mono f32 input configuration supporting {SAMPLE_RATE} Hz was found")
+    })?;
 
-    let config = supported_config.with_sample_rate(SAMPLE_RATE);
+    // `try_` rather than `with_sample_rate`: the latter panics on a range that
+    // does not cover the rate. `find_supported_config` already guarantees it
+    // does, so this is a second line of defence against that filter loosening.
+    let config = supported_config
+        .try_with_sample_rate(SAMPLE_RATE)
+        .ok_or_else(|| anyhow!("Input configuration does not support {SAMPLE_RATE} Hz"))?;
 
     let sample_rate_val = config.sample_rate();
     let config: cpal::StreamConfig = config.into();
@@ -447,28 +453,34 @@ pub(crate) fn dc_block(sample: f32, prev_x: &mut f32, prev_y: &mut f32) -> f32 {
     y
 }
 
-/// Finds the best supported audio configuration for the target sample rate.
+/// Finds a supported audio configuration that can run at `target_rate`.
 ///
-/// This function searches through available audio configurations and selects
-/// the one that best matches our requirements:
-/// - Mono channel (1 channel)
-/// - 32-bit float format
-/// - Closest sample rate to target
+/// The pipeline requires all three: mono (the [`DcBlocker`] carries one filter
+/// state, so interleaved channels would corrupt it), `f32` samples, and a range
+/// that **contains** `target_rate` — the buffer sizes, COLA window and
+/// Gatekeeper timings are dimensioned for it, so a nearby rate is not a
+/// substitute. Among qualifying ranges the one whose bounds sit closest to the
+/// target wins, which prefers a device's dedicated range over a catch-all one.
 ///
 /// # Arguments
 /// * `configs` - List of supported audio configurations from the device
-/// * `target_rate` - Desired sample rate in Hz
+/// * `target_rate` - Required sample rate in Hz
 ///
 /// # Returns
-/// * `Some(config)` - Best matching configuration
-/// * `None` - No suitable configuration found
+/// * `Some(config)` - A configuration whose range covers `target_rate`
+/// * `None` - The device offers no mono `f32` range covering it
 pub(crate) fn find_supported_config(
     configs: Vec<SupportedStreamConfigRange>,
     target_rate: u32,
 ) -> Option<SupportedStreamConfigRange> {
     configs
         .into_iter()
-        .filter(|c| c.channels() == 1 && c.sample_format() == cpal::SampleFormat::F32)
+        .filter(|c| {
+            c.channels() == 1
+                && c.sample_format() == cpal::SampleFormat::F32
+                && c.min_sample_rate() <= target_rate
+                && target_rate <= c.max_sample_rate()
+        })
         .min_by_key(|c| {
             let min_diff = (c.min_sample_rate() as i32 - target_rate as i32).abs();
             let max_diff = (c.max_sample_rate() as i32 - target_rate as i32).abs();

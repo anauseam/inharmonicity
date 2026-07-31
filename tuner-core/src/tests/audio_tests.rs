@@ -140,3 +140,71 @@ fn test_jacobsen_bias() {
         }
     }
 }
+
+/// `find_supported_config` must only ever return a range that **contains** the
+/// target rate. The pipeline's buffer sizes and timing constants are
+/// dimensioned for `SAMPLE_RATE`, so a merely-nearby range is not usable — and
+/// cpal's `with_sample_rate` panics when handed one.
+#[cfg(test)]
+mod find_supported_config {
+    use crate::audio::find_supported_config;
+    use cpal::{SampleFormat, SupportedBufferSize, SupportedStreamConfigRange};
+
+    /// Builds a config range; `buffer_size` is irrelevant to the selection.
+    fn range(
+        channels: u16,
+        min_rate: u32,
+        max_rate: u32,
+        format: SampleFormat,
+    ) -> SupportedStreamConfigRange {
+        SupportedStreamConfigRange::new(
+            channels,
+            min_rate,
+            max_rate,
+            SupportedBufferSize::Range { min: 64, max: 8192 },
+            format,
+        )
+    }
+
+    const TARGET: u32 = 44_100;
+
+    #[test]
+    fn accepts_a_range_covering_the_target() {
+        let found = find_supported_config(vec![range(1, 8_000, 96_000, SampleFormat::F32)], TARGET);
+        assert!(
+            found.is_some(),
+            "a covering mono f32 range must be accepted"
+        );
+    }
+
+    #[test]
+    fn rejects_a_range_that_excludes_the_target() {
+        // The panic case: nearest-by-distance would have returned this range,
+        // and `with_sample_rate(44100)` on it panics.
+        let found =
+            find_supported_config(vec![range(1, 48_000, 48_000, SampleFormat::F32)], TARGET);
+        assert!(
+            found.is_none(),
+            "48 kHz-only device must yield None, not a panicking config"
+        );
+    }
+
+    #[test]
+    fn rejects_stereo_and_non_f32() {
+        let configs = vec![
+            range(2, 8_000, 96_000, SampleFormat::F32), // stereo: one DcBlocker state
+            range(1, 8_000, 96_000, SampleFormat::I16), // wrong sample format
+        ];
+        assert!(find_supported_config(configs, TARGET).is_none());
+    }
+
+    #[test]
+    fn picks_the_covering_range_over_a_closer_but_excluding_one() {
+        let configs = vec![
+            range(1, 44_000, 44_050, SampleFormat::F32), // closer bounds, excludes target
+            range(1, 8_000, 96_000, SampleFormat::F32),  // wider, covers target
+        ];
+        let found = find_supported_config(configs, TARGET).expect("covering range exists");
+        assert!(found.min_sample_rate() <= TARGET && TARGET <= found.max_sample_rate());
+    }
+}

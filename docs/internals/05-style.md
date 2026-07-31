@@ -166,6 +166,28 @@ Two things are **not** history and must stay:
 In hot-path code prefer `debug_assert!` so the check is compiled out
 of release builds.
 
+## Where tests live
+
+Two locations are in use, and the choice is decided by **what the test needs
+to see**, not by file length:
+
+- **Inline `#[cfg(test)] mod tests` with `use super::*`** — the default, and
+  the only option for a test that touches module-private items. Most of the
+  algorithm suites are here because they pin internal constants and helpers.
+- **`src/tests/<subject>_tests.rs`** — for tests written against the
+  crate-visible API (`pub(crate)` / `pub`), registered in `lib.rs`'s
+  `#[cfg(test)] mod tests`.
+
+**Do not relocate tests to shorten a file.** A file under `src/tests/` cannot
+reach module-private items, so moving a suite there forces `pub(crate)` on
+everything it touches — widening the API surface to satisfy a layout
+preference, against the visibility default above. Test volume is not a
+sizing-rule concern.
+
+A third option exists and is unused: a crate-root `tests/` directory compiles
+as a separate crate and can reach only `pub` items. That is the right home for
+a genuine end-to-end test of the public API, if one is ever written.
+
 ## Feature Flags vs Debug Assertions
 
 When instrumenting the code for diagnostic logging:

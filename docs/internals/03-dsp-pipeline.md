@@ -118,13 +118,14 @@ Heavy diagnostic data structures (such as arrays of `[f32; 128]` for Goertzel tr
 The `Engine` now carries a `sample_rate` field (set from the resolved
 stream rate in `spawn_analysis_thread`) rather than hard-coding it in
 `Engine::new`. But the rate is not yet genuinely dynamic: the live
-capture path still requests 44 100 Hz from CPAL (`open_input_stream`
-calls `with_sample_rate(SAMPLE_RATE)`, relying on the OS to resample),
+capture path still *requires* 44 100 Hz from CPAL (`open_input_stream`
+selects a mono `f32` config whose range covers it, relying on the OS to
+resample, and fails cleanly when no such config exists),
 `CapturePayload` still passes a literal `44100` to the Worker, and the
 `AudioPool` buffer sizes, the COLA window, and the Gatekeeper timing
 constants are all dimensioned for 44.1 kHz. So the pipeline is not yet
 safe at other rates; enabling true dynamic-rate operation is tracked in
-the README's Work-in-Progress section. Until it lands, new code must not
+`TODO.md`. Until it lands, new code must not
 introduce more hard-coded references to 44 100 — read the rate from the
 single source of truth (the `SAMPLE_RATE` constant or the `Engine`'s
 `sample_rate` field) so the eventual migration stays a single-point

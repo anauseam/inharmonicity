@@ -201,6 +201,7 @@ pub fn create_widget_area(
     let partials_panel = create_partials_panel(data);
     let curve_plot_panel = create_curve_plot_panel(data, curve_bundle);
     let strobe_panel = create_strobe_panel(data);
+    let auto_mode_notice = create_auto_mode_notice(data);
     // let inharmonicity_graph_panel = create_inharmonicity_graph_panel(data, profile);
 
     // A helper function to safely embed optional widgets into a row/column layout.
@@ -241,7 +242,10 @@ pub fn create_widget_area(
     .width(Fill)
     .align_y(Alignment::Start);
 
-    column![
+    // The notice sits last and is pushed rather than wrapped: appearing and
+    // disappearing must not move the panels above it, and an empty placeholder
+    // would still take a row of the column's spacing.
+    let mut content = column![
         title,
         Space::new().height(20),
         top_row,
@@ -251,8 +255,41 @@ pub fn create_widget_area(
         curve_row,
     ]
     .width(Fill)
-    .spacing(10)
-    .into()
+    .spacing(10);
+
+    if let Some(notice) = auto_mode_notice {
+        content = content.push(notice);
+    }
+
+    content.into()
+}
+
+/// Creates the Auto-mode notice, shown only while no key is selected.
+///
+/// Auto-mode captures are recorded untrusted and never reach the tuning curve
+/// (ADR 0006 Corrections item 3), which is invisible from the UI otherwise: the
+/// capture succeeds, the measurement lands in the profile, and the curve simply
+/// does not move. Mode is also implicit here — selecting a key *is* entering
+/// Manual mode — so the notice names the surface that switches it.
+fn create_auto_mode_notice(data: &AppDisplayData) -> Option<Element<'static, Message>> {
+    if !matches!(data.tuning_mode, TuningMode::Auto) {
+        return None;
+    }
+
+    let select_hint = match data.instrument {
+        Instrument::Piano => "Select a key on the Keyboard Key Select panel",
+        Instrument::Guitar => "Select a string on the Guitar String Select panel",
+    };
+
+    Some(
+        text(format!(
+            "Auto mode — captures are excluded from the tuning curve. \
+             {select_hint} to tune or measure it."
+        ))
+        .size(14)
+        .color(iced::Color::from_rgb8(0xd9, 0x92, 0x26))
+        .into(),
+    )
 }
 
 /// Creates the strobe panel (design §5). The strobe needs a named key — a
