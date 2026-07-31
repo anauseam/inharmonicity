@@ -13,6 +13,11 @@ open.
 
 ## User-facing
 
+- **The profile is never auto-saved** — `Planned`. `InharmonicityProfile::to_file`
+  runs only from the *Save Profile* button, so closing the app mid-session
+  discards every measurement taken since the last manual save. A full-compass
+  pass is hours of work to lose. Saving after each accepted measurement is the
+  obvious fix; it pairs with the persistence item below.
 - **Persist calibration; load a profile at startup** — `Planned`. The
   noise-floor, NHWRSF onset and NINOS² thresholds live only in the runtime
   atomics and are lost on restart, and a saved profile is only loaded by button.
@@ -32,8 +37,32 @@ open.
   zero-beat against each other. The beat is already present as the amplitude
   envelope of a single strobe reference; it is not yet estimated or displayed.
   See `docs/design/strobe-and-manual-tuning-ui-design.md` §7.4.
-- **Flagged-key styling** — `Deferred`. `CurveKeyFlags` is computed per key
-  (negative stretch, excluded, Giordano-excluded, B fallback) but not surfaced.
+- **Flagged-key styling** — `Planned`. `CurveKeyFlags` is computed per key on
+  every recompute and never shown. Two of its five flags mean "this measurement
+  is suspect" (`excluded`, `negative_stretch`); the other three are
+  informational and must not be styled as errors. A red ✗ on the curve plot and
+  keyboard is the visible half of the per-key inspector — build them together.
+  See `docs/design/strobe-and-manual-tuning-ui-design.md` §5.6, §11.
+- **Per-key measurement inspector** — `Planned`. Review, drop, or re-measure one
+  key's measurement. This is what makes autosave safe without an automatic
+  acceptance gate, and where both bad-capture detectors are read: the
+  model-based `CurveKeyFlags` and a statistical repeat-disagreement check
+  against the ADR-0009 σ model.
+- **Show-all partials strobe mode** — `Deferred`. The v1 strobe shows one
+  Smart-Partials-selected band per key; a band-per-partial toggle is planned but
+  unbuilt (`strobe_partials` already emits every partial). Two costs kept it out
+  of v1: high-treble bands would carry raw-B target uncertainty, and deep-bass
+  low-partial bands would sit frozen behind the amplitude gate.
+  See `docs/design/strobe-and-manual-tuning-ui-design.md` §6.4 (R5).
+- **Per-note partial override** — `Deferred`. TuneLab's escape hatch for a
+  dead auto-chosen partial: an on-the-fly, non-persisted per-note override of
+  the displayed partial. Pairs with show-all. Same source, §6.4.
+- **Cents-normalized strobe rotation** — `Deferred`, and conditional. The band
+  rotates at the physical beat rate (D2). If a real tuning session shows Hz
+  rotation is unreadable across registers *despite* Smart-Partials selection and
+  the coarse readout, add an optional per-band angle rescale — cheap, no new
+  crossing. The trigger is explicitly a use-testing outcome, not a preference.
+  Same source, §5.5 (R9).
 - **Engine (c) ρ Low/High presets** — `Deferred`. Computing three (c) presets
   naively re-runs the ~1.3 s Giordano scan three times; the calibration has to be
   factored out of the per-preset path first. Rendered as greyed placeholders.
@@ -90,9 +119,11 @@ open.
 ## Pipeline and architecture
 
 - **Dynamic sample rate** — `Planned`. The rate is threaded through the
-  `Engine`, but the capture path still requests 44.1 kHz and the buffer sizes,
-  COLA window and Gatekeeper timings are all dimensioned for it. New code must
-  read the rate from the single source of truth so this stays a one-point change.
+  `Engine`, but the capture path still requires 44.1 kHz and the buffer sizes,
+  COLA window and Gatekeeper timings are all dimensioned for it. A device that
+  cannot offer it now fails with a clear error instead of panicking, but it
+  still cannot run. New code must read the rate from the single source of truth
+  so this stays a one-point change.
   → [`docs/internals/03-dsp-pipeline.md`](docs/internals/03-dsp-pipeline.md)
 - **`CaptureState` `compare_exchange`** — `Planned`. The three-thread baton-pass
   is convention-only today; `compare_exchange` would enforce it at the atomic
@@ -117,6 +148,11 @@ open.
 - **"Engine" is overloaded** — `Investigating`. `engine.rs` is the F0 detector;
   the tuning curve also has "engines (a)–(d)". Two unrelated meanings in one
   codebase and in the docs. Needs one of them renamed.
+- **Reconcile `peaks`' split test suite** — `Deferred`. The placement rule is
+  now written down ([05-style](docs/internals/05-style.md), "Where tests live"),
+  and `peaks` is the one module with tests in both locations. Low stakes: both
+  halves pass and each sits on the correct side of the visibility line, so this
+  is tidying, not a defect.
 - **Review the `unsafe` byte-slice transmute** in `worker.rs::write_diagnostics`
   — `Deferred`. Functionally correct; worth checking whether `bytemuck` replaces
   it without a performance cost.
