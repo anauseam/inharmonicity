@@ -80,18 +80,15 @@ fn load_profile(path: &str) -> InharmonicityProfile {
                     .collect()
             })
             .unwrap_or_default();
-        profile.measurements.insert(
+        profile.record(KeyMeasurement {
             key_index,
-            KeyMeasurement {
-                key_index,
-                measured_f0: e["measured_f0"].as_f64().unwrap_or(0.0) as f32,
-                partials,
-                calculated_b: e["calculated_b"].as_f64().map(|b| b as f32),
-                last_captured: String::new(),
-                // Honest provenance: these are auto-mode captures.
-                captured_in_auto: true,
-            },
-        );
+            measured_f0: e["measured_f0"].as_f64().unwrap_or(0.0) as f32,
+            partials,
+            calculated_b: e["calculated_b"].as_f64().map(|b| b as f32),
+            last_captured: String::new(),
+            // Honest provenance: these are auto-mode captures.
+            captured_in_auto: true,
+        });
     }
     profile
 }

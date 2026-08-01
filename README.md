@@ -16,17 +16,17 @@ For the design rationale and open observations, see [ARCHITECTURE.md](ARCHITECTU
 > tuning a piano end to end, so treat it as a capable alpha rather than a
 > finished product.
 >
-> What to know before using it:
+> Current limits:
 >
-> - **Work in Manual mode.** Automatic note discovery is still under validation,
->   and captures taken in Auto mode are excluded from the tuning curve by design.
-> - **Calibration is per-session.** The noise floor is measured at launch and
->   nothing is saved between runs.
-> - **A saved profile is not reloaded automatically** — press *Load Profile*.
-> - **Unisons are set by ear.** There is no unison-beat readout yet.
-> - **No pitch-raise over-pull calculation.** Detection and display stay correct
->   through a raise; the over-pull targets do not exist.
-> - **A440 only**, and no user-adjustable temperaments.
+> - **Manual mode only** — Auto-mode captures are excluded from the curve by design.
+> - **The noise floor is re-measured every launch** (it belongs to the room, not
+>   the instrument).
+> - **No per-key inspector.** Undo reverts the last capture; a suspect
+>   measurement cannot yet be reviewed or dropped, and the flags that mark one
+>   are computed but not shown.
+> - **Unisons are set by ear** — no unison-beat readout.
+> - **No pitch-raise over-pull targets.**
+> - **A440 only**, no user-adjustable temperaments.
 >
 > The full backlog, with what each item is blocked on, is in [TODO.md](TODO.md).
 
@@ -54,37 +54,26 @@ cargo run -p tuner-gui
 
 ### Tuning a piano
 
-The full path — measure the instrument, compute its curve, tune each string to
-that curve — is built and usable. Work in **Manual mode**: you name each key,
-which is both the supported tuning path and the only provenance the tuning
-curve accepts (see the note below).
+Work in **Manual mode** — you name each key, which is the only provenance the
+tuning curve accepts.
 
-1. **Let it calibrate.** On launch the app measures the room's noise floor for
-   about three seconds and shows `Calibrating…`. Keep quiet until it clears.
-   Calibration is not yet saved between sessions.
-2. **Pick a key.** Click it on the *Key select* keyboard. That selects the note
-   for both measurement and the strobe; clicking the same key again returns to
-   automatic detection.
-3. **Measure it.** Turn on *Measurement Mode*, press the capture button, and
-   strike the string. The app captures 1.5 s of stable decay, then measures the
-   key's fundamental and inharmonicity coefficient $B$ in the background. In
-   Manual mode each capture is armed individually, so press capture again for
-   the next key. *Undo* reverts the last one.
-4. **Watch the curve form.** Every accepted measurement recomputes the stretch
-   curve off-thread; the *Curve Plot* panel shows it and counts how many keys
-   are measured. Keys you have not captured follow the model rather than your
-   instrument, so the plot only settles as the compass fills in.
-5. **Tune.** Open the *Strobe* panel. It shows the selected key's target and a
-   rotating band: stationary means in tune, and the direction tells you sharp
-   or flat. When a string is too far off for the band to read, the panel
-   switches to a coarse cents number automatically. A frozen, dimmed band means
-   the note has decayed — strike it again. The curve locks when you start, so
-   targets cannot shift mid-pass; if a later capture changes the curve, a
-   *Re-lock* offer appears.
-6. **Save.** *Save Profile* writes the measurements to `tuning_profile.json`.
-   The curve itself is never saved — it is recomputed from the measurements.
-   A saved profile is not loaded automatically on the next launch; press *Load
-   Profile* to bring the instrument back and recompute its curve.
+1. **Calibrate.** The app measures the room's noise floor for ~3 s at launch;
+   keep quiet until `Calibrating…` clears.
+2. **Select a key** on the *Key select* keyboard (clicking it again returns to
+   automatic detection).
+3. **Measure.** Enable *Measurement Mode*, press capture, strike the string.
+   1.5 s of stable decay is captured and $f_0$/$B$ measured off-thread. *Undo*
+   reverts the last capture.
+4. **Watch the curve form** in the *Curve Plot* panel — unmeasured keys follow
+   the model, so it settles as the compass fills in.
+5. **Tune** in the *Strobe* panel: stationary band = in tune, direction = sharp
+   or flat, and it falls back to a coarse cents number when the string is too
+   far off to read. The curve locks on entry so targets cannot shift mid-pass.
+
+Measurements autosave to the open instrument's profile as they land — there is
+nothing to save, and the curve is recomputed rather than stored. The instrument
+is named beside the title; **Settings → Instrument Library** switches or creates
+one, so check the name before measuring a different instrument.
 
 For a non-piano instrument, switch the sidebar's reference toggle to **Ref: ET**
 for a pure equal-temperament strobe with no stretch curve.
@@ -96,9 +85,9 @@ for a pure equal-temperament strobe with no stretch curve.
 > yields a model-only curve with no measurements in it.
 
 Every capture also writes its raw audio and analysis to a `diagnostics/` folder
-beside the app, which grows over a tuning session. That data exists for
-development — the format, and the offline harnesses that read it, are documented
-in [`tuner-core/examples/README.md`](tuner-core/examples/README.md).
+in the per-user data directory (path printed at startup; not yet pruned). That
+data exists for development — the format and the offline harnesses that read it
+are documented in [`tuner-core/examples/README.md`](tuner-core/examples/README.md).
 
 ## Interface
 
@@ -114,7 +103,7 @@ features live in [TODO.md](TODO.md).
 - **Tuning Curve Display**: Live per-key stretch curve plot, recomputed off-thread as you capture
 - **Manual-Mode Strobe**: Tune each string to its own per-partial curve targets — a fine phase band with an OS-CFAR coarse readout for out-of-range strings, per-key Smart-Partials selection, and a curve lock that freezes targets for a pass
 - **ET Reference Mode**: Instrument-agnostic pure-equal-temperament strobe (no stretch curve) for non-piano use
-- **Profile Management**: Save and load piano tuning profiles with JSON persistence
+- **Profile Management**: Per-instrument profiles, autosaved as you measure, with a searchable library and the last instrument reopened at launch
 - **Transient Detection Calibration**: Manual and automatic transient detection calibration
 - **Noise Floor Calibration**: Manual and automatic noise floor calibration
 - **NINOS2 Stability Calibration**: Live oscilloscope with adjustable threshold for tuning the NINOS2 tonal stability gate
@@ -149,7 +138,7 @@ inharmonicity/
 │   │   │   ├── giordano.rs         # Giordano sensory-dissonance octave-width recipe (Plomp–Levelt/Sethares)
 │   │   │   └── whittaker.rs        # Whittaker smoother + shared banded LS solver
 │   │   ├── cola.rs                 # CircularFifo — COLA circular FIFO for overlapping frame analysis
-│   │   ├── models.rs               # Domain types: Note, Partial, KeyMeasurement, KeyProfile, profiles
+│   │   ├── models.rs               # Domain types: Note, Partial, KeyMeasurement, KeyProfile, InharmonicityProfile (schema v1)
 │   │   ├── pipeline.rs             # AudioPipeline mediator — Dual-FFT unconditional execution
 │   │   ├── engine.rs               # F0 Engine — TWM Discovery + M-of-N lock + Goertzel Phase Tracking
 │   │   ├── strobe.rs               # Manual-mode strobe: fixed-reference beat phase + OS-CFAR coarse readout (pipeline tap)

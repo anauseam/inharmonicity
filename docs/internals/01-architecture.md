@@ -182,3 +182,19 @@ already calls). Bypassing it — for example, having `audio.rs` call into
   signal processing lives entirely in `tuner-core`; `app.rs` only reads
   per-hop telemetry (`FrameOutput`) and worker results and writes config
   atomics. Keep it that way: DSP logic does not belong in `app.rs`.
+- **The GUI owns the profile, so the GUI owns where it goes.** The
+  *schema* is a domain type (`models::InharmonicityProfile`, so the
+  Worker and the offline harnesses share it), but every file-location
+  policy — the per-user directories, the app-settings document, the
+  listing the browser renders, the one-time import of a pre-move profile
+  — lives in `library.rs`. `tuner-core` stays headless and knows nothing
+  about `directories` or XDG. Persistence *timing* (autosave on capture
+  and undo, the session `.bak`) is likewise `app.rs` policy, not core's.
+  → [`session-persistence-and-profile-library.md`](../design/session-persistence-and-profile-library.md)
+- **File locations are injected, never assumed.** The frontend hands the
+  Worker its dump root (`Option<PathBuf>`; `None` writes none, so an
+  embedded host can opt out) rather than `tuner-core` resolving one.
+  The directory *name* for a capture is `worker::dump_dir_name`, next to
+  the code that writes it and public because the GUI deletes the dump of
+  an undone capture — when both sides hardcoded the path independently, a
+  change on one silently turned the other into a no-op.

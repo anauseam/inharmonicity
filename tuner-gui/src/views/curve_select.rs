@@ -96,7 +96,7 @@ fn create_detail(
     choice: EngineChoice,
     selected: EngineChoice,
 ) -> Element<'static, Message> {
-    let curve = choice.resolve(bundle);
+    let curve = bundle.curve(choice);
     let (cents, measured) = plot_inputs(curve);
 
     let measured_count = measured.iter().filter(|&&m| m).count();
@@ -173,7 +173,7 @@ fn thumb(
     y_range: (f32, f32),
     wide: bool,
 ) -> Element<'static, Message> {
-    let (cents, measured) = plot_inputs(choice.resolve(bundle));
+    let (cents, measured) = plot_inputs(bundle.curve(choice));
     let (w, h) = if wide { (330.0, 64.0) } else { (155.0, 54.0) };
 
     let plot =
@@ -255,7 +255,7 @@ fn shared_thumb_range(bundle: &CurveBundle) -> (f32, f32) {
     let mut lo = f32::MAX;
     let mut hi = f32::MIN;
     for choice in EngineChoice::ALL {
-        let (l, h) = curve_plot::auto_y_range(&choice.resolve(bundle).cents);
+        let (l, h) = curve_plot::auto_y_range(&bundle.curve(choice).cents);
         lo = lo.min(l);
         hi = hi.max(h);
     }

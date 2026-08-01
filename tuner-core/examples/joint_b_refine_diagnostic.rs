@@ -1139,7 +1139,13 @@ fn process_real_key(
 }
 
 fn report_real(profiles: &[KeyProfile; 88], cfg: &TwmConfig) {
-    let base = std::path::Path::new("diagnostics");
+    // Capture-set root, like every other harness: `-- <dir>`, default
+    // `diagnostics` (docs/internals/06-capture-sets.md).
+    let root = std::env::args()
+        .nth(1)
+        .filter(|a| !a.starts_with("--"))
+        .unwrap_or_else(|| "diagnostics".to_string());
+    let base = std::path::Path::new(&root);
     if !base.exists() {
         println!("\n(real-capture skipped: ./diagnostics not found)");
         return;

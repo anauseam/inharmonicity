@@ -7,6 +7,13 @@ instrument-specific. This file records what they are, what state the
 instruments were in, and the rules for consuming them, because none of that is
 recoverable from the audio.
 
+These sets live **in the repository**, and the harnesses that read them take the
+directory as an argument (`-- diagnostics_piano2`), defaulting to `diagnostics`.
+That is separate from where the *app* writes new dumps, which is a per-user
+directory chosen by the frontend — a released binary has no useful working
+directory. See
+[`../design/session-persistence-and-profile-library.md`](../design/session-persistence-and-profile-library.md) §3.
+
 ## The sets
 
 | Directory | Instrument | Captures | Keys | Captured for |

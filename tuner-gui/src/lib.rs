@@ -4,6 +4,8 @@
 
 pub mod app;
 pub mod calibration;
+pub mod library;
+pub mod session;
 pub mod utils;
 pub mod views;
 pub mod widgets;

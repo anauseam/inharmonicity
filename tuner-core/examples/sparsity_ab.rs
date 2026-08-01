@@ -153,7 +153,12 @@ fn main() {
     ];
     let mut agg = [[(0.0f64, 0usize, f32::MAX, 0usize); 3]; M];
 
-    let mut dirs: Vec<_> = fs::read_dir("./diagnostics")
+    // Capture-set root, like every other harness: `-- <dir>`, default
+    // `diagnostics` (docs/internals/06-capture-sets.md).
+    let root = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "diagnostics".to_string());
+    let mut dirs: Vec<_> = fs::read_dir(&root)
         .expect("run from repo root")
         .filter_map(|e| e.ok())
         .map(|e| e.path())

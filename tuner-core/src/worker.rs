@@ -43,7 +43,7 @@ use realfft::RealToComplex;
 use rustfft::num_complex::Complex;
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -109,6 +109,19 @@ pub struct CurveBundle {
 }
 
 impl CurveBundle {
+    /// The curve for `choice`. The selection lives on the profile
+    /// ([`models::EngineChoice`]) while the curves live here, so the resolution
+    /// belongs to whichever side owns the bundle — this one.
+    pub fn curve(&self, choice: models::EngineChoice) -> &TuningCurve {
+        match choice {
+            models::EngineChoice::RigaudPure => &self.rigaud_pure,
+            models::EngineChoice::PerKeySmoothed => &self.per_key_smoothed,
+            models::EngineChoice::GiordanoMean => &self.giordano,
+            models::EngineChoice::MultiBalanced => &self.multi_balanced,
+            models::EngineChoice::MultiPureTwelfths => &self.multi_pure_twelfths,
+        }
+    }
+
     /// Runs every engine at [`CurveParams::default()`] on the job's input.
     /// Cold path (~1.4 s, dominated by (c)'s Giordano scans) — worker thread
     /// only, never the DSP hot path. The ρ Low/Mean/High preset variants of
@@ -144,6 +157,25 @@ pub enum WorkerOutput {
     Curve(Box<CurveBundle>),
 }
 
+/// Directory name for one capture's diagnostic dump:
+/// `key_<idx>_<note>_<epoch>`, relative to the frontend-supplied dump root.
+///
+/// The epoch suffix makes every capture its own directory, so repeat captures
+/// of one key are all retained — the ADR-0009 repeat-noise decomposition
+/// consumes them, and a fixed per-key name silently overwrote earlier dumps.
+/// Offline tools discover dumps by the `key_` prefix and read the key identity
+/// from `analysis.json`, so the suffix is transparent to them.
+///
+/// Public because the frontend deletes the dump of a capture the user undoes,
+/// and both sides must agree on the name.
+pub fn dump_dir_name(measurement: &KeyMeasurement) -> String {
+    let (key_name, _) = models::find_nearest_note_by_index(measurement.key_index);
+    format!(
+        "key_{:03}_{}_{}",
+        measurement.key_index, key_name, measurement.last_captured
+    )
+}
+
 /// Manages the lifecycle of the background worker thread.
 ///
 /// The `WorkerManager` owns an `Arc<AudioPool>` so it can return processed buffers
@@ -157,6 +189,10 @@ pub struct WorkerManager {
     /// user-facing mid-session; a background job (curve recompute) is not.
     worker_job_rx: Receiver<WorkerJob>,
     result_tx: Sender<WorkerOutput>,
+    /// Directory capture dumps are written under, or `None` to write none.
+    /// Supplied by the frontend: where files land is a host policy, and an
+    /// embedded host (a plugin) may want no disk writes at all.
+    dump_dir: Option<PathBuf>,
 }
 
 impl WorkerManager {
@@ -166,6 +202,7 @@ impl WorkerManager {
         capture_rx: Receiver<CapturePayload>,
         worker_job_rx: Receiver<WorkerJob>,
         result_tx: Sender<WorkerOutput>,
+        dump_dir: Option<PathBuf>,
     ) -> Self {
         Self {
             audio_pool,
@@ -173,6 +210,7 @@ impl WorkerManager {
             capture_rx,
             worker_job_rx,
             result_tx,
+            dump_dir,
         }
     }
 
@@ -205,6 +243,7 @@ impl WorkerManager {
                             &self.audio_pool,
                             &self.atomics,
                             &self.result_tx,
+                            self.dump_dir.as_deref(),
                             &mut planner,
                             &mut fft_instance,
                             &mut time_buffer,
@@ -235,6 +274,7 @@ impl WorkerManager {
                             &self.audio_pool,
                             &self.atomics,
                             &self.result_tx,
+                            self.dump_dir.as_deref(),
                             &mut planner,
                             &mut fft_instance,
                             &mut time_buffer,
@@ -278,6 +318,7 @@ impl WorkerManager {
         audio_pool: &Arc<AudioPool>,
         atomics: &Arc<PipelineAtomics>,
         result_tx: &Sender<WorkerOutput>,
+        dump_dir: Option<&Path>,
         planner: &mut realfft::RealFftPlanner<f32>,
         fft_instance: &mut Arc<dyn RealToComplex<f32>>,
         time_buffer: &mut [f32],
@@ -429,6 +470,7 @@ impl WorkerManager {
 
         // Step 4: Write Diagnostic Dump
         Self::write_diagnostics(
+            dump_dir,
             &payload,
             &measurement,
             fft_size,
@@ -453,7 +495,9 @@ impl WorkerManager {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn write_diagnostics(
+        dump_dir: Option<&Path>,
         payload: &CapturePayload,
         measurement: &KeyMeasurement,
         fft_size: usize,
@@ -462,22 +506,19 @@ impl WorkerManager {
         b_confidence: f32,
         mat_f0: f32,
     ) {
-        let (key_name, _) = models::find_nearest_note_by_index(measurement.key_index);
+        let Some(dump_dir) = dump_dir else {
+            return;
+        };
+        let dir = dump_dir.join(dump_dir_name(measurement));
 
-        // Use measurement's organically resolved key_index. The capture
-        // timestamp suffix makes every capture its own directory, so
-        // repeat captures of one key are all retained (the repeat-capture
-        // noise-decomposition experiment consumes them; a fixed per-key
-        // name silently overwrote earlier dumps). Offline tools discover
-        // dumps by the `key_` prefix and read the key identity from
-        // analysis.json, so the suffix is transparent to them.
-        let mut dir = PathBuf::from("diagnostics");
-        dir.push(format!(
-            "key_{:03}_{}_{}",
-            measurement.key_index, key_name, measurement.last_captured
-        ));
-
-        if fs::create_dir_all(&dir).is_ok() {
+        if let Err(e) = fs::create_dir_all(&dir) {
+            eprintln!(
+                "[WORKER] Cannot write diagnostics to {}: {e}",
+                dir.display()
+            );
+            return;
+        }
+        {
             // Write audio.raw
             let mut file = dir.clone();
             file.push("audio.raw");

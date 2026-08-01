@@ -30,6 +30,7 @@ use ringbuf::{
     traits::{Consumer, Producer, Split},
 };
 use rustfft::num_complex::Complex;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
@@ -206,7 +207,7 @@ impl ProfileSender {
             return;
         }
         for key in 0..88u8 {
-            self.update_key_profile(key, profile.measurements.get(&key));
+            self.update_key_profile(key, profile.active(key));
         }
     }
 }
@@ -532,7 +533,7 @@ impl AudioPipeline {
     ///
     /// # Returns
     /// `(AudioPipeline, PipelinePorts)`.
-    pub fn new() -> (Self, PipelinePorts) {
+    pub fn new(dump_dir: Option<PathBuf>) -> (Self, PipelinePorts) {
         let audio_pool = Arc::new(ArrayQueue::new(8));
         // Pre-fill pool
         for _ in 0..8 {
@@ -552,7 +553,7 @@ impl AudioPipeline {
             && let Ok(profile) = InharmonicityProfile::from_file(PROFILE_PATH)
         {
             let mut applied = 0usize;
-            for (&key, measurement) in &profile.measurements {
+            for (key, measurement) in profile.active_entries() {
                 if let Some(kp) = KeyProfile::from_measurement(measurement)
                     && let Some(slot) = live_profiles.get_mut(key as usize)
                 {
@@ -590,6 +591,7 @@ impl AudioPipeline {
             capture_rx,
             worker_job_rx,
             result_tx,
+            dump_dir,
         )
         .start_workers();
 
@@ -1035,7 +1037,7 @@ mod tests {
         let mut sender = ProfileSender { tx };
 
         let mut profile = InharmonicityProfile::default();
-        profile.measurements.insert(3, measurement(3, Some(0.0017)));
+        profile.record(measurement(3, Some(0.0017)));
         sender.update_all(&profile);
 
         let mut seen = 0usize;
@@ -1064,7 +1066,7 @@ mod tests {
     /// `peaks::coarse_read` cannot reach.
     #[test]
     fn coarse_readout_reaches_frame_output() {
-        let (mut pipeline, mut ports) = AudioPipeline::new();
+        let (mut pipeline, mut ports) = AudioPipeline::new(None);
 
         // A4's fundamental as the reference; the string is 3 Hz sharp (≈ +12 ¢),
         // inside the ±100 ¢ search band and outside the strobe band's ±18 Hz.
@@ -1122,7 +1124,7 @@ mod tests {
     /// number taken from room rumble would be colored noise dressed as a partial.
     #[test]
     fn coarse_readout_withheld_in_silence() {
-        let (mut pipeline, mut ports) = AudioPipeline::new();
+        let (mut pipeline, mut ports) = AudioPipeline::new(None);
         let mut refs = [0.0f32; MAX_STROBE_REFS];
         refs[0] = 440.0;
         assert!(ports.strobe_refs.set_refs(StrobeRefUpdate {

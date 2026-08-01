@@ -10,20 +10,23 @@
 //! - **Communication**: Wait-free SPSC primitives (rtrb + triple_buffer + atomics)
 //! - **Updates**: 60 FPS continuous updates via subscription system
 
+use crate::library::{self, AppSettings, ProfileSort};
+use crate::session::ProfileSession;
 use crate::views::{main_view::create_main_view, settings_view::create_settings_view};
 use crate::widgets::envelope::ENVELOPE_HISTORY_LENGTH;
 use iced::{self, Element, Subscription, Theme};
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tuner_core::{
     FrameOutput,
     algorithms::curves,
     audio::{self, AudioSource, HOP_RATE_HZ, HostHandle},
-    models::{self, CurveInput, InharmonicityProfile, KeyMeasurement, NOTES},
+    models::{self, CurveInput, InharmonicityProfile, NOTES},
     pipeline::{CaptureState, PipelineHandle, load_f32, store_f32},
     strobe::StrobeRefUpdate,
-    worker::{CurveBundle, CurveJob, WorkerOutput},
+    worker::{self, CurveBundle, CurveJob, WorkerOutput},
 };
 
 /// Boxcar length for the cent meter's displayed value, as a duration: the mean
@@ -78,9 +81,29 @@ pub enum Message {
     // --- Messages for Inharmonicity Measurement & Profile ---
     ToggleMeasurementMode, // Toggle the partial measurement mode
     CaptureButtonClicked,  // Capture button was clicked (behavior depends on current state)
-    UndoLastCapture,       // Reverts the last target key overwrite (Manual or Auto)
-    SaveProfile,           // Save the current inharmonicity profile
-    LoadProfile,           // Load an inharmonicity profile from file
+    UndoLastCapture,       // Reverts the last capture of a key (Manual or Auto)
+    SaveProfile,           // Explicit flush; the profile also auto-saves
+    // ----------------------------------------------
+
+    // --- Profile library (the browser over the profiles directory) ---
+    /// Open this instrument's profile, adopting its settings.
+    OpenProfile(PathBuf),
+    /// Start a fresh, empty instrument.
+    NewProfile,
+    /// Delete a profile document (never the open one).
+    DeleteProfile(PathBuf),
+    /// Copy a profile as a new instrument record.
+    DuplicateProfile(PathBuf),
+    /// Reorder the browser.
+    LibrarySortChanged(ProfileSort),
+    /// Filter the browser across every identifying field.
+    LibrarySearchChanged(String),
+    /// Show or hide the instrument-library settings panel.
+    ToggleLibrary,
+    /// Edit one text field of the open instrument's identity.
+    IdentityFieldChanged(IdentityField, String),
+    /// Change the open instrument's family.
+    InstrumentKindChanged(models::InstrumentKind),
     // ----------------------------------------------
 
     // Settings menu items (placeholder for future implementation)
@@ -165,106 +188,31 @@ pub enum Instrument {
     Guitar,
 }
 
-/// Which engine of the [`CurveBundle`] the live plot (and, once built, the
-/// strobe) displays — strobe design note §9/§13. Selection is **display-only**
-/// (D7): every engine is already in the bundle, so switching never triggers a
-/// recompute. The (c) ρ Low/High presets are not variants yet — they are not
-/// computed until (c)'s calibration is factored out of the per-preset path
-/// (§14 step 6); the gallery renders them as deferred placeholders.
+/// Which text field of [`models::InstrumentIdentity`] an edit targets. One
+/// message with a field tag rather than seven near-identical messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EngineChoice {
-    /// (a) Rigaud-pure prior curve.
-    RigaudPure,
-    /// (b) per-key measured B + Whittaker smoothing.
-    PerKeySmoothed,
-    /// (c) Giordano-calibrated, ρ Mean preset.
-    GiordanoMean,
-    /// (d) multi-interval BALANCED — the manual-mode default (D7).
-    MultiBalanced,
-    /// (d) multi-interval PURE 12ths preset.
-    MultiPureTwelfths,
+pub enum IdentityField {
+    /// Display name — the only field that is not optional.
+    Name,
+    /// Manufacturer.
+    Make,
+    /// Model designation.
+    Model,
+    /// Serial number.
+    Serial,
+    /// Body form within the family.
+    Form,
+    /// Owner.
+    Owner,
+    /// Free text.
+    Notes,
 }
 
-impl EngineChoice {
-    /// Every selectable engine, in gallery order.
-    pub const ALL: [EngineChoice; 5] = [
-        EngineChoice::RigaudPure,
-        EngineChoice::PerKeySmoothed,
-        EngineChoice::GiordanoMean,
-        EngineChoice::MultiBalanced,
-        EngineChoice::MultiPureTwelfths,
-    ];
-
-    /// Full display name (detail view / panel titles).
-    pub fn label(&self) -> &'static str {
-        match self {
-            EngineChoice::RigaudPure => "(a) Rigaud prior",
-            EngineChoice::PerKeySmoothed => "(b) Per-key + Whittaker",
-            EngineChoice::GiordanoMean => "(c) Giordano · ρ Mean",
-            EngineChoice::MultiBalanced => "(d) Multi-interval · Balanced",
-            EngineChoice::MultiPureTwelfths => "(d) Multi-interval · Pure 12ths",
-        }
-    }
-
-    /// Short name for gallery thumbnails (the section header names the class).
-    pub fn short_label(&self) -> &'static str {
-        match self {
-            EngineChoice::RigaudPure => "Rigaud prior",
-            EngineChoice::PerKeySmoothed => "Per-key smoothed",
-            EngineChoice::GiordanoMean => "ρ Mean",
-            EngineChoice::MultiBalanced => "Balanced",
-            EngineChoice::MultiPureTwelfths => "Pure 12ths",
-        }
-    }
-
-    /// The chosen engine's curve within a bundle.
-    pub fn resolve<'a>(&self, bundle: &'a CurveBundle) -> &'a models::TuningCurve {
-        match self {
-            EngineChoice::RigaudPure => &bundle.rigaud_pure,
-            EngineChoice::PerKeySmoothed => &bundle.per_key_smoothed,
-            EngineChoice::GiordanoMean => &bundle.giordano,
-            EngineChoice::MultiBalanced => &bundle.multi_balanced,
-            EngineChoice::MultiPureTwelfths => &bundle.multi_pure_twelfths,
-        }
-    }
-}
-
-/// Which target function the app measures against — app-level, because every
-/// readout shares it: the strobe band, its cents readout, and the cent meter.
-///
-/// Orthogonal to reference *pitch* (design §11's A440 / `TuningCurve::d_g`,
-/// which shifts the whole curve): this selects *which* target function, not
-/// where it is anchored.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ReferenceMode {
-    /// The piano tuning curve's stretched `target_f1` (per-partial targets for
-    /// the strobe). The default, and the only mode that uses measured `B`.
-    #[default]
-    Curve,
-    /// Pure equal temperament, **fundamental only** — the n = 1 target is
-    /// B-immune (design R4), so no per-string inharmonicity is needed and a
-    /// correctly-pitched string shows no false beat. The instrument-agnostic
-    /// mode: it makes the app usable on a non-piano (e.g. a guitar string).
-    Et,
-}
-
-impl ReferenceMode {
-    /// The other mode — the toggle's target.
-    pub fn toggled(self) -> Self {
-        match self {
-            ReferenceMode::Curve => ReferenceMode::Et,
-            ReferenceMode::Et => ReferenceMode::Curve,
-        }
-    }
-
-    /// Short label for the toggle button.
-    pub fn label(self) -> &'static str {
-        match self {
-            ReferenceMode::Curve => "Ref: Curve",
-            ReferenceMode::Et => "Ref: ET",
-        }
-    }
-}
+/// The engine and reference-mode selections both persist with the profile
+/// (reopening an instrument reproduces the targets it was tuned to), so they
+/// are defined in `tuner-core::models` alongside the profile that carries them.
+/// Re-exported here because the whole frontend refers to them unqualified.
+pub use tuner_core::models::{EngineChoice, ReferenceMode};
 
 /// Display state of the manual-mode strobe (design §5, §13). Path A: the
 /// beat phase is **read** from `FrameOutput.strobe_angle` — the DSP-side
@@ -561,6 +509,21 @@ pub struct AppDisplayData {
     // View state
     pub settings_view_visible: bool,
 
+    // --- Profile library state ---
+    /// The instrument-library settings panel is the active one.
+    pub library_visible: bool,
+    /// Rows of the profiles directory, refreshed whenever the library changes.
+    pub library_entries: Vec<library::ProfileEntry>,
+    /// Current browser ordering.
+    pub library_sort: ProfileSort,
+    /// Current browser search term, matched across every identifying field.
+    pub library_search: String,
+    /// Identity of the open instrument, mirrored here so the header and the
+    /// library form can render it without borrowing the profile.
+    pub open_identity: models::InstrumentIdentity,
+    /// Path of the open profile, so the browser can mark and protect its row.
+    pub open_profile_path: Option<PathBuf>,
+
     // --- Curve display state (design §9/§13) ---
     /// The curve gallery is open in the settings main panel.
     pub curve_select_visible: bool,
@@ -685,9 +648,11 @@ pub struct TunerApp {
     frame_rx: Option<triple_buffer::Output<FrameOutput>>,
 
     // --- Inharmonicity State ---
-    inharmonicity_profile: InharmonicityProfile,
-    undo_history: VecDeque<(u8, Option<KeyMeasurement>)>,
-
+    /// The open instrument, its file, and the write policy around it.
+    session: ProfileSession,
+    /// App-level state — the resume pointer and recents. Not a property of any
+    /// instrument, so it is owned here rather than by the session.
+    app_settings: AppSettings,
     // --- Tuning-curve State (cold path, recomputed off-thread by the Worker) ---
     /// Latest curve bundle returned by the Worker (all engines). `None` until
     /// the first recompute lands. Derived data — never persisted (design §9).
@@ -739,8 +704,8 @@ impl Default for TunerApp {
         Self {
             host_handle: None,
             frame_rx: None,
-            inharmonicity_profile: InharmonicityProfile::default(),
-            undo_history: VecDeque::new(),
+            session: ProfileSession::default(),
+            app_settings: AppSettings::default(),
             curve_bundle: None,
             curve_dirty: false,
             curve_generation: 0,
@@ -767,6 +732,12 @@ impl Default for TunerApp {
                 strobe_visible: true,
                 // inharmonicity_graph_visible: true,
                 settings_view_visible: false,
+                library_visible: false,
+                library_entries: Vec::new(),
+                library_sort: ProfileSort::default(),
+                library_search: String::new(),
+                open_identity: models::InstrumentIdentity::default(),
+                open_profile_path: None,
                 curve_select_visible: false,
                 curve_detail: None,
                 selected_engine: EngineChoice::MultiBalanced,
@@ -819,13 +790,68 @@ impl TunerApp {
     /// distinguishing which one is about to be discarded. The epoch matches the
     /// on-disk `key_<idx>_<note>_<epoch>` diagnostics dir.
     fn refresh_undo_label(&mut self) {
-        self.display_data.undo_target_note = self.undo_history.back().map(|(idx, _)| {
-            let note = tuner_core::models::find_nearest_note_by_index(*idx).0;
-            match self.inharmonicity_profile.measurements.get(idx) {
-                Some(m) if !m.last_captured.is_empty() => format!("{note} · {}", m.last_captured),
-                _ => note,
+        self.display_data.undo_target_note = self.session.undo_target().map(|(key, epoch)| {
+            let note = tuner_core::models::find_nearest_note_by_index(key).0;
+            match epoch {
+                Some(e) => format!("{note} · {e}"),
+                None => note,
             }
         });
+    }
+
+    /// Adopts `profile` as the open instrument: syncs the live engine, applies
+    /// its persisted settings, recomputes the curve, and records it as the
+    /// profile to resume next launch.
+    ///
+    /// Undo history is dropped, because it indexes measurements of the
+    /// instrument being closed — replaying it against a different one would
+    /// write a stranger's measurement into this profile.
+    fn adopt_profile(&mut self, profile: InharmonicityProfile, path: PathBuf) {
+        self.display_data.selected_engine = profile.settings.engine;
+        self.display_data.reference_mode = profile.settings.reference_mode;
+        self.apply_profile_settings(&profile.settings.clone());
+        self.session.adopt(profile, path, &mut self.app_settings);
+        if let Err(e) = self.app_settings.save() {
+            eprintln!("[MAIN] Could not save app settings: {e}");
+        }
+        self.sync_identity_mirror();
+
+        if let Some(host) = self.host_handle.as_mut() {
+            host.profiles.update_all(self.session.profile());
+        }
+        // Recompute for the newly-opened instrument (the curve is never
+        // persisted; recompute-on-load).
+        self.mark_curve_dirty();
+        // A load is a new instrument — drop the lock so the strobe re-engages
+        // on the loaded curve (design §8).
+        self.strobe_lock.on_trusted_set_edit(TrustedSetEdit::Loaded);
+        self.refresh_undo_label();
+    }
+
+    /// Refreshes the display mirror of the open instrument's identity and
+    /// path. The views render from `display_data` only, so any edit to the
+    /// profile's identity has to land here too or the header goes stale.
+    fn sync_identity_mirror(&mut self) {
+        self.display_data.open_identity = self.session.profile().identity.clone();
+        self.display_data.open_profile_path = self.session.path().map(|p| p.to_path_buf());
+    }
+
+    /// Pushes the profile's instrument-character thresholds into the live
+    /// atomics. The noise floor is deliberately absent: it is an absolute RMS
+    /// in the room's own units and moves with mic, gain, room and HVAC, so it
+    /// is rig state and stays measured-at-launch. NHWRSF (normalized by Σ|X|)
+    /// and NINOS² (a dimensionless sparsity ratio) are level-independent and
+    /// describe the instrument, so they travel with it.
+    fn apply_profile_settings(&mut self, settings: &models::ProfileSettings) {
+        let config = &self.pipeline_handle.atomics.config;
+        store_f32(&config.nhwrsf_threshold, settings.nhwrsf_threshold);
+        store_f32(
+            &config.ninos2_stability_threshold,
+            settings.ninos2_stability_threshold,
+        );
+        self.display_data.settings_data.transient.current_threshold = settings.nhwrsf_threshold;
+        self.display_data.settings_data.ninos.current_threshold =
+            settings.ninos2_stability_threshold;
     }
 
     /// Marks the tuning curve stale after a trusted-set edit (capture merge,
@@ -850,7 +876,7 @@ impl TunerApp {
         if let Some(host) = self.host_handle.as_ref() {
             let job = CurveJob {
                 generation: self.curve_generation,
-                input: CurveInput::from_profile(&self.inharmonicity_profile),
+                input: CurveInput::from_profile(self.session.profile()),
             };
             if host.send_curve_job(job) {
                 self.curve_dirty = false;
@@ -886,6 +912,7 @@ impl TunerApp {
             Instrument::Guitar => ReferenceMode::Et,
             Instrument::Piano => ReferenceMode::Curve,
         };
+        self.session.profile_mut().settings.reference_mode = self.display_data.reference_mode;
         self.strobe_pushed = None;
         self.display_data.strobe = StrobeState::default();
 
@@ -921,10 +948,8 @@ impl TunerApp {
         // before the lock has engaged — so the needle reads the same frozen
         // target the strobe band does.
         match self.strobe_lock.engaged().or(self.curve_bundle.as_ref()) {
-            Some(bundle) => self
-                .display_data
-                .selected_engine
-                .resolve(bundle)
+            Some(bundle) => bundle
+                .curve(self.display_data.selected_engine)
                 .target_f1(key),
             None => et,
         }
@@ -1020,15 +1045,15 @@ impl TunerApp {
                     .engaged()
                     .expect("curve desired implies an engaged lock");
                 let b_raw = self
-                    .inharmonicity_profile
-                    .measurements
-                    .get(&key)
+                    .session
+                    .profile()
+                    .active(key)
                     .and_then(|m| m.calculated_b);
                 let n_star = match b_raw {
                     Some(_) => bundle.display_partials[key as usize],
                     None => 1,
                 };
-                let curve = engine.resolve(bundle);
+                let curve = bundle.curve(engine);
                 let b = b_raw.unwrap_or_else(|| models::get_expected_beta(key));
                 count = curve.strobe_partials(key, b, &mut refs);
                 // The f₀ the reference series was built from — `strobe_partials`
@@ -1177,6 +1202,19 @@ impl TunerApp {
     pub fn new() -> (Self, iced::Task<Message>) {
         let mut app = Self::default();
         app.start_audio_processing();
+        // Resolve which instrument the session starts on, then mirror its
+        // settings into the display state the same way an explicit open does.
+        app.app_settings = AppSettings::load();
+        app.session.open_at_startup(&mut app.app_settings);
+        if let Err(e) = app.app_settings.save() {
+            eprintln!("[MAIN] Could not save app settings: {e}");
+        }
+        let profile = app.session.profile();
+        app.display_data.selected_engine = profile.settings.engine;
+        app.display_data.reference_mode = profile.settings.reference_mode;
+        let settings = profile.settings.clone();
+        app.apply_profile_settings(&settings);
+        app.sync_identity_mirror();
         // Prior-only curve at launch (design §10): with zero trusted
         // measurements the bundle is the B_ξ-default curve, so the live plot
         // renders from the first frame and morphs as captures land.
@@ -1197,7 +1235,12 @@ impl TunerApp {
             return;
         }
 
-        match audio::spawn_analysis_thread(AudioSource::Default) {
+        let dump_dir = library::diagnostics_dir();
+        // The dev workflow feeds these to the offline harnesses, which take the
+        // directory as an argument — so it has to be discoverable.
+        eprintln!("[MAIN] Capture diagnostics → {}", dump_dir.display());
+
+        match audio::spawn_analysis_thread(AudioSource::Default, Some(dump_dir)) {
             Ok(mut handle) => {
                 eprintln!("[AUDIO] Hardware stream active.");
 
@@ -1224,6 +1267,9 @@ impl TunerApp {
         match message {
             Message::Exit => {
                 eprintln!("[MAIN] Window close requested - starting cleanup...");
+                if self.session.is_dirty() {
+                    self.session.persist();
+                }
                 if let Some(mut handle) = self.host_handle.take() {
                     eprintln!("[MAIN] Shutting down audio host...");
                     handle.stop();
@@ -1316,19 +1362,13 @@ impl TunerApp {
                 }
             }
             Message::UndoLastCapture => {
-                if let Some((idx, old_data)) = self.undo_history.pop_back() {
-                    // The capture being undone is the profile's current entry.
-                    // Its diagnostic dump is per-capture (timestamped dir, so
-                    // repeat captures are retained) — an undone capture is the
-                    // user declaring it bad, and offline tools glob every
-                    // diagnostics/key_* dir, so the dump must go with it.
-                    if let Some(bad) = self.inharmonicity_profile.measurements.get(&idx) {
-                        let (key_name, _) =
-                            tuner_core::models::find_nearest_note_by_index(bad.key_index);
-                        let dir = std::path::PathBuf::from("diagnostics").join(format!(
-                            "key_{:03}_{}_{}",
-                            bad.key_index, key_name, bad.last_captured
-                        ));
+                if let Some((idx, bad)) = self.session.undo() {
+                    {
+                        // The dump is per-capture (timestamped dir, so repeat
+                        // captures are all retained) — an undone capture is the
+                        // user declaring it bad, and offline tools glob every
+                        // `key_*` dir, so the dump must go with it.
+                        let dir = library::diagnostics_dir().join(worker::dump_dir_name(&bad));
                         if dir.is_dir() {
                             match std::fs::remove_dir_all(&dir) {
                                 Ok(()) => eprintln!(
@@ -1341,18 +1381,11 @@ impl TunerApp {
                             }
                         }
                     }
-                    if let Some(m) = old_data {
-                        self.inharmonicity_profile.measurements.insert(idx, m);
-                    } else {
-                        self.inharmonicity_profile.measurements.remove(&idx);
-                    }
                     // Revert the live engine template too (measured B if a prior
                     // measurement remains, else back to the Rigaud prior).
                     if let Some(host) = self.host_handle.as_mut() {
-                        host.profiles.update_key_profile(
-                            idx,
-                            self.inharmonicity_profile.measurements.get(&idx),
-                        );
+                        host.profiles
+                            .update_key_profile(idx, self.session.profile().active(idx));
                     }
                     eprintln!("[MAIN] Undoing profile change at index {}", idx);
                     // The trusted set may have changed; recompute the curve.
@@ -1367,34 +1400,100 @@ impl TunerApp {
                 self.refresh_undo_label();
             }
             Message::SaveProfile => {
-                match self
-                    .inharmonicity_profile
-                    .to_file(tuner_core::models::PROFILE_PATH)
-                {
-                    Ok(_) => eprintln!("[MAIN] Tuning profile saved successfully."),
-                    Err(e) => eprintln!("[MAIN] Error saving profile: {}", e),
+                // The profile auto-saves; this stays as an explicit flush.
+                self.session.persist();
+            }
+            Message::ToggleLibrary => {
+                let visible = !self.display_data.library_visible;
+                self.display_data.library_visible = visible;
+                if visible {
+                    // One settings panel at a time, as the calibration
+                    // panels already do.
+                    self.display_data.settings_view_visible = true;
+                    self.display_data.curve_select_visible = false;
+                    self.display_data.instrument_select_visible = false;
+                    self.display_data.settings_data.rms.visible = false;
+                    self.display_data.settings_data.transient.visible = false;
+                    self.display_data.settings_data.ninos.visible = false;
+                    self.display_data.library_entries =
+                        library::list_profiles(self.display_data.library_sort);
+                } else if self.session.is_dirty() {
+                    // Leaving the form: don't make a pending rename wait out
+                    // the quiet delay.
+                    self.session.persist();
                 }
             }
-            Message::LoadProfile => {
-                match InharmonicityProfile::from_file(tuner_core::models::PROFILE_PATH) {
-                    Ok(profile) => {
-                        self.inharmonicity_profile = profile;
-                        self.undo_history.clear();
-                        // Sync the freshly-loaded profile into the live engine so
-                        // detection reflects it immediately (crossing #4, all keys).
-                        if let Some(host) = self.host_handle.as_mut() {
-                            host.profiles.update_all(&self.inharmonicity_profile);
-                        }
-                        // Recompute the curve for the newly-loaded profile
-                        // (recompute-on-load; the curve is never persisted).
-                        self.mark_curve_dirty();
-                        // A load is a new baseline/instrument — drop the lock so
-                        // the strobe re-engages on the loaded curve (design §8).
-                        self.strobe_lock.on_trusted_set_edit(TrustedSetEdit::Loaded);
-                        eprintln!("[MAIN] Tuning profile loaded successfully.");
-                    }
-                    Err(e) => eprintln!("[MAIN] Error loading profile: {}", e),
+            Message::OpenProfile(path) => {
+                match InharmonicityProfile::from_file(&path) {
+                    Ok(profile) => self.adopt_profile(profile, path),
+                    Err(e) => eprintln!("[MAIN] Error loading profile {}: {e}", path.display()),
                 }
+                self.display_data.library_entries =
+                    library::list_profiles(self.display_data.library_sort);
+            }
+            Message::NewProfile => {
+                let name = library::default_profile_name();
+                let path = library::unique_path_for(&name);
+                self.adopt_profile(InharmonicityProfile::new(name), path);
+                self.display_data.library_entries =
+                    library::list_profiles(self.display_data.library_sort);
+            }
+            Message::DeleteProfile(path) => {
+                // Never delete the open instrument out from under the session.
+                if self.session.delete(&path) {
+                    self.app_settings.note_removed(&path);
+                    let _ = self.app_settings.save();
+                }
+                self.display_data.library_entries =
+                    library::list_profiles(self.display_data.library_sort);
+            }
+            Message::DuplicateProfile(path) => {
+                match InharmonicityProfile::from_file(&path) {
+                    Ok(mut profile) => {
+                        profile.identity.name = format!("{} (copy)", profile.identity.name);
+                        // A copy is a *different* instrument record: it must not
+                        // inherit the original's serial number, which is the one
+                        // field that claims identity.
+                        profile.identity.serial = None;
+                        let target = library::unique_path_for(&profile.identity.name);
+                        if let Err(e) = profile.to_file(&target) {
+                            eprintln!("[MAIN] Could not duplicate profile: {e}");
+                        }
+                    }
+                    Err(e) => eprintln!("[MAIN] Could not read {}: {e}", path.display()),
+                }
+                self.display_data.library_entries =
+                    library::list_profiles(self.display_data.library_sort);
+            }
+            Message::LibrarySortChanged(sort) => {
+                self.display_data.library_sort = sort;
+                self.display_data.library_entries = library::list_profiles(sort);
+            }
+            Message::LibrarySearchChanged(needle) => {
+                self.display_data.library_search = needle;
+            }
+            Message::IdentityFieldChanged(field, value) => {
+                let identity = &mut self.session.profile_mut().identity;
+                let value = if value.is_empty() { None } else { Some(value) };
+                match field {
+                    IdentityField::Name => {
+                        identity.name = value.unwrap_or_default();
+                    }
+                    IdentityField::Make => identity.make = value,
+                    IdentityField::Model => identity.model = value,
+                    IdentityField::Serial => identity.serial = value,
+                    IdentityField::Form => identity.form = value,
+                    IdentityField::Owner => identity.owner = value,
+                    IdentityField::Notes => identity.notes = value,
+                }
+                self.sync_identity_mirror();
+                // Keystroke-rate: coalesced, not one write per character.
+                self.session.touch();
+            }
+            Message::InstrumentKindChanged(kind) => {
+                self.session.profile_mut().identity.kind = kind;
+                self.sync_identity_mirror();
+                self.session.persist();
             }
             // ------------------------------------------
             Message::Temperament => {
@@ -1452,6 +1551,10 @@ impl TunerApp {
                 // reference set is about to change under the bank.
                 self.strobe_pushed = None;
                 self.display_data.strobe = StrobeState::default();
+                // Both tuning selections persist with the instrument, so
+                // reopening it reproduces the targets it was tuned to.
+                self.session.profile_mut().settings.reference_mode = mode;
+                self.session.persist();
             }
             Message::RequestRelock => {
                 // Only meaningful when a newer curve exists; the button is
@@ -1498,6 +1601,10 @@ impl TunerApp {
                 // Display-only (D7): all engines are in the bundle already,
                 // so no recompute — just repoint the plot (and later strobe).
                 self.display_data.selected_engine = choice;
+                // Persisted with the instrument: which curve it was tuned with
+                // is a fact about the tuning, not an app-wide preference.
+                self.session.profile_mut().settings.engine = choice;
+                self.session.persist();
             }
 
             // Message::ToggleInharmonicityGraph => {
@@ -1568,6 +1675,13 @@ impl TunerApp {
             Message::NhwrsfThresholdChanged(val) => {
                 store_f32(&self.pipeline_handle.atomics.config.nhwrsf_threshold, val);
                 self.display_data.settings_data.transient.current_threshold = val;
+                // Level-independent (normalized by Σ|X|) ⇒ instrument
+                // character, so it persists and travels with the profile.
+                // Recalibrating stays available regardless: level-independent
+                // is not noise-independent.
+                // Slider-rate, like the identity fields: coalesced.
+                self.session.profile_mut().settings.nhwrsf_threshold = val;
+                self.session.touch();
             }
             Message::ToggleNinosCalibration => {
                 let vis = !self.display_data.settings_data.ninos.visible;
@@ -1594,6 +1708,13 @@ impl TunerApp {
                     val,
                 );
                 self.display_data.settings_data.ninos.current_threshold = val;
+                // Dimensionless sparsity ratio ⇒ instrument character, same
+                // argument as the NHWRSF threshold above.
+                self.session
+                    .profile_mut()
+                    .settings
+                    .ninos2_stability_threshold = val;
+                self.session.touch();
             }
             Message::ToggleInstrumentSelect => {
                 let vis = !self.display_data.instrument_select_visible;
@@ -1720,28 +1841,17 @@ impl TunerApp {
                         WorkerOutput::Measurement(measurement) => {
                             let target_idx = measurement.key_index;
 
-                            // Backup old data for Undo History
-                            let old_data = self
-                                .inharmonicity_profile
-                                .measurements
-                                .get(&target_idx)
-                                .cloned();
-                            self.undo_history.push_back((target_idx, old_data));
-                            if self.undo_history.len() > 100 {
-                                self.undo_history.pop_front();
-                            }
-
-                            // Apply to the authoritative profile…
-                            self.inharmonicity_profile
-                                .measurements
-                                .insert(target_idx, measurement);
+                            // Appends and autosaves — a full-compass pass is
+                            // hours of work and the app has no other
+                            // guaranteed write point.
+                            self.session.record(measurement);
 
                             // …then push the recompiled (measured-B) template to the live
                             // engine via crossing #4.
                             if let Some(host) = self.host_handle.as_mut() {
                                 host.profiles.update_key_profile(
                                     target_idx,
-                                    self.inharmonicity_profile.measurements.get(&target_idx),
+                                    self.session.profile().active(target_idx),
                                 );
                             }
 
@@ -1785,6 +1895,7 @@ impl TunerApp {
                 self.update_strobe(frame_pushed);
 
                 self.refresh_undo_label();
+                self.session.flush_if_quiet();
 
                 if self.display_data.settings_view_visible {
                     if self.display_data.settings_data.rms.visible {
@@ -1902,7 +2013,7 @@ impl TunerApp {
         } else {
             create_main_view(
                 &self.display_data,
-                &self.inharmonicity_profile,
+                self.session.profile(),
                 Message::CaptureButtonClicked,
                 self.curve_bundle.as_ref(),
             )

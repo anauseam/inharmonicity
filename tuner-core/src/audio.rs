@@ -329,7 +329,7 @@ impl std::fmt::Debug for HostHandle {
 /// ```no_run
 /// use tuner_core::audio::{AudioSource, spawn_analysis_thread};
 ///
-/// let mut handle = spawn_analysis_thread(AudioSource::Default).unwrap();
+/// let mut handle = spawn_analysis_thread(AudioSource::Default, None).unwrap();
 ///
 /// // Read the freshest visualization frame
 /// let frame = handle.frame_rx.as_mut().unwrap().read();
@@ -338,8 +338,11 @@ impl std::fmt::Debug for HostHandle {
 /// // Clean shutdown
 /// handle.stop();
 /// ```
-pub fn spawn_analysis_thread(source: AudioSource) -> Result<HostHandle> {
-    let (pipeline, ports) = AudioPipeline::new();
+pub fn spawn_analysis_thread(
+    source: AudioSource,
+    dump_dir: Option<std::path::PathBuf>,
+) -> Result<HostHandle> {
+    let (pipeline, ports) = AudioPipeline::new(dump_dir);
     let PipelinePorts {
         handle: pipeline_handle,
         worker_rx,
