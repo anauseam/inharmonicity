@@ -7,7 +7,9 @@ use crate::app::{AppDisplayData, Instrument};
 use crate::utils::view_utils::{
     ButtonConfig, ButtonType, make_capture_button, make_sidebar_section, make_undo_button,
 };
-use crate::views::{curve_select, ninos2_calibration, rms_calibration, transient_calibration};
+use crate::views::{
+    curve_select, library_view, ninos2_calibration, rms_calibration, transient_calibration,
+};
 
 const TONAL_CONFIG: [ButtonConfig; 4] = [
     ButtonConfig {
@@ -68,8 +70,16 @@ const INSTRUMENT_CONFIG: [ButtonConfig; 1] = [ButtonConfig {
     button_type: ButtonType::Standard,
 }];
 
+// Which instrument is open, and every instrument previously measured.
+const LIBRARY_CONFIG: [ButtonConfig; 1] = [ButtonConfig {
+    label: "Instrument Library",
+    message: Some(Message::ToggleLibrary),
+    button_type: ButtonType::Standard,
+}];
+
 /// Static settings sidebar configuration
-const SETTINGS_SIDEBAR_CONFIG: [(&str, &[ButtonConfig]); 3] = [
+const SETTINGS_SIDEBAR_CONFIG: [(&str, &[ButtonConfig]); 4] = [
+    ("Instrument", LIBRARY_CONFIG.as_slice()),
     ("Tonal adjustments", TONAL_CONFIG.as_slice()),
     ("Program adjustments", PROGRAM_CONFIG.as_slice()),
     ("Instrument (debug)", INSTRUMENT_CONFIG.as_slice()),
@@ -92,7 +102,9 @@ pub fn create_settings_view(
     let title = text("Settings").size(28);
 
     // Build main panel content based on which sub-view is active
-    let main_panel_content: Element<'static, Message> = if data.curve_select_visible {
+    let main_panel_content: Element<'static, Message> = if data.library_visible {
+        library_view::create_library_panel(data)
+    } else if data.curve_select_visible {
         curve_select::create_curve_select_panel(
             curve_bundle,
             data.selected_engine,

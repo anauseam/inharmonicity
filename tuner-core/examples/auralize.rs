@@ -105,9 +105,7 @@ fn load_profile(path: &str) -> InharmonicityProfile {
     let mut reps: Vec<usize> = Vec::new();
     for (key_index, entries) in &by_key {
         reps.push(entries.len());
-        profile
-            .measurements
-            .insert(*key_index, aggregate_key(*key_index, entries));
+        profile.record(aggregate_key(*key_index, entries));
     }
     reps.sort_unstable();
     let total: usize = reps.iter().sum();

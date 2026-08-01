@@ -75,7 +75,7 @@ run async to the hot path. They may heap-allocate freely.
 | Async background worker, `CurveBundle` | `worker.rs` |
 | Stateless DSP math | `algorithms/{spectral,peaks,twm,discovery,mat,metrics,curves,rigaud,giordano,whittaker}.rs` |
 | Offline curve auralization (resynthesis) | `synth.rs` |
-| Domain types and lookup tables | `models.rs` |
+| Domain types, lookup tables, the persisted profile schema | `models.rs` |
 | Developer CLI tools & testing harnesses | `examples/` |
 
 ## File map — `tuner-gui/src/`
@@ -83,9 +83,11 @@ run async to the hot path. They may heap-allocate freely.
 | Concern | File(s) |
 | --- | --- |
 | Application entry, state hub, message handling | `app.rs`, `main.rs` |
-| View composition | `views/{main_view,settings_view,curve_select,rms_calibration,transient_calibration,ninos2_calibration}.rs` |
+| View composition | `views/{main_view,settings_view,curve_select,library_view,rms_calibration,transient_calibration,ninos2_calibration}.rs` |
 | Stateless widgets | `widgets/{cent_meter,curve_plot,envelope,partials_display,piano_keyboard,seismograph,spectrogram}.rs` |
 | Calibration logic | `calibration.rs` |
+| Profile library: per-user dirs, app settings, listing | `library.rs` |
+| Open instrument, its file, and the write policy | `session.rs` |
 | Shared view helpers | `utils/view_utils.rs` |
 
 ## Guidelines

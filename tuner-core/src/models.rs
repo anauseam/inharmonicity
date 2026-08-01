@@ -2,7 +2,9 @@
 //!
 //! Domain types for the tuner: notes and the 88-key lookup tables ([`NOTES`],
 //! [`Note`], [`NOTE_MAP`]), captured measurements ([`Partial`], [`KeyMeasurement`],
-//! [`InharmonicityProfile`]), and the discovery templates ([`KeyProfile`]).
+//! [`InharmonicityProfile`] with its [`InstrumentIdentity`] and
+//! [`ProfileSettings`]), the two persisted tuning selections ([`EngineChoice`],
+//! [`ReferenceMode`]), and the discovery templates ([`KeyProfile`]).
 //!
 //! It also holds the small body of *domain-specific* math that produces those types —
 //! the Rigaud inharmonicity prior ([`get_expected_beta`]), the Railsback stretch curve
@@ -100,42 +102,430 @@ fn default_captured_in_auto() -> bool {
     true
 }
 
-/// Canonical on-disk filename for the persisted [`InharmonicityProfile`].
-///
-/// The pipeline loads this at startup (so a previously-calibrated instrument
-/// benefits immediately) and the frontend persists to it. Defined here so the
-/// load path and the save path agree on a single name rather than duplicating a
-/// string literal across crates.
+/// Filename a pre-library profile was written to, relative to the working
+/// directory. Read-only: the frontend looks here once to import such a file,
+/// and [`AudioPipeline::new`](crate::pipeline::AudioPipeline::new)'s gated
+/// discovery-seeding path still reads it. Nothing writes it.
 pub const PROFILE_PATH: &str = "tuning_profile.json";
 
-/// The complete inharmonicity profile for a specific piano.
+/// Current [`InharmonicityProfile`] schema version. Version `0` — one
+/// measurement per key, no identity or settings — still deserializes; see
+/// [`InharmonicityProfile::from_file`].
+pub(crate) const PROFILE_SCHEMA_VERSION: u32 = 1;
+
+/// Measurements retained per key before the oldest is dropped.
 ///
-/// This is the top-level serializable object saved to and loaded from a JSON file.
-/// It maps each measured key index to its [`KeyMeasurement`] data. A `BTreeMap`
-/// keeps keys sorted automatically for clean serialization.
+/// Ours. Repeats exist to let a bad capture be spotted by disagreement against
+/// the σ_lnB model (ADR 0009), which needs only a few per key; the bound keeps
+/// a file that is rewritten on every capture from growing without limit.
+pub(crate) const MAX_MEASUREMENTS_PER_KEY: usize = 8;
+
+/// Default NHWRSF onset threshold — the flux a transient must exceed to be
+/// declared a new note event.
+pub(crate) const DEFAULT_NHWRSF_THRESHOLD: f32 = 0.9;
+
+/// Default NINOS² sustain-stability threshold.
+pub(crate) const DEFAULT_NINOS2_STABILITY_THRESHOLD: f32 = 10.0;
+
+/// The family of instrument a profile describes.
+///
+/// Affects display vocabulary only; every instrument is measured against the
+/// same 88-slot compass ([`midi_from_key`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum InstrumentKind {
+    /// The current focus: the only family with a per-instrument stretch curve.
+    #[default]
+    Piano,
+    /// Six-string guitar and relatives.
+    Guitar,
+    /// Bass guitar, upright bass.
+    Bass,
+    /// Harp, harpsichord, and other multi-course plucked instruments.
+    Harp,
+}
+
+impl InstrumentKind {
+    /// What this instrument's measured units are called in the UI.
+    pub fn unit_plural(&self) -> &'static str {
+        match self {
+            InstrumentKind::Piano => "keys",
+            _ => "strings",
+        }
+    }
+}
+
+impl std::fmt::Display for InstrumentKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InstrumentKind::Piano => f.write_str("Piano"),
+            InstrumentKind::Guitar => f.write_str("Guitar"),
+            InstrumentKind::Bass => f.write_str("Bass"),
+            InstrumentKind::Harp => f.write_str("Harp"),
+        }
+    }
+}
+
+/// Who and what the profile is a profile *of*.
+///
+/// Every field but `name` is optional: a profile exists from its first capture
+/// and may be identified later, so no field may be required to save one.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct InstrumentIdentity {
+    /// Display name. Auto-generated on creation, renameable.
+    pub name: String,
+    /// Instrument family — drives display vocabulary only.
+    #[serde(default)]
+    pub kind: InstrumentKind,
+    /// Manufacturer.
+    #[serde(default)]
+    pub make: Option<String>,
+    /// Model designation.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Serial number — the one field that identifies an instrument uniquely.
+    #[serde(default)]
+    pub serial: Option<String>,
+    /// Body form within the family: grand/upright/spinet, dreadnought, etc.
+    #[serde(default)]
+    pub form: Option<String>,
+    /// The instrument's owner.
+    #[serde(default)]
+    pub owner: Option<String>,
+    /// Free text.
+    #[serde(default)]
+    pub notes: Option<String>,
+}
+
+/// Which engine of the `CurveBundle` the plot and strobe display — strobe
+/// design note §9/§13. Selection is **display-only** (D7): every engine is
+/// already in the bundle, so switching never triggers a recompute. The (c) ρ
+/// Low/High presets are not variants yet — they are not computed until (c)'s
+/// calibration is factored out of the per-preset path (§14 step 6); the gallery
+/// renders them as deferred placeholders.
+///
+/// Resolve it against a bundle with `CurveBundle::curve`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum EngineChoice {
+    /// (a) Rigaud-pure prior curve.
+    RigaudPure,
+    /// (b) per-key measured B + Whittaker smoothing.
+    PerKeySmoothed,
+    /// (c) Giordano-calibrated, ρ Mean preset.
+    GiordanoMean,
+    /// (d) multi-interval BALANCED — the manual-mode default (D7).
+    #[default]
+    MultiBalanced,
+    /// (d) multi-interval PURE 12ths preset.
+    MultiPureTwelfths,
+}
+
+impl EngineChoice {
+    /// Every selectable engine, in gallery order.
+    pub const ALL: [EngineChoice; 5] = [
+        EngineChoice::RigaudPure,
+        EngineChoice::PerKeySmoothed,
+        EngineChoice::GiordanoMean,
+        EngineChoice::MultiBalanced,
+        EngineChoice::MultiPureTwelfths,
+    ];
+
+    /// Full display name (detail view / panel titles).
+    pub fn label(&self) -> &'static str {
+        match self {
+            EngineChoice::RigaudPure => "(a) Rigaud prior",
+            EngineChoice::PerKeySmoothed => "(b) Per-key + Whittaker",
+            EngineChoice::GiordanoMean => "(c) Giordano · ρ Mean",
+            EngineChoice::MultiBalanced => "(d) Multi-interval · Balanced",
+            EngineChoice::MultiPureTwelfths => "(d) Multi-interval · Pure 12ths",
+        }
+    }
+
+    /// Short name for gallery thumbnails (the section header names the class).
+    pub fn short_label(&self) -> &'static str {
+        match self {
+            EngineChoice::RigaudPure => "Rigaud prior",
+            EngineChoice::PerKeySmoothed => "Per-key smoothed",
+            EngineChoice::GiordanoMean => "ρ Mean",
+            EngineChoice::MultiBalanced => "Balanced",
+            EngineChoice::MultiPureTwelfths => "Pure 12ths",
+        }
+    }
+}
+
+/// Which target function the app measures against — every readout shares it:
+/// the strobe band, its cents readout, and the cent meter.
+///
+/// Orthogonal to reference *pitch* (design §11's A440 / [`TuningCurve::d_g`],
+/// which shifts the whole curve): this selects *which* target function, not
+/// where it is anchored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ReferenceMode {
+    /// The instrument's stretched `target_f1` (per-partial targets for the
+    /// strobe). The default, and the only mode that uses measured `B`.
+    #[default]
+    Curve,
+    /// Pure equal temperament, **fundamental only** — the n = 1 target is
+    /// B-immune (design R4), so no per-string inharmonicity is needed and a
+    /// correctly-pitched string shows no false beat. The instrument-agnostic
+    /// mode: it makes the app usable on a non-piano (e.g. a guitar string).
+    Et,
+}
+
+impl ReferenceMode {
+    /// The other mode — the toggle's target.
+    pub fn toggled(self) -> Self {
+        match self {
+            ReferenceMode::Curve => ReferenceMode::Et,
+            ReferenceMode::Et => ReferenceMode::Curve,
+        }
+    }
+
+    /// Short label for the toggle button.
+    pub fn label(self) -> &'static str {
+        match self {
+            ReferenceMode::Curve => "Ref: Curve",
+            ReferenceMode::Et => "Ref: ET",
+        }
+    }
+}
+
+/// Per-instrument settings that persist with the profile.
+///
+/// The two thresholds are level-independent quantities (NHWRSF is normalized
+/// by Σ|X|; NINOS² is a dimensionless ratio), so they characterise the
+/// instrument rather than the rig — unlike the silence floor, an absolute RMS,
+/// which is measured afresh each session and is deliberately absent here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileSettings {
+    /// NHWRSF onset threshold for this instrument.
+    #[serde(default = "default_nhwrsf_threshold")]
+    pub nhwrsf_threshold: f32,
+    /// NINOS² sustain-stability threshold for this instrument.
+    #[serde(default = "default_ninos2_threshold")]
+    pub ninos2_stability_threshold: f32,
+    /// Which curve engine this instrument was last tuned with. Consulted only
+    /// when `reference_mode` is [`ReferenceMode::Curve`].
+    #[serde(default)]
+    pub engine: EngineChoice,
+    /// Curve or plain ET. Per instrument because the curve engines are piano
+    /// models — a guitar profile that reopened in `Curve` mode would be wrong
+    /// every time.
+    #[serde(default)]
+    pub reference_mode: ReferenceMode,
+}
+
+/// Serde default for [`ProfileSettings::nhwrsf_threshold`].
+fn default_nhwrsf_threshold() -> f32 {
+    DEFAULT_NHWRSF_THRESHOLD
+}
+
+/// Serde default for [`ProfileSettings::ninos2_stability_threshold`].
+fn default_ninos2_threshold() -> f32 {
+    DEFAULT_NINOS2_STABILITY_THRESHOLD
+}
+
+impl Default for ProfileSettings {
+    fn default() -> Self {
+        Self {
+            nhwrsf_threshold: DEFAULT_NHWRSF_THRESHOLD,
+            ninos2_stability_threshold: DEFAULT_NINOS2_STABILITY_THRESHOLD,
+            engine: EngineChoice::default(),
+            reference_mode: ReferenceMode::default(),
+        }
+    }
+}
+
+/// The complete inharmonicity profile for one instrument.
+///
+/// The top-level serializable object saved to and loaded from a JSON file: who
+/// the instrument is, its settings, and every measurement taken of it. A key
+/// holds a **list** of measurements, newest last — repeats are retained so a
+/// bad capture can be identified by disagreement rather than silently
+/// overwriting the good one, and so an untrusted (auto-mode) capture can be
+/// kept for review without ever displacing a trusted one. [`Self::active`]
+/// resolves the list to the single measurement consumers read.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InharmonicityProfile {
-    /// Maps a piano key index (0–87) to its measurement data.
-    pub measurements: BTreeMap<u8, KeyMeasurement>,
+    /// Schema version, for migration. See [`PROFILE_SCHEMA_VERSION`].
+    #[serde(default)]
+    pub version: u32,
+    /// The instrument this profile describes.
+    #[serde(default)]
+    pub identity: InstrumentIdentity,
+    /// Persisted per-instrument settings.
+    #[serde(default)]
+    pub settings: ProfileSettings,
+    /// Unix seconds at which the profile was created.
+    #[serde(default)]
+    pub created: u64,
+    /// Unix seconds of the last write.
+    #[serde(default)]
+    pub modified: u64,
+    /// Unix seconds at which the profile was last opened — the sort order a
+    /// working tuner reaches for most ("date accessed", strobe design §12).
+    #[serde(default)]
+    pub last_opened: u64,
+    /// Maps a key index (0–87) to every measurement taken of it, oldest first.
+    /// Capped at [`MAX_MEASUREMENTS_PER_KEY`].
+    #[serde(default)]
+    pub measurements: BTreeMap<u8, Vec<KeyMeasurement>>,
+}
+
+impl Default for InharmonicityProfile {
+    fn default() -> Self {
+        Self {
+            version: PROFILE_SCHEMA_VERSION,
+            identity: InstrumentIdentity::default(),
+            settings: ProfileSettings::default(),
+            created: 0,
+            modified: 0,
+            last_opened: 0,
+            measurements: BTreeMap::new(),
+        }
+    }
+}
+
+/// The pre-versioning (v0) profile shape: one measurement per key, no identity
+/// and no settings. Read only by [`InharmonicityProfile::from_file`]'s fallback
+/// so a profile written before the v1 bump still opens.
+#[derive(Deserialize)]
+struct ProfileV0 {
+    measurements: BTreeMap<u8, KeyMeasurement>,
+}
+
+/// Unix seconds now, or 0 if the clock is before the epoch.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default()
 }
 
 impl InharmonicityProfile {
-    /// Saves the inharmonicity profile to a JSON file.
-    pub fn to_file(&self, path: &str) -> std::io::Result<()> {
-        let json_string = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
-        let mut file = std::fs::File::create(path)?;
-        use std::io::Write;
-        file.write_all(json_string.as_bytes())?;
-        Ok(())
+    /// A new, empty profile for `name`, stamped with the current time.
+    pub fn new(name: impl Into<String>) -> Self {
+        let now = unix_now();
+        Self {
+            identity: InstrumentIdentity {
+                name: name.into(),
+                ..InstrumentIdentity::default()
+            },
+            created: now,
+            modified: now,
+            last_opened: now,
+            ..Self::default()
+        }
     }
 
-    /// Loads an inharmonicity profile from a JSON file.
-    pub fn from_file(path: &str) -> std::io::Result<Self> {
-        let mut file = std::fs::File::open(path)?;
-        let mut data = String::new();
-        use std::io::Read;
-        file.read_to_string(&mut data)?;
-        let profile: Self = serde_json::from_str(&data).map_err(std::io::Error::other)?;
+    /// The one measurement consumers read for `key`, or `None` if unmeasured.
+    ///
+    /// **Newest trusted, else newest** — the ADR 0006 item 3 provenance rule
+    /// over a list. An auto-mode entry never displaces a manual one however
+    /// recent it is, because a discovery false-lock makes MAT confidently
+    /// measure the wrong series under the wrong key; it is retained, not read.
+    pub fn active(&self, key: u8) -> Option<&KeyMeasurement> {
+        let entries = self.measurements.get(&key)?;
+        entries
+            .iter()
+            .rev()
+            .find(|m| !m.captured_in_auto)
+            .or_else(|| entries.last())
+    }
+
+    /// [`Self::active`] for in-place edits — the inspector's handle on the
+    /// entry a key currently presents.
+    pub fn active_mut(&mut self, key: u8) -> Option<&mut KeyMeasurement> {
+        let entries = self.measurements.get_mut(&key)?;
+        let pos = entries
+            .iter()
+            .rposition(|m| !m.captured_in_auto)
+            .or_else(|| entries.len().checked_sub(1))?;
+        entries.get_mut(pos)
+    }
+
+    /// Every key that carries a measurement, paired with its active entry.
+    pub fn active_entries(&self) -> impl Iterator<Item = (u8, &KeyMeasurement)> {
+        self.measurements
+            .keys()
+            .filter_map(|&k| self.active(k).map(|m| (k, m)))
+    }
+
+    /// Appends a measurement to its key, evicting the oldest entry that is not
+    /// the active one once [`MAX_MEASUREMENTS_PER_KEY`] is reached.
+    pub fn record(&mut self, measurement: KeyMeasurement) {
+        let key = measurement.key_index;
+        let entries = self.measurements.entry(key).or_default();
+        entries.push(measurement);
+        while entries.len() > MAX_MEASUREMENTS_PER_KEY {
+            // The active entry is the newest trusted one, so the oldest
+            // droppable entry is the first that is not it.
+            let active_pos = entries
+                .iter()
+                .rposition(|m| !m.captured_in_auto)
+                .unwrap_or(entries.len() - 1);
+            let drop_at = if active_pos == 0 { 1 } else { 0 };
+            entries.remove(drop_at);
+        }
+    }
+
+    /// Removes the most recently appended measurement for `key`, returning it.
+    /// Leaves the key absent entirely if that was its only measurement — the
+    /// shape an undo of a first capture must restore.
+    pub fn undo_last(&mut self, key: u8) -> Option<KeyMeasurement> {
+        let entries = self.measurements.get_mut(&key)?;
+        let popped = entries.pop();
+        if entries.is_empty() {
+            self.measurements.remove(&key);
+        }
+        popped
+    }
+
+    /// Saves the profile to a JSON file, **atomically**: the bytes go to a
+    /// temporary file beside the target and are renamed over it, so a crash
+    /// mid-write leaves the previous profile intact rather than truncating it.
+    /// The temp file is a sibling deliberately — `rename` is only atomic within
+    /// one filesystem. Stamps `modified`.
+    pub fn to_file(&mut self, path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
+        let path = path.as_ref();
+        self.modified = unix_now();
+        let json_string = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
+
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        let tmp = std::path::PathBuf::from(tmp);
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)?;
+        }
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&tmp)?;
+            file.write_all(json_string.as_bytes())?;
+            file.sync_all()?;
+        }
+        std::fs::rename(&tmp, path)
+    }
+
+    /// Loads a profile from a JSON file, migrating the v0 shape if needed.
+    ///
+    /// A v0 file has one measurement per key and no identity: each becomes a
+    /// single-entry list, and the profile is named after the file it came from.
+    /// The migration is in-memory only — the caller decides whether to write it
+    /// back, so opening an old profile read-only never rewrites it.
+    pub fn from_file(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
+        let path = path.as_ref();
+        let data = std::fs::read_to_string(path)?;
+        if let Ok(profile) = serde_json::from_str::<Self>(&data) {
+            return Ok(profile);
+        }
+        let legacy: ProfileV0 = serde_json::from_str(&data).map_err(std::io::Error::other)?;
+        let name = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Imported profile".to_string());
+        let mut profile = Self::new(name);
+        for (key, measurement) in legacy.measurements {
+            profile.measurements.insert(key, vec![measurement]);
+        }
         Ok(profile)
     }
 }
@@ -602,5 +992,138 @@ mod tests {
         assert_eq!(key_from_midi(69), Some(48));
         assert_eq!(key_from_midi(20), None); // below A0
         assert_eq!(key_from_midi(109), None); // above C8
+    }
+
+    /// A measurement of `key`, tagged with its provenance and a marker `f0`
+    /// so the tests can tell entries apart.
+    fn m(key: u8, f0: f32, captured_in_auto: bool) -> KeyMeasurement {
+        KeyMeasurement {
+            key_index: key,
+            measured_f0: f0,
+            partials: Vec::new(),
+            calculated_b: Some(1e-4),
+            last_captured: format!("{f0}"),
+            captured_in_auto,
+        }
+    }
+
+    /// The active-entry rule (ADR 0006 item 3 over a list): an auto-mode
+    /// capture is retained for review but never displaces a manual one,
+    /// however recent it is.
+    #[test]
+    fn untrusted_never_displaces_trusted() {
+        let mut p = InharmonicityProfile::default();
+        p.record(m(5, 100.0, false)); // manual
+        p.record(m(5, 200.0, true)); // auto, arrives later
+        assert_eq!(p.active(5).unwrap().measured_f0, 100.0);
+        assert_eq!(p.measurements[&5].len(), 2, "the auto entry is retained");
+
+        // A newer *manual* capture does take over.
+        p.record(m(5, 300.0, false));
+        assert_eq!(p.active(5).unwrap().measured_f0, 300.0);
+
+        // With no manual entry at all, the newest untrusted one is active.
+        let mut q = InharmonicityProfile::default();
+        q.record(m(7, 10.0, true));
+        q.record(m(7, 20.0, true));
+        assert_eq!(q.active(7).unwrap().measured_f0, 20.0);
+        assert!(q.active(9).is_none());
+    }
+
+    /// Eviction bounds the file without ever dropping the entry consumers read.
+    #[test]
+    fn eviction_never_drops_the_active_entry() {
+        let mut p = InharmonicityProfile::default();
+        p.record(m(3, 1.0, false)); // the only trusted entry: stays active
+        for i in 0..(MAX_MEASUREMENTS_PER_KEY as u32 * 2) {
+            p.record(m(3, 100.0 + i as f32, true));
+        }
+        assert_eq!(p.measurements[&3].len(), MAX_MEASUREMENTS_PER_KEY);
+        assert_eq!(
+            p.active(3).unwrap().measured_f0,
+            1.0,
+            "the trusted entry survived eviction"
+        );
+    }
+
+    /// Undo pops the appended entry, and a key that never had one disappears
+    /// entirely — the shape the curve's `active_entries` expects.
+    #[test]
+    fn undo_last_restores_the_previous_shape() {
+        let mut p = InharmonicityProfile::default();
+        p.record(m(2, 1.0, false));
+        p.record(m(2, 2.0, false));
+        assert_eq!(p.undo_last(2).unwrap().measured_f0, 2.0);
+        assert_eq!(p.active(2).unwrap().measured_f0, 1.0);
+        assert_eq!(p.undo_last(2).unwrap().measured_f0, 1.0);
+        assert!(
+            !p.measurements.contains_key(&2),
+            "a key with no measurements must not linger as an empty list"
+        );
+        assert!(p.undo_last(2).is_none());
+    }
+
+    /// A v0 profile (one measurement per key, no identity or settings) still
+    /// opens, and lands on the current defaults.
+    #[test]
+    fn v0_profiles_migrate_on_load() {
+        let dir = std::env::temp_dir().join(format!("inh-v0-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old-upright.json");
+        std::fs::write(
+            &path,
+            r#"{"measurements":{"4":{"key_index":4,"measured_f0":55.0,
+               "partials":[],"calculated_b":0.0004,"last_captured":"1"}}}"#,
+        )
+        .unwrap();
+
+        let loaded = InharmonicityProfile::from_file(&path).unwrap();
+        assert_eq!(loaded.measurements[&4].len(), 1);
+        assert_eq!(loaded.active(4).unwrap().measured_f0, 55.0);
+        // Pre-flag entries are untrusted, so they can never feed the curve.
+        assert!(loaded.active(4).unwrap().captured_in_auto);
+        // Named after its file, and carrying today's defaults.
+        assert_eq!(loaded.identity.name, "old-upright");
+        assert_eq!(
+            loaded.settings.nhwrsf_threshold, DEFAULT_NHWRSF_THRESHOLD,
+            "a v0 file has no thresholds; it must adopt the defaults"
+        );
+        assert_eq!(loaded.settings.reference_mode, ReferenceMode::Curve);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Saving round-trips through the current schema, leaves no temp file
+    /// behind, and stamps `modified`.
+    #[test]
+    fn save_is_atomic_and_round_trips() {
+        let dir = std::env::temp_dir().join(format!("inh-rt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("upright.json");
+
+        let mut p = InharmonicityProfile::new("Front room upright");
+        p.identity.serial = Some("H1234567".into());
+        p.identity.kind = InstrumentKind::Guitar;
+        p.settings.engine = EngineChoice::GiordanoMean;
+        p.settings.reference_mode = ReferenceMode::Et;
+        p.record(m(11, 61.7, false));
+        p.to_file(&path).unwrap();
+
+        assert!(
+            !dir.join("upright.json.tmp").exists(),
+            "temp file left behind"
+        );
+        assert!(p.modified > 0, "save must stamp `modified`");
+
+        let back = InharmonicityProfile::from_file(&path).unwrap();
+        assert_eq!(back.version, PROFILE_SCHEMA_VERSION);
+        assert_eq!(back.identity.name, "Front room upright");
+        assert_eq!(back.identity.serial.as_deref(), Some("H1234567"));
+        assert_eq!(back.identity.kind, InstrumentKind::Guitar);
+        assert_eq!(back.settings.engine, EngineChoice::GiordanoMean);
+        assert_eq!(back.settings.reference_mode, ReferenceMode::Et);
+        assert_eq!(back.active(11).unwrap().measured_f0, 61.7);
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -841,6 +841,9 @@ if Path A is reverted, ET mode goes with it.
   (pianometer.com/support); TuneLab 4.4 manual, "Table of Partials"
   (tunelab-world.com); Katsura Piano Tuner (katsurashareware.com); octave
   types / coincident partials (onpitch.com/why-do-the-octave-tests-work).
+- File management by the same four apps is surveyed separately, in
+  `session-persistence-and-profile-library.md` §5.1 — a different question from
+  this note's, and not a strobe concern.
 - Strobe/DSP background: strobe-tuner phase-comparator principle; lock-in / I/Q
   demodulation (the D1 math); Goertzel 1958 / Sysel–Rajmic 2012 (already cited
   in `engine.rs`).

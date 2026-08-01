@@ -63,18 +63,13 @@ const TOOLS_CONFIG: [ButtonConfig; 7] = [
     },
 ];
 
-const PROGRAM_CONFIG: [ButtonConfig; 2] = [
-    ButtonConfig {
-        label: "Save Profile",
-        message: Some(Message::SaveProfile),
-        button_type: ButtonType::Standard,
-    },
-    ButtonConfig {
-        label: "Load Profile",
-        message: Some(Message::LoadProfile),
-        button_type: ButtonType::Standard,
-    },
-];
+const PROGRAM_CONFIG: [ButtonConfig; 1] = [ButtonConfig {
+    // Captures auto-save; this is an explicit flush, kept because a
+    // "did that save?" affordance is worth more than the button costs.
+    label: "Save Profile",
+    message: Some(Message::SaveProfile),
+    button_type: ButtonType::Standard,
+}];
 
 /// Static main sidebar configuration
 const MAIN_SIDEBAR_CONFIG: [(&str, &[ButtonConfig]); 2] = [
@@ -192,7 +187,24 @@ pub fn create_widget_area(
     data: &AppDisplayData,
     curve_bundle: Option<&CurveBundle>,
 ) -> Element<'static, Message> {
-    let title = text("Inharmonicity").size(28);
+    // The open instrument is named beside the title on every frame. This is
+    // what makes resume-at-launch plus autosave safe: arriving at a second
+    // instrument and capturing would otherwise fold its measurements into the
+    // previous one's file with nothing on screen having said so. Managing
+    // instruments is a settings task; *knowing which one is open* is not.
+    let instrument = if data.open_identity.name.is_empty() {
+        "Untitled instrument".to_string()
+    } else {
+        data.open_identity.name.clone()
+    };
+    let title = row![
+        text("Inharmonicity").size(28),
+        Space::new().width(12),
+        text(instrument)
+            .size(14)
+            .color(iced::Color::from_rgb8(0xc3, 0xc2, 0xb7)),
+    ]
+    .align_y(Alignment::Center);
 
     // Build UI panels using dedicated helper methods
     let spectrogram_panel = create_spectrogram_panel(data);
@@ -447,7 +459,7 @@ fn create_curve_plot_panel(
     let engine = data.selected_engine;
     let (title_text, content): (String, Element<'static, Message>) = match curve_bundle {
         Some(bundle) => {
-            let curve = engine.resolve(bundle);
+            let curve = bundle.curve(engine);
             let mut measured = [false; 88];
             for (m, f) in measured.iter_mut().zip(curve.flags.iter()) {
                 *m = f.measured;
@@ -733,7 +745,6 @@ fn create_sidebar(
         .on_press(Message::ToggleSettingsView);
 
     sections = sections.push(settings_button);
-    sections = sections.push(Space::new().height(10));
 
     // Reference-mode toggle: app-level, because every readout is measured
     // against it — the strobe band, its cents readout, and the cent meter.

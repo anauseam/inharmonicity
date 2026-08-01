@@ -208,7 +208,7 @@ fn main() -> Result<()> {
         match tuner_core::models::InharmonicityProfile::from_file(p) {
             Ok(profile) => {
                 let mut applied = 0usize;
-                for (&key, m) in &profile.measurements {
+                for (key, m) in profile.active_entries() {
                     if let Some(kp) = KeyProfile::from_measurement(m)
                         && let Some(slot) = profiles_array.get_mut(key as usize)
                     {

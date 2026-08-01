@@ -78,7 +78,10 @@ impl CurveInput {
     /// and the Rigaud Eq.-20 F₀ is solvable.
     fn build(profile: &InharmonicityProfile, include_auto: bool) -> Self {
         let mut keys: Vec<Option<CurveKeyData>> = (0..88).map(|_| None).collect();
-        for (&idx, m) in &profile.measurements {
+        // One entry per key — `active` applies the provenance rule over the
+        // key's repeat list (newest trusted, else newest), so an auto-mode
+        // capture can never displace a manual one here.
+        for (idx, m) in profile.active_entries() {
             if idx >= 88 || (m.captured_in_auto && !include_auto) {
                 continue;
             }
@@ -1396,17 +1399,14 @@ mod tests {
                 })
                 .filter(|p| p.frequency < crate::audio::SAMPLE_RATE as f32 / 2.0)
                 .collect();
-            profile.measurements.insert(
-                k as u8,
-                KeyMeasurement {
-                    key_index: k as u8,
-                    measured_f0: f0,
-                    partials,
-                    calculated_b: Some(b),
-                    last_captured: String::new(),
-                    captured_in_auto: false,
-                },
-            );
+            profile.record(KeyMeasurement {
+                key_index: k as u8,
+                measured_f0: f0,
+                partials,
+                calculated_b: Some(b),
+                last_captured: String::new(),
+                captured_in_auto: false,
+            });
         }
         profile
     }
@@ -1539,8 +1539,10 @@ mod tests {
     #[test]
     fn test_auto_captures_are_untrusted() {
         let mut profile = synth_profile(0..88);
-        for m in profile.measurements.values_mut() {
-            m.captured_in_auto = true;
+        for entries in profile.measurements.values_mut() {
+            for m in entries {
+                m.captured_in_auto = true;
+            }
         }
         let input = crate::models::CurveInput::from_profile(&profile);
         assert_eq!(input.measured_count(), 0);
@@ -1559,7 +1561,7 @@ mod tests {
         // Poison key 14's B to 40× its physical value: pair (2, 14) then
         // implies a compressed octave under ρ(bass) ≈ 4.4.
         let poisoned = 14u8;
-        let m = profile.measurements.get_mut(&poisoned).unwrap();
+        let m = profile.active_mut(poisoned).unwrap();
         let b_bad = m.calculated_b.unwrap() * 40.0;
         m.calculated_b = Some(b_bad);
         let input = crate::models::CurveInput::from_profile(&profile);
@@ -1613,12 +1615,7 @@ mod tests {
         let full = per_key_smoothed(&deviating, &params);
         assert!(!full.flags[14].curve_b_fallback);
         let mut starved_profile = synth_profile_deviating(0..88);
-        starved_profile
-            .measurements
-            .get_mut(&14)
-            .unwrap()
-            .partials
-            .truncate(4);
+        starved_profile.active_mut(14).unwrap().partials.truncate(4);
         let starved = crate::models::CurveInput::from_profile(&starved_profile);
         let curve = per_key_smoothed(&starved, &params);
         assert!(
@@ -1639,8 +1636,10 @@ mod tests {
     /// not the partial frequencies.
     fn synth_profile_deviating(keys: impl Iterator<Item = usize>) -> InharmonicityProfile {
         let mut profile = synth_profile(keys);
-        for (&k, m) in profile.measurements.iter_mut() {
+        let measured: Vec<u8> = profile.measurements.keys().copied().collect();
+        for k in measured {
             let factor = 1.0 + 0.3 * (k as f32 / 6.0).sin();
+            let m = profile.active_mut(k).unwrap();
             m.calculated_b = Some(m.calculated_b.unwrap() * factor);
         }
         profile

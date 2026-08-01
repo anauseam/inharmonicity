@@ -9,21 +9,51 @@ open.
 `Gated on X` (blocked on a specific input) · `Investigating` (outcome unknown) ·
 `Built, gated off` (shipped behind a flag).
 
+## Sequencing
+
+Most of this file has no ordering. These four steps do, agreed 2026-08-01:
+
+1. **Finish the in-flight user-facing work** — session durability (landed),
+   then the **per-key inspector + flagged-key styling** below, which is what
+   makes autosave's "the human is the gate" true in practice rather than only
+   in principle. Then the band-slope move, unison assist, and the
+   Neyman–Pearson gate measurement.
+2. **Upgrade to CPAL 0.18.1** (below). Before the refactors, so the module
+   boundaries are drawn around the API we are keeping rather than redrawn after.
+3. **The structural work revised this session** — the `worker.rs` / `audio.rs` /
+   `models.rs` boundary pass, the `app.rs` split, and the two open arguments
+   recorded with them.
+4. Everything else, unordered.
+
 ---
 
 ## User-facing
 
-- **The profile is never auto-saved** — `Planned`. `InharmonicityProfile::to_file`
-  runs only from the *Save Profile* button, so closing the app mid-session
-  discards every measurement taken since the last manual save. A full-compass
-  pass is hours of work to lose. Saving after each accepted measurement is the
-  obvious fix; it pairs with the persistence item below.
-- **Persist calibration; load a profile at startup** — `Planned`. The
-  noise-floor, NHWRSF onset and NINOS² thresholds live only in the runtime
-  atomics and are lost on restart, and a saved profile is only loaded by button.
-  Splitting rig state (noise floor, remeasured each session) from instrument
-  state (the two dimensionless thresholds, which belong to the profile) is the
-  design question.
+- **Profile export / import from an arbitrary path** — `Deferred`. The library
+  browser covers new / open / resume / duplicate / delete over the profiles
+  directory with no new dependency; sending a profile to a colleague, or opening
+  one they sent, needs a native file dialog (`rfd`), which is a real system
+  dependency on Linux. The field's answer is cloud sync or share-sheet export
+  (§5.1 of the note below) — decide when the need is real.
+  → [`docs/design/session-persistence-and-profile-library.md`](docs/design/session-persistence-and-profile-library.md)
+- **Repeat-disagreement detector** — `Gated on` real repeat captures from a
+  tuning session. Schema v1 already retains up to
+  `MAX_MEASUREMENTS_PER_KEY` measurements per key with per-entry provenance;
+  what is missing is the statistic — captures differing by more than
+  σ_lnB(n) = max(19.3·n⁻³, 0.0035) predicts flag a bad capture. Compare
+  **within** a provenance class. It is the second detector the inspector reads.
+  → [ADR 0009](docs/adr/0009-repeat-capture-noise-decomposition.md),
+  [`docs/design/session-persistence-and-profile-library.md`](docs/design/session-persistence-and-profile-library.md)
+- **Capture-dump retention, and a user-settable dump location** — `Planned`.
+  Every capture writes raw audio to `data_local_dir()/diagnostics/` and nothing
+  ever prunes it, so a working tuner's disk use grows without bound. Needs a
+  policy (age or total size) and somewhere to show it. Undo already deletes the
+  dump of the capture it reverts. Making the *location* settable needs no new
+  crossing: the dump root is Worker state, and `WorkerJob` (crossing #6) was
+  built so a new kind of request is a new variant — `WorkerJob::SetDumpDir`
+  carries a `PathBuf` fine, since that channel is crossbeam rather than a
+  wait-free ring. Left unbuilt only because no UI changes it yet.
+  → [`docs/design/session-persistence-and-profile-library.md`](docs/design/session-persistence-and-profile-library.md)
 - **Pre-built binaries** — `Planned`. The tuner should be usable without a Rust
   toolchain now that the measure → curve → strobe path is complete.
 - **Reference pitch other than A440** — `Deferred`. `TuningCurve.d_g` already
@@ -43,11 +73,14 @@ open.
   informational and must not be styled as errors. A red ✗ on the curve plot and
   keyboard is the visible half of the per-key inspector — build them together.
   See `docs/design/strobe-and-manual-tuning-ui-design.md` §5.6, §11.
-- **Per-key measurement inspector** — `Planned`. Review, drop, or re-measure one
-  key's measurement. This is what makes autosave safe without an automatic
-  acceptance gate, and where both bad-capture detectors are read: the
-  model-based `CurveKeyFlags` and a statistical repeat-disagreement check
-  against the ADR-0009 σ model.
+- **Per-key measurement inspector** — `Planned`, and now the main gap. Review,
+  drop, or re-measure one key. Autosave ships without an automatic acceptance
+  gate on the argument that the human is the gate (§4 of the note below) — the inspector
+  is where that human actually looks. It is where both bad-capture detectors are
+  read: the model-based `CurveKeyFlags` and the statistical repeat-disagreement
+  check above. Schema v1 already keeps the per-key measurement list and the
+  untrusted entries it needs to show.
+  → [`docs/design/session-persistence-and-profile-library.md`](docs/design/session-persistence-and-profile-library.md)
 - **Show-all partials strobe mode** — `Deferred`. The v1 strobe shows one
   Smart-Partials-selected band per key; a band-per-partial toggle is planned but
   unbuilt (`strobe_partials` already emits every partial). Two costs kept it out
@@ -108,6 +141,15 @@ open.
 
 ## Worker and measurement
 
+- **`key_index` is not a sufficient measurement identity on every instrument** —
+  `Deferred`, and only matters once a non-piano workflow exists. A fretted note
+  is producible on several strings of different gauge and speaking length, hence
+  different $B$; a piano note is 1–3 strings. A per-string/course discriminator
+  on `KeyMeasurement` is the obvious shape, and costs nothing to add later — an
+  additive `#[serde(default)]` field needs no migration, which is why one was
+  *not* reserved speculatively.
+  → [`docs/design/session-persistence-and-profile-library.md`](docs/design/session-persistence-and-profile-library.md) §1.1
+
 - **MAT serial-vs-simultaneous on a second instrument** — `Gated on` a second
   instrument. Confirming the serial order generalizes retires the simultaneous
   fallback and re-enables the paper's tighter §2.4 peak-detection band.
@@ -118,6 +160,14 @@ open.
 
 ## Pipeline and architecture
 
+- **Upgrade to CPAL 0.18.1** — `Planned`, and **before** the module-boundary
+  work (see Sequencing). The workspace pins `cpal = "0.17.3"`. The upgrade
+  touches `open_input_stream`, `find_supported_config` and the device/config
+  negotiation types, which is precisely the code the `audio.rs` split will move
+  — doing it after would mean drawing the new boundaries around an API we are
+  about to change. Verify the negotiated-rate path and the mono `f32` filter
+  still hold, and that a device offering no 44.1 kHz mono config still fails
+  with the clear error rather than panicking.
 - **Dynamic sample rate** — `Planned`. The rate is threaded through the
   `Engine`, but the capture path still requires 44.1 kHz and the buffer sizes,
   COLA window and Gatekeeper timings are all dimensioned for it. A device that
@@ -134,13 +184,44 @@ open.
   `tuner-core`. Moving it to `strobe.rs` also removes a dropped-frame guard that
   only exists because the GUI reads a lossy buffer.
   → [`docs/internals/01-architecture.md`](docs/internals/01-architecture.md)
-- **`audio.rs` three-way split** — `Deferred`. Three concerns in one file: the
-  CPAL stream, the cross-cutting DSP constants, and the thread host. Splitting
-  them retires the accepted `models ↔ audio` cycle. A deliberate whole-codebase
-  pass, not a re-export shim.
-- **`models/` growth pattern** — `Deferred`. `models.rs` becomes a directory
-  when the single file stops feeling right; no threshold beyond that.
-  → [`docs/internals/04-algorithms-and-models.md`](docs/internals/04-algorithms-and-models.md)
+- **Module-boundary pass across `worker.rs`, `audio.rs` and `models.rs`** —
+  `Deferred`, and one item rather than three because they would otherwise
+  reshuffle each other. Each file now mixes categories that want separating, and
+  the ordering *within* each file has drifted too — DSP, message types and file
+  I/O interleaved rather than grouped:
+  - **`worker.rs`** holds four concerns: the message types
+    (`CurveJob`/`CurveBundle`/`WorkerOutput`), the threading
+    (`WorkerManager`), the heavy DSP (`process_payload`), and disk I/O
+    (`write_diagnostics`, `dump_dir_name`). The likeliest split is
+    message-types out and I/O out; whether the I/O leaf is a shared
+    `diagnostics` module used across `tuner-core`, or stays worker-local, is
+    the open question — a first attempt at a standalone module was rejected as
+    a broad domain name owning four lines of logic.
+  - **`audio.rs`** holds three: the CPAL stream, the cross-cutting DSP
+    constants, and the thread host. Splitting retires the accepted
+    `models ↔ audio` cycle.
+  - **`models.rs`** becomes a directory when the single file stops feeling
+    right; it now carries the persisted profile schema as well as the note
+    tables and the discovery templates.
+
+  **Two arguments are open and should be settled by this pass, not before:**
+  - *Should worker construction leave `AudioPipeline::new`?* It spawns the
+    Worker thread as a side effect, which is why the dump root traverses a
+    constructor that never reads it. **Against separating it:** the whole point
+    of `spawn_analysis_thread` is that a frontend calls one turnkey function
+    and gets a running system — pushing worker lifecycle onto every consumer
+    costs exactly the ergonomics the host extension exists to provide.
+    **For:** host policy would then be supplied where the worker is built,
+    instead of threaded through two layers that ignore it.
+  - *Should the host-assembly entry take a `HostConfig { source, dump_dir }`?*
+    Today it is two positional arguments and `spawn_analysis_thread(src, None)`
+    does not say what `None` means. Deferred so the public shape changes once,
+    with the split, rather than twice.
+
+  A deliberate whole-codebase pass, not a re-export shim; zero behaviour
+  change; its own commit.
+  → [`docs/internals/04-algorithms-and-models.md`](docs/internals/04-algorithms-and-models.md),
+  [`docs/internals/05-style.md`](docs/internals/05-style.md)
 - **`ninos2` → `spectral_sparsity` rename** — `Deferred`. The gate is ours, not
   Mounir's NINOS²; the historical name persists across ~11 files plus CSV
   headers. Deferred until the Gatekeeper is reworked anyway.
