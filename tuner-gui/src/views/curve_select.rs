@@ -13,6 +13,7 @@
 //! All thumbnails share one y-range so the engines' shapes compare honestly.
 
 use crate::Message;
+use crate::advisory;
 use crate::app::EngineChoice;
 use crate::widgets::curve_plot::{self, CurvePlot, PlotMode};
 use iced::widget::{Space, button, column, container, row, text};
@@ -97,22 +98,16 @@ fn create_detail(
     selected: EngineChoice,
 ) -> Element<'static, Message> {
     let curve = bundle.curve(choice);
-    let (cents, measured) = plot_inputs(curve);
+    let (cents, measured, suspect) = plot_inputs(curve);
 
     let measured_count = measured.iter().filter(|&&m| m).count();
-    // Advisory flags on *measured* keys only (§5.6's recapture set); on an
-    // unmeasured key, prior fallback is expected, not a warning.
-    let flagged_count = curve
-        .flags
-        .iter()
-        .filter(|f| f.measured && (f.excluded || f.negative_stretch || f.giordano_excluded))
-        .count();
+    let flagged_count = suspect.iter().filter(|&&s| s).count();
 
     let back = button(text("← Gallery").size(14))
         .padding([6, 10])
         .on_press(Message::CurveDetailClosed);
 
-    let plot = container(CurvePlot::new(cents, measured, PlotMode::Full, None).view())
+    let plot = container(CurvePlot::new(cents, measured, suspect, PlotMode::Full, None).view())
         .width(Length::Fill)
         .height(Length::Fixed(320.0));
 
@@ -173,13 +168,14 @@ fn thumb(
     y_range: (f32, f32),
     wide: bool,
 ) -> Element<'static, Message> {
-    let (cents, measured) = plot_inputs(bundle.curve(choice));
+    let (cents, measured, suspect) = plot_inputs(bundle.curve(choice));
     let (w, h) = if wide { (330.0, 64.0) } else { (155.0, 54.0) };
 
-    let plot =
-        container(CurvePlot::new(cents, measured, PlotMode::Sparkline, Some(y_range)).view())
-            .width(Length::Fixed(w))
-            .height(Length::Fixed(h));
+    let plot = container(
+        CurvePlot::new(cents, measured, suspect, PlotMode::Sparkline, Some(y_range)).view(),
+    )
+    .width(Length::Fixed(w))
+    .height(Length::Fixed(h));
 
     let name = if selected == choice {
         format!("{} ✓", choice.short_label())
@@ -240,13 +236,14 @@ fn deferred_thumb(name: &'static str) -> Element<'static, Message> {
     .into()
 }
 
-/// Cents + measured flags of a curve, in the plot widget's input form.
-fn plot_inputs(curve: &TuningCurve) -> ([f32; 88], [bool; 88]) {
+/// Cents, measured flags and suspect marks of a curve, in the plot widget's
+/// input form.
+pub fn plot_inputs(curve: &TuningCurve) -> ([f32; 88], [bool; 88], [bool; 88]) {
     let mut measured = [false; 88];
     for (m, f) in measured.iter_mut().zip(curve.flags.iter()) {
         *m = f.measured;
     }
-    (curve.cents, measured)
+    (curve.cents, measured, advisory::suspect_keys(&curve.flags))
 }
 
 /// One y-range across every engine in the bundle, so the gallery's

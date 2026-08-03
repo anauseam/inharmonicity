@@ -115,9 +115,9 @@ pub(crate) const PROFILE_SCHEMA_VERSION: u32 = 1;
 
 /// Measurements retained per key before the oldest is dropped.
 ///
-/// Ours. Repeats exist to let a bad capture be spotted by disagreement against
-/// the σ_lnB model (ADR 0009), which needs only a few per key; the bound keeps
-/// a file that is rewritten on every capture from growing without limit.
+/// Ours. Repeats exist to be compared against each other in the inspector,
+/// which needs only a few per key; the bound keeps a file that is rewritten on
+/// every capture from growing without limit.
 pub(crate) const MAX_MEASUREMENTS_PER_KEY: usize = 8;
 
 /// Default NHWRSF onset threshold — the flux a transient must exceed to be
@@ -340,7 +340,7 @@ impl Default for ProfileSettings {
 /// The top-level serializable object saved to and loaded from a JSON file: who
 /// the instrument is, its settings, and every measurement taken of it. A key
 /// holds a **list** of measurements, newest last — repeats are retained so a
-/// bad capture can be identified by disagreement rather than silently
+/// suspect capture can be compared against the others rather than silently
 /// overwriting the good one, and so an untrusted (auto-mode) capture can be
 /// kept for review without ever displacing a trusted one. [`Self::active`]
 /// resolves the list to the single measurement consumers read.
@@ -478,6 +478,25 @@ impl InharmonicityProfile {
             self.measurements.remove(&key);
         }
         popped
+    }
+
+    /// Removes the measurement at `index` in `key`'s list, returning it, or
+    /// `None` if the key or index does not exist.
+    ///
+    /// The reviewing counterpart to [`Self::undo_last`], which can only pop the
+    /// tail: a repeat that looks wrong later is rarely the newest one. Holds the
+    /// same invariant — a key left with no measurements disappears entirely, so
+    /// it reads as unmeasured rather than as an empty list.
+    pub fn remove(&mut self, key: u8, index: usize) -> Option<KeyMeasurement> {
+        let entries = self.measurements.get_mut(&key)?;
+        if index >= entries.len() {
+            return None;
+        }
+        let removed = entries.remove(index);
+        if entries.is_empty() {
+            self.measurements.remove(&key);
+        }
+        Some(removed)
     }
 
     /// Saves the profile to a JSON file, **atomically**: the bytes go to a
@@ -1061,6 +1080,36 @@ mod tests {
             "a key with no measurements must not linger as an empty list"
         );
         assert!(p.undo_last(2).is_none());
+    }
+
+    /// `remove` reaches any entry, not just the tail, and holds `undo_last`'s
+    /// invariant: emptying a key removes the key.
+    #[test]
+    fn remove_reaches_any_entry_and_empties_the_key() {
+        let mut p = InharmonicityProfile::default();
+        p.record(m(6, 1.0, false));
+        p.record(m(6, 2.0, true));
+        p.record(m(6, 3.0, true));
+
+        // The middle entry — the one `undo_last` can never reach.
+        assert_eq!(p.remove(6, 1).unwrap().measured_f0, 2.0);
+        assert_eq!(p.measurements[&6].len(), 2);
+        assert_eq!(
+            p.active(6).unwrap().measured_f0,
+            1.0,
+            "trusted still active"
+        );
+
+        assert!(p.remove(6, 5).is_none(), "index past the end");
+        assert!(p.remove(9, 0).is_none(), "unmeasured key");
+
+        p.remove(6, 0).unwrap();
+        p.remove(6, 0).unwrap();
+        assert!(
+            !p.measurements.contains_key(&6),
+            "a key with no measurements must not linger as an empty list"
+        );
+        assert!(p.active(6).is_none());
     }
 
     /// A v0 profile (one measurement per key, no identity or settings) still

@@ -68,9 +68,13 @@ impl KeyboardView {
     }
 
     fn view(&self) -> Element<'_, LocalMessage> {
-        PianoKeyboard::new(self.detected_key_index, self.selected_key_index)
-            .view()
-            .map(LocalMessage::from)
+        PianoKeyboard::new(
+            self.detected_key_index,
+            self.selected_key_index,
+            [false; 88],
+        )
+        .view()
+        .map(LocalMessage::from)
     }
 
     fn subscription(&self) -> Subscription<LocalMessage> {

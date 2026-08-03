@@ -106,6 +106,21 @@ pub enum Message {
     InstrumentKindChanged(models::InstrumentKind),
     // ----------------------------------------------
 
+    // --- Per-key measurement inspector (the review surface autosave assumes) ---
+    /// Show or hide the inspector settings panel.
+    ToggleInspector,
+    /// Review this key's retained measurements, the inspector already open.
+    InspectKey(u8),
+    /// Open the inspector on this key — the flagged-key jump from the strobe.
+    ReviewKey(u8),
+    /// Show or hide the reviewed key's earlier measurements.
+    ToggleInspectorHistory,
+    /// Discard one retained measurement of a key. Its audio stays on disk.
+    DropMeasurement(u8, usize),
+    /// Arm a fresh capture of a key, via the ordinary manual path.
+    RemeasureKey(u8),
+    // ----------------------------------------------
+
     // Settings menu items (placeholder for future implementation)
     Temperament,     // Temperament selection
     TuningStandard,  // Tuning standard (A440, etc.)
@@ -206,6 +221,27 @@ pub enum IdentityField {
     Owner,
     /// Free text.
     Notes,
+}
+
+/// One retained measurement of one key, as the inspector renders it.
+///
+/// A display mirror of a [`models::KeyMeasurement`], like the library's
+/// `ProfileEntry`: the views read `AppDisplayData` alone, and the inspector
+/// needs the entry's *position* in its key's list to address a drop.
+#[derive(Debug, Clone)]
+pub struct InspectorRow {
+    /// Position in the key's measurement list — what `remove` addresses.
+    pub index: usize,
+    /// `KeyMeasurement::last_captured`; also names the on-disk dump.
+    pub epoch: String,
+    /// Manual-mode provenance: only these feed the tuning curve.
+    pub trusted: bool,
+    /// Partials MAT persisted — the σ_lnB model's index (ADR 0009).
+    pub partials: usize,
+    /// Measured inharmonicity coefficient.
+    pub b: Option<f32>,
+    /// This is the entry [`models::InharmonicityProfile::active`] resolves to.
+    pub is_active: bool,
 }
 
 /// The engine and reference-mode selections both persist with the profile
@@ -524,6 +560,19 @@ pub struct AppDisplayData {
     /// Path of the open profile, so the browser can mark and protect its row.
     pub open_profile_path: Option<PathBuf>,
 
+    // --- Per-key measurement inspector ---
+    /// The inspector settings panel is the active one.
+    pub inspector_visible: bool,
+    /// Key under review. Follows the manual selection, and is repointed when
+    /// the reviewed key loses its last measurement.
+    pub inspector_key: Option<u8>,
+    /// Every retained measurement of [`Self::inspector_key`], oldest first.
+    pub inspector_rows: Vec<InspectorRow>,
+    /// Show the reviewed key's earlier measurements as well as the one in use.
+    /// Collapsed by default — `active` already resolves which entry a key
+    /// presents, so the history is an override rather than a question.
+    pub inspector_expanded: bool,
+
     // --- Curve display state (design §9/§13) ---
     /// The curve gallery is open in the settings main panel.
     pub curve_select_visible: bool,
@@ -738,6 +787,10 @@ impl Default for TunerApp {
                 library_search: String::new(),
                 open_identity: models::InstrumentIdentity::default(),
                 open_profile_path: None,
+                inspector_visible: false,
+                inspector_key: None,
+                inspector_rows: Vec::new(),
+                inspector_expanded: false,
                 curve_select_visible: false,
                 curve_detail: None,
                 selected_engine: EngineChoice::MultiBalanced,
@@ -826,6 +879,108 @@ impl TunerApp {
         // on the loaded curve (design §8).
         self.strobe_lock.on_trusted_set_edit(TrustedSetEdit::Loaded);
         self.refresh_undo_label();
+        // A different instrument's keys: the reviewed key indexes measurements
+        // that are no longer in the profile.
+        self.display_data.inspector_key = None;
+        self.refresh_inspector();
+    }
+
+    /// Hides every settings main panel. The settings view renders one at a
+    /// time, so a toggle clears all of them here and then sets its own.
+    fn close_settings_panels(&mut self) {
+        let d = &mut self.display_data;
+        d.library_visible = false;
+        d.inspector_visible = false;
+        d.curve_select_visible = false;
+        d.instrument_select_visible = false;
+        d.settings_data.rms.visible = false;
+        d.settings_data.transient.visible = false;
+        d.settings_data.ninos.visible = false;
+    }
+
+    /// Refreshes the inspector's mirror of the open profile: the measured-key
+    /// picker and the reviewed key's retained entries. Called after anything
+    /// that changes the measurement set, since the views render from
+    /// `display_data` alone.
+    ///
+    /// A reviewed key that holds no measurements is kept, not repointed:
+    /// dropping a key's last entry removes the key from the profile, and
+    /// jumping the panel elsewhere at that moment would hide the outcome of
+    /// the action just taken — and lose the Re-measure button for it.
+    fn refresh_inspector(&mut self) {
+        let profile = self.session.profile();
+        let selected = match &self.display_data.tuning_mode {
+            TuningMode::Manual { key_index, .. } => Some(*key_index),
+            TuningMode::Auto => None,
+        };
+        let key = self
+            .display_data
+            .inspector_key
+            .or(selected)
+            .or_else(|| profile.measurements.keys().next().copied());
+        self.display_data.inspector_key = key;
+
+        let profile = self.session.profile();
+        let rows: Vec<InspectorRow> = key
+            .and_then(|k| {
+                let entries = profile.measurements.get(&k)?;
+                // Identified by address rather than by value: repeats of one
+                // key differ only in fields the user may legitimately see
+                // repeated.
+                let active = profile.active(k)?;
+                Some(
+                    entries
+                        .iter()
+                        .enumerate()
+                        .map(|(index, m)| InspectorRow {
+                            index,
+                            epoch: m.last_captured.clone(),
+                            trusted: !m.captured_in_auto,
+                            partials: m.partials.len(),
+                            b: m.calculated_b,
+                            is_active: std::ptr::eq(m, active),
+                        })
+                        .collect(),
+                )
+            })
+            .unwrap_or_default();
+        self.display_data.inspector_rows = rows;
+    }
+
+    /// Deletes a capture's diagnostics dump — the **undo** path only. A drop
+    /// distrusts the measurement, not the recording, so it keeps the audio
+    /// (design note §5.2).
+    fn remove_dump(measurement: &models::KeyMeasurement) {
+        let dir = library::diagnostics_dir().join(worker::dump_dir_name(measurement));
+        if dir.is_dir() {
+            match std::fs::remove_dir_all(&dir) {
+                Ok(()) => eprintln!(
+                    "[MAIN] Removed diagnostics of undone capture: {}",
+                    dir.display()
+                ),
+                Err(e) => eprintln!("[MAIN] Could not remove {}: {e}", dir.display()),
+            }
+        }
+    }
+
+    /// Enters manual mode on `key_index`: the DSP target, the meter's history,
+    /// and the strobe's accumulated phase all key off the selected note, so
+    /// they move together or not at all.
+    fn enter_manual_mode(&mut self, key_index: u8) {
+        let (note_name, _et_hz) = models::find_nearest_note_by_index(key_index);
+        self.display_data.tuning_mode = TuningMode::Manual {
+            key_index,
+            note_name,
+        };
+        self.pipeline_handle
+            .atomics
+            .config
+            .target_note
+            .store(key_index, Ordering::Relaxed);
+        self.display_data.smoothing_buffer.clear();
+        // New key ⇒ new strobe references; the accumulated phase is
+        // meaningless against them.
+        self.display_data.strobe = StrobeState::default();
     }
 
     /// Refreshes the display mirror of the open instrument's identity and
@@ -1215,6 +1370,7 @@ impl TunerApp {
         let settings = profile.settings.clone();
         app.apply_profile_settings(&settings);
         app.sync_identity_mirror();
+        app.refresh_inspector();
         // Prior-only curve at launch (design §10): with zero trusted
         // measurements the bundle is the B_ξ-default curve, so the live plot
         // renders from the first frame and morphs as captures land.
@@ -1300,20 +1456,10 @@ impl TunerApp {
                 }
 
                 // Different key or not in manual mode - switch to manual mode with new key
-                let (note_name, _et_hz) = models::find_nearest_note_by_index(key_index);
-                self.display_data.tuning_mode = TuningMode::Manual {
-                    key_index,
-                    note_name,
-                };
-                self.pipeline_handle
-                    .atomics
-                    .config
-                    .target_note
-                    .store(key_index, Ordering::Relaxed);
-                self.display_data.smoothing_buffer.clear();
-                // New key ⇒ new strobe references; the accumulated phase is
-                // meaningless against them.
-                self.display_data.strobe = StrobeState::default();
+                self.enter_manual_mode(key_index);
+                // The inspector follows the key being tuned.
+                self.display_data.inspector_key = Some(key_index);
+                self.refresh_inspector();
             }
             Message::SwitchToAutoMode => {
                 self.display_data.tuning_mode = TuningMode::Auto;
@@ -1363,24 +1509,10 @@ impl TunerApp {
             }
             Message::UndoLastCapture => {
                 if let Some((idx, bad)) = self.session.undo() {
-                    {
-                        // The dump is per-capture (timestamped dir, so repeat
-                        // captures are all retained) — an undone capture is the
-                        // user declaring it bad, and offline tools glob every
-                        // `key_*` dir, so the dump must go with it.
-                        let dir = library::diagnostics_dir().join(worker::dump_dir_name(&bad));
-                        if dir.is_dir() {
-                            match std::fs::remove_dir_all(&dir) {
-                                Ok(()) => eprintln!(
-                                    "[MAIN] Removed diagnostics of undone capture: {}",
-                                    dir.display()
-                                ),
-                                Err(e) => {
-                                    eprintln!("[MAIN] Could not remove {}: {e}", dir.display())
-                                }
-                            }
-                        }
-                    }
+                    // The dump is per-capture (timestamped dir, so repeat
+                    // captures are all retained) — an undone capture is the
+                    // user declaring it bad, so the dump goes with it.
+                    Self::remove_dump(&bad);
                     // Revert the live engine template too (measured B if a prior
                     // measurement remains, else back to the Rigaud prior).
                     if let Some(host) = self.host_handle.as_mut() {
@@ -1398,6 +1530,75 @@ impl TunerApp {
                 }
                 // History shrank; repoint (or clear) the Undo label.
                 self.refresh_undo_label();
+                self.refresh_inspector();
+            }
+            Message::ToggleInspector => {
+                let visible = !self.display_data.inspector_visible;
+                self.close_settings_panels();
+                self.display_data.inspector_visible = visible;
+                if visible {
+                    self.display_data.settings_view_visible = true;
+                    self.refresh_inspector();
+                }
+            }
+            Message::InspectKey(key) => {
+                // A different key's history is a different question; re-asking
+                // it is one click.
+                self.display_data.inspector_expanded = false;
+                self.display_data.inspector_key = Some(key);
+                self.refresh_inspector();
+            }
+            Message::ToggleInspectorHistory => {
+                self.display_data.inspector_expanded = !self.display_data.inspector_expanded;
+            }
+            Message::ReviewKey(key) => {
+                self.close_settings_panels();
+                self.display_data.inspector_visible = true;
+                self.display_data.settings_view_visible = true;
+                self.display_data.inspector_expanded = false;
+                self.display_data.inspector_key = Some(key);
+                self.refresh_inspector();
+            }
+            Message::DropMeasurement(key, index) => {
+                if let Some(dropped) = self.session.remove(key, index) {
+                    // The dump stays: a drop distrusts the *measurement*, and
+                    // the audio may still yield a good one later.
+                    eprintln!(
+                        "[MAIN] Capture audio kept at {}",
+                        library::diagnostics_dir()
+                            .join(worker::dump_dir_name(&dropped))
+                            .display()
+                    );
+                    // The key may now resolve to a different entry, or to none.
+                    if let Some(host) = self.host_handle.as_mut() {
+                        host.profiles
+                            .update_key_profile(key, self.session.profile().active(key));
+                    }
+                    eprintln!("[MAIN] Dropped measurement {index} of key {key}");
+                    self.mark_curve_dirty();
+                    // A drop is an edit to the trusted set, and the lock's
+                    // response to it is undo's: the in-progress pass is not
+                    // moved under the tuner (R6).
+                    self.strobe_lock.on_trusted_set_edit(TrustedSetEdit::Undone);
+                }
+                self.refresh_undo_label();
+                self.refresh_inspector();
+            }
+            Message::RemeasureKey(key) => {
+                // The ordinary manual path — no second capture route: select
+                // the key, turn measurement mode on, and arm.
+                self.enter_manual_mode(key);
+                self.display_data.inspector_key = Some(key);
+                self.display_data.measurement_mode_active = true;
+                self.display_data.capture_state = CaptureState::Armed;
+                self.pipeline_handle
+                    .atomics
+                    .capture_state
+                    .store(CaptureState::Armed as u8, Ordering::Relaxed);
+                // Back to the measuring surface: the note has to be played, and
+                // the strobe and keyboard live there.
+                self.display_data.settings_view_visible = false;
+                self.refresh_inspector();
             }
             Message::SaveProfile => {
                 // The profile auto-saves; this stays as an explicit flush.
@@ -1405,16 +1606,10 @@ impl TunerApp {
             }
             Message::ToggleLibrary => {
                 let visible = !self.display_data.library_visible;
+                self.close_settings_panels();
                 self.display_data.library_visible = visible;
                 if visible {
-                    // One settings panel at a time, as the calibration
-                    // panels already do.
                     self.display_data.settings_view_visible = true;
-                    self.display_data.curve_select_visible = false;
-                    self.display_data.instrument_select_visible = false;
-                    self.display_data.settings_data.rms.visible = false;
-                    self.display_data.settings_data.transient.visible = false;
-                    self.display_data.settings_data.ninos.visible = false;
                     self.display_data.library_entries =
                         library::list_profiles(self.display_data.library_sort);
                 } else if self.session.is_dirty() {
@@ -1579,15 +1774,9 @@ impl TunerApp {
             }
             Message::ToggleCurveSelect => {
                 let vis = !self.display_data.curve_select_visible;
+                self.close_settings_panels();
                 self.display_data.curve_select_visible = vis;
-                if vis {
-                    // Same mutual exclusion as the calibration sub-views:
-                    // one settings main panel at a time.
-                    self.display_data.settings_data.rms.visible = false;
-                    self.display_data.settings_data.transient.visible = false;
-                    self.display_data.settings_data.ninos.visible = false;
-                    self.display_data.instrument_select_visible = false;
-                } else {
+                if !vis {
                     self.display_data.curve_detail = None;
                 }
             }
@@ -1607,15 +1796,6 @@ impl TunerApp {
                 self.session.persist();
             }
 
-            // Message::ToggleInharmonicityGraph => {
-            //     eprintln!(
-            //         "[MAIN] Toggling inharmonicity graph visibility: {} -> {}",
-            //         self.display_data.inharmonicity_graph_visible,
-            //         !self.display_data.inharmonicity_graph_visible
-            //     );
-            //     self.display_data.inharmonicity_graph_visible =
-            //         !self.display_data.inharmonicity_graph_visible;
-            // }
             Message::ToggleSettingsView => {
                 eprintln!(
                     "[MAIN] Toggling settings view visibility: {} -> {}",
@@ -1626,13 +1806,8 @@ impl TunerApp {
             }
             Message::ToggleNoiseFloorAdjustment => {
                 let vis = !self.display_data.settings_data.rms.visible;
+                self.close_settings_panels();
                 self.display_data.settings_data.rms.visible = vis;
-                if vis {
-                    self.display_data.settings_data.transient.visible = false;
-                    self.display_data.settings_data.ninos.visible = false;
-                    self.display_data.curve_select_visible = false;
-                    self.display_data.instrument_select_visible = false;
-                }
             }
             Message::SilenceThresholdChanged(value) => {
                 // Write to shared atomics so the audio thread picks it up immediately
@@ -1655,13 +1830,9 @@ impl TunerApp {
             }
             Message::ToggleTransientCalibration => {
                 let vis = !self.display_data.settings_data.transient.visible;
+                self.close_settings_panels();
                 self.display_data.settings_data.transient.visible = vis;
-
-                if self.display_data.settings_data.transient.visible {
-                    self.display_data.settings_data.rms.visible = false;
-                    self.display_data.settings_data.ninos.visible = false;
-                    self.display_data.curve_select_visible = false;
-                    self.display_data.instrument_select_visible = false;
+                if vis {
                     self.display_data.settings_data.transient.is_frozen = false;
                     self.display_data.settings_data.transient.freeze_countdown = None;
                     self.display_data.settings_data.transient.history.clear();
@@ -1685,13 +1856,9 @@ impl TunerApp {
             }
             Message::ToggleNinosCalibration => {
                 let vis = !self.display_data.settings_data.ninos.visible;
+                self.close_settings_panels();
                 self.display_data.settings_data.ninos.visible = vis;
-
-                if self.display_data.settings_data.ninos.visible {
-                    self.display_data.settings_data.rms.visible = false;
-                    self.display_data.settings_data.transient.visible = false;
-                    self.display_data.curve_select_visible = false;
-                    self.display_data.instrument_select_visible = false;
+                if vis {
                     self.display_data.settings_data.ninos.history.clear();
                 }
             }
@@ -1718,13 +1885,8 @@ impl TunerApp {
             }
             Message::ToggleInstrumentSelect => {
                 let vis = !self.display_data.instrument_select_visible;
+                self.close_settings_panels();
                 self.display_data.instrument_select_visible = vis;
-                if vis {
-                    self.display_data.settings_data.rms.visible = false;
-                    self.display_data.settings_data.transient.visible = false;
-                    self.display_data.settings_data.ninos.visible = false;
-                    self.display_data.curve_select_visible = false;
-                }
             }
             Message::SetInstrument(inst) => {
                 if self.display_data.instrument != inst {
@@ -1868,6 +2030,8 @@ impl TunerApp {
                             // live curve advances and "newer curve available" lights.
                             self.strobe_lock
                                 .on_trusted_set_edit(TrustedSetEdit::Captured);
+
+                            self.refresh_inspector();
 
                             // Re-arm automatically if in Auto mode
                             if let TuningMode::Auto = self.display_data.tuning_mode {

@@ -12,10 +12,11 @@
 use iced::widget::{
     Space, button, column, container, pick_list, row, scrollable, text, text_input,
 };
-use iced::{Alignment, Element, Fill, Length};
+use iced::{Alignment, Border, Element, Fill, Length};
 
 use crate::app::{AppDisplayData, IdentityField};
 use crate::library::{ProfileEntry, ProfileSort};
+use crate::widgets::curve_plot;
 use tuner_core::models::InstrumentKind;
 
 /// Instrument families offered in the picker.
@@ -45,7 +46,8 @@ fn identity_row(
     .into()
 }
 
-/// The identity form for the open instrument.
+/// The identity form for the open instrument — the detail half of the panel's
+/// list–detail pair, following what is *open* rather than what is selected.
 ///
 /// Editable after the fact and never required: a profile exists and auto-saves
 /// from its first capture, and is named later. Its whole job is to make "is
@@ -53,8 +55,11 @@ fn identity_row(
 /// another instrument's measurements into this file.
 fn identity_panel(data: &AppDisplayData) -> Element<'static, crate::Message> {
     let id = &data.open_identity;
-    column![
-        text("Open instrument").size(16),
+    let form = column![
+        // Not "Open instrument": every row of the list below carries an *Open*
+        // button, so the word reads as the action there rather than as the
+        // state here.
+        text("Instrument details").size(16),
         Space::new().height(6),
         identity_row(
             "Name",
@@ -109,8 +114,22 @@ fn identity_panel(data: &AppDisplayData) -> Element<'static, crate::Message> {
             "Anything worth remembering"
         ),
     ]
-    .spacing(6)
-    .into()
+    .spacing(6);
+
+    // Boxed, because this panel is two subjects rather than one: the record
+    // being written to, and the collection it belongs to.
+    container(form)
+        .padding(12)
+        .width(Fill)
+        .style(|_theme| container::Style {
+            border: Border {
+                color: curve_plot::GRID,
+                width: 1.0,
+                radius: 6.0.into(),
+            },
+            ..container::Style::default()
+        })
+        .into()
 }
 
 /// One row of the saved-profile list.
@@ -201,7 +220,7 @@ pub fn create_library_panel(data: &AppDisplayData) -> Element<'static, crate::Me
     if shown == 0 {
         list = list.push(
             text(if data.library_search.is_empty() {
-                "No saved instruments yet — captures on this one are saved automatically."
+                "No instruments yet — captures on this one are saved automatically."
             } else {
                 "No instrument matches that search."
             })
@@ -209,11 +228,20 @@ pub fn create_library_panel(data: &AppDisplayData) -> Element<'static, crate::Me
         );
     }
 
+    // "All", not "Saved": everything is saved, always, so the word no longer
+    // distinguishes one instrument from another.
+    let total = data.library_entries.len();
+    let heading = if shown == total {
+        format!("All instruments · {total}")
+    } else {
+        format!("All instruments · {shown} of {total}")
+    };
+
     container(
         column![
             identity_panel(data),
             Space::new().height(14),
-            text("Saved instruments").size(16),
+            text(heading).size(16),
             Space::new().height(6),
             controls,
             Space::new().height(6),

@@ -8,7 +8,8 @@ use crate::utils::view_utils::{
     ButtonConfig, ButtonType, make_capture_button, make_sidebar_section, make_undo_button,
 };
 use crate::views::{
-    curve_select, library_view, ninos2_calibration, rms_calibration, transient_calibration,
+    curve_select, inspector_view, library_view, ninos2_calibration, rms_calibration,
+    transient_calibration,
 };
 
 const TONAL_CONFIG: [ButtonConfig; 4] = [
@@ -70,12 +71,20 @@ const INSTRUMENT_CONFIG: [ButtonConfig; 1] = [ButtonConfig {
     button_type: ButtonType::Standard,
 }];
 
-// Which instrument is open, and every instrument previously measured.
-const LIBRARY_CONFIG: [ButtonConfig; 1] = [ButtonConfig {
-    label: "Instrument Library",
-    message: Some(Message::ToggleLibrary),
-    button_type: ButtonType::Standard,
-}];
+// Which instrument is open, and every instrument previously measured; plus the
+// per-key review surface autosave assumes (design note §4).
+const LIBRARY_CONFIG: [ButtonConfig; 2] = [
+    ButtonConfig {
+        label: "Instrument Library",
+        message: Some(Message::ToggleLibrary),
+        button_type: ButtonType::Standard,
+    },
+    ButtonConfig {
+        label: "Measurement Inspector",
+        message: Some(Message::ToggleInspector),
+        button_type: ButtonType::Standard,
+    },
+];
 
 /// Static settings sidebar configuration
 const SETTINGS_SIDEBAR_CONFIG: [(&str, &[ButtonConfig]); 4] = [
@@ -104,6 +113,8 @@ pub fn create_settings_view(
     // Build main panel content based on which sub-view is active
     let main_panel_content: Element<'static, Message> = if data.library_visible {
         library_view::create_library_panel(data)
+    } else if data.inspector_visible {
+        inspector_view::create_inspector_panel(data, curve_bundle)
     } else if data.curve_select_visible {
         curve_select::create_curve_select_panel(
             curve_bundle,
@@ -195,8 +206,10 @@ fn create_instrument_select_panel(instrument: Instrument) -> Element<'static, Me
 fn create_settings_sidebar(data: &AppDisplayData) -> Element<'static, Message> {
     let mut sections = column![].spacing(10);
 
-    // Add Settings button at the top
-    let settings_button = button(text("Settings").size(16).width(Fill))
+    // The same control as the main view's "Settings", so it names where it
+    // goes rather than where it is — otherwise it reads as the label of the
+    // view you are already in.
+    let settings_button = button(text("← Back to Tuner").size(16).width(Fill))
         .padding([10, 15])
         .style(|_theme, _status| {
             use iced::widget::button;

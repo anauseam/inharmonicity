@@ -21,9 +21,10 @@ For the design rationale and open observations, see [ARCHITECTURE.md](ARCHITECTU
 > - **Manual mode only** — Auto-mode captures are excluded from the curve by design.
 > - **The noise floor is re-measured every launch** (it belongs to the room, not
 >   the instrument).
-> - **No per-key inspector.** Undo reverts the last capture; a suspect
->   measurement cannot yet be reviewed or dropped, and the flags that mark one
->   are computed but not shown.
+> - **A suspect capture is caught by eye, not automatically.** The measurement
+>   inspector shows every retained measurement of a key and lets you drop or
+>   re-measure it, and the curve marks the keys it doubts — but no automatic
+>   acceptance gate exists, and two candidates have been measured and rejected.
 > - **Unisons are set by ear** — no unison-beat readout.
 > - **No pitch-raise over-pull targets.**
 > - **A440 only**, no user-adjustable temperaments.

@@ -2,6 +2,7 @@
 //!
 //! This module contains the main GUI application for the Inharmonicity piano tuning software.
 
+pub mod advisory;
 pub mod app;
 pub mod calibration;
 pub mod library;
