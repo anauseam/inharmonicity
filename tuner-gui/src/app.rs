@@ -18,7 +18,6 @@ use iced::{self, Element, Subscription, Theme};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
-use std::time::Instant;
 use tuner_core::{
     FrameOutput,
     algorithms::curves,
@@ -268,20 +267,10 @@ pub struct StrobeState {
     pub ref_hz: Option<f32>,
     /// D3 amplitude gate, as reported by the strobe bank — band frozen.
     pub gated: bool,
-    /// Unwrapped accumulated beat phase (cycles) for the band-slope readout,
-    /// reconstructed on the GUI side from the wrapped [`Self::beat_phase`].
-    pub band_unwrapped: f32,
-    /// Previous frame's wrapped angle, for the unwrap delta. `None` = no
-    /// baseline yet (first ungated frame after a (re)target or re-strike).
-    pub band_prev_raw: Option<f32>,
-    /// Time-stamped `(t, band_unwrapped)` history over the last
-    /// [`BAND_SLOPE_WINDOW_SECS`] — least-squares-fit to the beat rate.
-    pub band_history: VecDeque<(Instant, f32)>,
-    /// Cents-vs-target from the band's rotation *rate* (slope of the history).
-    /// The low-jitter readout: the band integrates phase, so its slope has
-    /// variance ~1/T³ vs the instantaneous estimate's per-hop noise. `None`
-    /// until the window spans [`BAND_SLOPE_MIN_SPAN_SECS`] with enough of its
-    /// frames ([`BAND_SLOPE_MIN_FRAME_FRACTION`]); held while gated.
+    /// Cents-vs-target from `FrameOutput.strobe_beat_hz` — the fine readout.
+    /// The band integrates phase DSP-side, so its rate is far steadier than an
+    /// instantaneous estimate, but it aliases past [`BAND_READABLE_HZ`].
+    /// `None` while the bank's fit is filling or restarting.
     pub band_cents: Option<f32>,
     /// Partial the coarse read is centred on (`curves::coarse_read_partial`).
     /// Independent of [`Self::n_star`]: the band and the coarse number answer
@@ -312,9 +301,6 @@ impl Default for StrobeState {
             n_star: 1,
             ref_hz: None,
             gated: true,
-            band_unwrapped: 0.0,
-            band_prev_raw: None,
-            band_history: VecDeque::new(),
             band_cents: None,
             coarse_n: 1,
             coarse_cents: None,
@@ -323,49 +309,6 @@ impl Default for StrobeState {
         }
     }
 }
-
-/// Sliding window the band-slope readout fits over (§5.5 / R12).
-///
-/// The trade is **linear cost against an inelastic benefit** (ADR 0011 §11): the
-/// fit lags a turning peg by exactly `T/2` — an OLS slope estimates the rate at
-/// the window's *midpoint* — while the jitter it buys falls far slower than the
-/// `T⁻³` law, because the bank's analysis windows overlap 75–87 % and extra hops
-/// are mostly the same audio. Measured, tripling `T` buys 1.8× on piano and
-/// nothing measurable on guitar.
-///
-/// 0.6 s is the responsive-enough end of that trade in use, and 1 ¢ of steadiness
-/// is inside the range a professional tuner works in. To trade the 300 ms of lag
-/// back, shorten this; two lengths are derived rather than arbitrary, and each
-/// *removes* a constant by absorbing [`BAND_SLOPE_MIN_SPAN_SECS`] (which can never
-/// exceed it):
-/// `BASS_WINDOW_SIZE / SAMPLE_RATE` ≈ 0.186 s matches the coarse read's own group
-/// delay, so the two readouts lag equally and the source switch stops stepping
-/// the number; 0.25 s simply collapses the two constants. Escaping the trade
-/// rather than moving along it needs a two-state (g–h / Kalman) estimator on
-/// (phase, rate), which weights old data instead of discarding it.
-const BAND_SLOPE_WINDOW_SECS: f32 = 0.6;
-
-/// Minimum span before a rate is shown; the coarse read covers the fill-in.
-///
-/// Floored by the analysis window itself: the bank integrates over
-/// `BASS_WINDOW_SIZE` samples ≈ 0.186 s, so a fit spanning less than that is
-/// drawing a line through repeats of *one* window's audio and has no independent
-/// information about the rate. This value clears that floor by 1.34×
-/// (`band_slope_span_clears_the_analysis_window` pins it).
-const BAND_SLOPE_MIN_SPAN_SECS: f32 = 0.25;
-
-/// Fraction of a span's expected frames the history must still hold for its fit
-/// to be published — the **frame-loss guard**, not a precision floor (two points
-/// already determine a slope).
-///
-/// Derived from what frame loss costs: for points spread over a fixed span,
-/// `Var(slope) ∝ 1/n`, so retaining a quarter of them doubles the slope's
-/// standard error. That is the point at which the fit stops being worth
-/// publishing, and it is scale-free — it follows [`BAND_SLOPE_WINDOW_SECS`]
-/// instead of silently becoming lax if the window shortens. At the shipped window
-/// that is ≈ 6 of 26 expected frames, and it trips when the UI falls below
-/// ≈ 11 fps against a 43 Hz hop.
-const BAND_SLOPE_MIN_FRAME_FRACTION: f32 = 0.25;
 
 /// Readable range (Hz) of the fixed-reference strobe band before its per-hop
 /// phase drift aliases. The boundary is exact — half a cycle per hop is
@@ -380,8 +323,8 @@ const BAND_SLOPE_MIN_FRAME_FRACTION: f32 = 0.25;
 /// what the coarse read is for. A hop/unwrap limit, not a Goertzel one.
 const BAND_READABLE_HZ: f32 = BAND_ALIAS_HZ - BAND_UNWRAP_MARGIN_HZ;
 
-/// Half a cycle of beat phase per hop — the exact point past which the GUI's
-/// per-frame unwrap folds. Computed, not written down: a hard-coded 21.5 would
+/// Half a cycle of beat phase per hop — the exact point past which the bank's
+/// per-hop unwrap folds. Computed, not written down: a hard-coded 21.5 would
 /// silently become wrong if the hop or sample rate moved.
 const BAND_ALIAS_HZ: f32 = 0.5 * HOP_RATE_HZ;
 
@@ -427,43 +370,6 @@ fn debounce_verdict(state: &mut bool, run: &mut u8, verdict: bool) {
             *run = 0;
         }
     }
-}
-
-/// Least-squares slope of `(t, unwrapped-cycles)` → beat rate (Hz) → cents vs
-/// `ref_hz`. `None` until the history spans [`BAND_SLOPE_MIN_SPAN_SECS`] and has
-/// kept [`BAND_SLOPE_MIN_FRAME_FRACTION`] of its frames. The rate is the strobe's
-/// true observable
-/// (design §3): rotation = f_live − f_ref, so its slope is the detuning.
-fn band_slope_cents(history: &VecDeque<(Instant, f32)>, ref_hz: Option<f32>) -> Option<f32> {
-    let ref_hz = ref_hz?;
-    if ref_hz <= 0.0 {
-        return None;
-    }
-    let t0 = history.front()?.0;
-    let span = history.back()?.0.duration_since(t0).as_secs_f32();
-    if span < BAND_SLOPE_MIN_SPAN_SECS {
-        return None;
-    }
-    // Frame-loss guard, against the frames this span *should* have delivered.
-    if (history.len() as f32) < BAND_SLOPE_MIN_FRAME_FRACTION * span * HOP_RATE_HZ {
-        return None;
-    }
-    let (mut sx, mut sy, mut sxx, mut sxy, mut n) = (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
-    for &(t, y) in history {
-        let x = t.duration_since(t0).as_secs_f64();
-        let y = y as f64;
-        sx += x;
-        sy += y;
-        sxx += x * x;
-        sxy += x * y;
-        n += 1.0;
-    }
-    let denom = n * sxx - sx * sx;
-    if denom.abs() < 1e-9 {
-        return None;
-    }
-    let beat_hz = ((n * sxy - sx * sy) / denom) as f32; // cycles/s
-    Some(1200.0 * ((ref_hz + beat_hz) / ref_hz).log2())
 }
 
 #[derive(Debug, Clone)]
@@ -628,14 +534,50 @@ enum StrobeLock {
     /// capture or undo landing mid-pass moves the *live* `curve_bundle` but
     /// never this (R6). Boxed so the common `Disengaged` state stays small —
     /// the same reason [`crate::worker::CurveBundle`] is boxed on its channel.
-    Engaged(Box<CurveBundle>),
+    Engaged(Box<LockedTargets>),
+}
+
+/// Everything a strobe reference set is built from, frozen together.
+///
+/// Both halves must come from here: the retarget identity that decides when to
+/// re-push the bank keys off the *locked* generation, so a target input read
+/// live would move the targets without the bank ever being told.
+struct LockedTargets {
+    bundle: CurveBundle,
+    /// Per-key raw measured B at lock time (`InharmonicityProfile::active`),
+    /// the second argument `TuningCurve::strobe_partials` needs.
+    b_raw: [Option<f32>; 88],
+}
+
+impl LockedTargets {
+    /// Freezes the live bundle together with the profile's current B per key.
+    fn freeze(bundle: &CurveBundle, profile: &InharmonicityProfile) -> Box<Self> {
+        Box::new(Self {
+            bundle: bundle.clone(),
+            b_raw: snapshot_b(profile),
+        })
+    }
+}
+
+/// The B every key currently presents — [`InharmonicityProfile::active`], the
+/// same entry the curve input, the inspector and the keyboard resolve to.
+fn snapshot_b(profile: &InharmonicityProfile) -> [Option<f32>; 88] {
+    std::array::from_fn(|k| profile.active(k as u8).and_then(|m| m.calculated_b))
 }
 
 impl StrobeLock {
     /// The frozen bundle, if engaged.
     fn engaged(&self) -> Option<&CurveBundle> {
         match self {
-            StrobeLock::Engaged(c) => Some(c),
+            StrobeLock::Engaged(l) => Some(&l.bundle),
+            StrobeLock::Disengaged => None,
+        }
+    }
+
+    /// The frozen measured B for `key`, if engaged.
+    fn locked_b(&self, key: u8) -> Option<f32> {
+        match self {
+            StrobeLock::Engaged(l) => l.b_raw[key as usize],
             StrobeLock::Disengaged => None,
         }
     }
@@ -1132,7 +1074,8 @@ impl TunerApp {
             && matches!(self.strobe_lock, StrobeLock::Disengaged)
             && let Some(live) = &self.curve_bundle
         {
-            self.strobe_lock = StrobeLock::Engaged(Box::new(live.clone()));
+            self.strobe_lock =
+                StrobeLock::Engaged(LockedTargets::freeze(live, self.session.profile()));
         }
 
         // Project the lock into the panel's view-model: the frozen generation,
@@ -1155,6 +1098,11 @@ impl TunerApp {
         // gen/engine components are inert (0 / default) so a mode flip still
         // changes the identity and forces a re-push. Curve mode keys off the
         // **locked** generation, so a re-lock (and only a re-lock) re-pushes.
+        //
+        // Every input to the reference set below must be reachable from this
+        // tuple. One read from live state instead of the lock changes `refs`
+        // without changing the identity, so the bank is never told and the
+        // label disagrees with the band it is labelling.
         let desired: Option<(u8, bool, u64, EngineChoice)> = manual_key.and_then(|key| {
             if et_mode {
                 Some((key, true, 0, EngineChoice::MultiBalanced))
@@ -1199,11 +1147,7 @@ impl TunerApp {
                     .strobe_lock
                     .engaged()
                     .expect("curve desired implies an engaged lock");
-                let b_raw = self
-                    .session
-                    .profile()
-                    .active(key)
-                    .and_then(|m| m.calculated_b);
+                let b_raw = self.strobe_lock.locked_b(key);
                 let n_star = match b_raw {
                     Some(_) => bundle.display_partials[key as usize],
                     None => 1,
@@ -1246,20 +1190,15 @@ impl TunerApp {
             .as_ref()
             .filter(|f| desired.is_some() && (n_star as usize) <= f.strobe_count)
             .map(|f| {
-                (
-                    f.strobe_angle[n_star as usize - 1],
-                    f.strobe_gated[n_star as usize - 1],
-                )
+                let i = n_star as usize - 1;
+                (f.strobe_angle[i], f.strobe_gated[i], f.strobe_beat_hz[i])
             });
 
         let strobe = &mut self.display_data.strobe;
-        // A retarget (key / partial / ref change) invalidates the accumulated
-        // beat phase — reset the band-slope history so the rate is only ever
-        // fit over a contiguous run against one fixed reference.
+        // A retarget (key / partial / ref change) invalidates every readout in
+        // flight: frames computed before the DSP took the new references carry
+        // the old key's numbers.
         if strobe.ref_hz != ref_hz || strobe.n_star != n_star {
-            strobe.band_unwrapped = 0.0;
-            strobe.band_prev_raw = None;
-            strobe.band_history.clear();
             strobe.out_of_range = false;
             strobe.range_run = 0;
             strobe.band_cents = None;
@@ -1300,51 +1239,18 @@ impl TunerApp {
         }
 
         match bank {
-            Some((angle, gated)) => {
+            Some((angle, gated, beat_hz)) => {
                 strobe.beat_phase = angle;
                 strobe.gated = gated;
-                // Band-slope readout: accumulate only on a *new* frame (the
-                // triple buffer redelivers the last frame on idle ticks, and
-                // re-counting it would flatten the slope) and only while
-                // ungated (a frozen band holds its angle — including gated
-                // hops would read the detuning toward zero). A gate freezes the
-                // last rate; a re-strike resumes from a fresh baseline.
-                if frame_pushed && !gated {
-                    match strobe.band_prev_raw {
-                        Some(prev) => {
-                            let mut d = angle - prev;
-                            if d > 0.5 {
-                                d -= 1.0;
-                            } else if d < -0.5 {
-                                d += 1.0;
-                            }
-                            strobe.band_unwrapped += d;
-                        }
-                        // First ungated frame (fresh target or re-strike):
-                        // seed the baseline, publish no drift, and drop the old
-                        // rate so a re-strike shows "listening…" until the
-                        // window refills — never a stale number.
-                        None => {
-                            strobe.band_history.clear();
-                            strobe.band_cents = None;
-                        }
-                    }
-                    strobe.band_prev_raw = Some(angle);
-
-                    let now = Instant::now();
-                    strobe.band_history.push_back((now, strobe.band_unwrapped));
-                    while strobe.band_history.front().is_some_and(|&(t, _)| {
-                        now.duration_since(t).as_secs_f32() > BAND_SLOPE_WINDOW_SECS
-                    }) {
-                        strobe.band_history.pop_front();
-                    }
-                    if let Some(c) = band_slope_cents(&strobe.band_history, ref_hz) {
-                        strobe.band_cents = Some(c);
-                    }
-                } else if gated {
-                    // Freeze: hold the last rate, drop the baseline so the
-                    // next strike starts clean (no phantom jump across the gap).
-                    strobe.band_prev_raw = None;
+                // Fine readout: the bank's rotation rate, converted at the
+                // displayed reference. Freezing while gated and dropping on a
+                // re-strike are the bank's (`StrobeResult::beat_hz`). The guard
+                // is the coarse read's: a frame computed against the previous
+                // key would be a wrong number rather than a late one.
+                if self.strobe_pushed == Some(desired) {
+                    strobe.band_cents = beat_hz
+                        .zip(ref_hz.filter(|r| *r > 0.0))
+                        .map(|(hz, r)| 1200.0 * ((r + hz) / r).log2());
                 }
             }
             // Bank not (yet) targeting this key: hold the last angle, gated.
@@ -1763,7 +1669,8 @@ impl TunerApp {
                 // target (design §8). Force a re-push and reset the shown
                 // phase, exactly like a key change.
                 if let Some(live) = &self.curve_bundle {
-                    self.strobe_lock = StrobeLock::Engaged(Box::new(live.clone()));
+                    self.strobe_lock =
+                        StrobeLock::Engaged(LockedTargets::freeze(live, self.session.profile()));
                     self.strobe_pushed = None;
                     self.display_data.strobe = StrobeState::default();
                 }
@@ -2207,72 +2114,6 @@ impl TunerApp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
-
-    /// Builds a `(t, unwrapped-cycles)` history for a steady `beat_hz` at the
-    /// DSP hop cadence and asserts the fit recovers the corresponding cents.
-    fn fit(beat_hz: f32, ref_hz: f32, secs: f32) -> Option<f32> {
-        let base = Instant::now();
-        let dt = 1024.0 / 44_100.0; // one hop
-        let mut hist = VecDeque::new();
-        let mut t = 0.0f32;
-        while t <= secs {
-            hist.push_back((base + Duration::from_secs_f32(t), beat_hz * t));
-            t += dt;
-        }
-        band_slope_cents(&hist, Some(ref_hz))
-    }
-
-    /// A +0.5 Hz beat at A2 must read the matching sharp cents; −0.5 Hz the
-    /// mirror flat; and an in-tune (0 Hz) band must read ≈ 0.
-    #[test]
-    fn band_slope_recovers_beat_rate() {
-        let expect = |hz: f32| 1200.0 * ((110.0 + hz) / 110.0f32).log2();
-        let sharp = fit(0.5, 110.0, 0.6).expect("enough span");
-        assert!(
-            (sharp - expect(0.5)).abs() < 0.05,
-            "sharp {sharp} vs {}",
-            expect(0.5)
-        );
-        let flat = fit(-0.5, 110.0, 0.6).expect("enough span");
-        assert!(
-            (flat - expect(-0.5)).abs() < 0.05,
-            "flat {flat} vs {}",
-            expect(-0.5)
-        );
-        let in_tune = fit(0.0, 110.0, 0.6).expect("enough span");
-        assert!(in_tune.abs() < 0.02, "in-tune must read ~0, got {in_tune}");
-    }
-
-    /// Below the minimum span the fit withholds a number (the instantaneous
-    /// readout covers the fill-in), and a missing reference yields `None`.
-    /// The minimum span must clear one analysis window, or the fit is drawing a
-    /// line through repeats of the same audio (ADR 0011 §11).
-    #[test]
-    fn band_slope_span_clears_the_analysis_window() {
-        let analysis_secs = audio::BASS_WINDOW_SIZE as f32 / audio::SAMPLE_RATE as f32;
-        assert!(
-            BAND_SLOPE_MIN_SPAN_SECS >= analysis_secs,
-            "min span {BAND_SLOPE_MIN_SPAN_SECS} s is under one analysis window ({analysis_secs} s)"
-        );
-    }
-
-    /// The frame-loss guard must reproduce the 6-of-26 floor it replaced at the
-    /// shipped window, and must scale if that window moves.
-    #[test]
-    fn band_slope_frame_guard_scales_with_the_window() {
-        let needed = |span: f32| (BAND_SLOPE_MIN_FRAME_FRACTION * span * HOP_RATE_HZ).ceil() as u32;
-        assert_eq!(needed(BAND_SLOPE_WINDOW_SECS), 7, "≈6–7 of 26 at 0.6 s");
-        assert_eq!(
-            needed(BAND_SLOPE_MIN_SPAN_SECS),
-            3,
-            "≈3 of 11 at the min span"
-        );
-        assert!(
-            needed(BAND_SLOPE_WINDOW_SECS / 2.0) < needed(BAND_SLOPE_WINDOW_SECS),
-            "the guard must follow the window, not sit at an absolute count"
-        );
-    }
 
     /// A verdict that alternates — the measured behaviour at the boundary — must
     /// never move the displayed source, however long it flaps.
@@ -2283,6 +2124,30 @@ mod tests {
             debounce_verdict(&mut state, &mut run, i % 2 == 0);
         }
         assert!(!state, "an alternating verdict must not switch the source");
+    }
+
+    /// The frozen B must be the entry the key presents — newest trusted, else
+    /// newest — so locking cannot silently retarget a key onto an unattended
+    /// capture the curve itself excluded.
+    #[test]
+    fn locked_b_snapshots_the_active_entry() {
+        let mut profile = InharmonicityProfile::new("test");
+        let entry = |key, b, auto| models::KeyMeasurement {
+            key_index: key,
+            measured_f0: 100.0,
+            partials: Vec::new(),
+            calculated_b: Some(b),
+            last_captured: String::new(),
+            captured_in_auto: auto,
+        };
+        profile.record(entry(3, 1e-4, false));
+        profile.record(entry(3, 9e-4, true)); // newer, but unattended
+        profile.record(entry(4, 2e-4, true)); // auto only: still what key 4 presents
+
+        let b = snapshot_b(&profile);
+        assert_eq!(b[3], Some(1e-4), "a newer auto entry must not displace it");
+        assert_eq!(b[4], Some(2e-4));
+        assert_eq!(b[5], None, "unmeasured keys carry no B");
     }
 
     /// A sustained verdict switches, and only on the full run: one agreeing hop
@@ -2302,17 +2167,5 @@ mod tests {
         assert!(!state, "the run restarted, so still no switch");
         debounce_verdict(&mut state, &mut run, true);
         assert!(state, "the full run switches the source");
-    }
-
-    #[test]
-    fn band_slope_withholds_until_ready() {
-        assert!(
-            fit(0.5, 110.0, 0.1).is_none(),
-            "too short a baseline must be None"
-        );
-        assert!(
-            fit(0.5, 0.0, 0.6).is_none(),
-            "non-positive ref must be None"
-        );
     }
 }

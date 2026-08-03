@@ -34,6 +34,7 @@ So temporal integration, if added, sits on top of the **per-frame peak lists** �
 Two candidate homes, with very different stakes:
 
 ### A. Discovery pipeline (real-time)
+
 Track peaks across hop-advanced frames; feed **persistence-filtered / track-averaged** peaks
 to TWM instead of the raw single-frame peak list. Upside: rejects transient and
 sympathetic-resonance peaks that don't persist; stabilizes peak frequencies.
@@ -43,6 +44,7 @@ deliberately kept stateless, and must avoid the **full-sequence Viterbi / path-p
 mechanism ADR 0005 rejected.
 
 ### B. Worker (post-capture)
+
 Run multi-frame tracking *within* the captured buffer to stabilize MAT's partial set before
 the median solve. Latency is free (already async), stakes are lower (the key is already
 identified), and it cannot regress discovery. The cheaper, safer first experiment if this is
@@ -78,7 +80,7 @@ CSPE = Short & Garcia); our bespoke assemblies underperformed. Apply the same ru
 ## Noise-source taxonomy — what this lever can and cannot fix
 
 | Confuser | Temporal behavior | Multi-frame helps? |
-|---|---|---|
+| --- | --- | --- |
 | Sympathetic resonance (other strings ringing) | Builds *after* onset, decays with driver, weaker | **Yes** — onset-timing/persistence separates it |
 | Attack broadband (treble) | Transient, dies fast | **Yes** |
 | Random spectral noise peaks | Non-persistent | **Yes** |

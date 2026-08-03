@@ -1,8 +1,8 @@
-# Inharmonicity — a Professional Tuner for Inharmonic Stringed Instruments
+# Inharmonicity — an Electronic Tuner for Inharmonic Stringed Instruments
 
 ![Inharmonicity Interface](images/interface-screenshot.png)
 
-An open-source, professional-grade tuner built in Rust for **inharmonic stringed instruments**. With real-time audio analysis, pitch detection, and cent-deviation measurement, it measures each string's inharmonicity and drives a manual-mode strobe display for tuning each string to its own partial targets. The **current focus is the piano** for which it computes a per-instrument stretch curve; an instrument-agnostic ET reference mode already works, and the inharmonicity measurement and strobe **generalize to any stiff string**. Full-piano validation is ongoing, and other stiff stringed instruments will benefit from the work in the future.
+An open-source, electronic tuner built in Rust designed for precision tuning of **stiff stringed, inharmonic instruments**. With real-time audio analysis, pitch detection, and cent-deviation measurement, it measures each string's inharmonicity and drives a strobe display for tuning each string to its own partial targets. The **current focus is the piano** for which it computes a per-instrument stretch curve; an instrument-agnostic ET reference mode already works, and the inharmonicity measurement and strobe **generalize to any stiff string**. Full-piano validation is ongoing, and other stiff stringed instruments will benefit from the work in the future.
 
 For a detailed WIP overview of the algorithms used, see the [Anauseam documentation](https://docs.anauseam.org/project-docs/inharmonicity-tuner/00_intro).
 For the design rationale and open observations, see [ARCHITECTURE.md](ARCHITECTURE.md). For contribution guidelines, see [CONTRIBUTING.md](CONTRIBUTING.md).
@@ -18,9 +18,7 @@ For the design rationale and open observations, see [ARCHITECTURE.md](ARCHITECTU
 >
 > Current limits:
 >
-> - **Manual mode only** — Auto-mode captures are excluded from the curve by design.
-> - **The noise floor is re-measured every launch** (it belongs to the room, not
->   the instrument).
+> - **Manual mode only** — Auto-mode captures and the strobe tuner are excluded from the curve by design.
 > - **A suspect capture is caught by eye, not automatically.** The measurement
 >   inspector shows every retained measurement of a key and lets you drop or
 >   re-measure it, and the curve marks the keys it doubts — but no automatic
@@ -222,7 +220,7 @@ The pipeline also manages the **`WorkerManager`** (`worker.rs`), which owns a si
 > | `engine.rs` — TWM discovery + Goertzel phase tracking | 🔬 R&D |
 > | `worker.rs` — background (f₀, B) measurement (single thread) | 📐 Provisional |
 > | `curves.rs` + `rigaud.rs`/`giordano.rs`/`whittaker.rs` — tuning-curve engines (a)–(d) | 📐 Provisional |
-> | `strobe.rs` — manual-mode strobe (fixed-ref beat phase + OS-CFAR coarse readout, Path A) | 📐 Provisional |
+> | `strobe.rs` — manual-mode strobe (fixed-ref beat phase, its band-slope rate, + OS-CFAR coarse readout, Path A) | 📐 Provisional |
 > | `synth.rs` — offline curve → audio resynthesis (cold-path, no audio stream) | 📐 Provisional |
 > | `peaks.rs` — Jacobsen sub-bin peak extraction + OS-CFAR coarse read | 🧩 Extensible |
 > | `twm.rs` — canonical Two-Way Mismatch scoring | 🔬 R&D |

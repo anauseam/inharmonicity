@@ -943,6 +943,7 @@ impl AudioPipeline {
         // spinning) whether or not the engine holds a note lock.
         frame_output.strobe_angle = strobe_result.angle;
         frame_output.strobe_gated = strobe_result.gated;
+        frame_output.strobe_beat_hz = strobe_result.beat_hz;
         frame_output.strobe_count = strobe_result.count;
         frame_output.coarse_hz = strobe_result.coarse_hz;
 

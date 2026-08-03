@@ -56,8 +56,8 @@ Speaker **playback** is a separate, currently-unbuilt concern. When it is
 added (the GUI "hear the curve" feature), the CPAL **output** stream will live
 in `audio` — the single CPAL boundary — **not** in the GUI, because the core is
 headless and the GUI speaks only the six channels above. It is the mirror of
-crossing #1: the output callback is the real-time _consumer_ filling a
-`&mut [f32]`, fed by a lock-free ring buffer whose _producer_ is the cold
+crossing #1: the output callback is the real-time *consumer* filling a
+`&mut [f32]`, fed by a lock-free ring buffer whose *producer* is the cold
 `synth`. That is a sanctioned **seventh crossing**, exposed as an opt-in handle
 like `spawn_analysis_thread` and subject to the same wait-free callback
 discipline. It is deferred; duplex (playback during capture) is out of scope.
@@ -126,10 +126,10 @@ The default answer is **no**.
 Not everything inside `process_cola_hop` is a chain stage, though. The
 hop also hosts **taps**: parallel observers that read the hop's audio
 or the components' outputs and produce telemetry without sitting in
-the chain's data path. Today there are three: the treble-magnitude
-extraction for the spectrogram, the diagnostic history pre-roll, and
-the `Strobe` (step 5b — fixed-reference beat phase and coarse spectral
-readout, ADR 0011). The test for a tap is **deletability**: removing it
+the chain's data path. Which steps are taps, and what each produces, is
+the Class column of [`03`](03-dsp-pipeline.md)'s per-hop table — the
+ground truth this file judges against, and the only place the list is
+kept. The test for a tap is **deletability**: removing it
 must leave gating, detection, and measurement bit-identical, because
 nothing in the chain consumes its output — the `Strobe` reads a *target*
 the UI nominated, never the engine's tracker, and writes only

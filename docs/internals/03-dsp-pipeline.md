@@ -48,9 +48,9 @@ truth it judges against.
 | 4 | Bass magnitude spectrum | **Engine discovery** | **chain** |
 | 4 | Treble magnitude spectrum | spectrogram (`FrameOutput`) only | tap |
 | 5 | **Engine** → `Option<PitchResult>`: silence/transient resets → discovery (Stage-A discrete scoring over the bass magnitudes, M-of-N acquisition lock, tracker seeding) or tracking (adaptive Goertzel bank, NP gate, EMA) | telemetry, capture latch | **chain** |
-| 5b | **Strobe** → `StrobeResult`: fixed-reference beat phase and bounded CFAR-gated coarse spectral readout at the nominated reference partial (skipped during `Silence`) | `FrameOutput` only | tap |
+| 5b | **Strobe** → `StrobeResult`: fixed-reference beat phase, its sliding-window least-squares rate per reference, and a bounded CFAR-gated coarse spectral readout at the nominated reference partial (skipped during `Silence`) | `FrameOutput` only | tap |
 | 6 | Capture accumulation & dispatch — the `CaptureState` baton: onset pre-roll → `Recording` on Stable → 1.5 s or decay → dispatch gate → `CapturePayload` to the Worker (crossing #5), with backpressure recovery | Worker → MAT → `KeyMeasurement` → profile | **capture limb** (chain branch) |
-| 7 | `FrameOutput` assembly: treble magnitudes, gate telemetry, pitch fields when locked, strobe fields + `coarse_hz` unconditionally → triple buffer (crossing #2) | GUI | out |
+| 7 | `FrameOutput` assembly: treble magnitudes, gate telemetry, pitch fields when locked, strobe fields (angle, gate, rate) + `coarse_hz` unconditionally → triple buffer (crossing #2) | GUI | out |
 
 Two things this table encodes that a "stream → gate → engine" sketch
 hides: the windowing/FFT front-end is itself a chain stage (the
@@ -69,9 +69,10 @@ On the hot path:
 - No `clone()` on heap-owning types (`Vec`, `Box<[T]>`, `String`).
   `Arc::clone` is fine because it is just an atomic increment.
 - All scratch buffers used inside the hop are owned by the pipeline
-  (`ProcessingFrame`), the components (`Gatekeeper`, `Engine`, and
-  `Strobe` — which owns its step-5b `coarse_scratch` CFAR reference
-  cells), or the COLA buffer — allocated once at startup via `Box<[T]>`.
+  (`ProcessingFrame`), the components (`Gatekeeper`, `Engine`, `Strobe`),
+  or the COLA buffer — allocated once at startup via `Box<[T]>` or a
+  fixed-size array. A component's cross-hop history counts: a sliding
+  window is a fixed-size ring on the component, never a growing buffer.
 - Algorithms accept `&[T]` / `&mut [T]` slices for input and output;
   they do not allocate their own working space.
 

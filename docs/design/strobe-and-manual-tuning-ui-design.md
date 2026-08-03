@@ -529,8 +529,14 @@ moving target mid-pass.
   all engines, D7.)
 
 State: a `locked_curve: Option<CurveBundle>` distinct from the live
-`curve_bundle`, plus the selected engine and the per-key `n*` (which locks with
-it).
+`curve_bundle`, plus the selected engine, the per-key `n*` (which locks with
+it), **and the per-key measured B** — `strobe_partials` takes the curve target
+*and* B, so a lock holding only the curve leaves half the reference set live.
+The rule the implementation enforces (2026-08-02): every input to a reference
+set comes from the lock, because the identity that decides when to re-push the
+DSP bank keys off the locked generation — a target input read from live state
+moves the targets without the bank being told, and the panel then labels a band
+with a target it is not beating against.
 
 ---
 
