@@ -174,6 +174,21 @@ impl ProfileSession {
         removed.map(|m| (key, m))
     }
 
+    /// Discards one retained measurement of `key` — the inspector's drop —
+    /// returning it. Persists immediately, for the same reason undo does.
+    ///
+    /// One undo of that key is forgotten with it: undo pops the key's tail, so
+    /// leaving the history intact would let a later undo discard a *different*
+    /// measurement than the one it was recorded for.
+    pub fn remove(&mut self, key: u8, index: usize) -> Option<KeyMeasurement> {
+        let removed = self.profile.remove(key, index)?;
+        if let Some(pos) = self.undo_history.iter().rposition(|&k| k == key) {
+            self.undo_history.remove(pos);
+        }
+        self.persist();
+        Some(removed)
+    }
+
     /// Marks an interaction-rate edit for a coalesced write. The clock restarts
     /// on every call, so the write lands once the user stops typing or dragging
     /// rather than once per character or slider step.
@@ -336,6 +351,32 @@ mod tests {
             "the rollback point must not advance with later writes"
         );
         assert!(!after_second.contains("\"key_index\": 2"));
+
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// An inspector drop reaches any entry, writes through, and consumes one
+    /// undo of that key — otherwise the next undo would discard a measurement
+    /// it was never recorded for.
+    #[test]
+    fn a_drop_writes_through_and_consumes_one_undo() {
+        let (mut s, path) = session("drop");
+        s.record(measurement(4, 10.0));
+        s.record(measurement(4, 20.0));
+        assert_eq!(s.undo_history.len(), 2);
+
+        // The older entry — the one undo cannot reach.
+        assert_eq!(s.remove(4, 0).unwrap().measured_f0, 10.0);
+        let on_disk = InharmonicityProfile::from_file(&path).unwrap();
+        assert_eq!(on_disk.measurements[&4].len(), 1);
+        assert_eq!(on_disk.active(4).unwrap().measured_f0, 20.0);
+        assert_eq!(s.undo_history.len(), 1, "the drop consumed one undo");
+
+        // The one remaining undo removes the one remaining entry, leaving the
+        // history empty rather than pointing at a key that no longer exists.
+        assert_eq!(s.undo().unwrap().1.measured_f0, 20.0);
+        assert!(s.undo().is_none());
+        assert!(s.remove(4, 0).is_none(), "nothing left to drop");
 
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }

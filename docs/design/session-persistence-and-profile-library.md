@@ -45,15 +45,16 @@ wrong key. That damage was memory-only until a manual save; autosave would have
 made it permanent. Appending plus a resolution rule fixes it structurally,
 rather than by adding a gate.
 
-**(b) Repeats are the raw material of a bad-capture detector.** They are kept to
-*catch outliers, not to average*: ADR 0009 measured
-σ_lnB(n) = max(19.3·n⁻³, 0.0035), so bass/mid repeat spread is ~0.4 % and
-averaging helps essentially only where the curve already absorbs the noise
-through inverse-variance ln-B shrinkage, and where the strobe displays n = 1
-whose target is identically B-immune (R4). What repeats *do* buy is
-**disagreement detection** — two captures differing by more than σ_lnB predicts
-identify a bad one. That comparison must be made **within** a provenance class;
-mixing trusted and untrusted captures corrupts the σ it rests on.
+**(b) Repeats are the raw material of review.** They are kept to *catch
+outliers, not to average*: ADR 0009 measured σ_lnB(n) = max(19.3·n⁻³, 0.0035),
+so bass/mid repeat spread is ~0.4 % and averaging helps essentially only where
+the curve already absorbs the noise through inverse-variance ln-B shrinkage, and
+where the strobe displays n = 1 whose target is identically B-immune (R4).
+
+This was originally written as **automatic** disagreement detection — "two
+captures differing by more than σ_lnB predicts identify a bad one". **That is
+refuted** (§5.3): the repeats survive as what the inspector *shows a human*, key
+by key, which is what shipped.
 
 **The active-entry rule.** `InharmonicityProfile::active` returns the **newest
 trusted entry, else the newest** — ADR 0006 item 3 expressed over a list. Every
@@ -172,7 +173,8 @@ rebuildable offline through `regenerate_partials`.
 item 4 demoted it to a diagnostic — it measures self-consistency, not accuracy —
 and it was **not** resurrected as an autosave gate. With no trustworthy
 automatic criterion the human is the gate, which is what the per-key inspector
-is for (TODO.md, still unbuilt — the main gap this note leaves open).
+is for (§5.2, shipped 2026-08-01). §5.3 records the second attempt at an
+automatic criterion, and why it also failed.
 
 Three mechanics:
 
@@ -238,6 +240,89 @@ pianometer.com/2024/04/02/pianometer-ios-change-log); Verituner features
 (tunelab-world.com/managefiles.html); CyberTuner support
 (cybertuner.com/irctsupport).
 
+### 5.2 The measurement inspector *(tuner-gui, 2026-08-01)*
+
+The surface §4 assumes. A settings panel — reviewing is not tuning — showing
+every retained measurement of one key with its epoch, provenance, partial count
+and B, the curve's verdict on that key, and three remedies: **drop one entry**
+(any entry, not just the tail — `InharmonicityProfile::remove`, since a repeat
+that looks wrong later is rarely the newest), **re-measure** (the ordinary
+manual path: select, arm, capture — no second capture route), or leave it.
+
+Two couplings are load-bearing and easy to get wrong:
+
+- **A dropped entry keeps its dump, and an undone one does not.** The asymmetry
+  is deliberate. Undo means *this capture should not have been taken* — a
+  mis-strike, the wrong key selected, a phone ringing — so its audio has no
+  later use and leaving debris from an unwanted action would surprise. A drop
+  means only *this measurement is not trusted*, which is a claim about the
+  estimate, not the recording: piano #2's deep bass is the standing case, where
+  the audio was genuine and only the cached analysis was wrong. Keeping the
+  audio is also what makes §4's "a poisoned profile is rebuildable offline"
+  true for the entries a user actually rejects. Disk is bounded by the
+  retention policy (TODO.md), not by deleting on rejection.
+- **A drop consumes one undo of that key.** Undo pops the key's *tail*; leaving
+  the history intact would let a later undo discard a different measurement
+  than the one it was recorded for.
+
+**The curve is the key picker.** The panel selects a key by clicking the curve
+plot rather than from a list of note names: the plot already shows which keys
+are measured (dots), which are doubted (✗) and which are gaps, so choosing what
+to review is the same act as reading the curve, and every key is reachable —
+including unmeasured ones, which a measured-keys list cannot offer a
+re-measure. `CurvePlot` gained an opt-in `on_select` for this rather than a
+second widget: the gallery thumbnails pass nothing and stay inert, so there is
+one rendering of a curve in the app, not two that can drift.
+
+**A flagged key carries its remedies where the user already is.** The strobe
+panel's ✗ offers *Re-measure* (the ordinary capture flow, so it belongs on the
+measuring surface) and *Review measurements* (which opens this panel on that
+key, because dropping an entry means choosing between a key's repeats and that
+needs the list). Sending the user to hunt through settings for either would be
+the slow path.
+
+The red-✗ marks on the curve plot, the keyboard and the strobe panel are the
+same verdict rendered in three places, resolved once in `advisory.rs`. Which
+flags earn a ✗ is measured, and is argued in the strobe design note §5.6.
+
+### 5.3 Rejected: the σ_lnB repeat-disagreement detector
+
+Schema v1 retains repeats partly to support an automatic check — flag a capture
+that disagrees with its key's other captures by more than
+σ_lnB(n) = max(19.3·n⁻³, 0.0035) predicts (ADR 0009). **Measured on piano #2's
+595 repeats through `regenerate_partials`, it does not work**, in two
+independent ways:
+
+- **It fires on well-behaved data.** A 3σ pairwise rule flags **29 of 88 keys**;
+  8σ still flags 8. Nothing in that set is a bad capture — these are the very
+  repeats ADR 0009's σ was fitted to. The model describes the *median* key of an
+  n-bin, while individual keys sit up to 3.5× (bass), 7.9× (mid) and 23× (treble)
+  above their model σ, so the statistic has no calibrated tail.
+- **It is weakly correlated with consequence.** Expressed as movement of the
+  strobe target (worst partial n ≤ 8), bass repeats disagree by a median
+  **0.10 ¢** and mid by 0.39 ¢ — below anything the readouts resolve — while the
+  treble's median **197 ¢** is the known information floor that
+  `curve_b_fallback` already marks and the ln-B shrinkage already absorbs. Of
+  the 13 mid keys whose repeats do move the target past 1 ¢, the 3σ rule catches
+  **4**; it misses F5 (8.2 ¢, z = 2.0) and A#5 (6.6 ¢, z = 0.3) while firing on
+  a dozen keys that move by ≤ 0.1 ¢.
+
+So there is no operating point: loose enough to catch the real movers and it
+flags a third of the compass; tight enough to stay quiet and it only reports
+disagreements a glance would already catch. A detector thresholded in *target
+cents* rather than in σ_lnB units is the shape that could work, and is not
+designed here — the inspector shows the repeats and the human decides, which is
+§4's position anyway.
+
+**What repeats are actually worth, then.** The same measurement that refutes the
+detector points at the real use: those per-key departures from σ_lnB(n) — 3.5×,
+7.9×, 23× — are not noise in the comparison, they are the *precision of that
+key's B*, and the curve currently guesses it from partial count alone. Feeding a
+measured σ_m into the shrinkage weight w = σ_p²/(σ_p² + σ_m²) corrects how much
+the curve trusts each key, which is a systematic error rather than the ~0.05 ¢
+averaging would buy. Tracked in TODO.md; it needs a small-sample estimator,
+since k = 2–3 makes a raw sample SD nearly worthless.
+
 ---
 
 ## 6. Consequences and what stays open
@@ -257,8 +342,12 @@ on crossing #6 — a new variant on a channel explicitly designed to take them,
 not a new crossing, since that leg is a crossbeam channel and can carry a
 `PathBuf`.
 
-Open, all in TODO.md: the **per-key inspector** and **flagged-key ✗ styling**
-(what makes §4's "the human is the gate" true in practice rather than only in
-principle); the **repeat-disagreement detector** over the σ_lnB model once a
-session has produced real repeats; **export/import from an arbitrary path**; and
-**dump retention** — nothing prunes `diagnostics/`, which grows without limit.
+Closed since: the **per-key inspector** and **flagged-key ✗ styling** (§5.2,
+§5.6 of the strobe note) — what makes §4's "the human is the gate" true in
+practice rather than only in principle — and the **repeat-disagreement
+detector**, measured and rejected (§5.3).
+
+Open, both in TODO.md: **export/import from an arbitrary path**; and **dump
+retention** — nothing prunes `diagnostics/`, which grows without limit, and the
+inspector now deletes dumps one at a time without ever showing how many there
+are.

@@ -273,11 +273,33 @@ cents-normalized as an optional per-band angle rescale (cheap; no new crossing).
 
 ### 5.6 Flagged keys
 
-If the selected key is flagged by the curve (`CurveKeyFlags`:
-`negative_stretch`, `excluded`, `giordano_excluded`, or `curve_b_fallback`),
-overlay a **red ✗** on the strobe with a one-line reason and a "recapture
-recommended" hint (curve design note §2 — the detector never clamps; it advises).
-This reuses flags already on every `TuningCurve`.
+If the selected key is flagged by the curve, overlay a **red ✗** on the strobe
+with a one-line reason and a "recapture recommended" hint (curve design note §2
+— the detector never clamps; it advises). This reuses flags already on every
+`TuningCurve`.
+
+**Two of the five flags qualify, not four** (corrected 2026-08-01; this section
+originally listed `giordano_excluded` and `curve_b_fallback` as well, and
+predates the ADR-0009 shrinkage work that made `curve_b_fallback` routine).
+Measured over both capture sets:
+
+| flag | piano #1 | piano #2 | verdict |
+| --- | --- | --- | --- |
+| `excluded` | 0/88 | 0/88 | **suspect** — red ✗ |
+| `negative_stretch` | 0/88 | 0/88 | **suspect** — red ✗ |
+| `curve_b_fallback` | 21/88 (20 of the 25 treble keys) | 22/88 (20 treble) | informational |
+| `giordano_excluded` | 40/88 | 39/88 | informational, and engine (c) only |
+
+`curve_b_fallback` is set for **every unmeasured key** as well, so on a fresh
+instrument it covers all 88; `giordano_excluded` covers ~45 % of the compass on
+both pianos. Styling either as an error paints most of the keyboard red where
+nothing is wrong — the same mistake in the other direction as not styling at
+all. The two suspect flags are rare rather than never: they fire on no key of
+either capture set, and on 1 of 88 on a fully-measured manual profile. That
+rarity is the point — an error mark that appears often stops being read.
+
+The severity split and its wording live in `tuner-gui/src/advisory.rs`, one
+place for all three surfaces.
 
 ---
 
@@ -565,9 +587,10 @@ theme-aware, one visual system across thumbnails, detail plot, and this widget.)
   which maps to the curve's global offset `d_g` (`TuningCurve.d_g`,
   `d_g = 1200·log₂(ref/440)`). **Locked to A440 (`d_g = 0`) for v1**; the
   non-440 UI is deferred UX. The plumbing (`d_g` on the curve) already exists.
-- **Flagged keys (red ✗).** In the strobe (§5.6) and optionally as small marks
-  on the keyboard/plot, surface `CurveKeyFlags` with a recapture hint. Deferred
-  styling; the flags are already computed per key.
+- **Flagged keys (red ✗).** Shipped 2026-08-01: the strobe panel (§5.6), the
+  curve plot, and the keyboard all mark the two suspect flags with a recapture
+  hint. The informational three are shown as plain lines in the measurement
+  inspector, never as errors — see §5.6's measured counts.
 
 ---
 

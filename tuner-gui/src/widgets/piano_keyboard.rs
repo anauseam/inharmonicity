@@ -15,6 +15,8 @@
 use iced::widget::canvas::{self, Canvas, Event, Fill, Geometry, Path, Stroke};
 use iced::{Color, Element, Point, Rectangle, Renderer, Size, Theme, mouse};
 
+use crate::widgets::curve_plot::SUSPECT;
+
 /// Number of white keys on an 88-key piano.
 const WHITE_KEY_COUNT: usize = 52;
 /// Total number of keys on an 88-key piano.
@@ -37,6 +39,9 @@ pub struct PianoKeyboard {
     detected_key_index: Option<u8>,
     /// User-selected key index (from mouse clicks)
     selected_key_index: Option<u8>,
+    /// Keys whose measurement the curve doubts, from
+    /// [`crate::advisory::suspect_keys`] — marked with a red ✗.
+    suspect: [bool; 88],
 }
 
 impl PianoKeyboard {
@@ -45,10 +50,16 @@ impl PianoKeyboard {
     /// # Arguments
     /// * `detected_key_index` - Currently detected key from audio analysis (0-87)
     /// * `selected_key_index` - User-selected key from mouse clicks (0-87)
-    pub fn new(detected_key_index: Option<u8>, selected_key_index: Option<u8>) -> Self {
+    /// * `suspect` - Per-key suspect-measurement marks
+    pub fn new(
+        detected_key_index: Option<u8>,
+        selected_key_index: Option<u8>,
+        suspect: [bool; 88],
+    ) -> Self {
         Self {
             detected_key_index,
             selected_key_index,
+            suspect,
         }
     }
 
@@ -151,6 +162,21 @@ where
     ) -> Vec<Geometry> {
         let mut frame = canvas::Frame::new(renderer, bounds.size());
 
+        /// A ✗ centred on `(cx, cy)`, on a key whose measurement the curve
+        /// doubts. Drawn white over the saturated selected/detected fills —
+        /// the red mark is invisible against the red selection, which is
+        /// exactly the key the user just clicked.
+        fn suspect_mark(frame: &mut canvas::Frame, cx: f32, cy: f32, arm: f32, highlighted: bool) {
+            let cross = Path::new(|b| {
+                b.move_to(Point::new(cx - arm, cy - arm));
+                b.line_to(Point::new(cx + arm, cy + arm));
+                b.move_to(Point::new(cx + arm, cy - arm));
+                b.line_to(Point::new(cx - arm, cy + arm));
+            });
+            let color = if highlighted { Color::WHITE } else { SUSPECT };
+            frame.stroke(&cross, Stroke::default().with_width(1.6).with_color(color));
+        }
+
         let white_key_width = bounds.width / WHITE_KEY_COUNT as f32;
         let black_key_width = white_key_width * 0.6;
         let black_key_height = bounds.height * 0.6;
@@ -181,6 +207,16 @@ where
                     ),
                     Stroke::default().with_color(Color::BLACK),
                 );
+                // Below the black keys, where a white key is unobstructed.
+                if self.suspect[i] {
+                    suspect_mark(
+                        &mut frame,
+                        white_key_x + white_key_width * 0.5,
+                        bounds.height * 0.82,
+                        white_key_width * 0.25,
+                        is_selected || is_detected,
+                    );
+                }
                 white_key_x += white_key_width;
             }
         }
@@ -205,6 +241,16 @@ where
                     Size::new(black_key_width, black_key_height),
                     Fill::from(color),
                 );
+                // Inside the black key: below it is the white key's territory.
+                if self.suspect[i] {
+                    suspect_mark(
+                        &mut frame,
+                        key_x + black_key_width * 0.5,
+                        black_key_height * 0.8,
+                        black_key_width * 0.3,
+                        is_selected || is_detected,
+                    );
+                }
             } else {
                 white_key_idx += 1.0;
             }

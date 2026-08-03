@@ -4,12 +4,14 @@
 //! for the Inharmonicity piano tuning application.
 
 use crate::Message;
+use crate::advisory;
 use crate::app::{AppDisplayData, Instrument, ReferenceMode, TuningMode};
 use crate::calibration::CALIBRATION_FRAMES;
 use crate::utils::view_utils::{
     ButtonConfig, ButtonType, make_capture_button, make_sidebar_section, make_undo_button,
 };
-use crate::widgets::curve_plot::{CurvePlot, PlotMode};
+use crate::views::curve_select;
+use crate::widgets::curve_plot::{CurvePlot, PlotMode, SUSPECT};
 use crate::widgets::strobe_display::StrobeDisplay;
 use crate::widgets::{cent_meter, guitar_strings, partials_display, piano_keyboard, spectrogram};
 use iced::widget::{Space, button, column, container, row, text};
@@ -209,10 +211,10 @@ pub fn create_widget_area(
     // Build UI panels using dedicated helper methods
     let spectrogram_panel = create_spectrogram_panel(data);
     let cent_meter_panel = create_cent_meter_panel(data);
-    let keyboard_panel = create_keyboard_panel(data);
+    let keyboard_panel = create_keyboard_panel(data, curve_bundle);
     let partials_panel = create_partials_panel(data);
     let curve_plot_panel = create_curve_plot_panel(data, curve_bundle);
-    let strobe_panel = create_strobe_panel(data);
+    let strobe_panel = create_strobe_panel(data, curve_bundle);
     let auto_mode_notice = create_auto_mode_notice(data);
     // let inharmonicity_graph_panel = create_inharmonicity_graph_panel(data, profile);
 
@@ -313,12 +315,19 @@ fn create_auto_mode_notice(data: &AppDisplayData) -> Option<Element<'static, Mes
 ///
 /// The target it reads against follows the app-level [`ReferenceMode`] (the
 /// sidebar toggle), shared with the cent meter.
-fn create_strobe_panel(data: &AppDisplayData) -> Option<Element<'static, Message>> {
+fn create_strobe_panel(
+    data: &AppDisplayData,
+    curve_bundle: Option<&CurveBundle>,
+) -> Option<Element<'static, Message>> {
     if !data.strobe_visible {
         return None;
     }
 
-    let TuningMode::Manual { note_name, .. } = &data.tuning_mode else {
+    let TuningMode::Manual {
+        note_name,
+        key_index,
+    } = &data.tuning_mode
+    else {
         let panel = container(
             column![
                 text("Strobe").size(18),
@@ -417,6 +426,33 @@ fn create_strobe_panel(data: &AppDisplayData) -> Option<Element<'static, Message
         None => Space::new().into(),
     };
 
+    // §5.6: a red ✗ with the reason when the curve doubts this key's
+    // measurement, and its two remedies. Dropping is not offered here — it
+    // means choosing between a key's repeats, which needs the inspector's list.
+    let key = *key_index;
+    let flagged: Element<'static, Message> = curve_bundle
+        .and_then(|b| advisory::suspect(&b.curve(data.selected_engine).flags[key as usize]))
+        .map_or_else(
+            || Space::new().into(),
+            |a| {
+                column![
+                    text(format!("✗ {}", a.reason)).size(12).color(SUSPECT),
+                    row![
+                        button(text("Re-measure").size(12))
+                            .padding([3, 8])
+                            .on_press(Message::RemeasureKey(key)),
+                        Space::new().width(8),
+                        button(text("Review measurements").size(12))
+                            .padding([3, 8])
+                            .on_press(Message::ReviewKey(key)),
+                    ]
+                    .align_y(Alignment::Center),
+                ]
+                .spacing(5)
+                .into()
+            },
+        );
+
     let panel = container(
         column![
             row![text(title).size(18), Space::new().width(Fill)].align_y(Alignment::Center),
@@ -432,6 +468,7 @@ fn create_strobe_panel(data: &AppDisplayData) -> Option<Element<'static, Message
             ]
             .align_y(Alignment::Center),
             Space::new().height(8),
+            flagged,
             lock_footer,
         ]
         .width(Fill)
@@ -457,23 +494,37 @@ fn create_curve_plot_panel(
     }
 
     let engine = data.selected_engine;
+    // Clicking the plot selects that key, exactly as clicking the keyboard
+    // does — the plot is the surface that shows *which* keys want attention.
+    let selected_key = match &data.tuning_mode {
+        TuningMode::Manual { key_index, .. } => Some(*key_index),
+        TuningMode::Auto => None,
+    };
     let (title_text, content): (String, Element<'static, Message>) = match curve_bundle {
         Some(bundle) => {
             let curve = bundle.curve(engine);
-            let mut measured = [false; 88];
-            for (m, f) in measured.iter_mut().zip(curve.flags.iter()) {
-                *m = f.measured;
-            }
+            let (cents, measured, suspect) = curve_select::plot_inputs(curve);
             let measured_count = measured.iter().filter(|&&m| m).count();
+            let flagged = suspect.iter().filter(|&&s| s).count();
+            let flagged_note = if flagged > 0 {
+                format!(" · {flagged} flagged")
+            } else {
+                String::new()
+            };
             (
                 format!(
-                    "Tuning Curve — {} · {measured_count}/88 measured",
+                    "Tuning Curve — {} · {measured_count}/88 measured{flagged_note}",
                     engine.label()
                 ),
-                container(CurvePlot::new(curve.cents, measured, PlotMode::Full, None).view())
-                    .width(Fill)
-                    .height(Fill)
-                    .into(),
+                container(
+                    CurvePlot::new(cents, measured, suspect, PlotMode::Full, None)
+                        .selected(selected_key)
+                        .on_select(Message::KeySelected)
+                        .view(),
+                )
+                .width(Fill)
+                .height(Fill)
+                .into(),
             )
         }
         None => (
@@ -606,7 +657,10 @@ fn create_cent_meter_panel(data: &AppDisplayData) -> Option<Element<'static, Mes
 /// guitar-string picker when the instrument toggle is set to Guitar (debug).
 /// Both surfaces publish the same `KeySelected(key_index)`; only the picker
 /// differs.
-fn create_keyboard_panel(data: &AppDisplayData) -> Option<Element<'static, Message>> {
+fn create_keyboard_panel(
+    data: &AppDisplayData,
+    curve_bundle: Option<&CurveBundle>,
+) -> Option<Element<'static, Message>> {
     if !data.key_select_visible {
         return None;
     }
@@ -619,10 +673,17 @@ fn create_keyboard_panel(data: &AppDisplayData) -> Option<Element<'static, Messa
         TuningMode::Auto => detected_key_index,
     };
 
+    // Suspect marks come from the engine on display, so the ✗ on a key and the
+    // ✗ on the plot are always the same verdict.
+    let suspect = curve_bundle.map_or([false; 88], |b| {
+        advisory::suspect_keys(&b.curve(data.selected_engine).flags)
+    });
+
     let (title, select_content): (&str, Element<'static, Message>) = match data.instrument {
         Instrument::Piano => (
             "Keyboard Key Select",
-            piano_keyboard::PianoKeyboard::new(detected_key_index, selected_key_index).view(),
+            piano_keyboard::PianoKeyboard::new(detected_key_index, selected_key_index, suspect)
+                .view(),
         ),
         Instrument::Guitar => (
             "Guitar String Select",
@@ -745,14 +806,6 @@ fn create_sidebar(
         .on_press(Message::ToggleSettingsView);
 
     sections = sections.push(settings_button);
-
-    // Reference-mode toggle: app-level, because every readout is measured
-    // against it — the strobe band, its cents readout, and the cent meter.
-    sections = sections.push(
-        button(text(reference_mode.label()).size(14).width(Fill))
-            .padding([8, 15])
-            .on_press(Message::SetReferenceMode(reference_mode.toggled())),
-    );
     sections = sections.push(Space::new().height(10));
 
     // Add all settings sections
@@ -763,6 +816,22 @@ fn create_sidebar(
             measurement_mode_active,
         ));
     }
+
+    // Reference: what every readout is measured against — the strobe band, its
+    // cents readout, and the cent meter alike. Its own section because the
+    // reference *pitch* and the temperament belong beside the mode when they
+    // are built (TODO.md), and because it is not a tool that can be shown or
+    // hidden like the entries above.
+    sections = sections.push(
+        column![
+            text("Reference").size(18),
+            Space::new().height(10),
+            button(text(reference_mode.label()).size(14).width(Fill))
+                .padding([6, 10])
+                .on_press(Message::SetReferenceMode(reference_mode.toggled())),
+        ]
+        .spacing(5),
+    );
 
     // Add capture button if in measurement mode
     if measurement_mode_active {

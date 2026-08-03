@@ -13,11 +13,9 @@ open.
 
 Most of this file has no ordering. These four steps do, agreed 2026-08-01:
 
-1. **Finish the in-flight user-facing work** — session durability (landed),
-   then the **per-key inspector + flagged-key styling** below, which is what
-   makes autosave's "the human is the gate" true in practice rather than only
-   in principle. Then the band-slope move, unison assist, and the
-   Neyman–Pearson gate measurement.
+1. **Finish the in-flight user-facing work** — session durability and the
+   per-key inspector + flagged-key styling have landed. Then the band-slope
+   move, unison assist, and the Neyman–Pearson gate measurement.
 2. **Upgrade to CPAL 0.18.1** (below). Before the refactors, so the module
    boundaries are drawn around the API we are keeping rather than redrawn after.
 3. **The structural work revised this session** — the `worker.rs` / `audio.rs` /
@@ -36,19 +34,13 @@ Most of this file has no ordering. These four steps do, agreed 2026-08-01:
   dependency on Linux. The field's answer is cloud sync or share-sheet export
   (§5.1 of the note below) — decide when the need is real.
   → [`docs/design/session-persistence-and-profile-library.md`](docs/design/session-persistence-and-profile-library.md)
-- **Repeat-disagreement detector** — `Gated on` real repeat captures from a
-  tuning session. Schema v1 already retains up to
-  `MAX_MEASUREMENTS_PER_KEY` measurements per key with per-entry provenance;
-  what is missing is the statistic — captures differing by more than
-  σ_lnB(n) = max(19.3·n⁻³, 0.0035) predicts flag a bad capture. Compare
-  **within** a provenance class. It is the second detector the inspector reads.
-  → [ADR 0009](docs/adr/0009-repeat-capture-noise-decomposition.md),
-  [`docs/design/session-persistence-and-profile-library.md`](docs/design/session-persistence-and-profile-library.md)
 - **Capture-dump retention, and a user-settable dump location** — `Planned`.
   Every capture writes raw audio to `data_local_dir()/diagnostics/` and nothing
   ever prunes it, so a working tuner's disk use grows without bound. Needs a
-  policy (age or total size) and somewhere to show it. Undo already deletes the
-  dump of the capture it reverts. Making the *location* settable needs no new
+  policy (age or total size) and somewhere to show it, and it is now the *only*
+  thing bounding disk: undo deletes the dump of the capture it reverts, but the
+  inspector's drop deliberately keeps it, since a distrusted measurement may
+  still have good audio behind it. Making the *location* settable needs no new
   crossing: the dump root is Worker state, and `WorkerJob` (crossing #6) was
   built so a new kind of request is a new variant — `WorkerJob::SetDumpDir`
   carries a `PathBuf` fine, since that channel is crossbeam rather than a
@@ -67,20 +59,6 @@ Most of this file has no ordering. These four steps do, agreed 2026-08-01:
   zero-beat against each other. The beat is already present as the amplitude
   envelope of a single strobe reference; it is not yet estimated or displayed.
   See `docs/design/strobe-and-manual-tuning-ui-design.md` §7.4.
-- **Flagged-key styling** — `Planned`. `CurveKeyFlags` is computed per key on
-  every recompute and never shown. Two of its five flags mean "this measurement
-  is suspect" (`excluded`, `negative_stretch`); the other three are
-  informational and must not be styled as errors. A red ✗ on the curve plot and
-  keyboard is the visible half of the per-key inspector — build them together.
-  See `docs/design/strobe-and-manual-tuning-ui-design.md` §5.6, §11.
-- **Per-key measurement inspector** — `Planned`, and now the main gap. Review,
-  drop, or re-measure one key. Autosave ships without an automatic acceptance
-  gate on the argument that the human is the gate (§4 of the note below) — the inspector
-  is where that human actually looks. It is where both bad-capture detectors are
-  read: the model-based `CurveKeyFlags` and the statistical repeat-disagreement
-  check above. Schema v1 already keeps the per-key measurement list and the
-  untrusted entries it needs to show.
-  → [`docs/design/session-persistence-and-profile-library.md`](docs/design/session-persistence-and-profile-library.md)
 - **Show-all partials strobe mode** — `Deferred`. The v1 strobe shows one
   Smart-Partials-selected band per key; a band-per-partial toggle is planned but
   unbuilt (`strobe_partials` already emits every partial). Two costs kept it out
@@ -108,8 +86,14 @@ Most of this file has no ordering. These four steps do, agreed 2026-08-01:
   "hear the curve" control needs an audio **output** stream, which is a
   sanctioned seventh crossing living in `tuner_core::audio`, never in the GUI.
   → [`docs/internals/01-architecture.md`](docs/internals/01-architecture.md)
-- **Diagnostics viewer / importer** — `Deferred`. A settings panel to read and
-  graph `analysis.json`, and to import one into the profile. Developer tooling.
+- **Capture importer** — `Deferred`, and an **example executable, not a GUI
+  panel** (developer tooling; decided 2026-08-02). Reads capture dumps and
+  merges measurements back into a profile — the recovery path for an inspector
+  drop, which deliberately keeps the audio. It must **re-run the analysis on
+  `audio.raw`**, never import the dump's cached `analysis.json`: that cache is
+  exactly what was wrong about piano #2's deep bass while its audio was fine
+  (`06-capture-sets.md`). `examples/regenerate_partials` already does the
+  re-analysis half.
 
 ## Engine and discovery
 
@@ -150,6 +134,20 @@ Most of this file has no ordering. These four steps do, agreed 2026-08-01:
   *not* reserved speculatively.
   → [`docs/design/session-persistence-and-profile-library.md`](docs/design/session-persistence-and-profile-library.md) §1.1
 
+- **Per-key measured σ_m instead of the σ_lnB(n) model** — `Investigating`, and
+  the most promising use of repeat captures. The curve's shrinkage weight
+  w = σ_p²/(σ_p² + σ_m²) takes σ_m from a *model* of partial count,
+  σ_lnB(n) = max(19.3·n⁻³, 0.0035). Measured against the repeats themselves, an
+  individual key's true σ departs from that model by up to 3.5× (bass), 7.9×
+  (mid) and 23× (treble), and every one of those errors goes straight into how
+  much the curve trusts that key. With k repeats σ_m is directly measurable.
+  **This, not averaging, is where more captures pay:** averaging k B-values
+  gains ~0.05 ¢ of target movement in the bass and cannot beat shrinkage in the
+  treble, whereas a mis-weighted key is a systematic error. Needs a shrinkage
+  estimator for small k (k = 2–3 gives a very noisy sample SD — pooled or
+  hierarchical, not the raw SD) and validation on both instruments.
+  → [ADR 0009](docs/adr/0009-repeat-capture-noise-decomposition.md),
+  [`docs/design/session-persistence-and-profile-library.md`](docs/design/session-persistence-and-profile-library.md) §5.3
 - **MAT serial-vs-simultaneous on a second instrument** — `Gated on` a second
   instrument. Confirming the serial order generalizes retires the simultaneous
   fallback and re-enables the paper's tighter §2.4 peak-detection band.
@@ -252,6 +250,12 @@ These are measured and understood, not defects awaiting a fix.
   → [ARCHITECTURE.md](ARCHITECTURE.md#the-dc-blockers-corner-sits-at-35-hz-above-a0)
 - **Stereo DC blocker (latent).** Unreachable through `open_input_stream`, which
   accepts mono `f32` configs only; live only for `AudioSource::External`.
+- **No automatic bad-capture detector.** Two candidates have been measured and
+  rejected: MAT's `b_confidence` (self-consistency, not accuracy — ADR 0006
+  item 4) and a σ_lnB repeat-disagreement threshold (fires on 29 of 88
+  well-behaved keys, and is weakly correlated with how much the disagreement
+  moves the target). The human is the gate, through the measurement inspector.
+  → [`docs/design/session-persistence-and-profile-library.md`](docs/design/session-persistence-and-profile-library.md) §5.3
 - **Coarse readout caveats.** Bounded and measured — the search loss correction,
   the register where the gate degenerates to a ratio test, and the motion tail.
   → [`docs/internals/suspected-issues.md`](docs/internals/suspected-issues.md),

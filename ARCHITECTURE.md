@@ -151,23 +151,23 @@ This is a single detached worker thread spawned at pipeline construction inside 
 
 This is the graphical interface thread operating at 60 FPS.
 
-- **Action:** Consumes the high-speed stream of `FrameOutput` structures from Thread 2 via the `triple_buffer` to drive the instantaneous tuning visualizers (spectrogram, cents-deviation, keyboard). Drains `WorkerOutput` results from the Worker via the `worker_rx` receiver: a `Measurement` is **appended** to its key's list in the `InharmonicityProfile`, which then auto-saves — appending rather than replacing is what stops an unattended Auto-mode capture displacing a trusted one, since `active()` reads the newest *trusted* entry (and, when measured-B discovery seeding is enabled, the recompiled template goes back to the live engine via the `profiles` producer — crossing #4); a `Curve` bundle is stashed in UI state to drive the curve display. On any trusted-set edit (capture merge, undo, profile load) it enqueues a `WorkerJob::Curve` for the Worker to recompute the curve off-thread (recompute-on-load; the curve is never persisted). Reads/writes configuration (e.g., silence threshold, target key) and polls runtime observations (e.g., smoothed RMS for the Envelope Viewer) via `Arc<PipelineAtomics>`.
+- **Action:** Consumes the high-speed stream of `FrameOutput` structures from Thread 2 via the `triple_buffer` to drive the instantaneous tuning visualizers (spectrogram, cents-deviation, keyboard). Drains `WorkerOutput` results from the Worker via the `worker_rx` receiver: a `Measurement` is **appended** to its key's list in the `InharmonicityProfile`, which then auto-saves — appending rather than replacing is what stops an unattended Auto-mode capture displacing a trusted one, since `active()` reads the newest _trusted_ entry (and, when measured-B discovery seeding is enabled, the recompiled template goes back to the live engine via the `profiles` producer — crossing #4); a `Curve` bundle is stashed in UI state to drive the curve display. On any trusted-set edit (capture merge, undo, profile load) it enqueues a `WorkerJob::Curve` for the Worker to recompute the curve off-thread (recompute-on-load; the curve is never persisted). Reads/writes configuration (e.g., silence threshold, target key) and polls runtime observations (e.g., smoothed RMS for the Envelope Viewer) via `Arc<PipelineAtomics>`.
 
 #### Cross-Thread Communication Topology
 
 Because `tuner-core` enforces strict zero-allocation, wait-free real-time audio constraints, it relies on a rigidly defined topology for inter-thread message passing:
 
-| Pathway               | Primitive                | Direction                     | Purpose                                                               |
-| --------------------- | ------------------------ | ----------------------------- | --------------------------------------------------------------------- |
-| **Hardware Capture**  | `ringbuf` SPSC           | Stream (1) → DSP (2)          | Lossless elastic buffer for incoming raw audio.                       |
-| **Structural Output** | `triple_buffer`          | DSP (2) → UI (4)              | Lossy continuous viz telemetry (`FrameOutput`).                       |
-| **DSP Parameters**    | `Arc<Atomic*>`           | UI (4) ↔ DSP (2)              | Wait-free configuration and metric reads/writes.                      |
-| **Capture Dispatch**  | crossbeam SPSC (bounded) | DSP (2) → Worker (3)          | `CapturePayload` containing pooled audio buffer + metadata.           |
-| **Buffer Recycling**  | Lock-Free Object Pool    | DSP (2) ↔ Worker (3)          | Recycled `Box<[f32; 66150]>` arrays — zero allocation during capture. |
-| **Capture Lifecycle** | `AtomicU8` (baton-pass)  | UI (4) → DSP (2) → Worker (3) | `CaptureState`: Idle → Armed → Recording → Processing → Idle.         |
-| **Worker Results**    | crossbeam SPSC (bounded) | Worker (3) → UI (4)           | `WorkerOutput`: `Measurement(KeyMeasurement)` per capture, `Curve(CurveBundle)` per recompute. |
-| **Worker Jobs**       | crossbeam SPSC (bounded) | UI (4) → Worker (3)           | `WorkerJob`: curve-recompute requests (`CurveInput` snapshot, latest-wins). |
-| **Template Update**   | `ringbuf` SPSC           | UI (4) → DSP (2)              | Recompiled `KeyProfile` (measured $B$) into the engine's templates.   |
+| Pathway               | Primitive                | Direction                     | Purpose                                                                                                                                         |
+| --------------------- | ------------------------ | ----------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Hardware Capture**  | `ringbuf` SPSC           | Stream (1) → DSP (2)          | Lossless elastic buffer for incoming raw audio.                                                                                                 |
+| **Structural Output** | `triple_buffer`          | DSP (2) → UI (4)              | Lossy continuous viz telemetry (`FrameOutput`).                                                                                                 |
+| **DSP Parameters**    | `Arc<Atomic*>`           | UI (4) ↔ DSP (2)              | Wait-free configuration and metric reads/writes.                                                                                                |
+| **Capture Dispatch**  | crossbeam SPSC (bounded) | DSP (2) → Worker (3)          | `CapturePayload` containing pooled audio buffer + metadata.                                                                                     |
+| **Buffer Recycling**  | Lock-Free Object Pool    | DSP (2) ↔ Worker (3)          | Recycled `Box<[f32; 66150]>` arrays — zero allocation during capture.                                                                           |
+| **Capture Lifecycle** | `AtomicU8` (baton-pass)  | UI (4) → DSP (2) → Worker (3) | `CaptureState`: Idle → Armed → Recording → Processing → Idle.                                                                                   |
+| **Worker Results**    | crossbeam SPSC (bounded) | Worker (3) → UI (4)           | `WorkerOutput`: `Measurement(KeyMeasurement)` per capture, `Curve(CurveBundle)` per recompute.                                                  |
+| **Worker Jobs**       | crossbeam SPSC (bounded) | UI (4) → Worker (3)           | `WorkerJob`: curve-recompute requests (`CurveInput` snapshot, latest-wins).                                                                     |
+| **Template Update**   | `ringbuf` SPSC           | UI (4) → DSP (2)              | Recompiled `KeyProfile` (measured $B$) into the engine's templates.                                                                             |
 | **Strobe References** | `ringbuf` SPSC           | UI (4) → DSP (2)              | `StrobeRefUpdate` (curve targets + coarse partial) into the `Strobe`. Second instance of the Template-Update crossing class, not a new channel. |
 
 The channel-by-channel contract is documented in
@@ -285,7 +285,7 @@ Attempting to change the sample rate dynamically would require migrating away fr
 ### The DC blocker's corner sits at 35 Hz, above A0
 
 The input conditioner is a one-pole high-pass with α = 0.995, whose −3 dB corner
-is `(1−α)·fs/2π` ≈ **35 Hz**. That is *above* A0's 27.5 Hz fundamental, which it
+is `(1−α)·fs/2π` ≈ **35 Hz**. That is _above_ A0's 27.5 Hz fundamental, which it
 attenuates by 4.2 dB (3.3 dB at C1, 1.5 at A1, 0.4 by A2). For a tuner that
 sets out to capture the whole bass register that looks wrong, so it was measured
 rather than argued, and the corner is kept.
@@ -301,7 +301,7 @@ rather than argued, and the corner is kept.
   error worsens 0.70 ¢ → 1.85 ¢.
 - **A steeper filter is the better lever, and still not worth it.** Order — not α
   — is the axis that escapes the trade: a 3rd-order Butterworth at 25 Hz recovers
-  2.4 dB at A0 while admitting slightly *less* rumble, for 9 µs per 23 ms callback
+  2.4 dB at A0 while admitting slightly _less_ rumble, for 9 µs per 23 ms callback
   (0.04 % of one core), which is affordable. It was rejected on outcome: MAT's
   measured `B` moves by a median of **0.00 %** across 87 keys, and the coarse read
   by +0.3 points of availability. MAT tracks 30+ partials and the deep-bass

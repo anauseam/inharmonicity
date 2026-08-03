@@ -83,9 +83,10 @@ run async to the hot path. They may heap-allocate freely.
 | Concern | File(s) |
 | --- | --- |
 | Application entry, state hub, message handling | `app.rs`, `main.rs` |
-| View composition | `views/{main_view,settings_view,curve_select,library_view,rms_calibration,transient_calibration,ninos2_calibration}.rs` |
+| View composition | `views/{main_view,settings_view,curve_select,library_view,inspector_view,rms_calibration,transient_calibration,ninos2_calibration}.rs` |
 | Stateless widgets | `widgets/{cent_meter,curve_plot,envelope,partials_display,piano_keyboard,seismograph,spectrogram}.rs` |
 | Calibration logic | `calibration.rs` |
+| What a curve's per-key flags mean to the user | `advisory.rs` |
 | Profile library: per-user dirs, app settings, listing | `library.rs` |
 | Open instrument, its file, and the write policy | `session.rs` |
 | Shared view helpers | `utils/view_utils.rs` |
