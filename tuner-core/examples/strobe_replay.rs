@@ -12,7 +12,7 @@
 //! per-hop `angle` (cycles, mod 1) is unwrapped in the harness and
 //! least-squares-fit to recover the rotation rate and its residual.
 //!
-//! ## Two experiments (they answer different questions)
+//! ## The experiments (they answer different questions)
 //!
 //! **E1 — detuning coherence (ET fundamental).** Reference = the pure ET
 //! harmonic series `n·f_ET` (B = 0); we read the **fundamental** band (n = 1),
@@ -30,6 +30,17 @@
 //! register table) and, for bass keys, A/B the 4096-sample window (auto) vs a
 //! forced 1024 window to quantify the R3 payoff on real bass audio.
 //!
+//! **E3 — per-hop delta noise.** The quantity `BAND_READABLE_HZ`'s margin below
+//! the alias boundary is made of (ADR 0011 §10).
+//!
+//! **E4 — fit-window length.** Slope jitter against window length, measured, vs
+//! the exact `T/2` motion lag (ADR 0011 §11).
+//!
+//! **E5 — shipped rate vs an independent fit.** `StrobeResult::beat_hz` is the
+//! bank's own least-squares slope; E5 refits the same retained points here and
+//! reports the disagreement, so the DSP-side estimator is checked against real
+//! audio rather than only against synthetic hops.
+//!
 //! Run: `cargo run --release --example strobe_replay -- [diagnostics_dir]`
 
 use std::path::{Path, PathBuf};
@@ -38,16 +49,18 @@ use tuner_core::algorithms::curves::default_display_partials;
 use tuner_core::algorithms::spectral::{goertzel, goertzel_bass};
 use tuner_core::audio::{BASS_WINDOW_SIZE, HOP_RATE_HZ, HOP_SIZE, SAMPLE_RATE};
 use tuner_core::models::NOTES;
-use tuner_core::strobe::{MAX_STROBE_REFS, Strobe, StrobeRefUpdate};
+use tuner_core::strobe::{
+    BAND_SLOPE_MIN_POINTS, BAND_SLOPE_POINTS, BAND_SLOPE_WINDOW_SECS, MAX_STROBE_REFS, Strobe,
+    StrobeRefUpdate,
+};
 
 /// Phase-unwrap / rotation Nyquist: the largest offset (Hz) whose per-hop
 /// phase advance stays inside ±0.5 cycle, hence readable as rotation.
 const ALIAS_HZ: f32 = 0.5 * HOP_RATE_HZ;
 
-/// Hops the GUI least-squares-fits the band slope over — `BAND_SLOPE_WINDOW_SECS`
-/// (0.6 s, `app.rs`) at the hop cadence. E3 detrends over the same span, so its
-/// noise figure is the one that window actually sees.
-const BAND_WIN_HOPS: usize = (0.6 * HOP_RATE_HZ) as usize;
+/// Hops the bank least-squares-fits the band slope over. E3 detrends over the
+/// same span, so its noise figure is the one that window actually sees.
+const BAND_WIN_HOPS: usize = (BAND_SLOPE_WINDOW_SECS * HOP_RATE_HZ) as usize;
 
 /// Fit-window lengths E4 sweeps, in seconds. 0.186 s is the 8192-sample analysis
 /// window — the coarse read's own group delay, and so the length at which the two
@@ -208,15 +221,48 @@ fn slope_diffs(unwrapped: &[f32], usable: &[bool], n: usize) -> Vec<f32> {
     rates.windows(2).map(|w| w[1] - w[0]).collect()
 }
 
+/// **Shipped rate vs an independent fit (E5).** For every hop the bank published
+/// a rate on, refits the points it held — the current unbroken ungated run,
+/// capped at the window — and returns the absolute disagreements in Hz.
+///
+/// The bank restarts its fit on the first live hop after a gate, so the run's
+/// first point carries no delta; that only shifts the series by a constant,
+/// which an OLS slope ignores.
+fn rate_disagreement(
+    unwrapped: &[f32],
+    ungated: &[bool],
+    shipped: &[Option<f32>],
+    win_hops: usize,
+    min_hops: usize,
+) -> Vec<f32> {
+    let mut out = Vec::new();
+    let mut run_start = 0usize;
+    for i in 0..unwrapped.len() {
+        if !ungated[i] {
+            run_start = i + 1;
+            continue;
+        }
+        let Some(rate) = shipped[i] else { continue };
+        let held = (i - run_start + 1).min(win_hops);
+        if held < min_hops {
+            continue;
+        }
+        let mine = fit(&unwrapped[i + 1 - held..=i]).0 * HOP_RATE_HZ;
+        out.push((rate - mine).abs());
+    }
+    out
+}
+
 /// Drives the shipped [`Strobe`] over the capture with a given reference
-/// set; returns the per-hop unwrapped angle (cycles) and the per-hop **ungated**
-/// mask for the band at `read_idx` (0-based partial index), aligned index-wise.
+/// set; returns the per-hop unwrapped angle (cycles), the per-hop **ungated**
+/// mask, and the per-hop published beat rate (Hz) for the band at `read_idx`
+/// (0-based partial index), aligned index-wise.
 fn run_strobe(
     cap: &Capture,
     refs: &[f32; MAX_STROBE_REFS],
     count: usize,
     read_idx: usize,
-) -> (Vec<f32>, Vec<bool>) {
+) -> (Vec<f32>, Vec<bool>, Vec<Option<f32>>) {
     let mut strobe = Strobe::new(SAMPLE_RATE);
     strobe.retarget(StrobeRefUpdate {
         count,
@@ -229,6 +275,7 @@ fn run_strobe(
     let hops = (cap.audio.len() - BASS_WINDOW_SIZE) / HOP_SIZE;
     let mut unwrapped = Vec::with_capacity(hops);
     let mut ungated = Vec::with_capacity(hops);
+    let mut shipped = Vec::with_capacity(hops);
     let (mut prev, mut acc) = (0.0f32, 0.0f32);
     let mut frame_buf = tuner_core::pipeline::ProcessingFrame::new();
     for h in 0..hops {
@@ -245,9 +292,10 @@ fn run_strobe(
         acc += d;
         unwrapped.push(acc);
         ungated.push(!fr.gated[read_idx]);
+        shipped.push(fr.beat_hz[read_idx]);
         prev = fr.angle[read_idx];
     }
-    (unwrapped, ungated)
+    (unwrapped, ungated, shipped)
 }
 
 /// Direct phase-accumulation on a single reference with a chosen window,
@@ -308,6 +356,8 @@ fn main() {
     let mut e3: Vec<(u8, f32, f32, f32)> = Vec::new();
     // E4: key, displayed reference Hz, σ_d, observed slope jitter per window.
     let mut e4: Vec<(u8, f32, f32, Vec<Vec<f32>>)> = Vec::new();
+    // E5: |shipped beat rate − an independent refit of the same points|, Hz.
+    let mut e5: Vec<f32> = Vec::new();
 
     println!(
         "{:>4} {:>4} {:>3} {:>8} {:>8} {:>8} {:>7} {:>6}",
@@ -336,7 +386,14 @@ fn main() {
         // The band the user watches, on the shipped ET reference set, so the
         // margin below the alias boundary can be derived instead of chosen.
         if n_star >= 1 && n_star <= count {
-            let (unwrapped, ungated) = run_strobe(&cap, &refs_et, count, n_star - 1);
+            let (unwrapped, ungated, shipped) = run_strobe(&cap, &refs_et, count, n_star - 1);
+            e5.extend(rate_disagreement(
+                &unwrapped,
+                &ungated,
+                &shipped,
+                BAND_SLOPE_POINTS,
+                BAND_SLOPE_MIN_POINTS,
+            ));
             if let Some((sd, p999, dmax)) = delta_noise(&unwrapped, &ungated, BAND_WIN_HOPS) {
                 e3.push((cap.key, sd, p999, dmax));
                 let jit = WINDOW_SECS
@@ -354,7 +411,7 @@ fn main() {
         if let Some(f_live1) = cap.partial_hz[1] {
             let offset = f_live1 - f_et;
             if offset.abs() < ALIAS_HZ {
-                let (unwrapped, ungated) = run_strobe(&cap, &refs_et, count, 0);
+                let (unwrapped, ungated, _) = run_strobe(&cap, &refs_et, count, 0);
                 let gated = 1.0
                     - ungated.iter().filter(|u| **u).count() as f32 / ungated.len().max(1) as f32;
                 if gated < 0.5 && unwrapped.len() > 8 {
@@ -539,6 +596,24 @@ fn main() {
              {:.2} at 0.4 s and {:.2} at 1.0 s.",
             (0.186f32 / 0.4).powf(1.5),
             (0.186f32 / 1.0).powf(1.5)
+        );
+    }
+
+    println!("\n=== E5: shipped beat rate vs an independent refit of the same points ===");
+    if e5.is_empty() {
+        println!("no published rates (every run shorter than the minimum span)");
+    } else {
+        let mut sorted = e5.clone();
+        sorted.sort_by(f32::total_cmp);
+        println!(
+            "published rates: {}  (window {} points, minimum {})\n\
+             |Δ| median {:.2e} Hz, p99 {:.2e} Hz, max {:.2e} Hz",
+            e5.len(),
+            BAND_SLOPE_POINTS,
+            BAND_SLOPE_MIN_POINTS,
+            median(e5.clone()),
+            sorted[((sorted.len() as f32 * 0.99) as usize).min(sorted.len() - 1)],
+            sorted.last().copied().unwrap_or(f32::NAN),
         );
     }
 

@@ -28,16 +28,22 @@ The six sanctioned crossings:
   packed struct. Visualizations and structural
   state ride together because they are sampled from the same DSP hop
   and the GUI parses the entire frame on each tick.
-- The strobe angles (`strobe_angle` / `strobe_gated`) are **accumulated
-  state, not increments**: the `Strobe` integrates beat phase on the
-  DSP thread precisely because this buffer is lossy — a dropped frame
-  skips a visual update instead of losing beat cycles (strobe design R2).
-- `coarse_hz` is the opposite kind of payload — **stateless per hop**, the
-  coarse readout's absolute frequency for the nominated reference partial
-  (`Option<f32>`; `None` = `Silence`, no reference, or nothing clearing the
-  local noise). A dropped frame costs one update and nothing else. It ships in
-  Hz, not cents, because the frontend owns the reference the number is displayed
-  against (ADR 0011).
+- **The buffer is lossy, which sorts the payload into two kinds.** Most
+  fields are per-hop snapshots — the magnitude spectrum, gate telemetry,
+  the pitch and coarse-readout fields — where a dropped frame costs one
+  update and nothing else. The rest are quantities a dropped frame would
+  *destroy*, so the DSP thread owns them across hops and ships the result:
+  the strobe's accumulated beat phase (an integrated count, not an
+  increment — strobe design R2) and its least-squares rate, fit over a
+  window indexed by hop rather than by the GUI's irregular tick. **Anything
+  cumulative, or fitted across hops, belongs on the DSP side of this
+  buffer** — the consumer selects and formats, it does not integrate.
+- **Frequencies ship as absolute Hz, never cents** (`coarse_hz`,
+  `strobe_beat_hz`): the reference a number is displayed against is the
+  frontend's policy, and the DSP does not hold it (ADR 0011).
+- Per-field semantics — what each `Option` means, which entries of an
+  array are valid — live in `FrameOutput`'s own doc comments, not here.
+  This section is the crossing's contract; the struct is its schema.
 - The GUI thread reads the freshest frame on each tick. Because the
   GUI typically runs at ~60 FPS while the DSP hop rate is lower
   (bounded by audio stream latency plus the per-hop DSP cost), the
@@ -87,28 +93,22 @@ The second instance: the UI pushes the tuned key's per-partial strobe
 reference frequencies to the DSP-side `Strobe` (strobe design §5.2,
 Path A), which computes both the beat phase and the coarse readout at step 5b.
 
-- **Payload:** `strobe::StrobeRefUpdate { count, refs: [f32; 12],
-  coarse_index, spacing_hz }` — the curve targets `f_n*` of the key being
-  tuned; `count: 0` clears the bank. Heap-free and `Copy`.
-  - `coarse_index` (1-based `n`) nominates which reference the coarse read
-    centres on; `0`, or an index past `count`, disables it. Deliberately
-    independent of the strobe's *displayed* partial — the two readouts answer
-    different questions (ADR 0011 §7).
-  - `spacing_hz` is the key's partial spacing f₀\*, which scales the search
-    band's neighbour cap and the CFAR reference width. It is **not**
-    interchangeable with the centre frequency; they coincide only at n = 1.
-  - Both are the **frontend's policy**: the DSP searches where it is told.
-    `curves::coarse_read_partial` is the derived rule for the index.
+- **Payload:** `strobe::StrobeRefUpdate` — one key's per-partial reference
+  frequencies, plus which of them the coarse read centres on and the key's
+  partial spacing; `count: 0` clears the bank. Heap-free and `Copy`. Field
+  semantics are on the struct. One message carries both readouts' targets
+  because they are one component, so they cannot disagree about which key
+  they are looking at.
+- **Policy direction:** every value in the payload is the **frontend's**
+  choice. The DSP searches where it is told and never nominates a target
+  of its own.
 - **Producer:** `pipeline::StrobeSender`, a single-owner `ringbuf` producer
   held in `HostHandle`. Pushed only on key change / re-lock / engine switch
   (user-rate); a full ring returns `false` and the GUI retries next tick.
   Capacity `STROBE_REF_QUEUE_CAPACITY = 2`.
 - **Consumer:** `AudioPipeline` drains to the *newest* update at the top of
   `process_cola_hop` (a superseded reference set is worthless) and hands it to
-  `Strobe::retarget`, which resets the bank's accumulated angles. The `Strobe`
-  component retains the reference set internally — the beat phase and the
-  coarse search are one component (step 5b), so they read one and the same
-  references by construction.
+  `Strobe::retarget`, which resets the bank's accumulated angles and rate fits.
 
 ### Heap-allocation invariant
 
@@ -126,7 +126,7 @@ without a data race.
 
 Only required if the heap-allocation invariant above is ever violated
 (for example, a hot filter-coefficient swap). The pattern is to push
-the _old_ object out through a dedicated SPSC ring buffer (DSP → UI)
+the *old* object out through a dedicated SPSC ring buffer (DSP → UI)
 so the UI thread drops it on its next tick. Treat this scenario as a
 design smell — reconsider the design before implementing it.
 
@@ -158,7 +158,7 @@ design smell — reconsider the design before implementing it.
   via the shared `AtomicU8`. Curve jobs touch neither the pool nor the
   baton.
 
-The curve _result_ rides this crossing's `WorkerOutput` rather than a
+The curve *result* rides this crossing's `WorkerOutput` rather than a
 channel of its own because the reuse test (see crossing #6) is not met —
 same producer (Worker), same consumer (UI), no priority split.
 
@@ -186,7 +186,7 @@ real-time payload, or **(b)** it needs priority or ordering separation
 from existing traffic. The job channel meets **both**: its producer is
 the UI thread (not the DSP thread that feeds captures over #5), and
 captures must be serviced ahead of curve jobs. That is why it is its own
-crossing. (The curve _result_, by contrast, meets neither test and so
+crossing. (The curve *result*, by contrast, meets neither test and so
 merges into #5's `WorkerOutput`.)
 
 ### Worker loop: captures first, latest-wins jobs

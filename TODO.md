@@ -13,9 +13,9 @@ open.
 
 Most of this file has no ordering. These four steps do, agreed 2026-08-01:
 
-1. **Finish the in-flight user-facing work** — session durability and the
-   per-key inspector + flagged-key styling have landed. Then the band-slope
-   move, unison assist, and the Neyman–Pearson gate measurement.
+1. **Finish the in-flight user-facing work** — session durability, the per-key
+   inspector + flagged-key styling, and the band-slope move have landed. Then
+   unison assist and the Neyman–Pearson gate measurement.
 2. **Upgrade to CPAL 0.18.1** (below). Before the refactors, so the module
    boundaries are drawn around the API we are keeping rather than redrawn after.
 3. **The structural work revised this session** — the `worker.rs` / `audio.rs` /
@@ -176,12 +176,6 @@ Most of this file has no ordering. These four steps do, agreed 2026-08-01:
 - **`CaptureState` `compare_exchange`** — `Planned`. The three-thread baton-pass
   is convention-only today; `compare_exchange` would enforce it at the atomic
   level. → [`docs/internals/02-cross-thread-communication.md`](docs/internals/02-cross-thread-communication.md)
-- **Band-slope estimator belongs in `tuner-core`** — `Planned`. The strobe's
-  primary readout is least-squares-fitted in `app.rs`, which holds cross-hop
-  state and estimates a signal — both of which the architecture rules put in
-  `tuner-core`. Moving it to `strobe.rs` also removes a dropped-frame guard that
-  only exists because the GUI reads a lossy buffer.
-  → [`docs/internals/01-architecture.md`](docs/internals/01-architecture.md)
 - **Module-boundary pass across `worker.rs`, `audio.rs` and `models.rs`** —
   `Deferred`, and one item rather than three because they would otherwise
   reshuffle each other. Each file now mixes categories that want separating, and

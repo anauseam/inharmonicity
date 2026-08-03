@@ -71,7 +71,7 @@ run async to the hot path. They may heap-allocate freely.
 | Pipeline mediator, shared atomics, AudioPool | `pipeline.rs` |
 | Signal validator (5-state) | `gatekeeper.rs` |
 | F0 detection (TWM + Goertzel) | `engine.rs` |
-| Strobe bank (fixed-reference beat phase) | `strobe.rs` |
+| Strobe bank (fixed-reference beat phase + its rate) | `strobe.rs` |
 | Async background worker, `CurveBundle` | `worker.rs` |
 | Stateless DSP math | `algorithms/{spectral,peaks,twm,discovery,mat,metrics,curves,rigaud,giordano,whittaker}.rs` |
 | Offline curve auralization (resynthesis) | `synth.rs` |

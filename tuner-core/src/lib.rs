@@ -94,6 +94,15 @@ pub struct FrameOutput {
     /// Per-reference D3 amplitude gate (`true` = below floor, angle held).
     /// Parallel to `strobe_angle`.
     pub strobe_gated: [bool; 12],
+    /// Per-reference beat rate `f_live − f_ref` (Hz) — the band's rotation
+    /// *rate*, least-squares-fit DSP-side over
+    /// [`strobe::BAND_SLOPE_WINDOW_SECS`]. Parallel to `strobe_angle`, and the
+    /// fine half of the readout pair: phase-integrated, so it is far steadier
+    /// than a per-hop frequency estimate, but it aliases past ±21.5 Hz where
+    /// `coarse_hz` takes over. `None` while the fit is filling or has been
+    /// restarted by a re-strike. Like `coarse_hz` it ships in Hz — the
+    /// reference it is measured against is `StrobeRefUpdate::refs[i]`.
+    pub strobe_beat_hz: [Option<f32>; 12],
     /// Number of valid strobe references (0 = no key being strobed).
     pub strobe_count: usize,
     /// Coarse readout: the measured frequency (Hz) of the strobed key's coarse
@@ -126,6 +135,7 @@ impl Default for FrameOutput {
             tracked_count: 0,
             strobe_angle: [0.0; 12],
             strobe_gated: [true; 12],
+            strobe_beat_hz: [None; 12],
             strobe_count: 0,
             coarse_hz: None,
         }

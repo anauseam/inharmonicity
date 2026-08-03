@@ -15,6 +15,11 @@
 //! lossy `FrameOutput` triple buffer cannot corrupt it — a dropped frame
 //! skips one visual update instead of losing beat cycles.
 //!
+//! The bank ships that rotation twice: the accumulated angle, and its **rate** —
+//! a least-squares fit of the unwrapped angle against hop index over
+//! [`BAND_SLOPE_WINDOW_SECS`], in Hz. Rotation is exactly `f_live − f_ref`
+//! (design §3), so that slope is the detuning.
+//!
 //! Deep-bass references evaluate a 4096-sample window (R3): partial spacing
 //! ≈ f₀ falls inside the 1024-sample Hann main lobe below ≈ 86 Hz, and no
 //! choice of displayed partial changes the spacing. Window length ≠ hop —
@@ -27,12 +32,51 @@
 //! would be room noise (see [`Strobe::process`]).
 
 use crate::algorithms::{peaks, spectral};
-use crate::audio::{BASS_WINDOW_SIZE, HOP_SIZE, WINDOW_SIZE};
+use crate::audio::{BASS_WINDOW_SIZE, HOP_RATE_HZ, HOP_SIZE, WINDOW_SIZE};
 use crate::pipeline::ProcessingFrame;
 
 /// Capacity of the reference bank — mirrors the tracker's partial ceiling
 /// and `FrameOutput`'s strobe arrays.
 pub const MAX_STROBE_REFS: usize = 12;
+
+/// Sliding window the band-slope fit spans (strobe design §5.5 / R12).
+///
+/// The trade is **linear cost against an inelastic benefit** (ADR 0011 §11): the
+/// fit lags a turning peg by exactly `T/2` — an OLS slope estimates the rate at
+/// the window's *midpoint* — while the jitter it buys falls far slower than the
+/// `T⁻³` law, because the bank's analysis windows overlap 75–87 % and extra hops
+/// are mostly the same audio. Measured, tripling `T` buys 1.8× on piano and
+/// nothing measurable on guitar.
+///
+/// 0.6 s is the responsive-enough end of that trade in use, and 1 ¢ of steadiness
+/// is inside the range a professional tuner works in. To trade the 300 ms of lag
+/// back, shorten this; two lengths are derived rather than arbitrary, and each
+/// *removes* a constant by absorbing [`BAND_SLOPE_MIN_SPAN_SECS`] (which can never
+/// exceed it): `BASS_WINDOW_SIZE / SAMPLE_RATE` ≈ 0.186 s matches the coarse
+/// read's own group delay, so the two readouts lag equally and the source switch
+/// stops stepping the number; 0.25 s simply collapses the two constants. Escaping
+/// the trade rather than moving along it needs a two-state (g–h / Kalman)
+/// estimator on (phase, rate), which weights old data instead of discarding it.
+pub const BAND_SLOPE_WINDOW_SECS: f32 = 0.6;
+
+/// Points the fit retains — one per hop across [`BAND_SLOPE_WINDOW_SECS`], plus
+/// the current hop.
+pub const BAND_SLOPE_POINTS: usize = (BAND_SLOPE_WINDOW_SECS * HOP_RATE_HZ) as usize + 1;
+
+/// Minimum span before a rate is published; the coarse read covers the fill-in.
+///
+/// Floored by the analysis window itself: the bank integrates over
+/// `BASS_WINDOW_SIZE` samples ≈ 0.186 s, so a fit spanning less than that is
+/// drawing a line through repeats of *one* window's audio and has no independent
+/// information about the rate. This value clears that floor by 1.34×
+/// (`test_band_slope_span_clears_the_analysis_window` pins it).
+pub const BAND_SLOPE_MIN_SPAN_SECS: f32 = 0.25;
+
+/// Points needed to span [`BAND_SLOPE_MIN_SPAN_SECS`]: `n` points bridge `n − 1`
+/// hop intervals, and the truncating cast has to round *up* to reach the span —
+/// hence `+ 2`, which `test_band_slope_point_counts_bracket_their_durations`
+/// pins in both directions.
+pub const BAND_SLOPE_MIN_POINTS: usize = (BAND_SLOPE_MIN_SPAN_SECS * HOP_RATE_HZ) as usize + 2;
 
 /// One key's strobe reference set, in transit UI → DSP (crossing #4 charter:
 /// grouped parameters that must apply atomically on a frame boundary).
@@ -70,6 +114,14 @@ pub struct StrobeResult {
     /// D3 amplitude gate: `true` = this reference was below the noise floor
     /// this hop (its angle was held, not advanced).
     pub gated: [bool; MAX_STROBE_REFS],
+    /// Beat rate per reference, `f_live − f_ref` in Hz — the slope of the
+    /// accumulated angle over [`BAND_SLOPE_WINDOW_SECS`]. `None` until the fit
+    /// spans [`BAND_SLOPE_MIN_SPAN_SECS`]; held at its last value while the
+    /// reference is gated, and dropped again when a re-strike restarts the fit.
+    ///
+    /// Hz, not cents: the reference is `refs[i]` and the frontend owns what it
+    /// displays the offset against (crossing #2's rule for `coarse_hz`).
+    pub beat_hz: [Option<f32>; MAX_STROBE_REFS],
     /// CFAR-gated coarse spectral readout (Hz), or `None`.
     pub coarse_hz: Option<f32>,
 }
@@ -80,8 +132,104 @@ impl Default for StrobeResult {
             count: 0,
             angle: [0.0; MAX_STROBE_REFS],
             gated: [true; MAX_STROBE_REFS],
+            beat_hz: [None; MAX_STROBE_REFS],
             coarse_hz: None,
         }
+    }
+}
+
+/// Sliding-window OLS fit of one reference's unwrapped beat phase (cycles),
+/// indexed by hop. The hop cadence is regular, so the abscissae are a fixed
+/// integer sequence: the normal equations reduce to running sums, and the
+/// window's span follows from its point count.
+struct BandSlope {
+    /// Retained unwrapped phase, oldest at `head`.
+    y: [f32; BAND_SLOPE_POINTS],
+    head: usize,
+    len: usize,
+    /// `Σ y_j` and `Σ j·y_j` over the retained points, `j = 0` at the oldest.
+    sum_y: f64,
+    sum_jy: f64,
+    /// Running unwrapped phase (cycles). Rebased at every restart so it cannot
+    /// grow past f32's useful precision during a long sustain.
+    unwrapped: f32,
+    /// Last published slope, cycles per hop.
+    rate: Option<f32>,
+    /// A gated hop breaks the run; the next live hop restarts the fit.
+    restart: bool,
+}
+
+impl BandSlope {
+    const fn new() -> Self {
+        Self {
+            y: [0.0; BAND_SLOPE_POINTS],
+            head: 0,
+            len: 0,
+            sum_y: 0.0,
+            sum_jy: 0.0,
+            unwrapped: 0.0,
+            rate: None,
+            restart: true,
+        }
+    }
+
+    /// Drops the fit and its published rate, and breaks the run so the next
+    /// live hop starts a fresh baseline. Points past `len` are never read, so
+    /// the ring itself needs no clearing.
+    fn reset(&mut self) {
+        self.head = 0;
+        self.len = 0;
+        self.sum_y = 0.0;
+        self.sum_jy = 0.0;
+        self.unwrapped = 0.0;
+        self.rate = None;
+        self.restart = true;
+    }
+
+    /// Gated hop: hold the last rate — a frozen band's angle does not advance,
+    /// so integrating the gap would read the detuning toward zero — and break
+    /// the run so a re-strike resumes without a phantom jump across it.
+    fn hold(&mut self) {
+        self.restart = true;
+    }
+
+    /// Live hop: `cycles` is the wrapped beat-phase advance since the last hop.
+    fn push(&mut self, cycles: f32) {
+        if self.restart {
+            self.reset();
+            self.restart = false;
+        } else {
+            self.unwrapped += cycles;
+        }
+
+        if self.len == BAND_SLOPE_POINTS {
+            // Evicting the oldest point shifts every survivor one place down,
+            // so `Σ j·y` loses the whole of `Σ y` less the evicted term.
+            let old = self.y[self.head] as f64;
+            self.sum_jy -= self.sum_y - old;
+            self.sum_y -= old;
+            self.head = (self.head + 1) % BAND_SLOPE_POINTS;
+            self.len -= 1;
+        }
+        let j = self.len as f64;
+        self.y[(self.head + self.len) % BAND_SLOPE_POINTS] = self.unwrapped;
+        self.sum_y += self.unwrapped as f64;
+        self.sum_jy += j * self.unwrapped as f64;
+        self.len += 1;
+
+        if self.len >= BAND_SLOPE_MIN_POINTS {
+            self.rate = Some(self.slope());
+        }
+    }
+
+    /// OLS slope in cycles per hop. The abscissae are `0..n`, so
+    /// `n·Σj² − (Σj)²` reduces to `n²(n²−1)/12` — nonzero for every `n ≥ 2`,
+    /// which [`BAND_SLOPE_MIN_POINTS`] guarantees.
+    fn slope(&self) -> f32 {
+        debug_assert!(self.len >= 2, "a slope needs two points");
+        let n = self.len as f64;
+        let sum_j = n * (n - 1.0) / 2.0;
+        ((n * self.sum_jy - sum_j * self.sum_y) / (n * n * (n * n - 1.0) / 12.0)) as f32
     }
 }
 
@@ -95,6 +243,8 @@ pub struct Strobe {
     long_window: bool,
     prev_phase: [f32; MAX_STROBE_REFS],
     angle: [f32; MAX_STROBE_REFS],
+    /// Sliding-window rate fit per reference.
+    band: [BandSlope; MAX_STROBE_REFS],
     /// First hop after a retarget: seed `prev_phase` only, publish no drift.
     warmup: bool,
     /// Coarse-read parameters from the last retarget.
@@ -116,6 +266,7 @@ impl Strobe {
             long_window: false,
             prev_phase: [0.0; MAX_STROBE_REFS],
             angle: [0.0; MAX_STROBE_REFS],
+            band: [const { BandSlope::new() }; MAX_STROBE_REFS],
             warmup: true,
             coarse_index: 0,
             spacing_hz: 0.0,
@@ -149,6 +300,9 @@ impl Strobe {
             self.count > 0 && update.refs[0] * 1024.0 < 2.0 * self.sample_rate as f32;
         self.prev_phase = [0.0; MAX_STROBE_REFS];
         self.angle = [0.0; MAX_STROBE_REFS];
+        for band in &mut self.band {
+            band.reset();
+        }
         self.warmup = true;
     }
 
@@ -194,6 +348,7 @@ impl Strobe {
             if self.warmup {
                 self.prev_phase[i] = phase;
                 out.angle[i] = self.angle[i];
+                self.band[i].hold();
                 continue;
             }
 
@@ -208,12 +363,18 @@ impl Strobe {
             self.prev_phase[i] = phase;
 
             let gated = is_silence || amplitude < t_amp || !delta.is_finite();
-            if !gated {
-                self.angle[i] =
-                    (self.angle[i] + delta / (2.0 * core::f32::consts::PI)).rem_euclid(1.0);
+            if gated {
+                self.band[i].hold();
+            } else {
+                let cycles = delta / (2.0 * core::f32::consts::PI);
+                self.angle[i] = (self.angle[i] + cycles).rem_euclid(1.0);
+                self.band[i].push(cycles);
             }
             out.gated[i] = gated;
             out.angle[i] = self.angle[i];
+            out.beat_hz[i] = self.band[i]
+                .rate
+                .map(|cycles_per_hop| cycles_per_hop / t_hop);
         }
         self.warmup = false;
 
@@ -374,9 +535,84 @@ mod tests {
         assert!(bank.coarse_target().is_none());
     }
 
-    /// Streams a sine `delta_hz` off the reference through the bank and
-    /// returns (final angle, any hop gated after warmup).
-    fn run_bank(f_ref: f32, delta_hz: f32, hops: usize) -> (f32, bool) {
+    /// The fit's minimum span must clear one analysis window, or it is drawing a
+    /// line through repeats of the same audio (ADR 0011 §11).
+    #[test]
+    fn test_band_slope_span_clears_the_analysis_window() {
+        let analysis_secs = BASS_WINDOW_SIZE as f32 / 44_100.0;
+        assert!(
+            BAND_SLOPE_MIN_SPAN_SECS >= analysis_secs,
+            "min span {BAND_SLOPE_MIN_SPAN_SECS} s is under one analysis window ({analysis_secs} s)"
+        );
+    }
+
+    /// Both point counts are truncating casts of a duration, so pin them from
+    /// both sides: the retained window must cover its seconds, and the minimum
+    /// must be the *first* count that spans its own.
+    #[test]
+    fn test_band_slope_point_counts_bracket_their_durations() {
+        let span = |points: usize| (points - 1) as f32 / HOP_RATE_HZ;
+        assert!(span(BAND_SLOPE_POINTS) <= BAND_SLOPE_WINDOW_SECS);
+        assert!(span(BAND_SLOPE_POINTS + 1) > BAND_SLOPE_WINDOW_SECS);
+        assert!(span(BAND_SLOPE_MIN_POINTS) >= BAND_SLOPE_MIN_SPAN_SECS);
+        assert!(span(BAND_SLOPE_MIN_POINTS - 1) < BAND_SLOPE_MIN_SPAN_SECS);
+    }
+
+    /// The running sums must reproduce a textbook OLS over the retained points,
+    /// evictions included — the fit's whole correctness argument.
+    #[test]
+    fn test_band_slope_matches_a_direct_fit() {
+        let mut band = BandSlope::new();
+        let mut pushed: Vec<f64> = Vec::new();
+        let mut y = 0.0f32;
+        for h in 0..BAND_SLOPE_POINTS * 3 {
+            // Curved, so a mis-weighted eviction cannot cancel out.
+            let cycles = 0.02 + 0.004 * (h as f32 * 0.3).sin();
+            if h > 0 {
+                y += cycles;
+            }
+            band.push(cycles);
+            pushed.push(y as f64);
+
+            let w = &pushed[pushed.len().saturating_sub(BAND_SLOPE_POINTS)..];
+            assert_eq!(band.len, w.len(), "retained count at hop {h}");
+            if w.len() < BAND_SLOPE_MIN_POINTS {
+                assert!(band.rate.is_none(), "no rate before the minimum span");
+                continue;
+            }
+            let n = w.len() as f64;
+            let (sum_j, sum_y) = (n * (n - 1.0) / 2.0, w.iter().sum::<f64>());
+            let sum_jy: f64 = w.iter().enumerate().map(|(j, v)| j as f64 * v).sum();
+            let sum_jj: f64 = (0..w.len()).map(|j| (j * j) as f64).sum();
+            let direct = (n * sum_jy - sum_j * sum_y) / (n * sum_jj - sum_j * sum_j);
+            let got = band.rate.expect("rate past the minimum span") as f64;
+            assert!(
+                (got - direct).abs() < 1e-6,
+                "hop {h}: incremental {got} vs direct {direct}"
+            );
+        }
+    }
+
+    /// A gated run holds the last rate and then drops it: the first live hop
+    /// after the gap restarts the fit, so a re-strike shows nothing until the
+    /// window refills rather than a stale rate.
+    #[test]
+    fn test_band_slope_holds_then_restarts_across_a_gate() {
+        let mut band = BandSlope::new();
+        for _ in 0..BAND_SLOPE_MIN_POINTS + 1 {
+            band.push(0.02);
+        }
+        let held = band.rate.expect("filled");
+        band.hold();
+        assert_eq!(band.rate, Some(held), "a gated hop holds the last rate");
+        band.push(0.02);
+        assert!(band.rate.is_none(), "the re-strike restarts the fit");
+        assert_eq!(band.len, 1);
+    }
+
+    /// Streams a sine `delta_hz` off the reference through the bank and returns
+    /// (final angle, final beat rate, any hop gated after warmup).
+    fn run_bank(f_ref: f32, delta_hz: f32, hops: usize) -> (f32, Option<f32>, bool) {
         let fs = 44_100u32;
         let f_sig = f_ref + delta_hz;
         let total = BASS_WINDOW_SIZE + hops * HOP_SIZE;
@@ -395,6 +631,7 @@ mod tests {
         });
 
         let mut angle = 0.0;
+        let mut beat_hz = None;
         let mut any_gated = false;
         let mut frame_buf = ProcessingFrame::new();
         for h in 0..hops {
@@ -402,11 +639,12 @@ mod tests {
             frame_buf.audio_buffer[..BASS_WINDOW_SIZE].copy_from_slice(window);
             let frame = bank.process(&frame_buf, 0.005, false);
             angle = frame.angle[0];
+            beat_hz = frame.beat_hz[0];
             if h > 0 && frame.gated[0] {
                 any_gated = true;
             }
         }
-        (angle, any_gated)
+        (angle, beat_hz, any_gated)
     }
 
     /// A 440 Hz reference hearing 441 Hz must accumulate ≈ Δf·t beat
@@ -415,7 +653,7 @@ mod tests {
     fn test_beat_phase_accumulates_at_delta_f() {
         let hops = 20; // 19 integrating hops ≈ 0.4412 s after warmup
         let t = (hops - 1) as f32 * HOP_SIZE as f32 / 44_100.0;
-        let (angle, any_gated) = run_bank(440.0, 1.0, hops);
+        let (angle, _, any_gated) = run_bank(440.0, 1.0, hops);
         assert!(!any_gated, "clean sine above floor must not gate");
         assert!(
             (angle - t).abs() < 0.03,
@@ -423,7 +661,7 @@ mod tests {
         );
 
         // Flat by 1 Hz ⇒ same magnitude, opposite direction (mod 1).
-        let (angle_flat, _) = run_bank(440.0, -1.0, hops);
+        let (angle_flat, _, _) = run_bank(440.0, -1.0, hops);
         assert!(
             (angle_flat - (1.0 - t)).abs() < 0.03,
             "expected ≈{:.3}, got {angle_flat:.3}",
@@ -431,12 +669,37 @@ mod tests {
         );
     }
 
-    /// In tune ⇒ stationary: zero offset accumulates ≈ nothing.
+    /// The published rate is the detuning itself, signed — the readout contract
+    /// (design §3: rotation = f_live − f_ref).
+    #[test]
+    fn test_beat_rate_recovers_the_detuning() {
+        for delta in [1.0f32, -1.0, 0.5] {
+            let rate = run_bank(440.0, delta, BAND_SLOPE_MIN_POINTS + 2)
+                .1
+                .expect("past the minimum span");
+            assert!(
+                (rate - delta).abs() < 0.05,
+                "expected ≈{delta} Hz, got {rate:.3}"
+            );
+        }
+        // Withheld until the fit spans its minimum: warmup costs one hop.
+        assert!(
+            run_bank(440.0, 1.0, BAND_SLOPE_MIN_POINTS).1.is_none(),
+            "a short run must publish no rate"
+        );
+    }
+
+    /// In tune ⇒ stationary: zero offset accumulates ≈ nothing and reads ≈ 0 Hz.
     #[test]
     fn test_in_tune_is_stationary() {
-        let (angle, _) = run_bank(440.0, 0.0, 30);
+        let (angle, rate, _) = run_bank(440.0, 0.0, 30);
         let drift = angle.min(1.0 - angle);
         assert!(drift < 0.02, "in-tune band must not rotate, got {angle:.4}");
+        let rate = rate.expect("past the minimum span");
+        assert!(
+            rate.abs() < 0.05,
+            "in-tune band must read ≈0 Hz, got {rate}"
+        );
     }
 
     /// D3: silence gates every reference and holds the angle (R2 — the

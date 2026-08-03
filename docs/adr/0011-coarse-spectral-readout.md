@@ -429,6 +429,17 @@ if the window moves, and it trips when the UI falls below ≈ 11 fps against a
 43 Hz hop. Two tests pin it, along with the analysis-window floor on the minimum
 span.
 
+**Amendment (2026-08-02): the frame-loss guard is deleted, and the two window
+constants now live in `strobe.rs`.** The fit moved to the DSP side, where every
+hop delivers exactly one point and the cadence is regular — so the guard's whole
+premise (a lossy triple buffer between the estimator and the hops) is gone, and
+the window is expressed directly in points: `BAND_SLOPE_POINTS` = the window plus
+the current hop, `BAND_SLOPE_MIN_POINTS` = the first count that spans the minimum,
+both derived from the seconds constants above and pinned in both directions by
+test. Everything else in §§10–11 is carried across unchanged, and `strobe_replay`
+reproduces both sections' tables on all three sets after the move. The debounce
+(§10) stays in the frontend: it is a display-source decision, not an estimator.
+
 ## Limitations / threats to validity
 
 - **Out-of-range flicker — CLOSED by measurement (2026-07-26).** Recorded here
