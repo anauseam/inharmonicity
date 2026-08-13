@@ -65,8 +65,9 @@ discipline. It is deferred; duplex (playback during capture) is out of scope.
 ## Pipeline ownership (Split / Handle pattern)
 
 `AudioPipeline` owns the real-time DSP components: `Gatekeeper`,
-`Engine`, the `Strobe`, the COLA `CircularFifo`, the `AudioPool`,
-and the inline capture-accumulation state. It is moved to the audio
+`Engine`, the `Strobe` (which in turn owns its per-reference band-slope
+fits and unison baseband records), the COLA `CircularFifo`, the
+`AudioPool`, and the inline capture-accumulation state. It is moved to the audio
 thread and is the only thing that mutates the pipeline's internal state.
 
 `PipelinePorts` is the GUI's window into the running pipeline. It carries
@@ -160,8 +161,8 @@ Every audio hop runs exactly one function:
 2. Runs the `Gatekeeper` for signal validation; receives a `GateResult`.
 3. Runs the `Engine` for F0 detection when the Gatekeeper approves the
    signal.
-4. Runs the `Strobe` for fixed-reference beat phase and coarse spectral
-   readout; receives a `StrobeResult`.
+4. Runs the `Strobe` for fixed-reference beat phase, its rate, the unison
+   lines, and the coarse spectral readout; receives a `StrobeResult`.
 5. Syncs observations back to the shared atomics and produces a
    `FrameOutput` for the GUI's `triple_buffer`.
 6. Manages capture accumulation: `Armed → Recording → dispatch to

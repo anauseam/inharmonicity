@@ -141,6 +141,34 @@ fn test_jacobsen_bias() {
     }
 }
 
+/// The tabulated `c_N` values `jacobsen` uses on the hot path must be what
+/// Candan Eq. 12 actually evaluates to, and the short lengths the unison ring
+/// transforms at must be nowhere near the 2.0 asymptote the table falls back to
+/// — 2.4 % of scale at 56 points, applied to every reported line offset.
+#[test]
+fn candan_c_n_reproduces_the_jacobsen_table() {
+    assert!((spectral::candan_c_n(2048) - 2.001_329).abs() < 1e-6);
+    assert!((spectral::candan_c_n(8192) - 2.000_332).abs() < 1e-6);
+
+    // The unison ring's own range (`strobe::unison`), against the fallback.
+    for &(n, want) in &[(25usize, 2.116_2f32), (56, 2.050_2), (64, 2.043_7)] {
+        let got = spectral::candan_c_n(n);
+        assert!(
+            (got - want).abs() < 1e-3,
+            "c_N({n}) = {got}, expected {want}"
+        );
+        assert!(
+            got - 2.0 > 0.02,
+            "c_N({n}) = {got} is within the asymptote's rounding — the table's \
+             2.0 fallback would be harmless and this test would not be needed"
+        );
+    }
+
+    // Monotone toward the asymptote: the correction is a finite-N effect.
+    assert!(spectral::candan_c_n(56) > spectral::candan_c_n(128));
+    assert!(spectral::candan_c_n(128) > spectral::candan_c_n(8192));
+}
+
 /// `find_supported_config` must only ever return a range that **contains** the
 /// target rate. The pipeline's buffer sizes and timing constants are
 /// dimensioned for `SAMPLE_RATE`, so a merely-nearby range is not usable — and

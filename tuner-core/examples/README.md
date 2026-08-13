@@ -91,8 +91,22 @@ Offline tools discover dumps by the `key_` prefix and read the key identity from
 
 - **`strobe_replay`** — runs the shipped `Strobe` bank over real captures and
   reports rotation fidelity: detuning coherence (E1), the bass-window A/B (E2),
-  per-hop delta noise behind the readable-range margin (E3), and fit-window
-  jitter versus motion lag (E4). Also has `--chatter` and `--refset` modes.
+  per-hop delta noise behind the readable-range margin (E3), fit-window jitter
+  versus motion lag (E4), and the shipped rate against an independent refit (E5).
+  Also has `--chatter` and `--refset` modes.
+
+  **E6–E9 are unison assist** (ADR 0012): the estimator against synthetic truth
+  — resolution law, accuracy, the level/separation surface and the false-split
+  null (E6); availability, repeat
+  reproducibility and the discriminator's verdict on real captures (E7); every
+  reported line matched against a full-rate DFT of the identical span, to
+  attribute the unexplained ones (E8); and per-hop cost in `--release` against
+  the callback budget (E9). E6 and E9 are synthetic and run whatever directory
+  is passed.
+
+  E1–E5 are ADR 0011's and must not move: a change to the strobe that shifts
+  them has changed the band-slope or coarse readout, which the unison work is a
+  tap alongside rather than a stage within.
 
   ```bash
   cargo run --release --example strobe_replay -- diagnostics

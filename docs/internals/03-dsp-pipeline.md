@@ -48,9 +48,9 @@ truth it judges against.
 | 4 | Bass magnitude spectrum | **Engine discovery** | **chain** |
 | 4 | Treble magnitude spectrum | spectrogram (`FrameOutput`) only | tap |
 | 5 | **Engine** → `Option<PitchResult>`: silence/transient resets → discovery (Stage-A discrete scoring over the bass magnitudes, M-of-N acquisition lock, tracker seeding) or tracking (adaptive Goertzel bank, NP gate, EMA) | telemetry, capture latch | **chain** |
-| 5b | **Strobe** → `StrobeResult`: fixed-reference beat phase, its sliding-window least-squares rate per reference, and a bounded CFAR-gated coarse spectral readout at the nominated reference partial (skipped during `Silence`) | `FrameOutput` only | tap |
+| 5b | **Strobe** → `StrobeResult`: fixed-reference beat phase, its sliding-window least-squares rate per reference, the per-reference baseband record and the unison lines it resolves (with the discriminator's verdict), and a bounded CFAR-gated coarse spectral readout at the nominated reference partial (skipped during `Silence`) | `FrameOutput` only | tap |
 | 6 | Capture accumulation & dispatch — the `CaptureState` baton: onset pre-roll → `Recording` on Stable → 1.5 s or decay → dispatch gate → `CapturePayload` to the Worker (crossing #5), with backpressure recovery | Worker → MAT → `KeyMeasurement` → profile | **capture limb** (chain branch) |
-| 7 | `FrameOutput` assembly: treble magnitudes, gate telemetry, pitch fields when locked, strobe fields (angle, gate, rate) + `coarse_hz` unconditionally → triple buffer (crossing #2) | GUI | out |
+| 7 | `FrameOutput` assembly: treble magnitudes, gate telemetry, pitch fields when locked, strobe fields (angle, gate, rate, amplitude, unison lines + resolution + verdict) + `coarse_hz` unconditionally → triple buffer (crossing #2) | GUI | out |
 
 Two things this table encodes that a "stream → gate → engine" sketch
 hides: the windowing/FFT front-end is itself a chain stage (the
@@ -73,6 +73,12 @@ On the hot path:
   or the COLA buffer — allocated once at startup via `Box<[T]>` or a
   fixed-size array. A component's cross-hop history counts: a sliding
   window is a fixed-size ring on the component, never a growing buffer.
+- **Transform plans are startup state, not per-hop state.** `rustfft`'s and
+  `realfft`'s planners allocate on every `plan_*` call, so a component that
+  transforms at a length chosen at runtime (`strobe::unison`, whose record
+  grows) plans *every* length it can reach once, at construction, and
+  indexes them thereafter. Its execution scratch is sized to the largest
+  plan's requirement the same way.
 - Algorithms accept `&[T]` / `&mut [T]` slices for input and output;
   they do not allocate their own working space.
 

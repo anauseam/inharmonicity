@@ -34,13 +34,23 @@ The six sanctioned crossings:
   update and nothing else. The rest are quantities a dropped frame would
   *destroy*, so the DSP thread owns them across hops and ships the result:
   the strobe's accumulated beat phase (an integrated count, not an
-  increment — strobe design R2) and its least-squares rate, fit over a
-  window indexed by hop rather than by the GUI's irregular tick. **Anything
-  cumulative, or fitted across hops, belongs on the DSP side of this
-  buffer** — the consumer selects and formats, it does not integrate.
+  increment — strobe design R2), its least-squares rate, fit over a
+  window indexed by hop rather than by the GUI's irregular tick, and the
+  unison lines, resolved from a per-reference baseband record the DSP side
+  accumulates and the GUI never sees. **Anything cumulative, or fitted
+  across hops, belongs on the DSP side of this buffer** — the consumer
+  selects and formats, it does not integrate. Note the *lines* are a
+  snapshot of that record, so a dropped frame costs one update; it is the
+  record itself that could not survive the crossing.
 - **Frequencies ship as absolute Hz, never cents** (`coarse_hz`,
-  `strobe_beat_hz`): the reference a number is displayed against is the
-  frontend's policy, and the DSP does not hold it (ADR 0011).
+  `strobe_beat_hz`, `unison_lines[..].offset_hz`,
+  `unison_resolution_hz`): the reference a number is displayed against is
+  the frontend's policy, and the DSP does not hold it (ADR 0011, ADR 0012).
+- **A detector's verdict crosses as a verdict, not as the numbers behind
+  it** (`unison_verdict`). Deciding whether a pair of lines is a unison or
+  one partial splitting against itself is a test over signal estimates, so
+  it runs DSP-side with the estimator it tests; the GUI renders the
+  outcome and does not re-derive it (ADR 0012 §6).
 - Per-field semantics — what each `Option` means, which entries of an
   array are valid — live in `FrameOutput`'s own doc comments, not here.
   This section is the crossing's contract; the struct is its schema.

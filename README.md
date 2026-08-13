@@ -23,7 +23,12 @@ For the design rationale and open observations, see [ARCHITECTURE.md](ARCHITECTU
 >   inspector shows every retained measurement of a key and lets you drop or
 >   re-measure it, and the curve marks the keys it doubts — but no automatic
 >   acceptance gate exists, and two candidates have been measured and rejected.
-> - **Unisons are set by ear** — no unison-beat readout.
+> - **Unison assist reads out, but rarely names what it sees.** The strings of
+>   the selected note are resolved as separate spectral lines with their beat
+>   rate, and the panel always states the resolution the reading is worth — but
+>   the test that separates a real unison from one string beating with itself
+>   returns "undetermined" on most notes, and the bass register is out of scope
+>   until what its extra lines are is established.
 > - **No pitch-raise over-pull targets.**
 > - **A440 only**, no user-adjustable temperaments.
 >
@@ -141,6 +146,9 @@ inharmonicity/
 │   │   ├── pipeline.rs             # AudioPipeline mediator — Dual-FFT unconditional execution
 │   │   ├── engine.rs               # F0 Engine — TWM Discovery + M-of-N lock + Goertzel Phase Tracking
 │   │   ├── strobe.rs               # Manual-mode strobe: fixed-reference beat phase + OS-CFAR coarse readout (pipeline tap)
+│   │   ├── strobe/
+│   │   │   ├── band_slope.rs       # Sliding-window OLS fit of the band's rotation rate
+│   │   │   └── unison.rs           # Per-reference baseband record → the note's individual strings
 │   │   ├── gatekeeper.rs           # 5-state signal validator (DSP only, no shared state)
 │   │   ├── worker.rs               # Background worker for heavy offline DSP
 │   │   ├── audio.rs                # CPAL audio capture, stream management, DC blocking
@@ -220,9 +228,9 @@ The pipeline also manages the **`WorkerManager`** (`worker.rs`), which owns a si
 > | `engine.rs` — TWM discovery + Goertzel phase tracking | 🔬 R&D |
 > | `worker.rs` — background (f₀, B) measurement (single thread) | 📐 Provisional |
 > | `curves.rs` + `rigaud.rs`/`giordano.rs`/`whittaker.rs` — tuning-curve engines (a)–(d) | 📐 Provisional |
-> | `strobe.rs` — manual-mode strobe (fixed-ref beat phase, its band-slope rate, + OS-CFAR coarse readout, Path A) | 📐 Provisional |
+> | `strobe.rs` + `strobe/` — manual-mode strobe (fixed-ref beat phase, its band-slope rate, the unison line estimator, + OS-CFAR coarse readout, Path A) | 📐 Provisional |
 > | `synth.rs` — offline curve → audio resynthesis (cold-path, no audio stream) | 📐 Provisional |
-> | `peaks.rs` — Jacobsen sub-bin peak extraction + OS-CFAR coarse read | 🧩 Extensible |
+> | `peaks.rs` — Jacobsen sub-bin peak extraction + OS-CFAR coarse read + unison line estimator | 🧩 Extensible |
 > | `twm.rs` — canonical Two-Way Mismatch scoring | 🔬 R&D |
 > | `app.rs` — GUI state hub | 🚧 In Development |
 >

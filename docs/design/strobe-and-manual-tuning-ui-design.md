@@ -405,7 +405,7 @@ required use for it at this program's goal.
 
 ---
 
-## 7. Interval-beat strobe & unison assist — status (2026-07-27)
+## 7. Interval-beat strobe & unison assist — status (2026-08-07)
 
 **Superseded status (2026-07-27 review).** §7 originally specified an
 interval-beat strobe as a planned "phase 2, two modes from the start." That
@@ -413,8 +413,9 @@ review concluded interval-beat between *different* notes has **no required use
 case for this program's goal**, and downgraded it to **build-if-requested**.
 Unison assist — the one genuine tuning need in this neighbourhood — was found
 to be a *separate, lighter* concept that does not need the interval-beat
-machinery (§7.4). The original spec is preserved below (§7.1–7.3) for the case
-where interval-beat is ever requested.
+machinery. It has since been **built**, but not in the shape §7.4 proposed;
+see that section. The original interval-beat spec is preserved below (§7.1–7.3)
+for the case where interval-beat is ever requested.
 
 ### 7.0 Why interval-beat is not required — intervals are correct by construction
 
@@ -443,23 +444,29 @@ Verituner" — a scope change, tracked as **build-if-requested**, not planned wo
 (The anticipatory two-mode switch in §13 is harmless if retained but no longer
 implies planned work.)
 
-### 7.4 Unison assist — separate, lightweight, a real tuning need
+### 7.4 Unison assist — **superseded, and built** (2026-08-07)
 
-A multi-string note (2–3 strings in the tenor/treble) must have its strings
-tuned to zero-beat against each other. This is the one genuine tuning need near
-interval-beat, and it does **not** need the interval mechanism:
+A multi-string note must have its strings zero-beat against each other, and this
+section proposed reading that as the **envelope beat**: the magnitude of a single
+Goertzel swells at |f₁ − f₂|, so estimating that periodicity gives the beat rate
+with no new two-note capability.
 
-- The strings are the **same note the user already selected** — no two-note
-  *discovery*, no separate (f₀, B) tracking.
-- It is the **envelope beat** on that one note's partial: the magnitude of a
-  single Goertzel oscillates at the strings' beat rate. The absolute strobe's
-  band already *stutters* visibly when a unison beats, so a clean unison readout
-  is an enhancement of what is partly there — not new two-note capability.
+**The physics is right and the conclusion is wrong.** The same data supports
+resolving the individual **strings** as separate spectral lines, which is
+strictly more informative — the magnitude route discards the phase, and the phase
+carries the *sign* of each offset and the *positions* of the strings; it also
+collapses a three-string note's three pair-beats into one real signal and needs a
+decay detrend that is itself an error source. Both routes hit the same ≈2/T
+resolution wall, so it buys nothing for what it gives up. It is also what the
+modern field ships, which §12 missed.
 
-So unison assist is a small, standalone future note (an envelope-beat readout on
-the selected note), not a consequence of interval-beat. It is a quality feature,
-not strictly required (unisons can be set by ear), so it too is unscheduled — but
-when built it is cheap and needs none of §7.1–7.3.
+Superseded by
+[`unison-assist-design.md`](unison-assist-design.md) (the derivation trail) and
+**[ADR 0012](../adr/0012-unison-line-estimator.md)** (what shipped). One
+asymmetry survives in the envelope route's favour and is worth keeping on record:
+the **split** between two lines is immune to baseband aliasing (both fold
+identically) while the absolute positions are not, so if a pitch-raise readout of
+unison spread outside ±21.5 Hz is ever wanted, that is the mechanism.
 
 ### 7.1 Purpose (original spec — if interval-beat is ever requested)
 
@@ -634,6 +641,24 @@ Takeaway: no universal fixed partial number; the two shipped philosophies are
 — our simplest v1 / optional toggle). Both pair the strobe with a coarse/numeric
 cents read (D4).
 
+**Addendum (2026-08-06): the survey missed a whole feature class.** Every product
+above was read for its *strobe*, and none was read for what it does about
+**unisons** — where the field has converged on a **spectrum display that resolves
+the individual strings as separate peaks**, not on an envelope-beat readout:
+
+- **TuneLab — Spectrum Display.** "Each string of a unison produces its own
+  peak"; the documented workflow is to tune one string, watch which peak moves,
+  and walk it onto the centre line.
+- **PianoMeter — Peak View.** Zoomed harmonic peaks, bold centre line at target,
+  dotted ±10 ¢ and outer ±100 ¢ guides, green pitch-raise target. Sold for
+  muteless pitch raises, treble tuning, and **diagnosing false beats**.
+- **pianoscope 4.0.** A spectrum display of the same class.
+
+That precedent is why §7.4 was overturned. Our version adds two things none of
+them appears to state: the **resolution the current reading is worth**, and a
+**test** for whether the resolved lines are a unison at all rather than one
+string beating with itself (ADR 0012 §§4, 6).
+
 ---
 
 ## 13. State model (GUI)
@@ -682,8 +707,8 @@ state (recompute-on-load).
    path so the gallery's (c) trio renders (retires the greyed placeholders).
 7. **Reference-pitch view** (A≠440), **flag styling** — deferred UX polish.
 8. ~~Interval-beat strobe~~ — **removed from the plan** (§7.0: build-if-requested,
-   not planned). Unison assist, if ever wanted, is a separate lightweight
-   envelope-beat readout (§7.4), not this.
+   not planned). Unison assist is separate and is now built, as a line estimator
+   rather than the envelope-beat readout §7.4 proposed.
 
 Commit boundary (user): **do not commit until the strobe display is built** —
 the Prompt-I foundation ships with the feature, not before.

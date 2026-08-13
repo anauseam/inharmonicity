@@ -11,6 +11,12 @@ AES-19(4), pp. 608–621, DOI 10.1109/TAES.1983.309350 — primary source read
 Review 29(3) (`resources/tracker/RCA-Review-1968-09.pdf`) is cited by the module
 as the cell-averaging predecessor only — a lineage claim, checked and correct.
 
+**Symbol note (2026-08-07):** `COARSE_P_FA` is now `CFAR_P_FA`. A second
+OS-CFAR gate in the same file — the unison line estimator's, ADR 0012 — makes the
+same 0.001 commitment, and one false-alarm budget per file is the honest shape;
+the value and its justification below are unchanged. Everything else audited here
+keeps its name.
+
 **Scope:** `coarse_read`, `cfar_multiplier`, and the gate constants
 (`COARSE_CFAR_QUANTILE`, `COARSE_CFAR_GUARD_BINS`, `COARSE_CFAR_FLANK_SPACINGS`,
 `COARSE_CFAR_FLANK_MIN_HZ`, `COARSE_P_FA`, `COARSE_CFAR_MIN_REFS`), the

@@ -24,7 +24,7 @@ CPAL audio callback  ──ringbuf SPSC──►  Analysis thread (DSP)
                                           │
                                           ├──► Gatekeeper  (signal validator)
                                           ├──► Engine      (TWM + Goertzel F0)
-                                          ├──► Strobe      (fixed-ref beat phase)
+                                          ├──► Strobe      (fixed-ref beat phase + unison lines)
                                           └──► capture accumulation
                                                   │
                                                   │  crossbeam SPSC (captures)
@@ -71,7 +71,7 @@ run async to the hot path. They may heap-allocate freely.
 | Pipeline mediator, shared atomics, AudioPool | `pipeline.rs` |
 | Signal validator (5-state) | `gatekeeper.rs` |
 | F0 detection (TWM + Goertzel) | `engine.rs` |
-| Strobe bank (fixed-reference beat phase + its rate) | `strobe.rs` |
+| Strobe bank (fixed-reference beat phase, its rate, the unison lines) | `strobe.rs`, `strobe/{band_slope,unison}.rs` |
 | Async background worker, `CurveBundle` | `worker.rs` |
 | Stateless DSP math | `algorithms/{spectral,peaks,twm,discovery,mat,metrics,curves,rigaud,giordano,whittaker}.rs` |
 | Offline curve auralization (resynthesis) | `synth.rs` |
@@ -84,7 +84,7 @@ run async to the hot path. They may heap-allocate freely.
 | --- | --- |
 | Application entry, state hub, message handling | `app.rs`, `main.rs` |
 | View composition | `views/{main_view,settings_view,curve_select,library_view,inspector_view,rms_calibration,transient_calibration,ninos2_calibration}.rs` |
-| Stateless widgets | `widgets/{cent_meter,curve_plot,envelope,partials_display,piano_keyboard,seismograph,spectrogram}.rs` |
+| Stateless widgets | `widgets/{cent_meter,curve_plot,envelope,guitar_strings,partials_display,piano_keyboard,seismograph,spectrogram,strobe_display,unison_display}.rs` |
 | Calibration logic | `calibration.rs` |
 | What a curve's per-key flags mean to the user | `advisory.rs` |
 | Profile library: per-user dirs, app settings, listing | `library.rs` |
@@ -117,7 +117,8 @@ docs/adr/
 ├── 0008-giordano-layer-fidelity-derived-weights.md  Engine (c)/(d): derived weights, 1-SE rule
 ├── 0009-repeat-capture-noise-decomposition.md Repeat-capture σ model; ln-B shrinkage
 ├── 0010-m-of-n-lock-rule-replay.md            M-of-N acquisition lock; two-instrument replay
-└── 0011-coarse-spectral-readout.md            Strobe coarse readout: CFAR gate, n* selection
+├── 0011-coarse-spectral-readout.md            Strobe coarse readout: CFAR gate, n* selection
+└── 0012-unison-line-estimator.md              Unison assist: baseband zoom DFT, OS-CFAR lines
 ```
 
 Each file is self-contained, and section headings are stable enough to be

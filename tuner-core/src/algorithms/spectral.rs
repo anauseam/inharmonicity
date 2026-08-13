@@ -223,10 +223,12 @@ pub fn jacobsen(
 }
 
 /// Candan 2015 Eq. 12 bias-correction factor `c_N` for the pipeline's Hann window
-/// (defined over `[0, N-1]`), precomputed offline by evaluating Eq. 12 with the
-/// window transform f_w and its derivative at 0, ±1 (derivation and numbers:
-/// docs/audits/faithfulness-audit-03-jacobsen.md). For Hann, c_N → 2 exactly as
-/// N → ∞; the finite-N values differ only in the fourth decimal.
+/// (defined over `[0, N-1]`), tabulated for the two FFT sizes [`jacobsen`] runs
+/// at. The values are [`candan_c_n`] evaluated at those sizes
+/// (`candan_c_n_reproduces_the_jacobsen_table` pins the agreement); the table
+/// exists because `jacobsen` is called per peak on the hot path and the numerical
+/// evaluation is `O(N)`. For Hann, c_N → 2 exactly as N → ∞; the finite-N values
+/// differ only in the fourth decimal.
 #[inline]
 fn candan_bias_correction(window_size: usize) -> f32 {
     match window_size {
@@ -235,6 +237,70 @@ fn candan_bias_correction(window_size: usize) -> f32 {
         // Hann asymptotic limit — within 1.4e-3 of exact for any N ≥ 1024.
         _ => 2.0,
     }
+}
+
+/// **Candan 2015 Eq. 12 evaluated numerically** for the project's Hann window
+/// (symmetric over `[0, N−1]`, the window [`fft`] and [`hann`] both apply) with
+/// no zero-padding (`N₂ = N`).
+///
+/// Eq. 12 is `c_N = B₀² / (A₁B₀ + A₀B₁)`, with the four real constants built
+/// (his Eq. 10) from the window transform and its derivative sampled at
+/// `α ∈ {−1, 0, 1}`:
+///
+/// ```text
+///   f_w(α)  = Σ_n w[n]·e^{−j2πnα/N}                    (Eq. 6)
+///   f_w'(α) = (−j2π/N)·Σ_n n·w[n]·e^{−j2πnα/N}
+///   A₀ = Im{f_w(1) − f_w(−1)}        A₁ = f_w'(1) − f_w'(−1)
+///   B₀ = 2f_w(0) − f_w(1) − f_w(−1)  B₁ = Im{2f_w'(0) − f_w'(1) − f_w'(−1)}
+/// ```
+///
+/// The paper gives no closed form for an arbitrary window and prescribes exactly
+/// this numerical route ("the simplicity of the numerical calculation of c_N from
+/// (12) render such an effort of limited reward"), so this is the port rather than
+/// a fit to one.
+///
+/// `O(N)` in trigonometry — call it once per length at startup, never per peak.
+/// Returns the Hann asymptote 2.0 for a length too short to form the three
+/// samples Eq. 10 needs.
+///
+/// `pub` so the offline harnesses can scale an offset the same way the shipping
+/// code does rather than transcribing a value; shipping callers are
+/// [`jacobsen`]'s table and [`crate::strobe::unison`]'s startup pass.
+///
+/// # Reference
+/// Candan, Ç. (2015). "Fine resolution frequency estimation from three DFT
+/// samples: Case of windowed data." Signal Processing 114, pp. 245–250.
+/// (Eqs. 6, 10, 12.)
+pub fn candan_c_n(window_size: usize) -> f32 {
+    if window_size < 4 {
+        return 2.0;
+    }
+    let n = window_size as f64;
+    // Index 0/1/2 ↔ α = −1/0/+1.
+    let mut f = [Complex::<f64>::new(0.0, 0.0); 3];
+    let mut df = [Complex::<f64>::new(0.0, 0.0); 3];
+    for k in 0..window_size {
+        let kf = k as f64;
+        let w = 0.5 * (1.0 - (2.0 * std::f64::consts::PI * kf / (n - 1.0)).cos());
+        for (slot, alpha) in [-1.0f64, 0.0, 1.0].into_iter().enumerate() {
+            let angle = -2.0 * std::f64::consts::PI * kf * alpha / n;
+            let e = Complex::new(angle.cos(), angle.sin());
+            f[slot] += e * w;
+            df[slot] += e * (w * kf);
+        }
+    }
+    let scale = Complex::new(0.0, -2.0 * std::f64::consts::PI / n);
+    let df = [df[0] * scale, df[1] * scale, df[2] * scale];
+
+    let a0 = (f[2] - f[0]).im;
+    let a1 = (df[2] - df[0]).re;
+    let b0 = (f[1] * 2.0 - f[2] - f[0]).re;
+    let b1 = (df[1] * 2.0 - df[2] - df[0]).im;
+    let denominator = a1 * b0 + a0 * b1;
+    if denominator.abs() < f64::EPSILON {
+        return 2.0;
+    }
+    (b0 * b0 / denominator) as f32
 }
 
 /// Signature shared by the fixed-length Goertzel evaluators ([`goertzel`],
