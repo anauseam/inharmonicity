@@ -96,7 +96,8 @@ pub struct FrameOutput {
     pub strobe_gated: [bool; 12],
     /// Per-reference beat rate `f_live − f_ref` (Hz) — the band's rotation
     /// *rate*, least-squares-fit DSP-side over
-    /// [`strobe::BAND_SLOPE_WINDOW_SECS`]. Parallel to `strobe_angle`, and the
+    /// [`strobe::band_slope::BAND_SLOPE_WINDOW_SECS`]. Parallel to
+    /// `strobe_angle`, and the
     /// fine half of the readout pair: phase-integrated, so it is far steadier
     /// than a per-hop frequency estimate, but it aliases past ±21.5 Hz where
     /// `coarse_hz` takes over. `None` while the fit is filling or has been
@@ -105,6 +106,32 @@ pub struct FrameOutput {
     pub strobe_beat_hz: [Option<f32>; 12],
     /// Number of valid strobe references (0 = no key being strobed).
     pub strobe_count: usize,
+    /// Per-reference Goertzel amplitude, in the time signal's own units.
+    /// Parallel to `strobe_angle`. This is the quantity `strobe_gated`
+    /// thresholds, so it is how far a frozen band was below the floor.
+    pub strobe_amplitude: [f32; 12],
+    /// The individual strings of each reference partial, resolved as separate
+    /// spectral lines by [`strobe::unison`] — signed Hz offsets from
+    /// `StrobeRefUpdate::refs[i]` plus a relative amplitude, strongest first.
+    /// Valid entries: `[0..unison_line_count[i]]`.
+    ///
+    /// A dropped frame costs one update: the ring lives DSP-side and this is a
+    /// snapshot of it, not an increment.
+    pub unison_lines: [[models::UnisonLine; algorithms::peaks::MAX_UNISON_LINES]; 12],
+    /// Valid entries of `unison_lines` per reference.
+    pub unison_line_count: [u8; 12],
+    /// `2/T` per reference (Hz) — the smallest split this reference's current
+    /// baseband record can separate. `0.0` while it publishes nothing.
+    ///
+    /// **Not optional telemetry.** Until the record is long enough, two strings
+    /// report as *one* line, which reads as "clean" at exactly the moment a tuner
+    /// decides they are finished; a display that shows the lines without this
+    /// number actively misleads.
+    pub unison_resolution_hz: [f32; 12],
+    /// Whether the resolved lines are a unison or one partial splitting against
+    /// itself — one verdict for the bank, since the test is precisely that the
+    /// split is constant *across* partials.
+    pub unison_verdict: strobe::unison::UnisonVerdict,
     /// Coarse readout: the measured frequency (Hz) of the strobed key's coarse
     /// partial, read straight off the magnitude spectrum
     /// (`algorithms::peaks::coarse_read`) at the partial the
@@ -137,6 +164,14 @@ impl Default for FrameOutput {
             strobe_gated: [true; 12],
             strobe_beat_hz: [None; 12],
             strobe_count: 0,
+            strobe_amplitude: [0.0; 12],
+            unison_lines: [[models::UnisonLine {
+                offset_hz: 0.0,
+                relative_amplitude: 0.0,
+            }; algorithms::peaks::MAX_UNISON_LINES]; 12],
+            unison_line_count: [0; 12],
+            unison_resolution_hz: [0.0; 12],
+            unison_verdict: strobe::unison::UnisonVerdict::Undetermined,
             coarse_hz: None,
         }
     }

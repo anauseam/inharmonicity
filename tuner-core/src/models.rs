@@ -55,6 +55,25 @@ pub struct SpectralPeak {
     pub magnitude: f32,
 }
 
+/// One spectral line of a note's baseband — in a multi-strung note, one string.
+///
+/// Produced by `algorithms::peaks::resolve_lines` from the strobe's per-reference
+/// complex baseband and consumed by `strobe::unison` and the frontend.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct UnisonLine {
+    /// Signed offset from the reference partial, in **Hz** — not cents. The
+    /// reference is `strobe::StrobeRefUpdate::refs[i]` and the frontend owns
+    /// what it displays the offset against (crossing #2's rule).
+    ///
+    /// Bounded by the baseband's own half-rate: `|offset_hz| < 0.5·f_hop`
+    /// ≈ 21.5 Hz, past which a line folds rather than leaving the band.
+    pub offset_hz: f32,
+    /// Magnitude relative to the strongest line of the same reference, so the
+    /// strongest is always 1.0. Dimensionless — a string's absolute level says
+    /// nothing without the strike.
+    pub relative_amplitude: f32,
+}
+
 /// A single measured partial (overtone) of a piano note.
 ///
 /// The fundamental is `number = 1`. Overtones are `number = 2, 3, …`.

@@ -13,14 +13,17 @@ use crate::utils::view_utils::{
 use crate::views::curve_select;
 use crate::widgets::curve_plot::{CurvePlot, PlotMode, SUSPECT};
 use crate::widgets::strobe_display::StrobeDisplay;
-use crate::widgets::{cent_meter, guitar_strings, partials_display, piano_keyboard, spectrogram};
+use crate::widgets::unison_display::{self, UnisonDisplay, UnisonMode};
+use crate::widgets::{cent_meter, guitar_strings, piano_keyboard, spectrogram};
 use iced::widget::{Space, button, column, container, row, text};
 use iced::{Alignment, Element, Fill, Length};
 use tuner_core::models::{self, InharmonicityProfile};
 use tuner_core::pipeline::CaptureState;
+use tuner_core::strobe::MAX_STROBE_REFS;
+use tuner_core::strobe::unison::UnisonVerdict;
 use tuner_core::worker::CurveBundle;
 
-const TOOLS_CONFIG: [ButtonConfig; 7] = [
+const TOOLS_CONFIG: [ButtonConfig; 6] = [
     ButtonConfig {
         label: "Spectrogram",
         message: Some(Message::ToggleSpectrogram),
@@ -34,11 +37,6 @@ const TOOLS_CONFIG: [ButtonConfig; 7] = [
     ButtonConfig {
         label: "Key select",
         message: Some(Message::ToggleKeySelect),
-        button_type: ButtonType::Standard,
-    },
-    ButtonConfig {
-        label: "Partials",
-        message: Some(Message::TogglePartials),
         button_type: ButtonType::Standard,
     },
     // The live tuning-curve plot (strobe design §10): watch the curve form
@@ -212,9 +210,9 @@ pub fn create_widget_area(
     let spectrogram_panel = create_spectrogram_panel(data);
     let cent_meter_panel = create_cent_meter_panel(data);
     let keyboard_panel = create_keyboard_panel(data, curve_bundle);
-    let partials_panel = create_partials_panel(data);
     let curve_plot_panel = create_curve_plot_panel(data, curve_bundle);
     let strobe_panel = create_strobe_panel(data, curve_bundle);
+    let unison_panel = create_unison_panel(data);
     let auto_mode_notice = create_auto_mode_notice(data);
     // let inharmonicity_graph_panel = create_inharmonicity_graph_panel(data, profile);
 
@@ -234,13 +232,9 @@ pub fn create_widget_area(
     .width(Fill)
     .align_y(Alignment::Start);
 
-    let bottom_row = row![
-        wrap_panel(keyboard_panel),
-        Space::new().width(10),
-        wrap_panel(partials_panel)
-    ]
-    .width(Fill)
-    .align_y(Alignment::Start);
+    let bottom_row = row![wrap_panel(keyboard_panel)]
+        .width(Fill)
+        .align_y(Alignment::Start);
 
     // let inharmonicity_graph_row = row![
     //     wrap_panel(inharmonicity_graph_panel),
@@ -251,7 +245,9 @@ pub fn create_widget_area(
     let curve_row = row![
         wrap_panel(curve_plot_panel),
         Space::new().width(10),
-        wrap_panel(strobe_panel)
+        wrap_panel(strobe_panel),
+        Space::new().width(10),
+        wrap_panel(unison_panel)
     ]
     .width(Fill)
     .align_y(Alignment::Start);
@@ -481,6 +477,136 @@ fn create_strobe_panel(
     Some(panel.into())
 }
 
+/// Creates the unison panel (ADR 0012): the selected note's individual strings,
+/// resolved as separate spectral lines and drawn as markers on a cents axis.
+///
+/// Three things it must always carry, and each is measured rather than
+/// stylistic:
+///
+/// - **the current resolution.** Until the DSP-side record is long enough two
+///   separated strings resolve as one line, which reads as "clean" exactly when
+///   a tuner is deciding they are done. "Clean to ±3 ¢" is honest; bare "clean"
+///   is not.
+/// - **the pair beats, in Hz.** Positions are cents and rates are Hz, the
+///   convention the rest of the readout uses, and the beat is what a tuner
+///   counts by ear.
+/// - **the discriminator's verdict**, visible rather than silently filtering.
+///   A second line is not proof of a second string: one string beating with
+///   itself looks identical, and in the bass that is what it usually is.
+///
+/// Gated on the strobe's own debounced `out_of_range` flag: past ±21.5 Hz the
+/// baseband folds, so the lines would be real content at fictitious places.
+fn create_unison_panel(data: &AppDisplayData) -> Option<Element<'static, Message>> {
+    if !data.strobe_visible {
+        return None;
+    }
+    let TuningMode::Manual { note_name, .. } = &data.tuning_mode else {
+        return None;
+    };
+
+    let u = &data.unison;
+    let compact = data.unison_mode == UnisonMode::Displayed;
+    let rows: Vec<_> = match (compact, u.displayed) {
+        (true, Some(i)) => vec![u.rows[i]],
+        (true, None) => Vec::new(),
+        (false, _) => u.rows.clone(),
+    };
+
+    // The resolution the reading is worth, from the row on screen.
+    let resolution = rows
+        .iter()
+        .map(|r| r.resolution_cents)
+        .fold(f32::NAN, f32::max);
+    let muted = iced::Color::from_rgb8(0xc3, 0xc2, 0xb7);
+    let amber = iced::Color::from_rgb8(0xd9, 0x92, 0x26);
+
+    let body: Element<'static, Message> = if data.strobe.out_of_range {
+        // The band's own verdict, reused: beyond it the lines alias.
+        text("Out of range — bring the string inside ±21.5 Hz of target first.")
+            .size(13)
+            .color(muted)
+            .into()
+    } else if rows.is_empty() {
+        text("Listening… strike the note and let it ring.")
+            .size(13)
+            .color(muted)
+            .into()
+    } else {
+        container(UnisonDisplay::new(rows.clone(), data.unison_mode, data.unison.span_cents).view())
+            .width(Fill)
+            .height(Length::Fixed(unison_body_height(compact)))
+            .into()
+    };
+
+    // How many strings, how far apart, and how fast they beat.
+    let strings = rows.iter().map(|r| r.count).max().unwrap_or(0);
+    let readout = match (strings, u.beats_hz.first()) {
+        (0, _) => "—".to_string(),
+        (1, _) => "one line".to_string(),
+        (n, Some(beat)) => format!("{n} lines · beat {beat:.2} Hz"),
+        (n, None) => format!("{n} lines"),
+    };
+    let resolution_note = if resolution.is_finite() && resolution > 0.0 {
+        format!("resolved to ±{resolution:.1} ¢")
+    } else {
+        "resolution unknown".to_string()
+    };
+
+    // The verdict is shown, not used to filter: a suppression toggle belongs
+    // with a future advanced mode, and until then hiding it would be the panel
+    // deciding what the tuner is allowed to doubt.
+    let (verdict_text, verdict_color) = match u.verdict {
+        UnisonVerdict::Unison if strings >= 2 => ("✓ consistent with a unison", muted),
+        UnisonVerdict::FalseBeat if strings >= 2 => ("✗ false beat — one string, not two", amber),
+        _ => ("verdict undetermined — too few partials resolved", muted),
+    };
+
+    let panel = container(
+        column![
+            row![
+                text(format!("Unison — {note_name}")).size(18),
+                Space::new().width(Fill),
+                button(
+                    text(if compact {
+                        "All partials"
+                    } else {
+                        "One partial"
+                    })
+                    .size(12)
+                )
+                .padding([3, 8])
+                .on_press(Message::ToggleUnisonMode),
+            ]
+            .align_y(Alignment::Center),
+            Space::new().height(8),
+            body,
+            Space::new().height(6),
+            row![
+                text(readout).size(15),
+                Space::new().width(Fill),
+                text(resolution_note).size(12).color(muted),
+            ]
+            .align_y(Alignment::Center),
+            text(verdict_text).size(12).color(verdict_color),
+        ]
+        .width(Fill)
+        .spacing(4)
+        .padding(15),
+    )
+    .width(Length::Fixed(360.0))
+    .height(Length::Fixed(unison_body_height(compact) + 120.0));
+
+    Some(panel.into())
+}
+
+/// Height of the unison canvas, in pixels — one fixed row per possible partial,
+/// so the panel never resizes as partials come and go. Rows past the key's own
+/// reference count are simply not drawn.
+fn unison_body_height(compact: bool) -> f32 {
+    let rows = if compact { 1.0 } else { MAX_STROBE_REFS as f32 };
+    rows * unison_display::ROW_HEIGHT + unison_display::ROW_CHROME
+}
+
 /// Creates the live tuning-curve plot panel (strobe design §10): the selected
 /// engine's d(m) from the freshest bundle, updating as captures land. Shows
 /// the prior-only curve at launch and a computing note until the first bundle
@@ -704,36 +830,6 @@ fn create_keyboard_panel(
     )
     .width(Fill)
     .height(Length::Fixed(200.0));
-
-    Some(panel.into())
-}
-
-/// Creates the partials display panel
-fn create_partials_panel(data: &AppDisplayData) -> Option<Element<'static, Message>> {
-    if !data.partials_visible {
-        return None;
-    }
-
-    // Partials have been removed from the pipeline output.
-    // This panel is kept for future use but shows no data currently.
-    let partials_data: Vec<f32> = Vec::new();
-
-    let partials_content: Element<'static, Message> =
-        partials_display::PartialsDisplay::new(partials_data).view();
-
-    let panel = container(
-        column![
-            text("Partials").size(18),
-            Space::new().height(10),
-            partials_content
-        ]
-        .width(Fill)
-        .height(Fill)
-        .spacing(5)
-        .padding(15),
-    )
-    .width(Fill)
-    .height(Length::Fixed(180.0));
 
     Some(panel.into())
 }

@@ -14,6 +14,7 @@ use crate::library::{self, AppSettings, ProfileSort};
 use crate::session::ProfileSession;
 use crate::views::{main_view::create_main_view, settings_view::create_settings_view};
 use crate::widgets::envelope::ENVELOPE_HISTORY_LENGTH;
+use crate::widgets::unison_display::{UnisonMode, UnisonRow};
 use iced::{self, Element, Subscription, Theme};
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -21,10 +22,12 @@ use std::sync::atomic::Ordering;
 use tuner_core::{
     FrameOutput,
     algorithms::curves,
+    algorithms::peaks::MAX_UNISON_LINES,
     audio::{self, AudioSource, HOP_RATE_HZ, HostHandle},
     models::{self, CurveInput, InharmonicityProfile, NOTES},
     pipeline::{CaptureState, PipelineHandle, load_f32, store_f32},
     strobe::StrobeRefUpdate,
+    strobe::unison::UnisonVerdict,
     worker::{self, CurveBundle, CurveJob, WorkerOutput},
 };
 
@@ -134,9 +137,9 @@ pub enum Message {
     ToggleSpectrogram,               // Show/hide spectrogram panel
     ToggleCentMeter,                 // Show/hide cent meter panel
     ToggleKeySelect,                 // Show/hide piano keyboard
-    TogglePartials,                  // Show/hide partials panel
     ToggleCurvePlot,                 // Show/hide the live tuning-curve plot (design §10)
     ToggleStrobe,                    // Show/hide the strobe panel (design §5)
+    ToggleUnisonMode,                // Compact vs stacked unison layout (ADR 0012)
     SetReferenceMode(ReferenceMode), // Which target function all readouts use (design §5)
     RequestRelock,                   // Open the re-lock confirm modal (design §8)
     ConfirmRelock,                   // Copy the live bundle into the strobe lock (design §8)
@@ -310,6 +313,49 @@ impl Default for StrobeState {
     }
 }
 
+/// Display state of the unison panel: the note's individual strings, resolved
+/// DSP-side by `tuner_core::strobe::unison` and mirrored here in **cents**
+/// against each partial's own target.
+///
+/// Positions in cents, rates in Hz, per the existing convention — the core ships
+/// signed Hz offsets and the frontend owns the reference they are read against.
+/// A partial's deviation from its own target equals the string's deviation from
+/// its target exactly (the cents offset is linear in f₀), so every row is on one
+/// scale and the markers of a unison line up across rows.
+#[derive(Debug, Clone, Default)]
+pub struct UnisonState {
+    /// One row per partial that resolved a line, ascending. Empty when the panel
+    /// has nothing to show.
+    pub rows: Vec<UnisonRow>,
+    /// Index into [`Self::rows`] of the displayed partial n\*, when it resolved
+    /// anything — the row the compact layout draws.
+    pub displayed: Option<usize>,
+    /// Beat rates the displayed partial's lines imply, in Hz, widest pair first.
+    /// This is the number a tuner counts by ear, so it stays in Hz.
+    pub beats_hz: Vec<f32>,
+    /// The DSP-side discriminator's verdict for the whole bank.
+    pub verdict: UnisonVerdict,
+    /// Half-width of the cents axis, held across hops (see
+    /// [`UNISON_SPAN_LADDER`]). `0.0` until a first frame sets it.
+    pub span_cents: f32,
+    /// Consecutive hops whose content would fit a narrower step.
+    pub shrink_run: u8,
+}
+
+/// Cents half-widths the unison axis is allowed to take.
+///
+/// A ladder rather than a continuous fit to the data, for the reason an
+/// oscilloscope has ranges: a marker that moved because the axis rescaled is
+/// indistinguishable from a string that moved, so a readout whose scale tracks
+/// its own content cannot be read while it changes. The steps span the task —
+/// ±3 ¢ is a unison being finished, ±100 ¢ is one not yet started.
+const UNISON_SPAN_LADDER: [f32; 4] = [3.0, 10.0, 30.0, 100.0];
+
+/// Fraction of the axis the widest marker may reach before the next step up is
+/// taken. Below 1.0 so a marker never sits on the frame edge, where its position
+/// stops being readable.
+const UNISON_SPAN_HEADROOM: f32 = 0.8;
+
 /// Readable range (Hz) of the fixed-reference strobe band before its per-hop
 /// phase drift aliases. The boundary is exact — half a cycle per hop is
 /// `fs/(2·HOP)` = 21.53 Hz — and this is that boundary less the measured
@@ -443,7 +489,6 @@ pub struct AppDisplayData {
     pub spectrogram_visible: bool,
     pub cent_meter_visible: bool,
     pub key_select_visible: bool,
-    pub partials_visible: bool,
     pub curve_plot_visible: bool,
     pub strobe_visible: bool,
     // pub inharmonicity_graph_visible: bool,
@@ -489,6 +534,12 @@ pub struct AppDisplayData {
     pub selected_engine: EngineChoice,
     /// Manual-mode strobe display state (design §5, Path A).
     pub strobe: StrobeState,
+    /// Unison panel state — the selected note's individual strings (ADR 0012).
+    pub unison: UnisonState,
+    /// Which partials the unison panel draws. Both layouts ship so the choice
+    /// can be made in use rather than argued: the compact one matches the strobe
+    /// band's partial, the stacked one shows the discriminator's own evidence.
+    pub unison_mode: UnisonMode,
     /// Which target function every readout is measured against — the strobe
     /// band, its cents readout, and the cent meter alike.
     pub reference_mode: ReferenceMode,
@@ -718,7 +769,6 @@ impl Default for TunerApp {
                 spectrogram_visible: true,
                 cent_meter_visible: true,
                 key_select_visible: true,
-                partials_visible: true,
                 curve_plot_visible: true,
                 strobe_visible: true,
                 // inharmonicity_graph_visible: true,
@@ -737,6 +787,8 @@ impl Default for TunerApp {
                 curve_detail: None,
                 selected_engine: EngineChoice::MultiBalanced,
                 strobe: StrobeState::default(),
+                unison: UnisonState::default(),
+                unison_mode: UnisonMode::Displayed,
                 reference_mode: ReferenceMode::default(),
                 strobe_lock_view: None,
                 relock_confirm_open: false,
@@ -923,6 +975,7 @@ impl TunerApp {
         // New key ⇒ new strobe references; the accumulated phase is
         // meaningless against them.
         self.display_data.strobe = StrobeState::default();
+        self.display_data.unison = UnisonState::default();
     }
 
     /// Refreshes the display mirror of the open instrument's identity and
@@ -1012,6 +1065,7 @@ impl TunerApp {
         self.session.profile_mut().settings.reference_mode = self.display_data.reference_mode;
         self.strobe_pushed = None;
         self.display_data.strobe = StrobeState::default();
+        self.display_data.unison = UnisonState::default();
 
         // Drop a manual target the guitar surface can't represent.
         let drop_target = inst == Instrument::Guitar
@@ -1255,6 +1309,116 @@ impl TunerApp {
             }
             // Bank not (yet) targeting this key: hold the last angle, gated.
             None => strobe.gated = true,
+        }
+
+        self.update_unison(&refs, count, n_star, desired, frame_pushed);
+    }
+
+    /// Mirrors the bank's resolved lines into the unison panel's display state.
+    ///
+    /// The core ships signed **Hz** offsets against each reference; this converts
+    /// them to cents against that same reference, which puts every partial's row
+    /// on one scale — a partial's deviation from its own target equals the
+    /// string's deviation from its target exactly, so a unison's markers line up
+    /// across rows and a false beat's do not.
+    fn update_unison(
+        &mut self,
+        refs: &[f32; 12],
+        count: usize,
+        n_star: u8,
+        desired: Option<(u8, bool, u64, EngineChoice)>,
+        frame_pushed: bool,
+    ) {
+        // Frames computed before the DSP took these references carry the
+        // previous key's lines — a wrong answer rather than a late one.
+        let stale = desired.is_none() || self.strobe_pushed != Some(desired);
+        let Some(frame) = self.display_data.last_frame.as_ref().filter(|_| !stale) else {
+            self.display_data.unison = UnisonState::default();
+            return;
+        };
+
+        let held = &self.display_data.unison;
+        let mut state = UnisonState {
+            verdict: frame.unison_verdict,
+            span_cents: held.span_cents,
+            shrink_run: held.shrink_run,
+            ..UnisonState::default()
+        };
+        // A row per reference the bank is targeting, resolved or not. The set
+        // changes only when the key does, so nothing reflows while tuning.
+        let live = count.min(frame.strobe_count).min(refs.len());
+        let mut widest = 0.0f32;
+        for (i, &f_ref) in refs.iter().enumerate().take(live) {
+            if f_ref <= 0.0 {
+                continue;
+            }
+            let to_cents = |hz: f32| 1200.0 * (1.0 + hz / f_ref).log2();
+            let lines = (frame.unison_line_count[i] as usize).min(MAX_UNISON_LINES);
+            let mut row = UnisonRow {
+                partial: i as u8 + 1,
+                count: lines as u8,
+                resolution_cents: to_cents(frame.unison_resolution_hz[i]),
+                ..UnisonRow::default()
+            };
+            for (line, slot) in frame.unison_lines[i][..lines].iter().enumerate() {
+                row.cents[line] = to_cents(slot.offset_hz);
+                row.amplitude[line] = slot.relative_amplitude;
+                widest = widest.max(row.cents[line].abs());
+            }
+            widest = widest.max(row.resolution_cents / 2.0);
+            if i + 1 == n_star as usize {
+                state.displayed = Some(state.rows.len());
+                // Every pair beat of the displayed partial, widest first: what a
+                // tuner counts by ear, and the one quantity that stays in Hz.
+                let offsets = &frame.unison_lines[i][..lines];
+                for (a, first) in offsets.iter().enumerate() {
+                    for second in &offsets[a + 1..] {
+                        state
+                            .beats_hz
+                            .push((second.offset_hz - first.offset_hz).abs());
+                    }
+                }
+                state.beats_hz.sort_by(|a, b| b.total_cmp(a));
+            }
+            state.rows.push(row);
+        }
+        state.span_cents = Self::unison_span(
+            state.span_cents,
+            &mut state.shrink_run,
+            widest,
+            frame_pushed,
+        );
+        self.display_data.unison = state;
+    }
+
+    /// Picks the axis step for this hop from [`UNISON_SPAN_LADDER`].
+    ///
+    /// **Grow immediately, shrink only after [`READOUT_SWITCH_HOPS`]**: content
+    /// must never be hidden, so a step too small is corrected on the spot, while
+    /// zooming in can afford to wait — and waiting is what stops the axis
+    /// flickering between two steps while a marker sits at the boundary. The
+    /// same hop count as the readout's source switch, and for the same reason:
+    /// consecutive frames share 7/8 of their audio, so eight hops is the first
+    /// independent sample.
+    fn unison_span(held: f32, shrink_run: &mut u8, widest: f32, frame_pushed: bool) -> f32 {
+        let needed = *UNISON_SPAN_LADDER
+            .iter()
+            .find(|step| widest <= **step * UNISON_SPAN_HEADROOM)
+            .unwrap_or(UNISON_SPAN_LADDER.last().expect("ladder is not empty"));
+        if held <= 0.0 || needed > held {
+            *shrink_run = 0;
+            return needed;
+        }
+        if needed == held || !frame_pushed {
+            *shrink_run = 0;
+            return held;
+        }
+        *shrink_run += 1;
+        if *shrink_run >= READOUT_SWITCH_HOPS {
+            *shrink_run = 0;
+            needed
+        } else {
+            held
         }
     }
 
@@ -1633,18 +1797,17 @@ impl TunerApp {
                 );
                 self.display_data.key_select_visible = !self.display_data.key_select_visible;
             }
-            Message::TogglePartials => {
-                eprintln!(
-                    "[MAIN] Toggling partials visibility: {} -> {}",
-                    self.display_data.partials_visible, !self.display_data.partials_visible
-                );
-                self.display_data.partials_visible = !self.display_data.partials_visible;
-            }
             Message::ToggleCurvePlot => {
                 self.display_data.curve_plot_visible = !self.display_data.curve_plot_visible;
             }
             Message::ToggleStrobe => {
                 self.display_data.strobe_visible = !self.display_data.strobe_visible;
+            }
+            Message::ToggleUnisonMode => {
+                self.display_data.unison_mode = match self.display_data.unison_mode {
+                    UnisonMode::Displayed => UnisonMode::AllPartials,
+                    UnisonMode::AllPartials => UnisonMode::Displayed,
+                };
             }
             Message::SetReferenceMode(mode) => {
                 self.display_data.reference_mode = mode;
@@ -1652,6 +1815,7 @@ impl TunerApp {
                 // reference set is about to change under the bank.
                 self.strobe_pushed = None;
                 self.display_data.strobe = StrobeState::default();
+                self.display_data.unison = UnisonState::default();
                 // Both tuning selections persist with the instrument, so
                 // reopening it reproduces the targets it was tuned to.
                 self.session.profile_mut().settings.reference_mode = mode;
@@ -1673,6 +1837,7 @@ impl TunerApp {
                         StrobeLock::Engaged(LockedTargets::freeze(live, self.session.profile()));
                     self.strobe_pushed = None;
                     self.display_data.strobe = StrobeState::default();
+                    self.display_data.unison = UnisonState::default();
                 }
                 self.display_data.relock_confirm_open = false;
             }
@@ -2167,5 +2332,47 @@ mod tests {
         assert!(!state, "the run restarted, so still no switch");
         debounce_verdict(&mut state, &mut run, true);
         assert!(state, "the full run switches the source");
+    }
+
+    /// The axis must never hide a marker, and must never flicker between two
+    /// steps while one sits at a boundary: grow on the spot, shrink only after a
+    /// full run of hops that would fit.
+    #[test]
+    fn unison_axis_grows_at_once_and_shrinks_slowly() {
+        let mut run = 0u8;
+
+        // Cold start takes the smallest step that fits.
+        let span = TunerApp::unison_span(0.0, &mut run, 1.0, true);
+        assert_eq!(span, 3.0);
+
+        // A marker past the headroom of the current step grows it immediately —
+        // one hop, no run, because content off the frame is not readable.
+        let span = TunerApp::unison_span(span, &mut run, 2.9, true);
+        assert_eq!(span, 10.0, "2.9 ¢ is past 80 % of the ±3 ¢ step");
+        let span = TunerApp::unison_span(span, &mut run, 40.0, true);
+        assert_eq!(span, 100.0, "growth skips straight to a step that fits");
+
+        // Shrinking waits out the full run, and any hop that does not fit
+        // resets it.
+        for _ in 0..READOUT_SWITCH_HOPS - 1 {
+            assert_eq!(TunerApp::unison_span(100.0, &mut run, 1.0, true), 100.0);
+        }
+        assert_eq!(TunerApp::unison_span(100.0, &mut run, 40.0, true), 100.0);
+        assert_eq!(run, 0, "a hop needing the wide step resets the run");
+        for _ in 0..READOUT_SWITCH_HOPS - 1 {
+            assert_eq!(TunerApp::unison_span(100.0, &mut run, 1.0, true), 100.0);
+        }
+        assert_eq!(
+            TunerApp::unison_span(100.0, &mut run, 1.0, true),
+            3.0,
+            "the full run shrinks"
+        );
+
+        // Idle ticks carry no evidence: the triple buffer redelivers the last
+        // frame, and counting it would let the run advance without new data.
+        let mut idle = 0u8;
+        for _ in 0..READOUT_SWITCH_HOPS * 2 {
+            assert_eq!(TunerApp::unison_span(100.0, &mut idle, 1.0, false), 100.0);
+        }
     }
 }

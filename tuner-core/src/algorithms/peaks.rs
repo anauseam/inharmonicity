@@ -7,16 +7,25 @@
 //!   above an absolute threshold), fed to TWM after [`mask_peaks`].
 //! - [`coarse_read`] — the tuning readout's *bounded* single-partial search
 //!   around a known reference, admitted by an ordered-statistic CFAR gate.
+//! - [`resolve_lines`] — the unison estimator's search over one reference
+//!   partial's *baseband*, admitted by the same gate against a sliding local
+//!   reference window.
 //!
 //! Do not fold the second onto the first: the global list is built only in the
 //! discovery branch (`identified_key.is_none()`), so it is unavailable exactly
 //! while a locked note is being tuned, and its Neyman–Pearson gate and masking
 //! can drop a weak target partial the readout still needs.
+//!
+//! The third shares [`cfar_multiplier`] with the second and nothing else: it
+//! reads a decimated baseband rather than a magnitude spectrum, and its
+//! reference geometry is deliberately the opposite one
+//! ([`UNISON_CFAR_GUARD_BINS`]).
 
+use rustfft::Fft;
 use rustfft::num_complex::Complex;
 
 use crate::algorithms::spectral;
-use crate::models::SpectralPeak;
+use crate::models::{SpectralPeak, UnisonLine};
 
 /// Extracts all significant spectral peaks from a magnitude spectrum with sub-bin
 /// interpolated frequencies using the complex-domain Jacobsen estimator.
@@ -294,10 +303,10 @@ const COARSE_CFAR_FLANK_SPACINGS: f32 = 1.5;
 /// (≈ key ≤ 25), and inert above — an absolute frequency, but a bounded one.
 const COARSE_CFAR_FLANK_MIN_HZ: f32 = 172.0;
 
-/// False-alarm probability the gate is calibrated to — the same 0.001
-/// [`spectral::neyman_pearson_k`] commits to, so the two gates differ only in
-/// *which* noise they measure, never in how permissive they are.
-const COARSE_P_FA: f32 = 0.001;
+/// False-alarm probability both CFAR gates in this file are calibrated to — the
+/// same 0.001 [`spectral::neyman_pearson_k`] commits to, so the gates differ only
+/// in *which* noise they measure, never in how permissive they are.
+const CFAR_P_FA: f32 = 0.001;
 
 /// Minimum reference cells for a usable noise estimate: below this the local
 /// null is unidentifiable and the read is withheld rather than guessed. Reached
@@ -535,13 +544,353 @@ pub fn coarse_read(
     // validated together.
     let m_eff = (hi - lo).div_ceil(2).max(1) as f32;
     let threshold =
-        noise * cfar_multiplier((n_ref / 2).max(2), (rank / 2).max(1), COARSE_P_FA / m_eff);
+        noise * cfar_multiplier((n_ref / 2).max(2), (rank / 2).max(1), CFAR_P_FA / m_eff);
     if !(threshold.is_finite() && threshold > 0.0 && best_mag >= threshold) {
         return None;
     }
 
     let f = spectral::jacobsen(complex_spectrum, best, fft_size, sample_rate);
     (f.is_finite() && f > 0.0).then_some(f)
+}
+
+// ─── Unison lines: baseband zoom-DFT + sliding local OS-CFAR ─────────────────
+
+/// Lines one reference can report — a three-string unison, the widest the piano
+/// builds. The cap means "the three strongest *admitted* lines", since candidates
+/// are magnitude-sorted and the CFAR loop stops at the first rejection.
+pub const MAX_UNISON_LINES: usize = 3;
+
+/// Guard cells either side of the cell under test, in bins — the Hann main lobe
+/// of the cell itself, whose skirt is not noise.
+///
+/// Do not give this detector [`coarse_read`]'s reference geometry: references
+/// drawn from flanks *outside* the search band exclude the dominant line's own
+/// skirt, so a secondary maximum riding that skirt is compared against distant
+/// background and admitted. Measured on a *single* synthetic string, up to
+/// **26.7 % false second lines** (ADR 0012 §2).
+const UNISON_CFAR_GUARD_BINS: usize = 2;
+
+/// Reference cells per side, at circular distance
+/// `(GUARD, GUARD + UNISON_CFAR_WINDOW_BINS]` from the cell under test — 32
+/// total, the same order as Rohling's own `N = 24 … 32 and more`.
+///
+/// The window slides with the cell under test rather than flanking a fixed band,
+/// so the reference is always the local background. Where the record is too short
+/// to reach this far the set degrades to *every* bin outside the guard, which is
+/// the same thing said with fewer cells; [`UNISON_MIN_BINS`] is the length below
+/// which that stops being enough.
+const UNISON_CFAR_WINDOW_BINS: usize = 16;
+
+/// Order statistic taken as the local noise estimate, as a fraction of the
+/// reference count — Rohling's rank parameter `k/N`, here the paper's own median.
+///
+/// Unlike [`COARSE_CFAR_QUANTILE`], which the harmonic comb drives *below* the
+/// paper's `k > N/2` recommendation, this window sees at most the note's other
+/// strings. Rohling §V binds from the usual side and is satisfied with margin:
+/// two interfering lines occupy `2 × (2·GUARD + 1) = 10` cells of the reference
+/// window against the `N_ref − k = 16` the criterion allows.
+///
+/// Do not raise it to the paper's own worked `q = 0.75`: with three lines
+/// present the reference window is signal-dominated at the upper quantile, and a
+/// three-string unison is lost outright (detection 100 % → 0 %, ADR 0012 §2).
+const UNISON_CFAR_QUANTILE: f32 = 0.50;
+
+/// Rayleigh criterion, in bins: two lines closer than the Hann main-lobe
+/// half-width (`2/T` Hz) are one line, and reporting them as two is a measured
+/// failure mode. Applied to the *refined* positions — at the integer grid the
+/// test is inert, because two distinct local maxima are already two bins apart.
+const UNISON_MERGE_BINS: f32 = 2.0;
+
+/// Reference cells Rohling's §V interference criterion demands of this geometry:
+/// an inhomogeneity is tolerable only while it "affects less than `(N − k)`
+/// resolution cells", and here the inhomogeneity is the note's *other* strings —
+/// [`MAX_UNISON_LINES`] − 1 of them, each occupying its own main lobe
+/// (`2·GUARD + 1` cells).
+const UNISON_MIN_REFS: usize = (((MAX_UNISON_LINES - 1) * (2 * UNISON_CFAR_GUARD_BINS + 1)) as f32
+    / (1.0 - UNISON_CFAR_QUANTILE)) as usize;
+
+/// Shortest transform [`resolve_lines`] will run — the length at which the
+/// reference window still holds [`UNISON_MIN_REFS`] cells once the cell under
+/// test and its guard are excluded.
+///
+/// This is the estimator's own floor, not a display policy: below it the
+/// reference window is signal-dominated whenever a second string is present, so
+/// "one line" stops meaning "no second line" and starts meaning "the detector is
+/// blind". [`strobe::unison`](crate::strobe::unison) honours it as the ring's
+/// publish floor.
+pub(crate) const UNISON_MIN_BINS: usize = UNISON_MIN_REFS + 2 * UNISON_CFAR_GUARD_BINS + 1;
+
+/// Caller-owned working buffers for [`resolve_lines`], reused across hops so the
+/// hot path allocates nothing. [`Self::spectrum`] and [`Self::magnitudes`] must
+/// hold at least the transform length, [`Self::fft`] at least the plan's
+/// `get_inplace_scratch_len()`.
+pub struct LineScratch<'a> {
+    /// Windowed baseband, transformed in place.
+    pub spectrum: &'a mut [Complex<f32>],
+    /// `|Z[m]|`, read by the candidate scan and the reference cells.
+    pub magnitudes: &'a mut [f32],
+    /// `rustfft`'s own in-place scratch.
+    pub fft: &'a mut [Complex<f32>],
+}
+
+/// **The unison line estimator** — resolves the individual strings of one
+/// reference partial as separate spectral lines, each a signed Hz offset from
+/// that reference. Returns how many were written to `out`.
+///
+/// # What it is
+/// A **zoom FFT** (Lyons, *Understanding DSP*, ch. 13) whose front end is already
+/// running: the strobe's Hann-windowed Goertzel at `f_ref` is the mixer and
+/// anti-alias filter, and taking one output per hop is the decimator, so
+/// `baseband[h]` is a sum of damped complex exponentials turning at each string's
+/// **offset** from the target. Sampled at `hop_rate_hz`, it is unambiguous over
+/// ±`hop_rate_hz/2` ≈ ±21.5 Hz. Resolution is set by observation time, not bin
+/// count — 50 % of pairs resolve at `2/T`, 100 % at ≈1.35·`2/T` — which is why
+/// the caller must publish `2/T` alongside the lines.
+///
+/// # Steps
+/// 1. Hann-window the record and take an `N`-point complex DFT, `N` =
+///    `baseband.len()`. **Natural Fourier bins, no zero-padding**: padded bins are
+///    interpolated rather than independent, and the CFAR null below assumes
+///    independence.
+/// 2. Take circular local maxima of `|Z|` in descending magnitude — the baseband
+///    spectrum wraps, so bin 0 and bin `N−1` are neighbours and there is no edge
+///    case.
+/// 3. Refine each sub-bin by the three-bin Candan estimator on the complex bins
+///    (the same Eq. 1 [`spectral::jacobsen`] ports, evaluated circularly), then
+///    reject any candidate within [`UNISON_MERGE_BINS`] of an accepted stronger
+///    one.
+/// 4. Admit by an ordered-statistic CFAR gate against a **sliding local**
+///    reference window ([`UNISON_CFAR_WINDOW_BINS`], [`UNISON_CFAR_GUARD_BINS`],
+///    [`UNISON_CFAR_QUANTILE`]), reusing [`cfar_multiplier`]. Candidates are
+///    magnitude-sorted, so the first rejection ends the list.
+///
+/// The Hann halvings and the `m_eff` search-loss divisor follow [`coarse_read`]'s
+/// calibrated pattern: this detector also takes an argmax, so ADR 0011 §5's
+/// correction applies, over the whole record rather than a bounded band.
+///
+/// # Arguments
+/// * `baseband` — the per-reference complex baseband, **oldest first**. Its
+///   length is the transform length; below [`UNISON_MIN_BINS`] nothing is
+///   reported. There is no upper bound — how long a record is worth keeping is
+///   the caller's policy, not this function's.
+/// * `fft` — a complex forward transform planned for exactly `baseband.len()`,
+///   built once at startup and held by the caller.
+/// * `c_n` — [`spectral::candan_c_n`] at that length. Passed in rather than
+///   evaluated here because it is `O(N)` in trigonometry and constant per length;
+///   the 2.0 asymptote is a 2.4 % scale error on every offset at these sizes.
+/// * `hop_rate_hz` — the baseband's sample rate, i.e. the DSP hop rate.
+/// * `scratch` — see [`LineScratch`].
+/// * `out` — receives up to `min(out.len(), MAX_UNISON_LINES)` lines, strongest
+///   first, with `relative_amplitude` normalised to that strongest line.
+///
+/// # Panics
+/// In debug builds, if `fft`'s length disagrees with `baseband`'s or a scratch
+/// buffer is too short. In release those are runtime `0`-returns rather than
+/// wrong answers.
+///
+/// # Reference
+/// Rohling, H. (1983). "Radar CFAR Thresholding in Clutter and Multiple Target
+/// Situations." IEEE Trans. AES-19(4) — the admission gate; §V sets the rank.
+/// Candan, Ç. (2015). Signal Processing 114, Eq. 1 — the sub-bin refinement.
+/// Lyons, R. (2010). *Understanding DSP*, ch. 13 — the zoom-FFT structure.
+pub fn resolve_lines(
+    baseband: &[Complex<f32>],
+    fft: &dyn Fft<f32>,
+    c_n: f32,
+    hop_rate_hz: f32,
+    scratch: &mut LineScratch<'_>,
+    out: &mut [UnisonLine],
+) -> usize {
+    let n = baseband.len();
+    debug_assert_eq!(
+        fft.len(),
+        n,
+        "resolve_lines: the plan must match the record"
+    );
+    debug_assert!(
+        scratch.spectrum.len() >= n
+            && scratch.magnitudes.len() >= n
+            && scratch.fft.len() >= fft.get_inplace_scratch_len(),
+        "resolve_lines scratch is undersized"
+    );
+    let max_lines = out.len().min(MAX_UNISON_LINES);
+    if n < UNISON_MIN_BINS
+        || max_lines == 0
+        || fft.len() != n
+        || scratch.spectrum.len() < n
+        || scratch.magnitudes.len() < n
+        || scratch.fft.len() < fft.get_inplace_scratch_len()
+        || !hop_rate_hz.is_finite()
+        || hop_rate_hz <= 0.0
+    {
+        return 0;
+    }
+
+    // ── Window and transform ──
+    // Hann over [0, N−1] — the window `c_n` is derived for and the one the rest
+    // of the pipeline applies.
+    let n_minus_1 = (n - 1) as f32;
+    for (i, (dst, &src)) in scratch.spectrum[..n].iter_mut().zip(baseband).enumerate() {
+        let w = 0.5 * (1.0 - (2.0 * core::f32::consts::PI * i as f32 / n_minus_1).cos());
+        *dst = src * w;
+    }
+    let scratch_len = fft.get_inplace_scratch_len();
+    fft.process_with_scratch(&mut scratch.spectrum[..n], &mut scratch.fft[..scratch_len]);
+    for (mag, z) in scratch.magnitudes[..n]
+        .iter_mut()
+        .zip(scratch.spectrum.iter())
+    {
+        *mag = z.norm();
+    }
+
+    // ── Candidates, strongest first ──
+    let half = n as f32 / 2.0;
+    let bin_hz = hop_rate_hz / n as f32;
+    let mut positions = [0.0f32; MAX_UNISON_LINES];
+    let mut found = 0usize;
+    let mut strongest = 0.0f32;
+    // The last candidate examined. Advancing a cursor through a strict total
+    // order is what lets the scan skip what it has already taken without a
+    // visited set — and so without any bound on the record length.
+    let mut cursor: Option<(f32, usize)> = None;
+
+    while found < max_lines {
+        let mut best: Option<(f32, usize)> = None;
+        for m in 0..n {
+            let mag = scratch.magnitudes[m];
+            let prev = scratch.magnitudes[(m + n - 1) % n];
+            let next = scratch.magnitudes[(m + 1) % n];
+            if !(mag > prev && mag > next) {
+                continue;
+            }
+            let candidate = (mag, m);
+            if cursor.is_some_and(|taken| !precedes(taken, candidate)) {
+                continue;
+            }
+            if best.is_none_or(|b| precedes(candidate, b)) {
+                best = Some(candidate);
+            }
+        }
+        let Some((mag, bin)) = best else { break };
+        cursor = best;
+
+        // Rayleigh merge, on the refined positions: at the integer grid two
+        // distinct local maxima are already two bins apart, so the test would
+        // never fire. A merged candidate is skipped, not terminal — the next one
+        // down may be a genuine third string.
+        let position = wrap_signed(
+            refine_circular(scratch.spectrum, bin, n, c_n),
+            n as f32,
+            half,
+        );
+        if positions[..found]
+            .iter()
+            .any(|p| circular_gap(*p, position, n as f32) < UNISON_MERGE_BINS)
+        {
+            continue;
+        }
+
+        if !admits(scratch.magnitudes, bin, n, mag) {
+            break; // magnitude-sorted ⇒ the first rejection ends the list
+        }
+
+        if found == 0 {
+            strongest = mag;
+        }
+        positions[found] = position;
+        out[found] = UnisonLine {
+            offset_hz: position * bin_hz,
+            relative_amplitude: if strongest > 0.0 {
+                mag / strongest
+            } else {
+                0.0
+            },
+        };
+        found += 1;
+    }
+
+    found
+}
+
+/// Strict total order on candidates: descending magnitude, ties broken by
+/// ascending bin. Total rather than merely descending because two bins of equal
+/// magnitude must still order, or a scan that advances by "strictly after the
+/// last one taken" would never leave them.
+fn precedes(a: (f32, usize), b: (f32, usize)) -> bool {
+    match a.0.total_cmp(&b.0) {
+        core::cmp::Ordering::Greater => true,
+        core::cmp::Ordering::Less => false,
+        core::cmp::Ordering::Equal => a.1 < b.1,
+    }
+}
+
+/// Circular distance between two bin indices.
+fn circular_bins(a: usize, b: usize, n: usize) -> usize {
+    let d = a.abs_diff(b);
+    d.min(n - d)
+}
+
+/// Circular distance between two fractional bin positions on a length-`n` ring.
+fn circular_gap(a: f32, b: f32, n: f32) -> f32 {
+    let d = (a - b).abs();
+    d.min(n - d)
+}
+
+/// Folds a bin position into `[−n/2, n/2)` — the baseband is signed around its
+/// reference, so bin `n − 1` is offset −1, not +(n − 1).
+fn wrap_signed(position: f32, n: f32, half: f32) -> f32 {
+    let folded = position.rem_euclid(n);
+    if folded >= half { folded - n } else { folded }
+}
+
+/// Candan Eq. 1 on the three complex bins around `bin`, taken circularly.
+/// Falls back to the bin centre on a degenerate denominator, as
+/// [`spectral::jacobsen`] does.
+fn refine_circular(spectrum: &[Complex<f32>], bin: usize, n: usize, c_n: f32) -> f32 {
+    let prev = spectrum[(bin + n - 1) % n];
+    let peak = spectrum[bin];
+    let next = spectrum[(bin + 1) % n];
+    let numerator = prev - next;
+    let denominator = Complex::new(2.0, 0.0) * peak - prev - next;
+    let delta = if denominator.norm_sqr() > 1e-12 {
+        c_n * (numerator / denominator).re
+    } else {
+        0.0
+    };
+    bin as f32 + if delta.is_finite() { delta } else { 0.0 }
+}
+
+/// The ordered-statistic CFAR admission test for one cell under test.
+fn admits(magnitudes: &[f32], bin: usize, n: usize, mag: f32) -> bool {
+    let mut cells = [0.0f32; 2 * UNISON_CFAR_WINDOW_BINS];
+    let mut n_ref = 0usize;
+    for (b, &m) in magnitudes[..n].iter().enumerate() {
+        let d = circular_bins(b, bin, n);
+        if d > UNISON_CFAR_GUARD_BINS
+            && d <= UNISON_CFAR_GUARD_BINS + UNISON_CFAR_WINDOW_BINS
+            && n_ref < cells.len()
+        {
+            cells[n_ref] = m;
+            n_ref += 1;
+        }
+    }
+    if n_ref < UNISON_MIN_REFS {
+        return false;
+    }
+
+    let refs = &mut cells[..n_ref];
+    let rank = (((n_ref - 1) as f32 * UNISON_CFAR_QUANTILE).round() as usize).clamp(1, n_ref - 1);
+    let (_, noise, _) = refs.select_nth_unstable_by(rank, f32::total_cmp);
+    let noise = *noise;
+
+    // The same three calibrated factors of two as `coarse_read`: Hann
+    // correlation halves the effective reference count and the record's
+    // independent cells, and the argmax costs a per-cell budget over the latter.
+    // The search here spans the whole record, there being no bounded band.
+    let m_eff = (n / 2).max(1) as f32;
+    let threshold =
+        noise * cfar_multiplier((n_ref / 2).max(2), (rank / 2).max(1), CFAR_P_FA / m_eff);
+    threshold.is_finite() && threshold > 0.0 && mag >= threshold
 }
 
 #[cfg(test)]
@@ -781,5 +1130,256 @@ mod tests {
         let mut mag = vec![0.0f32; fft_size / 2];
         spectral::magnitude_spectrum(&spec, fft_size, &mut mag);
         (mag, spec)
+    }
+
+    // ── resolve_lines ────────────────────────────────────────────────────────
+
+    /// The hop rate the strobe's baseband is sampled at.
+    const HOP_HZ: f32 = 44_100.0 / 1024.0;
+
+    /// One string: a damped complex exponential at `offset_hz` from the
+    /// reference, which is what the strobe's demodulated Goertzel produces.
+    struct Source {
+        offset_hz: f32,
+        amplitude: f32,
+        tau_secs: f32,
+    }
+
+    /// Builds a baseband record of `n` hops from the given strings plus
+    /// deterministic circular noise at `noise` RMS per component.
+    fn baseband(strings: &[Source], n: usize, noise: f32, seed: u32) -> Vec<Complex<f32>> {
+        let mut x = seed | 1;
+        let mut rand = move || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x as f32 / u32::MAX as f32 - 0.5
+        };
+        (0..n)
+            .map(|h| {
+                let t = h as f32 / HOP_HZ;
+                let mut z = Complex::new(noise * rand(), noise * rand());
+                for (k, s) in strings.iter().enumerate() {
+                    // Distinct start phases: two strings struck by one hammer do
+                    // not start in phase, and an in-phase pair is the easy case.
+                    let phase = 2.0 * std::f32::consts::PI * (s.offset_hz * t + 0.17 * k as f32);
+                    let decay = (-t / s.tau_secs).exp();
+                    z += Complex::new(phase.cos(), phase.sin()) * (s.amplitude * decay);
+                }
+                z
+            })
+            .collect()
+    }
+
+    /// Runs the shipped estimator over a record, planning its transform the way
+    /// the component does at startup.
+    fn resolve(record: &[Complex<f32>]) -> Vec<UnisonLine> {
+        let n = record.len();
+        let fft = rustfft::FftPlanner::<f32>::new().plan_fft_forward(n);
+        let mut spectrum = vec![Complex::new(0.0, 0.0); n];
+        let mut magnitudes = vec![0.0f32; n];
+        let mut fft_scratch = vec![Complex::new(0.0, 0.0); fft.get_inplace_scratch_len()];
+        let mut out = [UnisonLine::default(); MAX_UNISON_LINES];
+        let count = resolve_lines(
+            record,
+            fft.as_ref(),
+            spectral::candan_c_n(n),
+            HOP_HZ,
+            &mut LineScratch {
+                spectrum: &mut spectrum,
+                magnitudes: &mut magnitudes,
+                fft: &mut fft_scratch,
+            },
+            &mut out,
+        );
+        out[..count].to_vec()
+    }
+
+    /// [`UNISON_MIN_BINS`] is Rohling §V solved for the record length, so pin the
+    /// solution: at that length the reference window still holds enough cells for
+    /// the other two strings to be tolerable inhomogeneities, and one bin shorter
+    /// it does not.
+    #[test]
+    fn unison_min_record_satisfies_rohlings_interference_criterion() {
+        let lobe = 2 * UNISON_CFAR_GUARD_BINS + 1;
+        let interferers = MAX_UNISON_LINES - 1;
+        assert_eq!(UNISON_MIN_REFS, 20, "2 interferers × 5 lobe cells at q = ½");
+        assert_eq!(UNISON_MIN_BINS, 25);
+
+        // k/N ≤ 1 − (occupied / N_ref) is the criterion; check it holds at the
+        // floor and fails one cell below it.
+        let cells = |n: usize| (2 * UNISON_CFAR_WINDOW_BINS).min(n - lobe);
+        let ok =
+            |n: usize| UNISON_CFAR_QUANTILE <= 1.0 - (interferers * lobe) as f32 / cells(n) as f32;
+        assert!(ok(UNISON_MIN_BINS));
+        assert!(!ok(UNISON_MIN_BINS - 1));
+    }
+
+    /// Two strings 2.0 Hz apart over the 56-hop record must resolve as two lines
+    /// at the right places. This is the feature: a tuner watching two markers
+    /// converge.
+    #[test]
+    fn resolve_lines_finds_two_strings() {
+        let lines = resolve(&baseband(
+            &[
+                Source {
+                    offset_hz: -1.0,
+                    amplitude: 1.0,
+                    tau_secs: 1.5,
+                },
+                Source {
+                    offset_hz: 1.0,
+                    amplitude: 1.0,
+                    tau_secs: 1.5,
+                },
+            ],
+            56,
+            0.01,
+            0x1234_5678,
+        ));
+        assert_eq!(lines.len(), 2, "a 2 Hz split at 1.3 s must resolve");
+
+        let mut found: Vec<f32> = lines.iter().map(|l| l.offset_hz).collect();
+        found.sort_by(f32::total_cmp);
+        for (got, want) in found.iter().zip([-1.0f32, 1.0]) {
+            assert!(
+                (got - want).abs() < 0.15,
+                "line at {got} Hz, expected {want} Hz"
+            );
+        }
+        assert_eq!(lines[0].relative_amplitude, 1.0);
+        assert!(lines[1].relative_amplitude > 0.5);
+    }
+
+    /// **The null.** One string must report one line — no matter how clean, how
+    /// fast it decays, or how long the record. A false second line here is a
+    /// tuner chasing a beat that does not exist, and the flanking reference
+    /// geometry `coarse_read` uses produced them at up to 26.7 % (ADR 0012 §2).
+    #[test]
+    fn resolve_lines_reports_one_line_for_one_string() {
+        for (n, tau, noise, seed) in [
+            (30usize, 1.5f32, 0.03f32, 0x9e37_79b9u32),
+            (56, 1.5, 0.03, 0x85eb_ca6b),
+            (56, 0.4, 0.03, 0xc2b2_ae35),
+            (56, 1.5, 0.18, 0x27d4_eb2f), // SNR ≈ 15 dB
+            (40, 0.4, 0.18, 0x1656_67b1),
+        ] {
+            let lines = resolve(&baseband(
+                &[Source {
+                    offset_hz: 0.7,
+                    amplitude: 1.0,
+                    tau_secs: tau,
+                }],
+                n,
+                noise,
+                seed,
+            ));
+            assert_eq!(
+                lines.len(),
+                1,
+                "n={n} τ={tau} noise={noise}: one string must give one line, got {lines:?}"
+            );
+        }
+    }
+
+    /// Below the Rayleigh criterion two components *are* one line, and saying so
+    /// is the honest answer — the caller publishes `2/T` beside it so the display
+    /// can say how much "one line" is worth.
+    #[test]
+    fn resolve_lines_merges_inside_the_rayleigh_criterion() {
+        let lines = resolve(&baseband(
+            &[
+                Source {
+                    offset_hz: -0.2,
+                    amplitude: 1.0,
+                    tau_secs: 1.5,
+                },
+                Source {
+                    offset_hz: 0.2,
+                    amplitude: 1.0,
+                    tau_secs: 1.5,
+                },
+            ],
+            56,
+            0.01,
+            0x3c6e_f372,
+        ));
+        assert_eq!(lines.len(), 1, "0.4 Hz is under 2/T = 1.54 Hz");
+    }
+
+    /// A record too short for the gate to stand behind reports nothing rather
+    /// than something. There is no ceiling to match it: a record longer than
+    /// anything the ring currently keeps must still resolve, because how long to
+    /// keep is the caller's policy and not this function's.
+    #[test]
+    fn resolve_lines_has_a_floor_and_no_ceiling() {
+        // 5 Hz apart, so the pair clears 2/T at the floor (3.45 Hz) as well as
+        // at the long record — the test is about length limits, not resolution.
+        let two = [
+            Source {
+                offset_hz: -2.5,
+                amplitude: 1.0,
+                tau_secs: 1.5,
+            },
+            Source {
+                offset_hz: 2.5,
+                amplitude: 1.0,
+                tau_secs: 1.5,
+            },
+        ];
+        assert!(resolve(&baseband(&two, UNISON_MIN_BINS - 1, 0.01, 7)).is_empty());
+        assert_eq!(resolve(&baseband(&two, UNISON_MIN_BINS, 0.01, 7)).len(), 2);
+        // Well past the shipped ring cap, and past the 64 a bitmask scan allowed.
+        assert_eq!(resolve(&baseband(&two, 100, 0.01, 7)).len(), 2);
+
+        // No room to write an answer into ⇒ no work.
+        let record = baseband(&two, 56, 0.01, 7);
+        let fft = rustfft::FftPlanner::<f32>::new().plan_fft_forward(record.len());
+        let mut spectrum = vec![Complex::new(0.0, 0.0); record.len()];
+        let mut magnitudes = vec![0.0f32; record.len()];
+        let mut scratch = vec![Complex::new(0.0, 0.0); fft.get_inplace_scratch_len()];
+        assert_eq!(
+            resolve_lines(
+                &record,
+                fft.as_ref(),
+                spectral::candan_c_n(record.len()),
+                HOP_HZ,
+                &mut LineScratch {
+                    spectrum: &mut spectrum,
+                    magnitudes: &mut magnitudes,
+                    fft: &mut scratch,
+                },
+                &mut [],
+            ),
+            0
+        );
+    }
+
+    /// A silent baseband has no lines, and a lopsided pair still finds the
+    /// quiet string: sensitivity reaches ≈26 dB below the strongest (ADR 0012 §3).
+    #[test]
+    fn resolve_lines_handles_the_extremes() {
+        let silence = vec![Complex::new(0.0f32, 0.0); 56];
+        assert!(resolve(&silence).is_empty());
+
+        let lines = resolve(&baseband(
+            &[
+                Source {
+                    offset_hz: -1.5,
+                    amplitude: 1.0,
+                    tau_secs: 1.5,
+                },
+                Source {
+                    offset_hz: 1.5,
+                    amplitude: 0.1, // −20 dB
+                    tau_secs: 1.5,
+                },
+            ],
+            56,
+            0.002,
+            0x2545_f491,
+        ));
+        assert_eq!(lines.len(), 2, "a −20 dB second string must still be found");
+        assert!(lines[1].relative_amplitude < 0.3);
     }
 }

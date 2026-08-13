@@ -11,11 +11,17 @@ open.
 
 ## Sequencing
 
-Most of this file has no ordering. These four steps do, agreed 2026-08-01:
+Most of this file has no ordering. These steps do, agreed 2026-08-01 and
+extended 2026-08-07:
 
+0. **Capture the as-found unisons before the piano is tuned** — the only
+   irreversible item in this file. Tuning destroys that state; the set state can
+   be recreated by tuning again. Needs a small capture-metadata mechanism first
+   (which strings were sounding), and it doubles as the bass-attribution mute
+   test. → ADR 0012 Limitations
 1. **Finish the in-flight user-facing work** — session durability, the per-key
-   inspector + flagged-key styling, and the band-slope move have landed. Then
-   unison assist and the Neyman–Pearson gate measurement.
+   inspector + flagged-key styling, the band-slope move and unison assist have
+   landed. Then the Neyman–Pearson gate measurement.
 2. **Upgrade to CPAL 0.18.1** (below). Before the refactors, so the module
    boundaries are drawn around the API we are keeping rather than redrawn after.
 3. **The structural work revised this session** — the `worker.rs` / `audio.rs` /
@@ -26,6 +32,22 @@ Most of this file has no ordering. These four steps do, agreed 2026-08-01:
 ---
 
 ## User-facing
+
+- **Unison assist: the discriminator is near-silent, and the bass is out of
+  scope** — `Gated on longer captures` / `Gated on Prompt T`. The test that
+  separates a real unison from one string beating with itself returns
+  `Undetermined` on 70–87 % of tenor captures, because a fit over three
+  neighbouring partials has almost no lever arm in frequency; the fix is more
+  resolved partials, i.e. longer recordings, not a looser test. Separately, keys
+  0–27 produce a second line on essentially every capture of both instruments —
+  including single-strung keys — and what those lines are is unestablished, so
+  the panel never asserts a unison there. ≈10 % of *third* lines remain
+  unattributed.
+  → [ADR 0012](docs/adr/0012-unison-line-estimator.md) §§5–6, §8
+- **Unison assist: which panel layout to keep** — `Planned`. Both ship behind a
+  toggle (the displayed partial alone, or every resolved partial stacked)
+  because the captures cannot answer which reads better while tuning. Drop one
+  once it has been used on a real instrument.
 
 - **Profile export / import from an arbitrary path** — `Deferred`. The library
   browser covers new / open / resume / duplicate / delete over the profiles
@@ -55,10 +77,6 @@ Most of this file has no ordering. These four steps do, agreed 2026-08-01:
   through a raise (the coarse readout is lock-independent and has no ±21.5 Hz
   limit); what is missing is over-pull *targets* — a deficit-measurement pass and
   a model of how a raise redistributes tension.
-- **Unison assist** — `Deferred`. A multi-string note needs its strings
-  zero-beat against each other. The beat is already present as the amplitude
-  envelope of a single strobe reference; it is not yet estimated or displayed.
-  See `docs/design/strobe-and-manual-tuning-ui-design.md` §7.4.
 - **Show-all partials strobe mode** — `Deferred`. The v1 strobe shows one
   Smart-Partials-selected band per key; a band-per-partial toggle is planned but
   unbuilt (`strobe_partials` already emits every partial). Two costs kept it out
@@ -254,6 +272,21 @@ These are measured and understood, not defects awaiting a fix.
   the register where the gate degenerates to a ratio test, and the motion tail.
   → [`docs/internals/suspected-issues.md`](docs/internals/suspected-issues.md),
   [ADR 0011](docs/adr/0011-coarse-spectral-readout.md)
+- **Unison assist is resolution-bound, and says so.** A split resolves only once
+  it clears `2/T`; at or below the limit the *reported* separation collapses onto
+  the limit rather than the truth, and it is unreliable either way out to ≈1.6 ×.
+  The panel therefore always states what the current record is worth. 1.5 s of
+  observation cannot reach the endgame (a set unison is well under 1 ¢), which
+  is a property of observation time and not of the estimator.
+  → [ADR 0012](docs/adr/0012-unison-line-estimator.md) §4
+- **The stated resolution is geometric, and over-promises for a quiet second
+  string.** Measured: two strings within 6 dB resolve at the limit itself, but
+  one 12 dB or more down needs ≈1.6 × it. The panel does not qualify the number,
+  because the condition is unobservable precisely when it bites — the corner is
+  the one where the second line is *not* found, so there is no second amplitude
+  to condition on. Closing it is an estimator change (single-kernel fit,
+  asymmetric-shoulder residual), not a display one.
+  → [ADR 0012](docs/adr/0012-unison-line-estimator.md) §4
 
 ## No ETA
 

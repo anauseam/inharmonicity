@@ -945,6 +945,11 @@ impl AudioPipeline {
         frame_output.strobe_gated = strobe_result.gated;
         frame_output.strobe_beat_hz = strobe_result.beat_hz;
         frame_output.strobe_count = strobe_result.count;
+        frame_output.strobe_amplitude = strobe_result.amplitude;
+        frame_output.unison_lines = strobe_result.lines;
+        frame_output.unison_line_count = strobe_result.line_count;
+        frame_output.unison_resolution_hz = strobe_result.line_resolution_hz;
+        frame_output.unison_verdict = strobe_result.verdict;
         frame_output.coarse_hz = strobe_result.coarse_hz;
 
         if let Some(result) = pitch_result {
