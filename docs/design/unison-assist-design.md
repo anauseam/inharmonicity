@@ -425,8 +425,12 @@ The 4096 window is the theoretically correct filter — its first null sits exac
 at the baseband Nyquist — but it did **not** remove the spurious line in the same
 test (Hann sidelobes still admit a strong out-of-band interferer). Only presence
 was measured, not the folded line's *strength*, which is what decides whether it
-out-ranks a genuine string. **The window choice is therefore an open measurement,
-not a settled fix.**
+out-ranks a genuine string.
+
+**Closed 2026-08-12 by [ADR 0013](../adr/0013-bass-extra-lines-attribution.md)
+§2**, which measured the strength: the fold is severe at the 1024 window and
+suppressed at 4096, which is what makes R3's long window load-bearing for this
+consumer too. The window choice itself does not move.
 
 ### E-R — erroneous lines, matched against the full-rate DFT
 
@@ -604,7 +608,10 @@ Ordered by how much they could change the design.
 
 - **The bass attribution is inferred, not proven.** Established: the bass second
   lines are real spectral content, not aliased neighbouring partials, not
-  constant in cents, and poorly reproducible. *Not* established: what they are.
+  constant in cents, and poorly reproducible (that last leg was overturned —
+  header). *Not* established: what they are. **ADR 0013 took the candidate list
+  below as far as these captures allow**, and the decisive experiment is a
+  capture with one string muted.
   Candidates, none excluded — polarization false beats (wound strings are
   notorious); **longitudinal string modes** (Conklin), which land at frequencies
   unrelated to the transverse series; **sympathetic resonance from a neighbouring
@@ -612,12 +619,9 @@ Ordered by how much they could change the design.
   at 55 Hz is only ~3.3 Hz and therefore lands *inside* the ±21.5 Hz baseband —
   the same suspicion Prompt E was queued to investigate; soundboard/bridge mode
   coupling; or a genuinely wide bichord on these neglected instruments.
-- **The 4096-sample bass configuration was never tested synthetically.** Every
-  null and resolution trial used the 1024 window, which is critically sampled at
-  the hop rate. The deep bass uses `goertzel_bass` with the same 1024 hop, so its
-  baseband is 4× oversampled and its noise correspondingly correlated — exactly
-  the assumption the CFAR null rests on. This is a plausible contributor to the
-  bass behaviour above and must be tested before any bass claim.
+- ~~**The 4096-sample bass configuration was never tested synthetically.**~~
+  **Tested 2026-08-12 (ADR 0013 §1):** the null does break there, by far too
+  little to account for the bass behaviour above.
 - **The reference is assumed correct.** All real-capture runs used the *measured*
   partial frequency as `f_ref`, which centres the baseband. In the app `f_ref` is
   the curve target and an out-of-tune string sits off-centre; past ±21.5 Hz the

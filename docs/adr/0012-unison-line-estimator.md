@@ -250,7 +250,12 @@ repeat strikes, and they occur where there is only one string. What they *are* i
 unestablished; the obvious artefact is ruled out (they are not aliased
 neighbouring partials), and the candidates — polarization false beats,
 longitudinal modes, sympathetic resonance from a neighbouring key, soundboard
-coupling — are the subject of a separate investigation (Prompt T).
+coupling — were the subject of a separate investigation.
+
+**[ADR 0013](0013-bass-extra-lines-attribution.md) supersedes this section's
+scope wording.** The register ships — the estimator is sound there and the lines
+are not a second string — while what they *are* stays open. The scoping
+mechanism below is unchanged and is why it can ship at all.
 
 **There is no key threshold anywhere**, and there must not be. The scoping
 mechanism is the discriminator: measured over both instruments, the panel asserts
@@ -456,9 +461,9 @@ was never derived and no such constant exists.
   damped exponentials.
 - **The bass ring runs a 4096-sample Goertzel** (the existing R3 rule), so its
   baseband is 4× oversampled and its noise correspondingly correlated — the
-  assumption §1's null rests on. Never tested synthetically in that
-  configuration; a plausible contributor to §5 and a prerequisite for any bass
-  claim.
+  assumption §1's null rests on. **Measured since (ADR 0013 §1):** the null does
+  break there, by too little to account for §5, and the overlap costs exactly the
+  2× that §1's `N_ref/4` conjecture assumed.
 - **The discriminator is near-silent** (§6) and its `Undetermined` rate is
   dominated by lever arm, not by the instrument.
 - **≈10 % of third lines remain unattributed** (§8).

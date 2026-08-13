@@ -104,6 +104,15 @@ Offline tools discover dumps by the `key_` prefix and read the key identity from
   the callback budget (E9). E6 and E9 are synthetic and run whatever directory
   is passed.
 
+  **E10–E12 are the bass attribution** (ADR 0013): the null, the resolution law
+  and the baseband noise correlation in the deep bass's own 4096-sample window,
+  the folded interferer's strength, and a register sweep of neighbour leakage
+  (E10); whether the extra lines recur at fixed absolute frequencies across
+  different keys (E11); and every extra line against the families that could
+  have produced it — the struck key's own partials, the neighbouring keys',
+  Conklin's mixing products — each scored against a permutation null, plus the
+  fitted `Δ ∝ f^p` law and the flanking pair's symmetry (E12). E10 is synthetic.
+
   E1–E5 are ADR 0011's and must not move: a change to the strobe that shifts
   them has changed the band-slope or coarse readout, which the unison work is a
   tap alongside rather than a stage within.

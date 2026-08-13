@@ -61,6 +61,27 @@
 //! **E9 — cost.** µs per hop in `--release` for the whole bank, against the
 //! 23.2 ms callback the pipeline has to fit inside.
 //!
+//! ### The bass extra lines (ADR 0013)
+//!
+//! **E10 — the bass configuration, which every trial above skips.** The deep
+//! bass runs a 4096-sample Goertzel against the same 1024-sample hop (R3), so
+//! its baseband is 4× oversampled and its noise correlated — the independence
+//! the CFAR null assumes. The null, the resolution law and the noise
+//! correlation are measured there against the same audio through the 1024
+//! window; then the folded interferer's *strength* (the open E-Q question) and
+//! a sweep of how far up the compass a string's own neighbouring partials fold
+//! into its baseband.
+//!
+//! **E11 — do the extra lines sit at fixed absolute frequencies?** Recurrence
+//! across *different keys* is the signature of an instrument or room resonance
+//! rather than a property of the struck string.
+//!
+//! **E12 — attribution.** Every extra line against the families that could have
+//! produced it, each predicted from the instrument's own measured (f₀, B) and
+//! scored against a permutation null; then which side of the partial they sit
+//! on, the law their splits follow, and whether a third line is a symmetric
+//! sideband.
+//!
 //! Run: `cargo run --release --example strobe_replay -- [diagnostics_dir]`
 
 use std::path::{Path, PathBuf};
@@ -111,6 +132,9 @@ fn read_raw_f32(path: &Path) -> Option<Vec<f32>> {
 struct Capture {
     key: u8,
     f0: f32,
+    /// The capture's own `calculated_b`, which E12 uses only to *predict where
+    /// another key's partials sit* — never to calibrate a synthetic generator.
+    b: f32,
     noise_floor: f32,
     /// Measured partial frequency by number (1-indexed), `None` if absent.
     partial_hz: Vec<Option<f32>>,
@@ -124,6 +148,7 @@ fn load(dir: &Path) -> Option<Capture> {
     let key = m["key_index"].as_u64()? as u8;
     let f0 = m["mat_f0"].as_f64().or_else(|| m["measured_f0"].as_f64())? as f32;
     let noise_floor = m["noise_floor"].as_f64().unwrap_or(0.003) as f32;
+    let b = m["calculated_b"].as_f64().unwrap_or(0.0) as f32;
 
     let mut partial_hz = vec![None; MAX_STROBE_REFS + 1];
     if let Some(arr) = m["partials"].as_array() {
@@ -142,6 +167,7 @@ fn load(dir: &Path) -> Option<Capture> {
     Some(Capture {
         key,
         f0,
+        b,
         noise_floor,
         partial_hz,
         audio,
@@ -391,8 +417,12 @@ impl Noise {
 
 /// Renders `sources` as **audio**, so the trials go through the shipped Goertzel
 /// front end rather than a model of it: the analysis window, the decay and the
-/// noise are all in the loop.
-fn synth_audio(sources: &[Source], hops: usize, snr_db: f32, seed: u32) -> Vec<f32> {
+/// noise are all in the loop. Offsets are measured from `base_hz`.
+///
+/// `snr_db` is against the **total** source power, which is the probed line's own
+/// SNR only when it is the only source; a multi-source trial that wants a stated
+/// SNR at one line pre-compensates (see [`e10_bass_null`]).
+fn synth_audio(base_hz: f32, sources: &[Source], hops: usize, snr_db: f32, seed: u32) -> Vec<f32> {
     let total = BASS_WINDOW_SIZE + hops * HOP_SIZE;
     let signal_rms = (sources
         .iter()
@@ -408,7 +438,7 @@ fn synth_audio(sources: &[Source], hops: usize, snr_db: f32, seed: u32) -> Vec<f
             let t = i as f32 / SAMPLE_RATE as f32;
             let mut x = noise_amp * noise.next();
             for (k, s) in sources.iter().enumerate() {
-                let f = SYNTH_REF_HZ + s.offset_hz;
+                let f = base_hz + s.offset_hz;
                 let phase = 2.0 * std::f32::consts::PI * f * t + 1.1 * k as f32;
                 x += s.amplitude * (-t / s.tau_secs).exp() * phase.sin();
             }
@@ -480,7 +510,7 @@ fn run_unison(
 
 /// One synthetic trial: how many lines the bank resolved, and where.
 fn synth_trial(sources: &[Source], hops: usize, snr_db: f32, seed: u32) -> Resolved {
-    let audio = synth_audio(sources, hops, snr_db, seed);
+    let audio = synth_audio(SYNTH_REF_HZ, sources, hops, snr_db, seed);
     let mut refs = [0.0f32; MAX_STROBE_REFS];
     refs[0] = SYNTH_REF_HZ;
     let (best, _) = run_unison(&audio, &refs, 1, SYNTH_REF_HZ, 1e-6);
@@ -725,6 +755,458 @@ fn e6_synthetic() {
     println!("(design note E-U: 0 % at the 1024-sample window; the 4096 one broke at 45 %)");
 }
 
+// ─── The bass configuration (E10) ───────────────────────────────────────────
+
+/// Where content `delta_hz` from a reference lands in the baseband. One Goertzel
+/// output per hop *is* a decimation to `HOP_RATE_HZ`, so anything the analysis
+/// window admits folds into ±f_hop/2 — it never leaves the band, it only moves
+/// inside it (design note E-Q).
+fn fold_hz(delta_hz: f32) -> f32 {
+    let wrapped = delta_hz.rem_euclid(HOP_RATE_HZ);
+    if wrapped > 0.5 * HOP_RATE_HZ {
+        wrapped - HOP_RATE_HZ
+    } else {
+        wrapped
+    }
+}
+
+/// A first reference low enough that the bank's R3 rule selects the 4096-sample
+/// window (the boundary is `2·f_s/1024` ≈ 86 Hz), carrying no synthetic content
+/// of its own. It makes the window an A/B at any probed frequency: the bank
+/// keys the choice on `refs[0]`, and every reference is evaluated independently.
+const R3_FORCING_HZ: f32 = 50.0;
+
+/// One key's stiff-string series `f_n = n·f₀·√(1+Bn²)`, and the partial the
+/// panel displays for it.
+///
+/// `B` is the Rigaud medium **prior** at the key, never a capture's own
+/// `calculated_b`: the standing rule is that the synthetic generator is not
+/// recalibrated to the engine's measurements.
+struct KeyRefs {
+    f1: f32,
+    b: f32,
+    partials: [f32; MAX_STROBE_REFS],
+    probe_n: usize,
+}
+
+impl KeyRefs {
+    fn for_key(key: usize) -> Self {
+        let b = tuner_core::algorithms::rigaud::BXi::DEFAULT_MEDIUM.b_at_key(key) as f32;
+        let f1 = NOTES[key].frequency;
+        let f0 = f1 / (1.0 + b).sqrt();
+        let mut partials = [0.0f32; MAX_STROBE_REFS];
+        for (i, r) in partials.iter_mut().enumerate() {
+            let n = (i + 1) as f32;
+            *r = n * f0 * (1.0 + b * n * n).sqrt();
+        }
+        Self {
+            f1,
+            b,
+            partials,
+            probe_n: default_display_partials()[key] as usize,
+        }
+    }
+
+    fn probe_hz(&self) -> f32 {
+        self.partials[self.probe_n - 1]
+    }
+
+    /// Partial spacing at the probed partial — what has to clear the analysis
+    /// window's main lobe for the neighbours not to leak in.
+    fn spacing_hz(&self) -> f32 {
+        let n = self.probe_n;
+        if n >= MAX_STROBE_REFS {
+            self.partials[n - 1] - self.partials[n - 2]
+        } else {
+            self.partials[n] - self.partials[n - 1]
+        }
+    }
+
+    /// One string's whole partial series as sources, offsets measured from the
+    /// probed partial. Equal amplitudes: the deep bass radiates its fundamental
+    /// *worse* than its upper partials (ADR 0011 §"mechanism" — the n = 1
+    /// competitor runs 1.3–1.8 × the target at B0–C#1), so a flat series is not
+    /// a pessimistic choice there, and it is the leakage case the R3 window
+    /// exists for.
+    fn series(&self, tau: f32) -> Vec<Source> {
+        self.partials
+            .iter()
+            .map(|f| Source {
+                offset_hz: f - self.probe_hz(),
+                amplitude: 1.0,
+                tau_secs: tau,
+            })
+            .collect()
+    }
+}
+
+/// What the probed frequency resolves under one window, with the reference set
+/// shaped to select it: the probe alone (1024), or the probe behind
+/// [`R3_FORCING_HZ`] (4096, the shipped deep-bass path).
+fn probe_lines(audio: &[f32], probe_hz: f32, long: bool) -> Resolved {
+    let mut refs = [0.0f32; MAX_STROBE_REFS];
+    if long {
+        refs[0] = R3_FORCING_HZ;
+        refs[1] = probe_hz;
+        run_unison(audio, &refs, 2, refs[0], 1e-6).0[1]
+    } else {
+        refs[0] = probe_hz;
+        run_unison(audio, &refs, 1, probe_hz, 1e-6).0[0]
+    }
+}
+
+/// SNR against the *total* source power that puts the probed line — source 0 —
+/// at `want_db`. [`synth_audio`] scales its noise to every source together.
+fn total_snr_for(sources: &[Source], want_db: f32) -> f32 {
+    let total: f32 = sources.iter().map(|s| s.amplitude * s.amplitude).sum();
+    want_db + 10.0 * (total / sources[0].amplitude.powi(2)).log10()
+}
+
+/// The demodulated baseband of a **noise-only** input at `f_ref`, formed exactly
+/// as the bank forms it: one Goertzel per hop over the newest window, its
+/// reference rotation removed.
+fn baseband_noise(f_ref: f32, long: bool, hops: usize, seed: u32) -> Vec<Complex<f32>> {
+    let mut noise = Noise(seed | 1);
+    let audio: Vec<f32> = (0..BASS_WINDOW_SIZE + hops * HOP_SIZE)
+        .map(|_| noise.next())
+        .collect();
+    let t_hop = HOP_SIZE as f32 / SAMPLE_RATE as f32;
+    (0..hops)
+        .map(|h| {
+            let win = &audio[h * HOP_SIZE..h * HOP_SIZE + BASS_WINDOW_SIZE];
+            let (amp, phase) = if long {
+                goertzel_bass(win, SAMPLE_RATE, f_ref)
+            } else {
+                goertzel(win, SAMPLE_RATE, f_ref)
+            };
+            let turn = phase - 2.0 * std::f32::consts::PI * f_ref * t_hop * h as f32;
+            Complex::from_polar(amp, turn)
+        })
+        .collect()
+}
+
+/// **E10** — the null, the resolution law and the noise correlation in the
+/// **bass** configuration, which every synthetic trial before this one skipped.
+///
+/// The deep bass runs `goertzel_bass` (R3) against the same 1024-sample hop, so
+/// its baseband is 4× oversampled and consecutive samples share three quarters
+/// of their input. Correlated reference cells are exactly what an OS-CFAR
+/// threshold assumes away, so the shipped null — measured only at the treble's
+/// critically-sampled 1024 window — may not hold there at all. That is the first
+/// candidate explanation for the bass second lines (ADR 0012 §5, Prompt T).
+fn e10_bass_null() {
+    const TRIALS: usize = 40;
+    /// E1 — inside the 0–27 band whose second lines this is about, and well
+    /// under the R3 boundary, so its shipped path is the 4096-sample window.
+    const BASS_KEY: usize = 7;
+    let cfg = KeyRefs::for_key(BASS_KEY);
+    let probe = cfg.probe_hz();
+    println!("\n=== E10: the bass (4096-sample window) configuration ===");
+    println!(
+        "reference set: key {BASS_KEY} ({}), f₁ = {:.2} Hz, B = {:.2e} (Rigaud medium prior),\n\
+         probed at the displayed partial n = {} → {:.2} Hz, spacing there {:.1} Hz.  The A/B is\n\
+         the *same audio* through two reference sets differing only in what selects the\n\
+         window: the probe alone (1024) and the probe behind a {R3_FORCING_HZ:.0} Hz first reference (4096).",
+        NOTES[BASS_KEY].name,
+        cfg.f1,
+        cfg.b,
+        cfg.probe_n,
+        probe,
+        cfg.spacing_hz(),
+    );
+
+    println!("\n--- E10a: the null — one string must never report two ---");
+    println!(
+        "{:>34} {:>9} {:>9} {:>9} {:>9}",
+        "case", "1024 @30", "1024 @56", "4096 @30", "4096 @56"
+    );
+    for (label, series, snr) in [
+        ("isolated line, SNR 40", false, 40.0f32),
+        ("isolated line, SNR 15", false, 15.0),
+        ("isolated line, SNR 6", false, 6.0),
+        ("whole partial series, SNR 40", true, 40.0),
+        ("whole partial series, SNR 15", true, 15.0),
+        ("whole partial series, SNR 6", true, 6.0),
+    ] {
+        let sources = if series {
+            cfg.series(1.5)
+        } else {
+            vec![Source {
+                offset_hz: 0.0,
+                amplitude: 1.0,
+                tau_secs: 1.5,
+            }]
+        };
+        let snr_total = total_snr_for(&sources, snr);
+        let mut hits = [[0usize; 2]; 2]; // [window][record]
+        for (ri, &hops) in [30usize, 56].iter().enumerate() {
+            for t in 0..TRIALS {
+                let audio = synth_audio(
+                    probe,
+                    &sources,
+                    hops,
+                    snr_total,
+                    0x27d4_eb2fu32.wrapping_mul(t as u32 + 1),
+                );
+                hits[0][ri] += usize::from(probe_lines(&audio, probe, false).count >= 2);
+                hits[1][ri] += usize::from(probe_lines(&audio, probe, true).count >= 2);
+            }
+        }
+        print!("{label:>34}");
+        for window in &hits {
+            for record in window {
+                print!("{:>9.0}%", 100.0 * *record as f32 / TRIALS as f32);
+            }
+        }
+        println!();
+    }
+    println!(
+        "SNR is stated at the *probed* line in every row, so the two halves of the table\n\
+         differ only in the presence of the other eleven partials — spacing {:.1} Hz, i.e.\n\
+         inside the 1024-sample window's main lobe (±86 Hz) and outside the 4096 one's\n\
+         (±21.5 Hz).  A partial that leaks in folds: the baseband is sampled at {:.2} Hz.",
+        cfg.spacing_hz(),
+        HOP_RATE_HZ
+    );
+
+    println!("\n--- E10b: does a genuine pair still resolve there? 56-hop record ---");
+    println!(
+        "{:>10} {:>10} {:>12} {:>10} {:>12}",
+        "split Hz", "1024 P(2)", "1024 split", "4096 P(2)", "4096 split"
+    );
+    for split in [0.7f32, 1.0, 1.5, 2.0, 3.0, 5.0] {
+        let sources = vec![
+            Source {
+                offset_hz: -split / 2.0,
+                amplitude: 1.0,
+                tau_secs: 1.5,
+            },
+            Source {
+                offset_hz: split / 2.0,
+                amplitude: 1.0,
+                tau_secs: 1.5,
+            },
+        ];
+        let mut got = [Vec::new(), Vec::new()];
+        for t in 0..TRIALS {
+            let audio = synth_audio(
+                probe,
+                &sources,
+                56,
+                40.0,
+                0x1656_67b1u32.wrapping_mul(t as u32 + 1),
+            );
+            for (w, long) in [false, true].iter().enumerate() {
+                let r = probe_lines(&audio, probe, *long);
+                if r.count >= 2 {
+                    let mut o: Vec<f32> = r.lines[..2].iter().map(|l| l.offset_hz).collect();
+                    o.sort_by(f32::total_cmp);
+                    got[w].push(o[1] - o[0]);
+                }
+            }
+        }
+        println!(
+            "{split:>10.1} {:>9.0}% {:>12.2} {:>9.0}% {:>12.2}",
+            100.0 * got[0].len() as f32 / TRIALS as f32,
+            median(got[0].clone()),
+            100.0 * got[1].len() as f32 / TRIALS as f32,
+            median(got[1].clone()),
+        );
+    }
+
+    println!("\n--- E10d: how far up the compass does neighbour leakage reach? ---");
+    println!(
+        "One string, whole partial series, 56-hop record, SNR 40 at the probed partial —\n\
+         the E10a 'series' case swept across the compass. `R3` marks the window the shipped\n\
+         rule picks for that key. 'rel amp' is the strongest false line's amplitude relative\n\
+         to the true one, which is the strength E-Q measured only the *presence* of.\n"
+    );
+    println!(
+        "{:>4} {:>5} {:>7} {:>3} {:>8} {:>7} {:>5} {:>9} {:>7} {:>9} {:>7} {:>8}",
+        "key",
+        "note",
+        "f₁ Hz",
+        "n*",
+        "spacing",
+        "folds to",
+        "R3",
+        "1024 @40",
+        "@15",
+        "4096 @40",
+        "@15",
+        "rel amp"
+    );
+    for key in [7usize, 12, 19, 24, 26, 27, 31, 36, 43, 48] {
+        let k = KeyRefs::for_key(key);
+        let p = k.probe_hz();
+        let sources = k.series(1.5);
+        let mut hits = [[0usize; 2]; 2]; // [window][snr]
+        let mut rel = Vec::new();
+        for (si, snr) in [40.0f32, 15.0].iter().enumerate() {
+            let snr_total = total_snr_for(&sources, *snr);
+            for t in 0..TRIALS {
+                let audio = synth_audio(
+                    p,
+                    &sources,
+                    56,
+                    snr_total,
+                    0x7feb_352du32.wrapping_mul(t as u32 + 1),
+                );
+                for (w, long) in [false, true].iter().enumerate() {
+                    let r = probe_lines(&audio, p, *long);
+                    if r.count >= 2 {
+                        hits[w][si] += 1;
+                        if !*long && si == 0 {
+                            rel.push(r.lines[1].relative_amplitude);
+                        }
+                    }
+                }
+            }
+        }
+        let pct = |n: usize| 100.0 * n as f32 / TRIALS as f32;
+        println!(
+            "{key:>4} {:>5} {:>7.1} {:>3} {:>8.1} {:>+7.1} {:>5} {:>8.0}% {:>6.0}% {:>8.0}% {:>6.0}% {:>8.3}",
+            NOTES[key].name,
+            k.f1,
+            k.probe_n,
+            k.spacing_hz(),
+            fold_hz(k.spacing_hz()),
+            if k.f1 * 1024.0 < 2.0 * SAMPLE_RATE as f32 {
+                "4096"
+            } else {
+                "1024"
+            },
+            pct(hits[0][0]),
+            pct(hits[0][1]),
+            pct(hits[1][0]),
+            pct(hits[1][1]),
+            median(rel.clone()),
+        );
+    }
+    println!(
+        "'folds to' is where the next partial up lands after decimation: an offset wraps\n\
+         into ±{:.2} Hz, so a neighbour never leaves the baseband, it only moves inside it.",
+        0.5 * HOP_RATE_HZ
+    );
+
+    println!("\n--- E10e: the folded interferer's *strength* (the open E-Q question) ---");
+    println!(
+        "One true line at the probe, one equal-amplitude interferer δ Hz above it, SNR 40,\n\
+         56-hop record. E-Q confirmed a fold appears; what decides whether it out-ranks a\n\
+         genuine string is its amplitude, which was never measured.  Note the 1024-sample\n\
+         window's bin width is f_s/1024 = {:.2} Hz — the hop rate itself — so its Hann nulls\n\
+         land exactly on the offsets that fold to zero, which is why δ = 43 and 86 are empty\n\
+         rows.  Everywhere else there is no such protection.\n",
+        SAMPLE_RATE as f32 / 1024.0
+    );
+    println!(
+        "{:>8} {:>10} {:>11} {:>10} {:>11} {:>10}",
+        "δ Hz", "folds to", "1024 spur", "1024 amp", "4096 spur", "4096 amp"
+    );
+    for delta in [
+        5.0f32, 10.0, 15.0, 21.0, 30.0, 43.0, 55.0, 65.0, 86.0, 110.0, 150.0,
+    ] {
+        let sources = [
+            Source {
+                offset_hz: 0.0,
+                amplitude: 1.0,
+                tau_secs: 1.5,
+            },
+            Source {
+                offset_hz: delta,
+                amplitude: 1.0,
+                tau_secs: 1.5,
+            },
+        ];
+        let want = fold_hz(delta);
+        let mut hits = [0usize; 2];
+        let mut amps = [Vec::new(), Vec::new()];
+        for t in 0..TRIALS {
+            let audio = synth_audio(
+                probe,
+                &sources,
+                56,
+                40.0,
+                0x2545_f491u32.wrapping_mul(t as u32 + 1),
+            );
+            for (w, long) in [false, true].iter().enumerate() {
+                let r = probe_lines(&audio, probe, *long);
+                // The spurious line is the one at the predicted fold, not merely
+                // a second line: a fold within 2 bins of 0 is the target itself.
+                if let Some(l) = r.lines[..r.count as usize]
+                    .iter()
+                    .find(|l| (l.offset_hz - want).abs() < 1.0 && want.abs() > r.resolution_hz)
+                {
+                    hits[w] += 1;
+                    amps[w].push(l.relative_amplitude);
+                }
+            }
+        }
+        let pct = |n: usize| 100.0 * n as f32 / TRIALS as f32;
+        let db = |v: Vec<f32>| {
+            let m = median(v);
+            if m.is_nan() {
+                f32::NAN
+            } else {
+                20.0 * m.log10()
+            }
+        };
+        println!(
+            "{delta:>8.0} {:>+10.1} {:>10.0}% {:>9.0}dB {:>10.0}% {:>9.0}dB",
+            want,
+            pct(hits[0]),
+            db(amps[0].clone()),
+            pct(hits[1]),
+            db(amps[1].clone()),
+        );
+    }
+
+    println!("\n--- E10c: the mechanism — baseband noise correlation ---");
+    println!(
+        "A 4096-sample window advanced by a 1024-sample hop overlaps 75 %, so consecutive\n\
+         baseband samples are correlated and the record carries fewer independent samples\n\
+         than it has bins. ρ_k is the complex correlation coefficient at lag k, pooled over\n\
+         64 noise-only runs of {UNISON_RING_HOPS} hops; N/N_eff is the variance inflation of an average\n\
+         over the record, 1 + 2·Σ(1 − k/N)·|ρ_k|² (Welch 1967).  |ρ̂| of independent samples\n\
+         does not estimate 0 but ≈1/√N = {:.3}, which is the floor to read the table against.",
+        1.0 / (UNISON_RING_HOPS as f32).sqrt()
+    );
+    println!(
+        "\n{:>10} {:>9} {:>9} {:>9} {:>9} {:>10}",
+        "window", "ρ_1", "ρ_2", "ρ_3", "ρ_4", "N/N_eff"
+    );
+    for (label, long) in [("1024", false), ("4096", true)] {
+        let mut rho = [0.0f64; 4];
+        let runs = 64;
+        for seed in 0..runs {
+            let z = baseband_noise(probe, long, UNISON_RING_HOPS, 0x9e37_79b9 * (seed + 1));
+            let power: f32 = z.iter().map(|x| x.norm_sqr()).sum();
+            for (k, r) in rho.iter_mut().enumerate() {
+                let lag = k + 1;
+                let c: Complex<f32> = z[..z.len() - lag]
+                    .iter()
+                    .zip(&z[lag..])
+                    .map(|(a, b)| a.conj() * b)
+                    .sum();
+                *r += (c.norm() / power) as f64;
+            }
+        }
+        let rho: Vec<f32> = rho.iter().map(|r| (r / runs as f64) as f32).collect();
+        let n = UNISON_RING_HOPS as f32;
+        let inflation = 1.0
+            + 2.0
+                * rho
+                    .iter()
+                    .enumerate()
+                    .map(|(k, r)| (1.0 - (k + 1) as f32 / n) * r * r)
+                    .sum::<f32>();
+        println!(
+            "{label:>10} {:>9.3} {:>9.3} {:>9.3} {:>9.3} {:>10.2}",
+            rho[0], rho[1], rho[2], rho[3], inflation
+        );
+    }
+}
+
 /// The measured stiff-string reference set for a capture, from `analysis.json`'s
 /// own partial list. Returns the count written.
 fn measured_refs(cap: &Capture, out: &mut [f32; MAX_STROBE_REFS]) -> usize {
@@ -741,13 +1223,13 @@ fn measured_refs(cap: &Capture, out: &mut [f32; MAX_STROBE_REFS]) -> usize {
     count
 }
 
-/// Register label used by the unison summaries. Unison assist v1 is **tenor and
-/// treble**: the bass produces a second line on essentially every capture of both
-/// instruments, including single-strung keys, and what those lines are is
-/// unestablished (ADR 0012 §5, Prompt T).
+/// Register label used by the unison summaries. The bass is reported separately
+/// throughout: it produces a second line on essentially every capture of both
+/// instruments, including on single-strung keys, and those lines are real
+/// spectral content that is not a second string (ADR 0012 §5, ADR 0013).
 fn register(key: u8) -> &'static str {
     match key {
-        0..=27 => "bass (out of scope)",
+        0..=27 => "bass",
         28..=51 => "tenor",
         52..=75 => "treble",
         _ => "high 76–87",
@@ -763,7 +1245,7 @@ fn e7_real(captures: &[(Capture, Vec<Resolved>, UnisonVerdict, usize)]) {
         "{:>20} {:>9} {:>7} {:>6} {:>6} {:>10} {:>9}",
         "register", "captures", "≥1 line", "≥2", "≥3", "median T", "med 2/T"
     );
-    for band in ["bass (out of scope)", "tenor", "treble", "high 76–87"] {
+    for band in ["bass", "tenor", "treble", "high 76–87"] {
         let rows: Vec<&Resolved> = captures
             .iter()
             .filter(|(c, ..)| register(c.key) == band)
@@ -796,7 +1278,7 @@ fn e7_real(captures: &[(Capture, Vec<Resolved>, UnisonVerdict, usize)]) {
         "{:>20} {:>6} {:>7} {:>6} {:>6} {:>10} {:>9}",
         "register", "refs", "≥1 line", "≥2", "≥3", "median T", "med 2/T"
     );
-    for band in ["bass (out of scope)", "tenor", "treble", "high 76–87"] {
+    for band in ["bass", "tenor", "treble", "high 76–87"] {
         let rows: Vec<&Resolved> = captures
             .iter()
             .filter(|(c, ..)| register(c.key) == band)
@@ -832,7 +1314,7 @@ fn e7_real(captures: &[(Capture, Vec<Resolved>, UnisonVerdict, usize)]) {
         "register", "keys", "median split", "median MAD", "relative"
     );
     // Group by key, take each strike's split at the displayed partial.
-    for band in ["bass (out of scope)", "tenor", "treble"] {
+    for band in ["bass", "tenor", "treble"] {
         let mut per_key: Vec<(u8, Vec<f32>)> = Vec::new();
         for (cap, resolved, _, _) in captures.iter().filter(|(c, ..)| register(c.key) == band) {
             let n_star = table[cap.key as usize] as usize;
@@ -880,7 +1362,7 @@ fn e7_real(captures: &[(Capture, Vec<Resolved>, UnisonVerdict, usize)]) {
         "{:>20} {:>9} {:>9} {:>9} {:>14}",
         "register", "captures", "unison", "false beat", "undetermined"
     );
-    for band in ["bass (out of scope)", "tenor", "treble", "high 76–87"] {
+    for band in ["bass", "tenor", "treble", "high 76–87"] {
         let rows: Vec<UnisonVerdict> = captures
             .iter()
             .filter(|(c, ..)| register(c.key) == band)
@@ -1106,6 +1588,604 @@ fn e8_unexplained(captures: &[(Capture, Vec<Resolved>, UnisonVerdict, usize)]) {
     );
 }
 
+// ─── Bass attribution (E11–E12) ─────────────────────────────────────────────
+
+/// A reported line that is not the strongest at its reference — what Prompt T is
+/// about. The bass produces one on essentially every capture of both
+/// instruments, including on single-strung keys, and what they are is
+/// unestablished (ADR 0012 §5).
+struct Extra {
+    key: u8,
+    /// Partial number of the reference it sits on.
+    partial: usize,
+    f_ref: f32,
+    offset_hz: f32,
+    /// Analysis window that produced it — what the front end could admit at all,
+    /// its main lobe being ±2·f_s/N.
+    window: usize,
+    /// `2/T` of the record it came from — the floor its offset must clear
+    /// before the *position* means anything (ADR 0012 §4).
+    resolution_hz: f32,
+}
+
+impl Extra {
+    fn abs_hz(&self) -> f32 {
+        self.f_ref + self.offset_hz
+    }
+
+    /// Half the analysis window's Hann main lobe: content further out than this
+    /// enters through sidelobes only, at −34 dB or worse (E10e).
+    fn lobe_hz(&self) -> f32 {
+        2.0 * SAMPLE_RATE as f32 / self.window as f32
+    }
+}
+
+/// Every extra line the bank reported, over all captures.
+fn extras(captures: &[(Capture, Vec<Resolved>, UnisonVerdict, usize)]) -> Vec<Extra> {
+    let mut out = Vec::new();
+    for (cap, resolved, _, window) in captures {
+        for (i, r) in resolved.iter().enumerate() {
+            let Some(f_ref) = cap.partial_hz[i + 1] else {
+                continue;
+            };
+            for rank in 1..r.count as usize {
+                out.push(Extra {
+                    key: cap.key,
+                    partial: i + 1,
+                    f_ref,
+                    offset_hz: r.lines[rank].offset_hz,
+                    window: *window,
+                    resolution_hz: r.resolution_hz,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// The instrument's own partial layout, one row per key — where a *neighbouring*
+/// key's partials sit, which is what the sympathetic-resonance candidate
+/// predicts. Built from the set's own captures and extended past the twelve
+/// measured partials by the stiff-string law.
+struct KeyTable {
+    f0: [f32; 88],
+    b: [f32; 88],
+}
+
+impl KeyTable {
+    fn of(captures: &[(Capture, Vec<Resolved>, UnisonVerdict, usize)]) -> Self {
+        let mut f0 = [0.0f32; 88];
+        let mut b = [0.0f32; 88];
+        for key in 0..88 {
+            let rows: Vec<&Capture> = captures
+                .iter()
+                .map(|(c, ..)| c)
+                .filter(|c| c.key as usize == key && c.f0 > 0.0)
+                .collect();
+            if rows.is_empty() {
+                continue;
+            }
+            f0[key] = median(rows.iter().map(|c| c.f0).collect());
+            b[key] = median(rows.iter().map(|c| c.b).collect());
+        }
+        Self { f0, b }
+    }
+
+    /// The **phantom partials** that land near this key's partial `n`: Conklin's
+    /// nonlinear mixing products `fᵢ + fⱼ` with `i + j = n` and `2fᵢ − fⱼ` with
+    /// `2i − j = n`. They sit *below* the transverse partial, because the
+    /// transverse series is stretched by inharmonicity while a mixing product
+    /// adds linearly — `f_n − (fᵢ + fⱼ) = (3/2)·B·f₀·i·j·n` to first order in B.
+    ///
+    /// The *free* longitudinal series is not predictable from `(f₀, B)` — it
+    /// needs the string's length and `√(E/ρ)` — so this is the testable half of
+    /// the longitudinal candidate.
+    fn phantoms(&self, key: usize, n: usize, out: &mut Vec<f32>) {
+        out.clear();
+        let (f0, b) = (self.f0[key], self.b[key]);
+        if f0 <= 0.0 || n < 2 {
+            return;
+        }
+        let f = |m: usize| m as f32 * f0 * (1.0 + b * (m * m) as f32).sqrt();
+        for i in 1..n {
+            let j = n - i;
+            if i <= j {
+                out.push(f(i) + f(j));
+            }
+            // 2fᵢ − fⱼ with 2i − j = n, i.e. j = 2i − n.
+            if 2 * i > n {
+                out.push(2.0 * f(i) - f(2 * i - n));
+            }
+        }
+    }
+
+    /// This key's partials inside `centre ± half`, by the stiff-string law.
+    fn near(&self, key: usize, centre: f32, half: f32, out: &mut Vec<f32>) {
+        out.clear();
+        let (f0, b) = (self.f0[key], self.b[key]);
+        if f0 <= 0.0 {
+            return;
+        }
+        for m in 1..=64u32 {
+            let f = m as f32 * f0 * (1.0 + b * (m * m) as f32).sqrt();
+            if f > centre + half {
+                break;
+            }
+            if f >= centre - half {
+                out.push(f);
+            }
+        }
+    }
+}
+
+/// Does any candidate frequency in `set` fold onto the extra line?
+///
+/// A candidate is admitted only if the analysis window could pass it at all,
+/// and it is then folded, because the baseband is decimated: a component
+/// `Δ` from the reference is indistinguishable from one at `Δ ± k·f_hop`.
+fn folds_onto(set: &[f32], e: &Extra, offset_hz: f32, tol: f32) -> bool {
+    set.iter().any(|f| {
+        let delta = f - e.f_ref;
+        delta.abs() <= e.lobe_hz() && (fold_hz(delta) - offset_hz).abs() <= tol
+    })
+}
+
+/// **E11** — do the extra lines sit at *fixed absolute frequencies*?
+///
+/// Prompt T's second discriminating experiment, and Prompt E's test: recurrence
+/// of the same absolute frequency across *different keys* is the signature of an
+/// instrument or room resonance rather than a property of the struck string.
+fn e11_recurrence(captures: &[(Capture, Vec<Resolved>, UnisonVerdict, usize)]) {
+    const TOL_HZ: f32 = 0.5;
+    let all = extras(captures);
+    println!("\n=== E11: do the extra lines recur at fixed absolute frequencies? ===");
+    println!(
+        "A soundboard or room resonance sits where it sits whatever is struck, so an extra\n\
+         line it caused must reappear at the same absolute frequency under *other* keys.\n\
+         'shared' = this line has a partner within {TOL_HZ} Hz reported under a different key;\n\
+         'chance' is the same statistic with the offsets permuted between lines of the same\n\
+         register, which keeps both the reference layout and the offsets' own distribution\n\
+         and destroys only which line carries which. A resonance shows as shared ≫ chance."
+    );
+    println!(
+        "{:>20} {:>7} {:>9} {:>9} {:>10} {:>10}",
+        "register", "lines", "shared", "chance", "top bin", "null bin"
+    );
+    for band in ["bass", "tenor", "treble"] {
+        let rows: Vec<&Extra> = all.iter().filter(|e| register(e.key) == band).collect();
+        if rows.len() < 10 {
+            continue;
+        }
+        let shared = |freqs: &[(u8, f32)]| -> f32 {
+            let hit = freqs
+                .iter()
+                .filter(|(k, f)| {
+                    freqs
+                        .iter()
+                        .any(|(k2, f2)| k2 != k && (f2 - f).abs() <= TOL_HZ)
+                })
+                .count();
+            100.0 * hit as f32 / freqs.len() as f32
+        };
+        let observed: Vec<(u8, f32)> = rows.iter().map(|e| (e.key, e.abs_hz())).collect();
+        let permuted = shuffle(rows.iter().map(|e| e.offset_hz).collect(), 0x8f51_2ab3);
+        let drawn: Vec<(u8, f32)> = rows
+            .iter()
+            .zip(&permuted)
+            .map(|(e, d)| (e.key, e.f_ref + d))
+            .collect();
+        // How many distinct keys the most-populated bin draws from — the same
+        // question asked without a pairing rule, and asked of the null too.
+        let crowd = |set: &[(u8, f32)]| -> usize {
+            set.iter()
+                .map(|(_, f)| {
+                    let mut keys: Vec<u8> = set
+                        .iter()
+                        .filter(|(_, f2)| (f2 - f).abs() <= TOL_HZ)
+                        .map(|(k, _)| *k)
+                        .collect();
+                    keys.sort_unstable();
+                    keys.dedup();
+                    keys.len()
+                })
+                .max()
+                .unwrap_or(0)
+        };
+        let best = crowd(&observed);
+        println!(
+            "{band:>20} {:>7} {:>8.0}% {:>8.0}% {:>10} {:>10}",
+            rows.len(),
+            shared(&observed),
+            shared(&drawn),
+            best,
+            crowd(&drawn)
+        );
+        if band.starts_with("bass") && best >= 3 {
+            // The candidate fingerprint itself: where the most keys agree.
+            let mut top: Vec<(f32, usize)> = observed
+                .iter()
+                .map(|(_, f)| {
+                    let mut keys: Vec<u8> = observed
+                        .iter()
+                        .filter(|(_, f2)| (f2 - f).abs() <= TOL_HZ)
+                        .map(|(k, _)| *k)
+                        .collect();
+                    keys.sort_unstable();
+                    keys.dedup();
+                    (*f, keys.len())
+                })
+                .collect();
+            top.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.total_cmp(&b.0)));
+            top.dedup_by(|a, b| (a.0 - b.0).abs() <= TOL_HZ);
+            print!("  most-shared bass frequencies (Hz × distinct keys × partials):");
+            for (f, k) in top.iter().take(5) {
+                let mut partials: Vec<usize> = rows
+                    .iter()
+                    .filter(|e| (e.abs_hz() - f).abs() <= TOL_HZ)
+                    .map(|e| e.partial)
+                    .collect();
+                partials.sort_unstable();
+                partials.dedup();
+                print!("  {f:.1}×{k}×n{partials:?}");
+            }
+            println!();
+        }
+    }
+}
+
+/// **E12** — the attribution itself: every extra line against the families that
+/// could have produced it.
+///
+/// Every transverse partial of every key is predictable from the measured
+/// (f₀, B), so the struck key's own series, the neighbouring keys' series and
+/// Conklin's nonlinear-mixing family can each be *predicted* and the leftovers
+/// classified. Each family is scored against the same test run on redrawn
+/// positions, because the piano's spectrum is dense enough that a family with
+/// enough members explains everything by coincidence.
+fn e12_attribution(captures: &[(Capture, Vec<Resolved>, UnisonVerdict, usize)]) {
+    const TOL_HZ: f32 = 0.5;
+    let table = KeyTable::of(captures);
+    let all = extras(captures);
+    println!("\n=== E12: what could have produced the extra lines ===");
+    println!(
+        "Each family is predicted from the instrument's own measured (f₀, B), admitted only\n\
+         if the analysis window's main lobe reaches it (±{:.0} Hz at the 1024-sample window,\n\
+         ±{:.0} Hz at 4096), then folded into the baseband. Tolerance {TOL_HZ} Hz.\n\
+         'chance' repeats the identical test with the offsets permuted between lines.\n",
+        2.0 * SAMPLE_RATE as f32 / 1024.0,
+        2.0 * SAMPLE_RATE as f32 / 4096.0,
+    );
+    println!(
+        "{:>20} {:>7} {:>26} {:>9} {:>9} {:>9}",
+        "register", "lines", "family", "explains", "chance", "excess"
+    );
+
+    let families: [(&str, i32); 7] = [
+        ("own partials (E-N)", -1),
+        ("neighbour ±1 semitone", 1),
+        ("neighbour ±2 semitones", 2),
+        ("neighbour ±12 (octave)", 12),
+        ("any key on the piano", 88),
+        ("Conklin mixing, any fᵢ±fⱼ", -2),
+        ("phantom at this partial", -3),
+    ];
+
+    let mut candidates: Vec<f32> = Vec::new();
+    let mut scratch: Vec<f32> = Vec::new();
+    // The bass is split by *window*, because that is what decides which
+    // candidates the front end can admit at all: keys whose f₁ clears 86 Hz —
+    // roughly 20 upwards — ship the 1024-sample window with the panel still
+    // displaying partial 6, so their neighbouring partials are inside its main
+    // lobe and fold (E10d).
+    let bands: [(&str, usize); 3] = [
+        ("bass, 4096 window", 4096),
+        ("bass, 1024 window", 1024),
+        ("tenor", 0),
+    ];
+    for (band, window) in bands {
+        let rows: Vec<&Extra> = all
+            .iter()
+            .filter(|e| {
+                if window == 0 {
+                    register(e.key) == "tenor"
+                } else {
+                    register(e.key).starts_with("bass") && e.window == window
+                }
+            })
+            .collect();
+        if rows.len() < 10 {
+            continue;
+        }
+        // The null shuffles the *observed* offsets between lines of the same
+        // register rather than drawing uniformly: real offsets concentrate near
+        // the reference, and a uniform draw would credit every family with the
+        // difference between those two distributions.
+        let shuffled = shuffle(rows.iter().map(|e| e.offset_hz).collect(), 0x1d2c_5f97);
+        for (label, kind) in families {
+            let (mut hit, mut chance) = (0usize, 0usize);
+            for (idx, e) in rows.iter().enumerate() {
+                candidates.clear();
+                let key = e.key as usize;
+                match kind {
+                    -1 => {
+                        table.near(key, e.f_ref, e.lobe_hz(), &mut scratch);
+                        // The reference partial itself is not a candidate: it is
+                        // the line the extra is measured against.
+                        candidates.extend(scratch.iter().filter(|f| (*f - e.f_ref).abs() > TOL_HZ));
+                    }
+                    -2 => {
+                        table.near(key, 0.0, 4.0 * e.f_ref, &mut scratch);
+                        for (a, fi) in scratch.iter().enumerate() {
+                            for fj in &scratch[a..] {
+                                for f in [fi + fj, 2.0 * fi - fj] {
+                                    if (f - e.f_ref).abs() <= e.lobe_hz() {
+                                        candidates.push(f);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    -3 => table.phantoms(key, e.partial, &mut candidates),
+                    span => {
+                        let lo = key.saturating_sub(span as usize);
+                        let hi = (key + span as usize).min(87);
+                        for k2 in lo..=hi {
+                            if k2 == key {
+                                continue;
+                            }
+                            table.near(k2, e.f_ref, e.lobe_hz(), &mut scratch);
+                            candidates.extend(scratch.iter());
+                        }
+                    }
+                }
+                hit += usize::from(folds_onto(&candidates, e, e.offset_hz, TOL_HZ));
+                chance += usize::from(folds_onto(&candidates, e, shuffled[idx], TOL_HZ));
+            }
+            let n = rows.len() as f32;
+            let observed = 100.0 * hit as f32 / n;
+            let expected = 100.0 * chance as f32 / n;
+            println!(
+                "{band:>20} {:>7} {label:>26} {observed:>8.0}% {expected:>8.0}% {:>+8.0}%",
+                rows.len(),
+                observed - expected
+            );
+        }
+    }
+
+    println!("\n--- E12b: which side of the partial do they sit on? ---");
+    println!(
+        "A second string is above or below with equal prior probability, and so are the two\n\
+         polarizations of one string. A *phantom* partial is not: the transverse series is\n\
+         stretched by inharmonicity while the mixing product fᵢ + fⱼ adds linearly, so it\n\
+         must land BELOW its partial, by f_n − (fᵢ + fⱼ) ≈ (3/2)·B·f₀·i·j·n.\n"
+    );
+    println!(
+        "{:>20} {:>7} {:>9} {:>12} {:>12} {:>12} {:>11}",
+        "register", "lines", "below", "median δ Hz", "median |δ|", "in cents", "|δ|/(2/T)"
+    );
+    for band in ["bass", "tenor", "treble"] {
+        let rows: Vec<&Extra> = all.iter().filter(|e| register(e.key) == band).collect();
+        if rows.len() < 10 {
+            continue;
+        }
+        let below = rows.iter().filter(|e| e.offset_hz < 0.0).count();
+        println!(
+            "{band:>20} {:>7} {:>8.0}% {:>12.2} {:>12.2} {:>11.1}¢ {:>11.2}",
+            rows.len(),
+            100.0 * below as f32 / rows.len() as f32,
+            median(rows.iter().map(|e| e.offset_hz).collect()),
+            median(rows.iter().map(|e| e.offset_hz.abs()).collect()),
+            median(
+                rows.iter()
+                    .map(|e| 1200.0 * (1.0 + e.offset_hz.abs() / e.f_ref).log2())
+                    .collect()
+            ),
+            median(
+                rows.iter()
+                    .filter(|e| e.resolution_hz > 0.0)
+                    .map(|e| e.offset_hz.abs() / e.resolution_hz)
+                    .collect()
+            ),
+        );
+    }
+
+    println!("\n--- E12c: the phantom prediction, per partial ---");
+    println!(
+        "Predicted offsets are the mixing products fᵢ + fⱼ with i + j = n and 2fᵢ − fⱼ with\n\
+         2i − j = n, evaluated on the key's own measured (f₀, B) — a sparse set of at most\n\
+         n/2 values, all negative. 'ratio' is the observed offset over the nearest predicted\n\
+         one; a family that is right predicts 1.0.\n"
+    );
+    println!(
+        "{:>20} {:>4} {:>7} {:>12} {:>12} {:>9} {:>9}",
+        "register", "n", "lines", "predicted Hz", "observed Hz", "ratio", "within .5"
+    );
+    for band in ["bass", "tenor"] {
+        for n in [2usize, 4, 6, 8] {
+            let rows: Vec<&Extra> = all
+                .iter()
+                .filter(|e| register(e.key) == band && e.partial == n)
+                .collect();
+            if rows.len() < 10 {
+                continue;
+            }
+            let mut predicted = Vec::new();
+            let mut ratios = Vec::new();
+            let mut within = 0usize;
+            for e in &rows {
+                table.phantoms(e.key as usize, n, &mut candidates);
+                let Some(best) = candidates
+                    .iter()
+                    .map(|f| f - e.f_ref)
+                    .min_by(|a, b| (a - e.offset_hz).abs().total_cmp(&(b - e.offset_hz).abs()))
+                else {
+                    continue;
+                };
+                predicted.push(best);
+                ratios.push(e.offset_hz / best);
+                within += usize::from((best - e.offset_hz).abs() <= TOL_HZ);
+            }
+            if predicted.is_empty() {
+                continue;
+            }
+            println!(
+                "{band:>20} {n:>4} {:>7} {:>12.2} {:>12.2} {:>9.2} {:>8.0}%",
+                rows.len(),
+                median(predicted),
+                median(rows.iter().map(|e| e.offset_hz).collect()),
+                median(ratios),
+                100.0 * within as f32 / rows.len() as f32,
+            );
+        }
+    }
+
+    println!("\n--- E12e: are the flanking lines a symmetric pair? ---");
+    println!(
+        "Where three lines resolve, the two weaker ones are measured against the strongest.\n\
+         A modulation — anything that varies the string's amplitude or frequency at a fixed\n\
+         rate — puts a *symmetric* pair at ±ν around every partial, so `|d₁+d₂|/(|d₁|+|d₂|)`\n\
+         is 0. Three strings, or a string plus an unrelated line, have no reason to be\n\
+         symmetric. 'chance' pairs each d₁ with another triple's d₂.\n"
+    );
+    println!(
+        "{:>20} {:>8} {:>12} {:>12} {:>10} {:>10}",
+        "register", "triples", "median |d₁|", "median |d₂|", "symmetry", "chance"
+    );
+    for band in ["bass", "tenor", "treble"] {
+        let mut d1 = Vec::new();
+        let mut d2 = Vec::new();
+        for (cap, resolved, ..) in captures.iter().filter(|(c, ..)| register(c.key) == band) {
+            for (i, r) in resolved.iter().enumerate() {
+                if r.count == 3 && cap.partial_hz[i + 1].is_some() {
+                    d1.push(r.lines[1].offset_hz - r.lines[0].offset_hz);
+                    d2.push(r.lines[2].offset_hz - r.lines[0].offset_hz);
+                }
+            }
+        }
+        if d1.len() < 10 {
+            continue;
+        }
+        let asymmetry = |a: &[f32], b: &[f32]| -> Vec<f32> {
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| (x + y).abs() / (x.abs() + y.abs()).max(1e-6))
+                .collect()
+        };
+        let observed = asymmetry(&d1, &d2);
+        let permuted = asymmetry(&d1, &shuffle(d2.clone(), 0x94d0_49bb));
+        println!(
+            "{band:>20} {:>8} {:>12.2} {:>12.2} {:>10.2} {:>10.2}",
+            d1.len(),
+            median(d1.iter().map(|x| x.abs()).collect()),
+            median(d2.iter().map(|x| x.abs()).collect()),
+            median(observed),
+            median(permuted),
+        );
+    }
+
+    println!("\n--- E12d: the law the splits follow, fitted per capture ---");
+    println!(
+        "The discriminator fits ln Δ = ln a + p·ln f and asks whether p is 1 (a unison, both\n\
+         strings' partials scaling together) or 0 (a separation fixed in Hz). A phantom\n\
+         partial obeys neither: Δ ≈ (3/2)·B·f₀·i·j·n with i·j ≈ n²/4 gives Δ ∝ n³, i.e.\n\
+         p ≈ 3. This is the same fit the shipped test runs, reported as a distribution\n\
+         instead of a verdict.\n"
+    );
+    println!(
+        "A split at the record's own limit is reported *at* the limit whatever the truth was\n\
+         (ADR 0012 §4), and the limit is the same for every partial — which would itself\n\
+         manufacture p̂ = 0. The second row per register admits only splits wider than\n\
+         2 × 2/T, where §4 measures the reported separation to be exact.\n"
+    );
+    println!(
+        "{:>20} {:>13} {:>9} {:>9} {:>9} {:>9} {:>10} {:>9}",
+        "register", "splits used", "captures", "median p̂", "p10", "p90", "|p̂−1|<3σ", "|p̂|<3σ"
+    );
+    for band in ["bass", "tenor", "treble"] {
+        for (label, floor) in [("all", 0.0f32), ("> 2 × 2/T", 2.0)] {
+            let mut slopes = Vec::new();
+            let (mut near_unison, mut near_fixed) = (0usize, 0usize);
+            for (cap, resolved, ..) in captures.iter().filter(|(c, ..)| register(c.key) == band) {
+                let mut points = Vec::new();
+                for (i, r) in resolved.iter().enumerate() {
+                    let Some(f_ref) = cap.partial_hz[i + 1] else {
+                        continue;
+                    };
+                    if r.count < 2 {
+                        continue;
+                    }
+                    let lines = &r.lines[..r.count as usize];
+                    let lo = lines
+                        .iter()
+                        .map(|l| l.offset_hz)
+                        .fold(f32::INFINITY, f32::min);
+                    let hi = lines
+                        .iter()
+                        .map(|l| l.offset_hz)
+                        .fold(f32::NEG_INFINITY, f32::max);
+                    if hi - lo > floor * r.resolution_hz {
+                        points.push((f_ref.ln(), (hi - lo).ln()));
+                    }
+                }
+                let Some((slope, se)) = log_slope(&points) else {
+                    continue;
+                };
+                slopes.push(slope);
+                near_unison += usize::from((slope - 1.0).abs() <= 3.0 * se);
+                near_fixed += usize::from(slope.abs() <= 3.0 * se);
+            }
+            if slopes.len() < 5 {
+                continue;
+            }
+            let mut sorted = slopes.clone();
+            sorted.sort_by(f32::total_cmp);
+            let n = slopes.len();
+            println!(
+                "{band:>20} {label:>13} {n:>9} {:>9.2} {:>9.2} {:>9.2} {:>9.0}% {:>8.0}%",
+                median(slopes),
+                sorted[n / 10],
+                sorted[(n * 9 / 10).min(n - 1)],
+                100.0 * near_unison as f32 / n as f32,
+                100.0 * near_fixed as f32 / n as f32,
+            );
+        }
+    }
+}
+
+/// A deterministic permutation of `v` — the null that keeps a sample's own
+/// distribution and destroys only which line it belongs to.
+fn shuffle(mut v: Vec<f32>, seed: u32) -> Vec<f32> {
+    let mut noise = Noise(seed);
+    for i in (1..v.len()).rev() {
+        let j = ((noise.next() + 0.5) * (i + 1) as f32) as usize;
+        v.swap(i, j.min(i));
+    }
+    v
+}
+
+/// Least-squares slope of `(x, y)` and its standard error, the way
+/// `Unison::discriminate` computes them. `None` when the fit is degenerate.
+fn log_slope(points: &[(f32, f32)]) -> Option<(f32, f32)> {
+    if points.len() < 3 {
+        return None;
+    }
+    let n = points.len() as f32;
+    let mean_x = points.iter().map(|p| p.0).sum::<f32>() / n;
+    let mean_y = points.iter().map(|p| p.1).sum::<f32>() / n;
+    let s_xx: f32 = points.iter().map(|p| (p.0 - mean_x).powi(2)).sum();
+    let s_xy: f32 = points.iter().map(|p| (p.0 - mean_x) * (p.1 - mean_y)).sum();
+    if s_xx <= 0.0 {
+        return None;
+    }
+    let slope = s_xy / s_xx;
+    let rss: f32 = points
+        .iter()
+        .map(|p| (p.1 - mean_y - slope * (p.0 - mean_x)).powi(2))
+        .sum();
+    let se = (rss / (n - 2.0) / s_xx).sqrt();
+    (slope.is_finite() && se.is_finite() && se > 0.0).then_some((slope, se))
+}
+
 /// **E9** — per-hop cost of the whole bank in `--release`, against the 23.2 ms
 /// callback.
 fn e9_cost() {
@@ -1125,7 +2205,7 @@ fn e9_cost() {
             tau_secs: 60.0,
         })
         .collect();
-    let audio = synth_audio(&sources, hops, 40.0, 0x5bf0_3635);
+    let audio = synth_audio(SYNTH_REF_HZ, &sources, hops, 40.0, 0x5bf0_3635);
 
     let mut frame = tuner_core::pipeline::ProcessingFrame::new();
     let mut run = |coarse: u8| -> Vec<f32> {
@@ -1275,6 +2355,7 @@ fn main() {
                 Capture {
                     key: cap.key,
                     f0: cap.f0,
+                    b: cap.b,
                     noise_floor: cap.noise_floor,
                     partial_hz: cap.partial_hz.clone(),
                     audio: cap.audio.clone(),
@@ -1564,9 +2645,12 @@ fn main() {
 
     // ── Unison assist ──
     e6_synthetic();
+    e10_bass_null();
     if !unison.is_empty() {
         e7_real(&unison);
         e8_unexplained(&unison);
+        e11_recurrence(&unison);
+        e12_attribution(&unison);
     }
     e9_cost();
 }
