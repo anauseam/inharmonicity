@@ -492,7 +492,8 @@ fn create_strobe_panel(
 ///   counts by ear.
 /// - **the discriminator's verdict**, visible rather than silently filtering.
 ///   A second line is not proof of a second string: one string beating with
-///   itself looks identical, and in the bass that is what it usually is.
+///   itself looks identical, and in the bass it is measurably not a second
+///   string (ADR 0013 §4).
 ///
 /// Gated on the strobe's own debounced `out_of_range` flag: past ±21.5 Hz the
 /// baseband folds, so the lines would be real content at fictitious places.

@@ -33,17 +33,19 @@ extended 2026-08-07:
 
 ## User-facing
 
-- **Unison assist: the discriminator is near-silent, and the bass is out of
-  scope** — `Gated on longer captures` / `Gated on Prompt T`. The test that
-  separates a real unison from one string beating with itself returns
-  `Undetermined` on 70–87 % of tenor captures, because a fit over three
-  neighbouring partials has almost no lever arm in frequency; the fix is more
-  resolved partials, i.e. longer recordings, not a looser test. Separately, keys
-  0–27 produce a second line on essentially every capture of both instruments —
-  including single-strung keys — and what those lines are is unestablished, so
-  the panel never asserts a unison there. ≈10 % of *third* lines remain
+- **Unison assist: the discriminator is near-silent, and the bass second lines
+  are unattributed** — `Gated on longer captures` / `Gated on a mute-isolation
+  capture set`. The test that separates a real unison from one string beating
+  with itself returns `Undetermined` on 70–87 % of tenor captures, because a fit
+  over three neighbouring partials has almost no lever arm in frequency; the fix
+  is more resolved partials, i.e. longer recordings, not a looser test.
+  Separately, keys 0–27 produce a second line on essentially every capture of
+  both instruments — including single-strung keys. Those lines are real and are
+  measurably not a second string; every remaining candidate needs a capture with
+  one string muted, which no set has. ≈10 % of *third* lines remain
   unattributed.
-  → [ADR 0012](docs/adr/0012-unison-line-estimator.md) §§5–6, §8
+  → [ADR 0012](docs/adr/0012-unison-line-estimator.md) §§5–6, §8,
+  [ADR 0013](docs/adr/0013-bass-extra-lines-attribution.md)
 - **Unison assist: which panel layout to keep** — `Planned`. Both ship behind a
   toggle (the displayed partial alone, or every resolved partial stacked)
   because the captures cannot answer which reads better while tuning. Drop one

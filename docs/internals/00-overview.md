@@ -118,7 +118,8 @@ docs/adr/
 ├── 0009-repeat-capture-noise-decomposition.md Repeat-capture σ model; ln-B shrinkage
 ├── 0010-m-of-n-lock-rule-replay.md            M-of-N acquisition lock; two-instrument replay
 ├── 0011-coarse-spectral-readout.md            Strobe coarse readout: CFAR gate, n* selection
-└── 0012-unison-line-estimator.md              Unison assist: baseband zoom DFT, OS-CFAR lines
+├── 0012-unison-line-estimator.md              Unison assist: baseband zoom DFT, OS-CFAR lines
+└── 0013-bass-extra-lines-attribution.md       Bass second lines: attribution, the window
 ```
 
 Each file is self-contained, and section headings are stable enough to be

@@ -27,8 +27,9 @@ For the design rationale and open observations, see [ARCHITECTURE.md](ARCHITECTU
 >   the selected note are resolved as separate spectral lines with their beat
 >   rate, and the panel always states the resolution the reading is worth — but
 >   the test that separates a real unison from one string beating with itself
->   returns "undetermined" on most notes, and the bass register is out of scope
->   until what its extra lines are is established.
+>   returns "undetermined" on most notes. In the bass it withholds the claim
+>   almost always, and correctly: those keys carry a second line that is real
+>   spectral content but is not a second string, and what it *is* is unsettled.
 > - **No pitch-raise over-pull targets.**
 > - **A440 only**, no user-adjustable temperaments.
 >
