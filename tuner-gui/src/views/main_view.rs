@@ -11,7 +11,7 @@ use crate::utils::view_utils::{
     ButtonConfig, ButtonType, make_capture_button, make_sidebar_section, make_undo_button,
 };
 use crate::views::curve_select;
-use crate::widgets::curve_plot::{CurvePlot, PlotMode, SUSPECT};
+use crate::widgets::curve_plot::{CurvePlot, INK_SECONDARY, PlotMode, SUSPECT};
 use crate::widgets::strobe_display::StrobeDisplay;
 use crate::widgets::unison_display::{self, UnisonDisplay, UnisonMode};
 use crate::widgets::{cent_meter, guitar_strings, piano_keyboard, spectrogram};
@@ -111,6 +111,7 @@ pub fn create_main_view(
         data.undo_target_note.clone(),
         capture_message,
         data.reference_mode,
+        data.string_isolation.then_some(data.sounding_strings),
     );
 
     // Assemble the final layout
@@ -863,6 +864,95 @@ fn create_keyboard_panel(
 //     Some(panel.into())
 // }
 
+/// One string chip: lit when set, inert when the key has no such string.
+fn string_chip(
+    label: u8,
+    lit: bool,
+    lit_color: iced::Color,
+    on_press: Option<Message>,
+) -> Element<'static, Message> {
+    let enabled = on_press.is_some();
+    let mut chip = button(text(label.to_string()).size(13))
+        .padding([4, 12])
+        .style(move |_theme, _status| button::Style {
+            background: Some(iced::Background::Color(if lit {
+                lit_color
+            } else {
+                iced::Color::from_rgb(0.22, 0.22, 0.21)
+            })),
+            text_color: if enabled {
+                iced::Color::WHITE
+            } else {
+                iced::Color::from_rgb(0.45, 0.45, 0.45)
+            },
+            border: iced::Border {
+                radius: 4.0.into(),
+                ..iced::Border::default()
+            },
+            ..button::Style::default()
+        });
+    if let Some(message) = on_press {
+        chip = chip.on_press(message);
+    }
+    chip.into()
+}
+
+/// The string declaration the next capture will carry: how many strings the
+/// key is strung with (`Total`), and which of them are unmuted (`Sounding`).
+///
+/// Shown only when string isolation is switched on in Settings. The
+/// declaration is stamped onto the capture as it dispatches, so it applies to
+/// the *next* capture and must be set before arming.
+fn strings_section(strings: models::SoundingStrings) -> Element<'static, Message> {
+    let on_key_row = (1..=models::MAX_STRINGS_PER_KEY as u8).fold(
+        row![text("Total").size(13).width(Length::Fixed(70.0))].spacing(4),
+        |r, n| {
+            r.push(string_chip(
+                n,
+                strings.on_key == n,
+                iced::Color::from_rgb(0.25, 0.28, 0.36),
+                Some(Message::SetSoundingStrings(strings.with_on_key(n))),
+            ))
+        },
+    );
+
+    // A single-strung key's declaration is its count, so the whole row is
+    // inert there rather than offering a choice that does not exist.
+    let sounding_row = (0..models::MAX_STRINGS_PER_KEY).fold(
+        row![text("Sounding").size(13).width(Length::Fixed(70.0))].spacing(4),
+        |r, i| {
+            let selectable = strings.on_key > 1 && i < strings.on_key as usize;
+            r.push(string_chip(
+                i as u8 + 1,
+                strings.sounding[i],
+                iced::Color::from_rgb(0.24, 0.47, 0.30),
+                selectable.then(|| Message::SetSoundingStrings(strings.toggled(i))),
+            ))
+        },
+    );
+
+    column![
+        text("Strings").size(18),
+        text("on this key, then which sound")
+            .size(11)
+            .color(INK_SECONDARY),
+        Space::new().height(6),
+        on_key_row.align_y(Alignment::Center),
+        sounding_row.align_y(Alignment::Center),
+        // Warned rather than merely stated: the count alone declares nothing,
+        // so a capture armed in this state records no string state at all.
+        text(strings.to_string())
+            .size(11)
+            .color(if strings.sounding_count() == 0 {
+                SUSPECT
+            } else {
+                INK_SECONDARY
+            }),
+    ]
+    .spacing(5)
+    .into()
+}
+
 /// Creates the settings sidebar widget.
 ///
 /// Builds the right-side settings panel containing all application controls
@@ -883,6 +973,7 @@ fn create_sidebar(
     undo_target_note: Option<String>,
     capture_message: Message,
     reference_mode: ReferenceMode,
+    strings: Option<models::SoundingStrings>,
 ) -> Element<'static, Message> {
     let mut sections = column![].spacing(10);
 
@@ -932,6 +1023,9 @@ fn create_sidebar(
 
     // Add capture button if in measurement mode
     if measurement_mode_active {
+        if let Some(strings) = strings {
+            sections = sections.push(strings_section(strings));
+        }
         sections = sections.push(make_capture_button(capture_state, capture_message));
     }
 

@@ -126,6 +126,12 @@ fn process(dir: &Path) -> Option<serde_json::Value> {
         // dirs per key; downstream audits need the identity.
         "source_dir": dir.file_name().and_then(|n| n.to_str()),
         "measured_f0": seed,
+        // Passed through: the isolation set is consumed through this harness
+        // like every other, and there a capture means nothing without it.
+        "sounding_strings": meta
+            .get("sounding_strings")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
         "mat_f0": est.f0,
         "calculated_b": est.b,
         "prior_b": get_expected_beta(key_index),

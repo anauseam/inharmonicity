@@ -1,6 +1,6 @@
 # Capture Sets — the validation data
 
-Every empirical claim in this project rests on three sets of real recordings.
+Every empirical claim in this project rests on sets of real recordings.
 They are kept on disk and **never committed** (`.gitignore`: `diagnostics/`,
 `diagnostics_piano*/`) — they are large, regenerable-in-principle, and
 instrument-specific. This file records what they are, what state the
@@ -26,6 +26,62 @@ Note the naming inconsistency: piano **1** has an underscore before the index,
 piano **2** does not. This is why `.gitignore` uses `diagnostics_piano*/` — an
 earlier `diagnostics_piano_*/` silently failed to ignore 315 MB of piano-2
 captures.
+
+## The mute-isolation set (`diagnostics_piano<N>_unison/`) — not yet recorded
+
+A fourth set, distinct from the three above and **not interchangeable with
+them**: the same note recorded once per string in isolation (the others damped
+with a mute) and once open. It exists because nothing in the three sets can
+separate a real unison from one string beating against itself — every capture
+of a multi-strung note is a blend, and a reference DFT hits the same `2/T` wall
+the estimator does (ADR 0012 §8, ADR 0013 D3).
+
+What isolation buys, and nothing else does: the true split as a difference of
+two independently measured f₀ (not resolution-bound); a **false-beat positive
+control**, since a solo capture that still resolves two lines is a false beat by
+construction; and per-string B, which is the shipped discriminator's own
+untested premise.
+
+**The mechanism.** Which strings sounded is the operator's declaration, set
+before arming and stamped onto the capture by the DSP thread as it dispatches
+(`models::SoundingStrings`, `PipelineAtomics::capture_strings`). It reaches disk
+in `analysis.json`'s `metadata.sounding_strings` and rides through
+`regenerate_partials`; `null` means undeclared, which is what every capture in
+the three sets above carries and what ordinary tuning writes. **String 1 is the
+leftmost string of the note as the tuner faces the instrument.**
+
+The declaration is offered only when **String Isolation** is switched on in
+Settings (off by default, persisted in the app-settings document). While it is
+off the control is hidden *and* the standing declaration is retracted, so no
+capture can inherit a mute pattern from a session that has ended. A declaration
+carries two facts, and both are needed: how many strings the key is strung with,
+and which of them sounded. Without the count, one string of two and one of three
+are the same record, and neither "is this the open note" nor "do I have every
+solo" can be answered.
+
+**Consumption rules**, in addition to the ones below:
+
+- **A capture with `sounding_strings: null` is not part of this set**, whatever
+  directory it sits in. The declaration is the set.
+- **A solo capture measures one string, not the note**, so the profile retains
+  it but never treats it as the key's measurement: `KeyMeasurement::is_trusted`
+  disqualifies a declared, non-open capture exactly as it disqualifies an
+  auto-mode one, and the tuning curve and strobe read the key's open (or
+  undeclared) capture instead. A key measured *only* in isolation resolves to
+  its newest solo, and the two consumers then part company: the curve **skips
+  the key** (it admits trusted entries only, so the key falls back to the
+  prior), while the strobe still reads that solo's `B`. A pass that never takes
+  an open capture therefore leaves a hole in the curve, not a wrong point in
+  it.
+- **`on_key` is declared, not derived.** Where a piano's single/bi/trichord
+  breaks fall is instrument-specific, and this set is the first data that
+  records them. Declaring `on_key = 1` also declares the sounding string,
+  since a single-strung key admits only one; two and three stay explicit,
+  because there a forgotten mute would record a solo as an open capture.
+  Changing the count clears the sounding set for the same reason — a pattern
+  held across the change would declare a solo nobody made.
+- Validation-only like the others, and doubly so until a second instrument's
+  worth of it exists.
 
 ## Instrument state — read this before interpreting any number
 

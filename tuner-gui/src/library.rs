@@ -8,6 +8,7 @@
 //! decoration, is argued in
 //! `docs/design/session-persistence-and-profile-library.md` §3.
 
+use crate::app::Instrument;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tuner_core::models::{self, InharmonicityProfile};
@@ -87,6 +88,17 @@ pub struct AppSettings {
     /// Recently opened profiles, most recent first.
     #[serde(default)]
     pub recents: Vec<PathBuf>,
+    /// Show the per-capture string declaration (the mute-isolation metadata,
+    /// `docs/internals/06-capture-sets.md`). Off for ordinary tuning: it is a
+    /// measurement-session control, and while it is off no capture carries a
+    /// declaration at all.
+    #[serde(default)]
+    pub string_isolation: bool,
+    /// Which note picker the main view shows. An operator preference, not a
+    /// property of the open instrument — a profile carries its own
+    /// [`InstrumentKind`](tuner_core::models::InstrumentKind).
+    #[serde(default)]
+    pub instrument: Instrument,
 }
 
 impl AppSettings {

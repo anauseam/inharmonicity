@@ -16,9 +16,12 @@ extended 2026-08-07:
 
 0. **Capture the as-found unisons before the piano is tuned** — the only
    irreversible item in this file. Tuning destroys that state; the set state can
-   be recreated by tuning again. Needs a small capture-metadata mechanism first
-   (which strings were sounding), and it doubles as the bass-attribution mute
-   test. → ADR 0012 Limitations
+   be recreated by tuning again. It doubles as the bass-attribution mute test.
+   The capture-metadata mechanism it was waiting on is **built** (which strings
+   sounded, declared before arming — `docs/internals/06-capture-sets.md`), so
+   nothing blocks the session: isolation replaces resolution, and the longer
+   records the protocol sketched are wanted only for per-string decay τ.
+   → ADR 0012 Limitations, [ADR 0013](docs/adr/0013-bass-extra-lines-attribution.md) D3
 1. **Finish the in-flight user-facing work** — session durability, the per-key
    inspector + flagged-key styling, the band-slope move and unison assist have
    landed. Then the Neyman–Pearson gate measurement.

@@ -466,6 +466,7 @@ impl WorkerManager {
             calculated_b,
             last_captured: format!("{}", now), // Basic string timestamp
             captured_in_auto: payload.captured_in_auto,
+            sounding_strings: payload.sounding_strings,
         };
 
         // Step 4: Write Diagnostic Dump
@@ -576,6 +577,9 @@ impl WorkerManager {
                         // diagnostics (regenerate_partials → curve_compare) keep
                         // the trust flag instead of defaulting it to untrusted.
                         "captured_in_auto": measurement.captured_in_auto,
+                        // `null` unless the operator declared one; the
+                        // mute-isolation set is read from these dumps.
+                        "sounding_strings": measurement.sounding_strings,
                         "partials": measurement.partials,
                     }
                 });

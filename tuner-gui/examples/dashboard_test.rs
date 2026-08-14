@@ -109,6 +109,9 @@ impl DashboardTest {
             measurement_mode_active: false,
             capture_state: CaptureState::Idle,
             undo_target_note: None,
+            sounding_strings: models::SoundingStrings::UNDECLARED,
+            string_isolation: false,
+            string_isolation_visible: false,
             is_stale: false,
         };
 

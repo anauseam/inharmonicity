@@ -281,6 +281,7 @@ mod tests {
             calculated_b: Some(1e-4),
             last_captured: format!("{f0}"),
             captured_in_auto: false,
+            sounding_strings: None,
         }
     }
 
