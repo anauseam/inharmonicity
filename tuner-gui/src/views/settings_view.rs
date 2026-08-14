@@ -62,14 +62,23 @@ const PROGRAM_CONFIG: [ButtonConfig; 4] = [
     },
 ];
 
-// Debug-only surface: swaps the main-view note-select widget between the piano
-// keyboard and a six-button guitar-string picker. Not a full instrument mode —
-// no inharmonicity is measured for guitar (see `Instrument`).
-const INSTRUMENT_CONFIG: [ButtonConfig; 1] = [ButtonConfig {
-    label: "Instrument Select",
-    message: Some(Message::ToggleInstrumentSelect),
-    button_type: ButtonType::Standard,
-}];
+// Surfaces an ordinary tuning session never touches. Both persist with the
+// app rather than the open profile.
+const ADVANCED_CONFIG: [ButtonConfig; 2] = [
+    // Swaps the main-view note picker between the piano keyboard and a
+    // six-button guitar-string picker. Not a full instrument mode — no
+    // inharmonicity is measured for guitar (see `Instrument`).
+    ButtonConfig {
+        label: "Instrument Select",
+        message: Some(Message::ToggleInstrumentSelect),
+        button_type: ButtonType::Standard,
+    },
+    ButtonConfig {
+        label: "String Isolation",
+        message: Some(Message::ToggleStringIsolationPanel),
+        button_type: ButtonType::Standard,
+    },
+];
 
 // Which instrument is open, and every instrument previously measured; plus the
 // per-key review surface autosave assumes (design note §4).
@@ -91,7 +100,7 @@ const SETTINGS_SIDEBAR_CONFIG: [(&str, &[ButtonConfig]); 4] = [
     ("Instrument", LIBRARY_CONFIG.as_slice()),
     ("Tonal adjustments", TONAL_CONFIG.as_slice()),
     ("Program adjustments", PROGRAM_CONFIG.as_slice()),
-    ("Instrument (debug)", INSTRUMENT_CONFIG.as_slice()),
+    ("Advanced", ADVANCED_CONFIG.as_slice()),
 ];
 
 pub fn create_settings_view(
@@ -129,6 +138,8 @@ pub fn create_settings_view(
         ninos2_calibration::create_ninos2_calibration_panel(data)
     } else if data.instrument_select_visible {
         create_instrument_select_panel(data.instrument)
+    } else if data.string_isolation_visible {
+        create_string_isolation_panel(data.string_isolation)
     } else {
         text("Select a setting to adjust.").size(18).into()
     };
@@ -148,6 +159,64 @@ pub fn create_settings_view(
         .padding(20);
 
     container(main_content).width(Fill).height(Fill).into()
+}
+
+/// The string-isolation panel: what the per-capture string declaration is,
+/// and the switch that offers it.
+///
+/// It is off by default and hidden while off, because a declaration is only
+/// meaningful when strings are actually being damped one at a time — and a
+/// stale one left standing would label ordinary captures with a mute pattern
+/// that was not there.
+fn create_string_isolation_panel(enabled: bool) -> Element<'static, Message> {
+    fn segment(
+        label: &'static str,
+        target: bool,
+        active: bool,
+    ) -> iced::widget::Button<'static, Message> {
+        let btn = button(text(label).size(16))
+            .padding([8, 24])
+            .on_press(Message::SetStringIsolation(target));
+        if active {
+            btn.style(|_theme, _status| button::Style {
+                background: Some(iced::Background::Color(iced::Color::from_rgb(
+                    0.325, 0.278, 0.388,
+                ))), // purple — matches the active Settings button
+                text_color: iced::Color::WHITE,
+                ..button::Style::default()
+            })
+        } else {
+            btn
+        }
+    }
+
+    column![
+        text("String Isolation").size(20),
+        Space::new().height(8),
+        text(
+            "For measurement sessions where a note's strings are recorded one at a \
+             time, the others damped with a mute. Turning this on adds a declaration \
+             to the capture controls: how many strings the key is strung with, and \
+             which of them are sounding. It is written into the capture's \
+             analysis.json and shown on the measurement inspector's rows."
+        )
+        .size(13),
+        Space::new().height(8),
+        text(
+            "A solo capture measures one string, not the note, so it is not \
+             interchangeable with an ordinary capture. Leave this off for tuning: \
+             while it is off, captures record no string state at all."
+        )
+        .size(13),
+        Space::new().height(16),
+        row![
+            segment("Off", false, !enabled),
+            segment("On", true, enabled)
+        ]
+        .spacing(10),
+    ]
+    .spacing(6)
+    .into()
 }
 
 /// The instrument-select debug panel: a two-button segmented toggle between the

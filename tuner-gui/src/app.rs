@@ -16,6 +16,7 @@ use crate::views::{main_view::create_main_view, settings_view::create_settings_v
 use crate::widgets::envelope::ENVELOPE_HISTORY_LENGTH;
 use crate::widgets::unison_display::{UnisonMode, UnisonRow};
 use iced::{self, Element, Subscription, Theme};
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -123,6 +124,18 @@ pub enum Message {
     RemeasureKey(u8),
     // ----------------------------------------------
 
+    // --- String isolation: the per-capture string declaration ---
+    /// Show or hide the string-isolation settings panel.
+    ToggleStringIsolationPanel,
+    /// Turn the per-capture string declaration on or off. Off is the ordinary
+    /// tuning state, and turning it off clears the standing declaration.
+    SetStringIsolation(bool),
+    /// Declare how the key is strung and which of its strings will sound in
+    /// the next capture. Takes effect at the *next* dispatch, so it is set
+    /// before arming.
+    SetSoundingStrings(models::SoundingStrings),
+    // ----------------------------------------------
+
     // Settings menu items (placeholder for future implementation)
     Temperament,     // Temperament selection
     TuningStandard,  // Tuning standard (A440, etc.)
@@ -199,8 +212,9 @@ pub enum TuningMode {
 /// non-piano source; it measures no new inharmonicity. Switching is handled by
 /// `App::set_instrument`, which keeps the strobe reference and manual selection
 /// coherent across the change.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Instrument {
+    #[default]
     Piano,
     Guitar,
 }
@@ -236,12 +250,16 @@ pub struct InspectorRow {
     pub index: usize,
     /// `KeyMeasurement::last_captured`; also names the on-disk dump.
     pub epoch: String,
-    /// Manual-mode provenance: only these feed the tuning curve.
-    pub trusted: bool,
+    /// Manual-mode provenance. One of the two things that can keep an entry
+    /// out of the curve; the other is a string declaration that is not open.
+    pub manual: bool,
     /// Partials MAT persisted — the σ_lnB model's index (ADR 0009).
     pub partials: usize,
     /// Measured inharmonicity coefficient.
     pub b: Option<f32>,
+    /// Which strings the operator declared sounding, if any — a solo capture
+    /// measures one string, not the note.
+    pub sounding_strings: Option<models::SoundingStrings>,
     /// This is the entry [`models::InharmonicityProfile::active`] resolves to.
     pub is_active: bool,
 }
@@ -566,6 +584,16 @@ pub struct AppDisplayData {
     pub measurement_mode_active: bool,
     pub capture_state: CaptureState,
     pub undo_target_note: Option<String>,
+    /// Which strings the next capture will record as sounding. Sticky across
+    /// captures — a mute pattern is set at the instrument and then several
+    /// notes are taken through it — and stamped onto the capture by the DSP
+    /// thread, never by this side.
+    pub sounding_strings: models::SoundingStrings,
+    /// The string declaration is offered at all. Off for ordinary tuning, and
+    /// then no capture carries one; persisted in [`AppSettings`].
+    pub string_isolation: bool,
+    /// The string-isolation settings panel is open.
+    pub string_isolation_visible: bool,
 }
 
 /// Curve-lock state (design §8, D6) — the single source of truth for what
@@ -824,6 +852,9 @@ impl Default for TunerApp {
                 measurement_mode_active: false,
                 capture_state: CaptureState::Idle,
                 undo_target_note: None,
+                sounding_strings: models::SoundingStrings::UNDECLARED,
+                string_isolation: false,
+                string_isolation_visible: false,
             },
         }
     }
@@ -887,6 +918,7 @@ impl TunerApp {
         d.inspector_visible = false;
         d.curve_select_visible = false;
         d.instrument_select_visible = false;
+        d.string_isolation_visible = false;
         d.settings_data.rms.visible = false;
         d.settings_data.transient.visible = false;
         d.settings_data.ninos.visible = false;
@@ -929,9 +961,10 @@ impl TunerApp {
                         .map(|(index, m)| InspectorRow {
                             index,
                             epoch: m.last_captured.clone(),
-                            trusted: !m.captured_in_auto,
+                            manual: !m.captured_in_auto,
                             partials: m.partials.len(),
                             b: m.calculated_b,
+                            sounding_strings: m.sounding_strings,
                             is_active: std::ptr::eq(m, active),
                         })
                         .collect(),
@@ -939,6 +972,17 @@ impl TunerApp {
             })
             .unwrap_or_default();
         self.display_data.inspector_rows = rows;
+    }
+
+    /// Publishes the string declaration the next capture will carry. The
+    /// pipeline decodes the atomic when it dispatches, so a change lands on
+    /// the next capture and never on the one in flight.
+    fn set_capture_strings(&mut self, strings: models::SoundingStrings) {
+        self.display_data.sounding_strings = strings;
+        self.pipeline_handle
+            .atomics
+            .capture_strings
+            .store(strings.to_bits(), Ordering::Relaxed);
     }
 
     /// Deletes a capture's diagnostics dump — the **undo** path only. A drop
@@ -1036,15 +1080,15 @@ impl TunerApp {
 
     /// Swaps the main-view note-select surface (debug convenience) and keeps the
     /// couplings coherent. The manual-mode/DSP contract is instrument-agnostic —
-    /// it keys off the 0–87 index — so this touches only presentation-adjacent
-    /// state, but two things must stay consistent:
+    /// it keys off the 0–87 index — so this touches presentation state only:
     ///
-    /// * **Strobe reference.** Guitar defaults to ET (fundamental-only, curve-free,
-    ///   the sensible reference for a non-piano string); Piano reverts to the
-    ///   tuning curve. Either way the pending phase and push cache are cleared so
-    ///   [`Self::update_strobe`] re-targets the bank next tick — the same reset
-    ///   the manual `SetReferenceMode` performs. The user can still override
-    ///   the reference afterward from the strobe panel.
+    /// * **Nothing of the open instrument's.** The picker is an operator
+    ///   preference and must not edit the profile; `reference_mode` describes
+    ///   the instrument, not the widget. The reference the strobe reads is
+    ///   whatever the profile carries, changed from the Reference control.
+    /// * **Strobe phase.** The pending phase and push cache are cleared so
+    ///   [`Self::update_strobe`] re-targets the bank next tick — a manual target
+    ///   may be dropped below, so the bank cannot keep its accumulated angle.
     /// * **Manual selection.** Every key is a valid piano key, so Guitar→Piano
     ///   always preserves the target. Entering Guitar with a target that is *not*
     ///   one of the six open strings would leave a selection the guitar surface
@@ -1055,14 +1099,6 @@ impl TunerApp {
     fn set_instrument(&mut self, inst: Instrument) {
         self.display_data.instrument = inst;
 
-        // Instrument-appropriate strobe reference default. The reference set
-        // moves under the bank regardless (ET mode and/or a dropped target),
-        // so force a re-push and clear the accumulated phase either way.
-        self.display_data.reference_mode = match inst {
-            Instrument::Guitar => ReferenceMode::Et,
-            Instrument::Piano => ReferenceMode::Curve,
-        };
-        self.session.profile_mut().settings.reference_mode = self.display_data.reference_mode;
         self.strobe_pushed = None;
         self.display_data.strobe = StrobeState::default();
         self.display_data.unison = UnisonState::default();
@@ -1430,6 +1466,10 @@ impl TunerApp {
         // Resolve which instrument the session starts on, then mirror its
         // settings into the display state the same way an explicit open does.
         app.app_settings = AppSettings::load();
+        app.display_data.string_isolation = app.app_settings.string_isolation;
+        // The picker only; the profile's own saved `reference_mode` stays
+        // authoritative, so this does not run `set_instrument`'s coupling.
+        app.display_data.instrument = app.app_settings.instrument;
         app.session.open_at_startup(&mut app.app_settings);
         if let Err(e) = app.app_settings.save() {
             eprintln!("[MAIN] Could not save app settings: {e}");
@@ -1669,6 +1709,30 @@ impl TunerApp {
                 // the strobe and keyboard live there.
                 self.display_data.settings_view_visible = false;
                 self.refresh_inspector();
+            }
+            Message::ToggleStringIsolationPanel => {
+                let visible = !self.display_data.string_isolation_visible;
+                self.close_settings_panels();
+                self.display_data.string_isolation_visible = visible;
+                if visible {
+                    self.display_data.settings_view_visible = true;
+                }
+            }
+            Message::SetStringIsolation(on) => {
+                self.display_data.string_isolation = on;
+                self.app_settings.string_isolation = on;
+                if let Err(e) = self.app_settings.save() {
+                    eprintln!("[MAIN] Could not save app settings: {e}");
+                }
+                // Turning it off must retract the standing declaration, not
+                // merely stop showing it: an unseen one would keep landing on
+                // ordinary captures.
+                if !on {
+                    self.set_capture_strings(models::SoundingStrings::UNDECLARED);
+                }
+            }
+            Message::SetSoundingStrings(strings) => {
+                self.set_capture_strings(strings);
             }
             Message::SaveProfile => {
                 // The profile auto-saves; this stays as an explicit flush.
@@ -1963,6 +2027,10 @@ impl TunerApp {
             Message::SetInstrument(inst) => {
                 if self.display_data.instrument != inst {
                     self.set_instrument(inst);
+                    self.app_settings.instrument = inst;
+                    if let Err(e) = self.app_settings.save() {
+                        eprintln!("[MAIN] Could not save app settings: {e}");
+                    }
                 }
             }
             Message::Tick => {
@@ -2304,6 +2372,7 @@ mod tests {
             calculated_b: Some(b),
             last_captured: String::new(),
             captured_in_auto: auto,
+            sounding_strings: None,
         };
         profile.record(entry(3, 1e-4, false));
         profile.record(entry(3, 9e-4, true)); // newer, but unattended

@@ -59,30 +59,31 @@ use crate::models::{
 // ─── CurveInput construction ─────────────────────────────────────────────────
 
 impl CurveInput {
-    /// Builds the engine input from a profile, admitting **manual-mode
-    /// captures only** (the shipping rule).
+    /// Builds the engine input from a profile, admitting **trusted captures
+    /// only** (`KeyMeasurement::is_trusted` — the shipping rule).
     pub fn from_profile(profile: &InharmonicityProfile) -> Self {
         Self::build(profile, false)
     }
 
-    /// Builds the engine input admitting auto-mode captures as well.
-    /// **Diagnostics only** — offline harnesses (`examples/curve_compare`)
-    /// run on regenerated auto-mode captures, which are validation data, not
-    /// curve sources. Never call this on the user path.
-    pub fn from_profile_including_auto(profile: &InharmonicityProfile) -> Self {
+    /// Builds the engine input with the trust filter off, admitting auto-mode
+    /// and string-isolated captures alike. **Diagnostics only** — offline
+    /// harnesses (`examples/curve_compare`) run on regenerated auto-mode
+    /// captures, which are validation data, not curve sources. Never call this
+    /// on the user path.
+    pub fn from_profile_unfiltered(profile: &InharmonicityProfile) -> Self {
         Self::build(profile, true)
     }
 
     /// Trust filter + Eq.-20 F₀ derivation: admits a key only when its
     /// provenance passes, B is finite and positive, it carries ≥ 2 partials,
     /// and the Rigaud Eq.-20 F₀ is solvable.
-    fn build(profile: &InharmonicityProfile, include_auto: bool) -> Self {
+    fn build(profile: &InharmonicityProfile, include_untrusted: bool) -> Self {
         let mut keys: Vec<Option<CurveKeyData>> = (0..88).map(|_| None).collect();
         // One entry per key — `active` applies the provenance rule over the
         // key's repeat list (newest trusted, else newest), so an auto-mode
         // capture can never displace a manual one here.
         for (idx, m) in profile.active_entries() {
-            if idx >= 88 || (m.captured_in_auto && !include_auto) {
+            if idx >= 88 || (!m.is_trusted() && !include_untrusted) {
                 continue;
             }
             let Some(b) = m
@@ -1406,6 +1407,7 @@ mod tests {
                 calculated_b: Some(b),
                 last_captured: String::new(),
                 captured_in_auto: false,
+                sounding_strings: None,
             });
         }
         profile

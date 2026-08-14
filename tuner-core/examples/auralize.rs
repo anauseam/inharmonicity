@@ -170,6 +170,9 @@ fn aggregate_key(key_index: u8, entries: &[RawEntry]) -> KeyMeasurement {
         calculated_b,
         last_captured: String::new(),
         captured_in_auto: true, // honest provenance: auto-mode validation data
+        // The regen this consumes is a median over repeats, not one capture,
+        // so no single string declaration describes it.
+        sounding_strings: None,
     }
 }
 
@@ -297,7 +300,7 @@ fn main() {
     std::fs::create_dir_all(&out_dir).expect("create out dir");
 
     let profile = load_profile(&path);
-    let input = CurveInput::from_profile_including_auto(&profile);
+    let input = CurveInput::from_profile_unfiltered(&profile);
     let bxi = curves::instrument_b_fit(&input);
     println!(
         "auralize — additive resynthesis A/B/C/D on {path}\n\

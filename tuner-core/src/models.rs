@@ -2,7 +2,7 @@
 //!
 //! Domain types for the tuner: notes and the 88-key lookup tables ([`NOTES`],
 //! [`Note`], [`NOTE_MAP`]), captured measurements ([`Partial`], [`KeyMeasurement`],
-//! [`InharmonicityProfile`] with its [`InstrumentIdentity`] and
+//! [`SoundingStrings`], [`InharmonicityProfile`] with its [`InstrumentIdentity`] and
 //! [`ProfileSettings`]), the two persisted tuning selections ([`EngineChoice`],
 //! [`ReferenceMode`]), and the discovery templates ([`KeyProfile`]).
 //!
@@ -87,6 +87,145 @@ pub struct Partial {
     pub amplitude: f32,
 }
 
+/// Most strings one key can be strung with. A piano's bass is single- or
+/// double-strung and the rest trichord, but *which* key the breaks fall on is
+/// instrument-specific — hence [`SoundingStrings::on_key`] is declared per
+/// capture rather than derived from the key index.
+pub const MAX_STRINGS_PER_KEY: usize = 3;
+
+/// Which of a key's strings were sounding for one capture — the operator's
+/// declaration made before arming, not something the DSP measures.
+///
+/// It exists so a capture set can pair a note's **solo** captures (the other
+/// strings damped with a mute) with its **open** one. A solo resolves one
+/// string's (f₀, B) at full resolution, which is the only ground truth the
+/// unison line estimator can be checked against (ADR 0012 §8, ADR 0013 D3).
+///
+/// **Convention:** string 1 is the leftmost string of the note as the tuner
+/// faces the instrument, counting rightwards; `sounding[i]` is string `i + 1`.
+/// Entries at or beyond `on_key` are always `false`.
+///
+/// A capture with no string sounding is not a capture, so that state means
+/// "the operator declared nothing" and the capture records `None` — see
+/// [`SoundingStrings::from_bits`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SoundingStrings {
+    /// How many strings this key is strung with, in `1..=MAX_STRINGS_PER_KEY`.
+    pub on_key: u8,
+    /// Whether each of the key's strings sounded.
+    pub sounding: [bool; MAX_STRINGS_PER_KEY],
+}
+
+impl SoundingStrings {
+    /// A trichord with nothing declared — what a session starts in, and what
+    /// ordinary (non-isolation) use stays in.
+    pub const UNDECLARED: Self = Self {
+        on_key: MAX_STRINGS_PER_KEY as u8,
+        sounding: [false; MAX_STRINGS_PER_KEY],
+    };
+
+    /// How many of the key's strings sounded — one for a solo capture,
+    /// [`on_key`](Self::on_key) for an open one.
+    pub fn sounding_count(&self) -> u8 {
+        self.sounding.iter().filter(|s| **s).count() as u8
+    }
+
+    /// Every string of the key sounding: the note as it is played, and the
+    /// only state the unison panel's own reading can be compared against.
+    ///
+    /// Never true of a declaration with nothing sounding — deserialization
+    /// does not go through [`Self::from_bits`], so `on_key: 0` can reach here
+    /// from a hand-edited profile.
+    pub fn is_open(&self) -> bool {
+        self.sounding_count() > 0 && self.sounding_count() == self.on_key
+    }
+
+    /// Packs into
+    /// [`PipelineAtomics::capture_strings`](crate::pipeline::PipelineAtomics::capture_strings):
+    /// bits 0–2 the sounding set, bits 3–4 `on_key - 1`.
+    pub fn to_bits(&self) -> u8 {
+        let mut bits = (self.on_key.clamp(1, MAX_STRINGS_PER_KEY as u8) - 1) << 3;
+        for (i, s) in self.sounding.iter().enumerate() {
+            if *s {
+                bits |= 1 << i;
+            }
+        }
+        bits
+    }
+
+    /// Unpacks [`Self::to_bits`]. `None` when no string of the key is marked
+    /// sounding — the operator declared nothing, so the capture carries no
+    /// string state at all rather than a fabricated one.
+    pub fn from_bits(bits: u8) -> Option<Self> {
+        let on_key = ((bits >> 3) & 0b11).min(MAX_STRINGS_PER_KEY as u8 - 1) + 1;
+        let mut sounding = [false; MAX_STRINGS_PER_KEY];
+        for (i, s) in sounding.iter_mut().enumerate() {
+            *s = i < on_key as usize && bits & (1 << i) != 0;
+        }
+        let out = Self { on_key, sounding };
+        (out.sounding_count() > 0).then_some(out)
+    }
+
+    /// Restrings the key, **clearing the sounding set** if the count changed.
+    ///
+    /// A different count is a different key, so the previous key's mute pattern
+    /// does not carry: a set held across the change would declare a solo nobody
+    /// made, which is a wrong record rather than a missing one.
+    ///
+    /// A single-strung key is the exception in the other direction — it admits
+    /// one declaration, so the count *is* the declaration. **Do not extend that
+    /// to two or three strings**, where a forgotten mute would then be recorded
+    /// as an open capture.
+    pub fn with_on_key(self, on_key: u8) -> Self {
+        let on_key = on_key.clamp(1, MAX_STRINGS_PER_KEY as u8);
+        if on_key == self.on_key {
+            return self;
+        }
+        let mut sounding = [false; MAX_STRINGS_PER_KEY];
+        sounding[0] = on_key == 1;
+        Self { on_key, sounding }
+    }
+
+    /// Flips string `index` (0-based). Neither a string the key does not have
+    /// nor a single-strung key's one string can be flipped — the latter's
+    /// declaration is fixed by its count (see [`Self::with_on_key`]).
+    pub fn toggled(self, index: usize) -> Self {
+        let mut out = self;
+        if self.on_key > 1 && index < self.on_key as usize {
+            out.sounding[index] = !out.sounding[index];
+        }
+        out
+    }
+}
+
+impl std::fmt::Display for SoundingStrings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fn plural(n: u8) -> &'static str {
+            if n == 1 { "" } else { "s" }
+        }
+        if self.sounding_count() == 0 {
+            return write!(f, "no strings declared");
+        }
+        if self.is_open() {
+            return write!(f, "open, {} string{}", self.on_key, plural(self.on_key));
+        }
+        let named: Vec<String> = self
+            .sounding
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| **s)
+            .map(|(i, _)| (i + 1).to_string())
+            .collect();
+        write!(
+            f,
+            "string{} {} of {}",
+            plural(self.sounding_count()),
+            named.join("+"),
+            self.on_key
+        )
+    }
+}
+
 /// Stores all measured partials for a single piano key, plus the computed
 /// inharmonicity constant (B).
 ///
@@ -96,14 +235,21 @@ pub struct Partial {
 pub struct KeyMeasurement {
     /// The 88-key piano index (0 = A0, 87 = C8).
     pub key_index: u8,
-    /// Measured fundamental frequency (Hz).
+    /// The fundamental (Hz) MAT was **seeded** from — the live tracker's
+    /// reading, or the key's equal-temperament frequency where that reading
+    /// was absent or implausible (`worker::MAT_SEED_TOLERANCE`). It is not
+    /// MAT's refined f₀, which the profile does not carry; `partials` holds
+    /// the measured frequencies.
     pub measured_f0: f32,
     /// All measured partials for this key (fundamental + overtones).
     pub partials: Vec<Partial>,
     /// The computed inharmonicity coefficient, or `None` if not yet calculated
     /// or if there were insufficient partials.
     pub calculated_b: Option<f32>,
-    /// UTC timestamp of the most recent capture (ISO format).
+    /// When the capture was processed — Unix epoch seconds, decimal, as a
+    /// string. Also names the capture's dump directory
+    /// ([`worker::dump_dir_name`](crate::worker::dump_dir_name)), so the two
+    /// must agree.
     pub last_captured: String,
     /// Capture provenance: `true` when the key identity came from the
     /// auto-discovery path, `false` when the user named the key (manual
@@ -113,6 +259,31 @@ pub struct KeyMeasurement {
     /// so pre-flag data can never feed the curve.
     #[serde(default = "default_captured_in_auto")]
     pub captured_in_auto: bool,
+    /// Which of the key's strings sounded, when the operator declared it
+    /// before arming; `None` — the default, and what every capture predating
+    /// the field deserializes to — means undeclared, never "all three".
+    #[serde(default)]
+    pub sounding_strings: Option<SoundingStrings>,
+}
+
+impl KeyMeasurement {
+    /// Whether the tuning curve and the strobe may read this entry.
+    ///
+    /// Two independent disqualifications, both meaning "this did not measure
+    /// the note as it is played":
+    ///
+    /// - **auto-mode provenance** — the key identity was latched by discovery
+    ///   rather than named by the user (ADR 0006 Corrections item 3);
+    /// - **a declared partial unison** — strings were damped, so the entry
+    ///   measured one string. A capture that declared nothing is unaffected,
+    ///   which is every capture outside a mute-isolation session
+    ///   (`docs/internals/06-capture-sets.md`).
+    ///
+    /// Untrusted entries are retained and inspectable; they are never active
+    /// while a trusted one exists.
+    pub(crate) fn is_trusted(&self) -> bool {
+        !self.captured_in_auto && self.sounding_strings.is_none_or(|s| s.is_open())
+    }
 }
 
 /// Serde default for [`KeyMeasurement::captured_in_auto`]: legacy entries
@@ -447,7 +618,7 @@ impl InharmonicityProfile {
         entries
             .iter()
             .rev()
-            .find(|m| !m.captured_in_auto)
+            .find(|m| m.is_trusted())
             .or_else(|| entries.last())
     }
 
@@ -457,7 +628,7 @@ impl InharmonicityProfile {
         let entries = self.measurements.get_mut(&key)?;
         let pos = entries
             .iter()
-            .rposition(|m| !m.captured_in_auto)
+            .rposition(|m| m.is_trusted())
             .or_else(|| entries.len().checked_sub(1))?;
         entries.get_mut(pos)
     }
@@ -480,7 +651,7 @@ impl InharmonicityProfile {
             // droppable entry is the first that is not it.
             let active_pos = entries
                 .iter()
-                .rposition(|m| !m.captured_in_auto)
+                .rposition(|m| m.is_trusted())
                 .unwrap_or(entries.len() - 1);
             let drop_at = if active_pos == 0 { 1 } else { 0 };
             entries.remove(drop_at);
@@ -1042,7 +1213,123 @@ mod tests {
             calculated_b: Some(1e-4),
             last_captured: format!("{f0}"),
             captured_in_auto,
+            sounding_strings: None,
         }
+    }
+
+    /// The atomic that carries the declaration to the DSP thread is one byte,
+    /// so every state a session produces must survive the round trip.
+    #[test]
+    fn sounding_strings_round_trip_through_the_atomic() {
+        for on_key in 1..=MAX_STRINGS_PER_KEY as u8 {
+            for mask in 0..8u8 {
+                let mut s = SoundingStrings::UNDECLARED.with_on_key(on_key);
+                for i in 0..MAX_STRINGS_PER_KEY {
+                    if mask & (1 << i) != 0 {
+                        s = s.toggled(i);
+                    }
+                }
+                assert_eq!(
+                    SoundingStrings::from_bits(s.to_bits()),
+                    (s.sounding_count() > 0).then_some(s)
+                );
+            }
+        }
+    }
+
+    /// Silence is not a capture, so "nothing sounding" is the encoding of an
+    /// undeclared capture — the state ordinary use stays in.
+    #[test]
+    fn nothing_sounding_is_undeclared() {
+        assert_eq!(SoundingStrings::UNDECLARED.to_bits() & 0b111, 0);
+        assert_eq!(SoundingStrings::from_bits(0), None);
+        assert_eq!(SoundingStrings::from_bits(0b11_000), None);
+    }
+
+    /// A key cannot sound a string it does not have — neither by restringing
+    /// it away, nor by toggling one in, nor by decoding a byte that claims it.
+    #[test]
+    fn strings_beyond_the_key_never_sound() {
+        let tri = SoundingStrings::UNDECLARED.toggled(0).toggled(1).toggled(2);
+        assert!(tri.is_open());
+
+        // Restringing is a move to a different key, so the pattern is dropped
+        // rather than carried across.
+        let bi = tri.with_on_key(2);
+        assert_eq!(bi.sounding, [false; MAX_STRINGS_PER_KEY]);
+        assert_eq!(bi.toggled(0).toggled(1).sounding, [true, true, false]);
+        assert!(
+            bi.toggled(0).toggled(1).is_open(),
+            "a bichord with both strings sounding is open"
+        );
+        assert_eq!(bi.toggled(2).sounding, [false; MAX_STRINGS_PER_KEY]);
+
+        let single = SoundingStrings::from_bits(0b00_101).expect("string 1 sounds");
+        assert_eq!(single.on_key, 1);
+        assert_eq!(single.sounding, [true, false, false]);
+
+        // Deserialization does not clamp, so a strung-with-nothing entry must
+        // not read as open and become the key's measurement.
+        let malformed = SoundingStrings {
+            on_key: 0,
+            sounding: [false; MAX_STRINGS_PER_KEY],
+        };
+        assert!(!malformed.is_open());
+    }
+
+    /// The inspector and the sidebar read the same label, so it has to name
+    /// the three states the protocol distinguishes.
+    #[test]
+    fn sounding_strings_label_names_the_state() {
+        let tri = SoundingStrings::UNDECLARED;
+        assert_eq!(tri.to_string(), "no strings declared");
+        assert_eq!(tri.toggled(1).to_string(), "string 2 of 3");
+        assert_eq!(tri.toggled(0).toggled(2).to_string(), "strings 1+3 of 3");
+        assert_eq!(
+            tri.toggled(0).toggled(1).toggled(2).to_string(),
+            "open, 3 strings"
+        );
+        assert_eq!(
+            tri.with_on_key(1).to_string(),
+            "open, 1 string",
+            "the count is the whole declaration for a single-strung key"
+        );
+        assert_eq!(
+            tri.with_on_key(1).toggled(0).to_string(),
+            "open, 1 string",
+            "and its one string cannot be toggled away"
+        );
+    }
+
+    /// The degenerate case declares itself; the ambiguous ones must not. A
+    /// forgotten mute on a bichord or trichord would otherwise be recorded as
+    /// an open capture, which is a wrong record rather than a missing one.
+    #[test]
+    fn only_a_single_strung_key_declares_itself() {
+        assert!(SoundingStrings::UNDECLARED.with_on_key(1).is_open());
+        for n in 2..=MAX_STRINGS_PER_KEY as u8 {
+            let s = SoundingStrings::UNDECLARED.with_on_key(n);
+            assert_eq!(s.sounding_count(), 0, "{n} strings must be declared");
+            assert_eq!(SoundingStrings::from_bits(s.to_bits()), None);
+        }
+    }
+
+    /// Moving off a single-strung key must not leave its string declared: a
+    /// held [true, false, false] under a new count reads as a solo of string 1.
+    #[test]
+    fn a_changed_count_drops_the_previous_pattern() {
+        let single = SoundingStrings::UNDECLARED.with_on_key(1);
+        assert!(single.is_open());
+        for n in 2..=MAX_STRINGS_PER_KEY as u8 {
+            assert_eq!(single.with_on_key(n).sounding_count(), 0);
+        }
+        let open_trichord = SoundingStrings::UNDECLARED.toggled(0).toggled(1).toggled(2);
+        assert_eq!(open_trichord.with_on_key(2).sounding_count(), 0);
+        assert_eq!(
+            open_trichord.with_on_key(3),
+            open_trichord,
+            "re-selecting the same count changes nothing"
+        );
     }
 
     /// The active-entry rule (ADR 0006 item 3 over a list): an auto-mode
@@ -1066,6 +1353,53 @@ mod tests {
         q.record(m(7, 20.0, true));
         assert_eq!(q.active(7).unwrap().measured_f0, 20.0);
         assert!(q.active(9).is_none());
+    }
+
+    /// A solo capture measured one string, not the note, so it must never be
+    /// the entry the curve and strobe read — by the same rule that retains an
+    /// auto-mode capture without trusting it.
+    #[test]
+    fn a_declared_solo_is_retained_but_never_active() {
+        let solo = |key, f0| {
+            let mut m = m(key, f0, false);
+            m.sounding_strings = Some(SoundingStrings::UNDECLARED.toggled(1));
+            m
+        };
+        let open = |key, f0| {
+            let mut m = m(key, f0, false);
+            m.sounding_strings = Some(SoundingStrings::UNDECLARED.toggled(0).toggled(1).toggled(2));
+            m
+        };
+
+        let mut p = InharmonicityProfile::default();
+        p.record(m(5, 100.0, false)); // ordinary manual capture, undeclared
+        p.record(solo(5, 200.0)); // three solos follow…
+        p.record(solo(5, 201.0));
+        p.record(solo(5, 202.0));
+        assert_eq!(
+            p.active(5).unwrap().measured_f0,
+            100.0,
+            "solos must not displace the note's own measurement"
+        );
+        assert_eq!(p.measurements[&5].len(), 4, "all four are retained");
+
+        // …and the open capture that ends the pass does take over.
+        p.record(open(5, 300.0));
+        assert_eq!(p.active(5).unwrap().measured_f0, 300.0);
+
+        // A key measured only in isolation still presents its newest entry:
+        // one string is better than nothing, exactly as for auto-only keys.
+        let mut q = InharmonicityProfile::default();
+        q.record(solo(7, 10.0));
+        assert_eq!(q.active(7).unwrap().measured_f0, 10.0);
+    }
+
+    /// An undeclared capture is unaffected by the string rule — which is every
+    /// capture outside a mute-isolation session.
+    #[test]
+    fn undeclared_captures_keep_the_provenance_rule_alone() {
+        assert!(m(5, 1.0, false).is_trusted());
+        assert!(!m(5, 1.0, true).is_trusted());
     }
 
     /// Eviction bounds the file without ever dropping the entry consumers read.
@@ -1150,6 +1484,8 @@ mod tests {
         assert_eq!(loaded.active(4).unwrap().measured_f0, 55.0);
         // Pre-flag entries are untrusted, so they can never feed the curve.
         assert!(loaded.active(4).unwrap().captured_in_auto);
+        // And they declared no strings — never "all three".
+        assert_eq!(loaded.active(4).unwrap().sounding_strings, None);
         // Named after its file, and carrying today's defaults.
         assert_eq!(loaded.identity.name, "old-upright");
         assert_eq!(
@@ -1174,7 +1510,14 @@ mod tests {
         p.identity.kind = InstrumentKind::Guitar;
         p.settings.engine = EngineChoice::GiordanoMean;
         p.settings.reference_mode = ReferenceMode::Et;
-        p.record(m(11, 61.7, false));
+        let mut declared = m(11, 61.7, false);
+        declared.sounding_strings = Some(
+            SoundingStrings::UNDECLARED
+                .with_on_key(2)
+                .toggled(0)
+                .toggled(1),
+        );
+        p.record(declared);
         p.to_file(&path).unwrap();
 
         assert!(
@@ -1191,6 +1534,13 @@ mod tests {
         assert_eq!(back.settings.engine, EngineChoice::GiordanoMean);
         assert_eq!(back.settings.reference_mode, ReferenceMode::Et);
         assert_eq!(back.active(11).unwrap().measured_f0, 61.7);
+        let strings = back
+            .active(11)
+            .unwrap()
+            .sounding_strings
+            .expect("declaration kept");
+        assert_eq!(strings.on_key, 2);
+        assert_eq!(strings.sounding, [true, true, false]);
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

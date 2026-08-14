@@ -27,6 +27,11 @@ consume.
 Offline tools discover dumps by the `key_` prefix and read the key identity from
 `analysis.json`, so the directory name is not load-bearing.
 
+`analysis.json`'s `metadata.sounding_strings` carries the operator's declaration of which
+of the key's strings were sounding, or `null` where none was made — which is
+every capture outside the mute-isolation set. `regenerate_partials` passes it
+through.
+
 ## The harnesses
 
 ### Engine and discovery

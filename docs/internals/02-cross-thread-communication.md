@@ -67,6 +67,10 @@ The six sanctioned crossings:
   `AtomicU32`, etc.).
 - **Purpose:** adjust individual settings (thresholds, multipliers).
   Use `f32::to_bits()` / `f32::from_bits()` for floats.
+- `ConfigAtomics` holds **DSP parameters only** — every field is read by the
+  DSP on the hot path. An atomic the DSP does not read is not a parameter and
+  belongs elsewhere on `PipelineAtomics`; see the capture-lifecycle atomics
+  under crossing #6.
 
 ## 4. Grouped / dependent DSP parameters (UI → DSP)
 
@@ -153,7 +157,8 @@ design smell — reconsider the design before implementing it.
 
 - **DSP → Worker** — `CapturePayload` (a `stable_buffer` + optional
   `full_event_buffer` from the `AudioPool` plus metadata such as
-  `target_note` and `sample_rate`), `.try_send()` from the DSP thread.
+  `target_note`, `sample_rate`, and the capture-provenance fields
+  `captured_in_auto` and `sounding_strings`), `.try_send()` from the DSP thread.
   Capacity `CAPTURE_QUEUE_CAPACITY = 2` (subordinate to the `AudioPool`'s
   capacity of 8, the true backpressure ceiling).
 - **Worker → UI** — `WorkerOutput`, an enum of `Measurement(KeyMeasurement)`
@@ -217,7 +222,26 @@ the job carries a read-only `CurveInput` snapshot, a curve recompute can
 never overwrite or race a `KeyMeasurement` — the two ride separate
 channels with separate types.
 
-### CaptureState baton-pass
+### Capture-lifecycle atomics
+
+Two atomics sit on `PipelineAtomics` outside `ConfigAtomics`, because neither
+is a DSP parameter: the `CaptureState` baton below, and `capture_strings` —
+the operator's declaration of how the tuned key is strung and which of its
+strings are sounding (`06-capture-sets.md`). The declaration is written by the
+GUI at user rate and read by the pipeline **only** as it assembles a
+`CapturePayload`, which is the point: per-capture metadata has to arrive
+*with* its capture, and the payload is the only thing ordered against it. A
+`WorkerJob` (crossing #6) could not do this — the worker drains captures
+before jobs, so a declaration could be applied to a capture that was already
+processed.
+
+It stays a single byte so the string count and the sounding set are updated
+together, which is the atomicity requirement crossing #4 exists to serve; one
+word satisfies it without a ring. It is **not** packed into the baton: the two
+have different writers and different lifecycles, and sharing a word would
+break the baton's single-writer-per-transition partition below.
+
+#### CaptureState baton-pass
 
 `CaptureState` is an `AtomicU8` whose transitions are partitioned among
 three threads by convention. Each thread writes only its own

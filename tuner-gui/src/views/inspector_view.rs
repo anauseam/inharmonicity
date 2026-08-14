@@ -30,7 +30,7 @@ fn entry_row(key: u8, e: &InspectorRow) -> Element<'static, Message> {
     // Provenance is the load-bearing column: an auto-mode entry is retained but
     // never feeds the curve, so "why did dropping it change nothing?" has to be
     // answerable from the row itself.
-    let provenance = if e.trusted { "manual" } else { "auto" };
+    let provenance = if e.manual { "manual" } else { "auto" };
     let b = match e.b {
         Some(b) => format!("B = {b:.3e}"),
         None => "B —".to_string(),
@@ -44,6 +44,11 @@ fn entry_row(key: u8, e: &InspectorRow) -> Element<'static, Message> {
     ]
     .spacing(2)
     .width(Fill);
+    // Only the isolation set declares this, and there it is the whole point of
+    // the entry: a solo capture measured one string, not the note.
+    if let Some(strings) = e.sounding_strings {
+        label = label.push(text(strings.to_string()).size(11).color(INK_SECONDARY));
+    }
     if e.is_active {
         label = label.push(
             text("in use — the entry the curve and strobe read")

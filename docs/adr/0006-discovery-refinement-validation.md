@@ -669,6 +669,12 @@ manual-mode pivot does not lose them:
    `tuning_profile.json`. Discovery is insulated (the gate is off); the persisted
    profile is not. **Rule: the tuning curve consumes manual-mode captures only**,
    until a provenance flag (e.g. `captured_in_auto`) exists on `KeyMeasurement`.
+   *Amended 2026-08-13:* the flag exists, and the rule now has a second axis on
+   the same footing — a capture whose declared strings are not the note's full
+   unison measured one string, not the note. Both live in
+   `KeyMeasurement::is_trusted`; see
+   [`docs/internals/06-capture-sets.md`](../internals/06-capture-sets.md). No
+   capture predating the declaration is affected.
 4. **MAT's `confidence` is not part of DAFx-09 (decision recorded).** The paper
    outputs only (f₀, B); the median is its robustness mechanism. Our
    coherence×evidence scalar is a bespoke addition. Decision: it stays a **runtime

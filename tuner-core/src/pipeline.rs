@@ -42,7 +42,8 @@ use crate::algorithms::spectral;
 use crate::engine::Engine;
 use crate::gatekeeper::{Gatekeeper, SignalState};
 use crate::models::{
-    InharmonicityProfile, KeyMeasurement, KeyProfile, PROFILE_PATH, build_default_profiles,
+    InharmonicityProfile, KeyMeasurement, KeyProfile, PROFILE_PATH, SoundingStrings,
+    build_default_profiles,
 };
 use crate::strobe::{Strobe, StrobeRefUpdate};
 use crate::worker::{WorkerJob, WorkerManager, WorkerOutput};
@@ -79,6 +80,10 @@ pub struct CapturePayload {
     /// [`crate::models::KeyMeasurement`] — the tuning curve trusts manual
     /// captures only (ADR 0006 item 3).
     pub captured_in_auto: bool,
+    /// The operator's string declaration, decoded from
+    /// [`PipelineAtomics::capture_strings`] as this payload was assembled;
+    /// `None` when nothing was declared, which is the ordinary case.
+    pub sounding_strings: Option<SoundingStrings>,
 }
 
 // ─── Profile Updates (Crossing #4: UI → DSP) ─────────────────────────────────
@@ -385,6 +390,10 @@ pub struct PipelineAtomics {
     /// Bidirectional capture lifecycle state.
     /// GUI writes `Armed`, Pipeline writes `Recording`/`Processing`, Worker writes `Idle`.
     pub capture_state: AtomicU8,
+    /// UI → DSP: the operator's per-capture string declaration, packed by
+    /// [`SoundingStrings::to_bits`]. `0` = undeclared, the ordinary state; the
+    /// pipeline decodes it onto the [`CapturePayload`] it dispatches.
+    pub capture_strings: AtomicU8,
 }
 
 impl Default for PipelineAtomics {
@@ -403,6 +412,7 @@ impl Default for PipelineAtomics {
             },
             shutdown: AtomicBool::new(false),
             capture_state: AtomicU8::new(CaptureState::Idle as u8),
+            capture_strings: AtomicU8::new(0), // Default to undeclared
         }
     }
 }
@@ -885,6 +895,9 @@ impl AudioPipeline {
                             noise_floor: load_f32(&self.atomics.config.silence_threshold),
                             measured_f0: self.last_measured_f0,
                             captured_in_auto: target_note == 255,
+                            sounding_strings: SoundingStrings::from_bits(
+                                self.atomics.capture_strings.load(Ordering::Relaxed),
+                            ),
                         };
                         self.full_event_count = 0; // Clear state after dispatch
 
@@ -984,6 +997,7 @@ mod tests {
             calculated_b,
             last_captured: String::new(),
             captured_in_auto: true,
+            sounding_strings: None,
         }
     }
 
