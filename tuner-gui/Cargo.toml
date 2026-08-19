@@ -4,6 +4,9 @@ version.workspace = true
 edition = "2024"
 
 [dependencies]
+# Instrument identity (UUIDv7 — time-ordered, so dump directories sort by
+# creation). Already in the tree via iced; the v7 feature is what we add.
+uuid = { version = "1", features = ["v7"] }
 # Dependency on the local core logic crate
 tuner-core = { path = "../tuner-core" }
 

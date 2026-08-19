@@ -130,6 +130,17 @@ impl ProfileSession {
         settings: &mut AppSettings,
     ) {
         profile.last_opened = unix_now();
+        // Mint the identity on first open, so a profile written before the
+        // field existed gets one and the `persist` below makes it durable.
+        // Everything that must survive a rename — the dump directory above all
+        // — keys off this, so it is minted exactly once and never rewritten.
+        if profile.identity.id.is_empty() {
+            profile.identity.id = uuid::Uuid::now_v7().to_string();
+            eprintln!(
+                "[SESSION] Minted instrument id {} for '{}'",
+                profile.identity.id, profile.identity.name
+            );
+        }
         self.profile = profile;
         self.path = Some(path.clone());
         self.backed_up = false;

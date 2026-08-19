@@ -1,10 +1,15 @@
 //! # Background Worker (Thread 3) — Heavy Offline DSP
 //!
 //! The "Heavy Lifter" of the pipeline. A single dedicated background thread
-//! that receives filled 1.5-second audio captures from the Gatekeeper (via the
+//! that receives filled audio captures from the Gatekeeper (via the
 //! [`AudioPool`](crate::pipeline::AudioPool)) and performs computationally
 //! expensive offline DSP, such as extracting up to 32 partials and calculating
 //! the inharmonicity constant ($B$).
+//!
+//! A capture is 1.5 s by default and a measurement session may record longer
+//! ones, but the span this thread *measures* is fixed at
+//! [`CAPTURE_ANALYSIS_SAMPLES`](crate::pipeline::CAPTURE_ANALYSIS_SAMPLES) —
+//! the extra audio is written to disk and never analysed here.
 //!
 //! ## Why a Single Thread?
 //!
@@ -18,10 +23,12 @@
 //! The `WorkerManager` spawns a single background thread at pipeline startup.
 //! The thread blocks on a crossbeam receiver and processes payloads as they arrive:
 //!
-//! 1. Receive a `CapturePayload` (a `Box<[f32; 66150]>` buffer + metadata,
-//!    including the already-identified `target_note`)
-//! 2. Perform a high-resolution FFT on the captured audio + a one-sample-shifted
-//!    frame, and derive a CSPE super-resolution frequency map
+//! 1. Receive a `CapturePayload` (an audio buffer + metadata, including the
+//!    already-identified `target_note`)
+//! 2. Perform a high-resolution FFT on the first
+//!    [`CAPTURE_ANALYSIS_SAMPLES`](crate::pipeline::CAPTURE_ANALYSIS_SAMPLES) of
+//!    the captured audio + a one-sample-shifted frame, and derive a CSPE
+//!    super-resolution frequency map
 //! 3. Take the note identity from the payload (the Engine's discovery lock in
 //!    Auto mode, the user selection in Manual mode) — the worker does not
 //!    re-identify the note
@@ -37,7 +44,9 @@ use crate::algorithms::{
 };
 use crate::audio::BASS_WINDOW_SIZE;
 use crate::models::{self, CurveInput, KeyMeasurement, NOTES, Partial, TuningCurve};
-use crate::pipeline::{AudioPool, CapturePayload, CaptureState, PipelineAtomics};
+use crate::pipeline::{
+    AudioPool, CAPTURE_ANALYSIS_SAMPLES, CapturePayload, CaptureState, PipelineAtomics,
+};
 use crossbeam_channel::{Receiver, Sender, select};
 use realfft::RealToComplex;
 use rustfft::num_complex::Complex;
@@ -78,6 +87,13 @@ pub struct CurveJob {
 #[derive(Debug, Clone)]
 pub enum WorkerJob {
     Curve(CurveJob),
+    /// Write subsequent capture dumps under this directory, or none at all.
+    ///
+    /// Sent when the open instrument changes, so dumps follow the instrument
+    /// they belong to. The worker drains captures *before* jobs, so a capture
+    /// still in flight when the instrument changes is written under the old
+    /// root — which is the instrument it was actually taken on.
+    SetDumpDir(Option<PathBuf>),
 }
 
 /// All tuning-curve engines computed from one [`CurveJob`], echoed back to the
@@ -216,6 +232,9 @@ impl WorkerManager {
 
     pub fn start_workers(self) {
         std::thread::spawn(move || {
+            // Owned by the loop rather than read from `self`: the frontend
+            // moves it with `WorkerJob::SetDumpDir` when the instrument changes.
+            let mut dump_dir = self.dump_dir;
             let mut planner = realfft::RealFftPlanner::<f32>::new();
             // Pre-plan for max size
             let max_fft_size = BASS_WINDOW_SIZE * 8; // 65536
@@ -243,7 +262,7 @@ impl WorkerManager {
                             &self.audio_pool,
                             &self.atomics,
                             &self.result_tx,
-                            self.dump_dir.as_deref(),
+                            dump_dir.as_deref(),
                             &mut planner,
                             &mut fft_instance,
                             &mut time_buffer,
@@ -274,7 +293,7 @@ impl WorkerManager {
                             &self.audio_pool,
                             &self.atomics,
                             &self.result_tx,
-                            self.dump_dir.as_deref(),
+                            dump_dir.as_deref(),
                             &mut planner,
                             &mut fft_instance,
                             &mut time_buffer,
@@ -287,24 +306,34 @@ impl WorkerManager {
                     },
                     // A job-channel disconnect (Err) is ignored: captures may
                     // still flow, so keep serving the loop.
-                    recv(self.worker_job_rx) -> msg => if let Ok(mut job) = msg {
-                        // Coalesce: keep only the newest queued job (latest-wins;
-                        // an earlier one is already superseded). Only curve jobs
-                        // exist today — when a second kind is added, the `match`
-                        // below stops compiling, forcing a coalescing rethink.
+                    recv(self.worker_job_rx) -> msg => if let Ok(job) = msg {
+                        // Drain, then coalesce **per kind**. A curve bundle is
+                        // latest-wins — an earlier one is already superseded. A
+                        // dump-directory change is not: dropping one silently
+                        // files an instrument's captures under another's.
+                        let mut latest_curve = None;
+                        let mut latest_dir = None;
+                        let mut sort = |job| match job {
+                            WorkerJob::Curve(curve_job) => latest_curve = Some(curve_job),
+                            WorkerJob::SetDumpDir(dir) => latest_dir = Some(dir),
+                        };
+                        sort(job);
                         while let Ok(newer) = self.worker_job_rx.try_recv() {
-                            job = newer;
+                            sort(newer);
                         }
-                        match job {
-                            WorkerJob::Curve(curve_job) => {
-                                let bundle = CurveBundle::compute(&curve_job);
-                                // Drop on full: a superseded bundle is worthless, and
-                                // the UI re-requests from its dirty flag. Never blocks
-                                // captures.
-                                let _ = self
-                                    .result_tx
-                                    .try_send(WorkerOutput::Curve(Box::new(bundle)));
-                            }
+                        // Directory first: it decides where anything computed
+                        // after this point is written.
+                        if let Some(dir) = latest_dir {
+                            dump_dir = dir;
+                        }
+                        if let Some(curve_job) = latest_curve {
+                            let bundle = CurveBundle::compute(&curve_job);
+                            // Drop on full: a superseded bundle is worthless, and
+                            // the UI re-requests from its dirty flag. Never blocks
+                            // captures.
+                            let _ = self
+                                .result_tx
+                                .try_send(WorkerOutput::Curve(Box::new(bundle)));
                         }
                     },
                 }
@@ -314,7 +343,7 @@ impl WorkerManager {
 
     #[allow(clippy::too_many_arguments)]
     fn process_payload(
-        payload: CapturePayload,
+        mut payload: CapturePayload,
         audio_pool: &Arc<AudioPool>,
         atomics: &Arc<PipelineAtomics>,
         result_tx: &Sender<WorkerOutput>,
@@ -327,9 +356,21 @@ impl WorkerManager {
         magnitude_buffer: &mut [f32],
         cspe_buffer: &mut [f32],
     ) {
-        // Step 1: Calculate power-of-two size
-        let sample_count = payload.stable_sample_count.max(2048);
+        // Step 1: Calculate power-of-two size. Bounded at the analysis window,
+        // so a longer record stores more audio without measuring a longer span.
+        let sample_count = payload
+            .stable_sample_count
+            .clamp(2048, CAPTURE_ANALYSIS_SAMPLES);
         let fft_size = 1 << (usize::BITS - 1 - sample_count.leading_zeros());
+
+        // Zero-pad a record shorter than the transform. Pool buffers are
+        // reused, so the slack past `stable_sample_count` still holds the
+        // previous capture's audio — analysing it would mix two notes. The
+        // `+ 1` covers the CSPE frame's one-sample shift.
+        let analysed = fft_size + 1;
+        if payload.stable_sample_count < analysed {
+            payload.stable_buffer[payload.stable_sample_count..analysed].fill(0.0);
+        }
 
         if fft_instance.len() != fft_size {
             *fft_instance = planner.plan_fft_forward(fft_size);
@@ -351,9 +392,9 @@ impl WorkerManager {
         );
 
         // CSPE: transform the SAME frame advanced by one sample, then derive the per-bin
-        // super-resolution frequency map from the two spectra (DAFx-09 §2.3). The capture
-        // buffer holds 66150 samples and fft_size ≤ 65536, so the one-sample shift is in
-        // bounds; the Hann window zeroes the lone boundary sample regardless.
+        // super-resolution frequency map from the two spectra (DAFx-09 §2.3). `fft_size`
+        // is the largest power of two inside the analysis window, so `fft_size + 1` is
+        // always within the allocated buffer.
         spectral::fft(
             &payload.stable_buffer[1..fft_size + 1],
             &mut time_buffer[..fft_size],
@@ -596,6 +637,55 @@ impl WorkerManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::CAPTURE_MAX_SAMPLES;
+
+    /// The analysis window must stay inside the scratch buffers this thread
+    /// allocates once at startup (`max_fft_size = BASS_WINDOW_SIZE * 8`).
+    ///
+    /// This is what lets the capture length be a runtime knob without touching
+    /// the FFT ceiling: however long a record is, `fft_size` is the largest
+    /// power of two inside [`CAPTURE_ANALYSIS_SAMPLES`], and the scratch holds
+    /// it. Raise the analysis window past 2 × 65536 and the FFT plan outgrows
+    /// the buffers it is written into.
+    #[test]
+    fn the_analysis_window_fits_the_worker_scratch() {
+        let max_fft_size = BASS_WINDOW_SIZE * 8;
+        let fft_size = 1 << (usize::BITS - 1 - CAPTURE_ANALYSIS_SAMPLES.leading_zeros());
+        assert!(
+            fft_size <= max_fft_size,
+            "fft_size {fft_size} outgrew the {max_fft_size}-sample scratch"
+        );
+        // CSPE reads one sample past `fft_size`, from the *allocated* buffer
+        // rather than the analysed span, so the ceiling has to clear it too.
+        assert!(CAPTURE_MAX_SAMPLES > fft_size);
+    }
+
+    /// A record shorter than the transform is zero-padded, not filled with
+    /// whatever the pooled buffer held before it. The buffers are reused, so the
+    /// slack past `stable_sample_count` is the previous capture's audio.
+    #[test]
+    fn a_short_record_is_padded_with_silence_not_the_previous_capture() {
+        // Buffer pre-loaded with a loud "previous capture", then 512 samples of
+        // this one — under the 2048-sample floor, so the transform overruns it.
+        let mut buffer = vec![1.0f32; CAPTURE_MAX_SAMPLES].into_boxed_slice();
+        let recorded = 512usize;
+        buffer[..recorded].fill(0.25);
+
+        let sample_count = recorded.clamp(2048, CAPTURE_ANALYSIS_SAMPLES);
+        let fft_size = 1 << (usize::BITS - 1 - sample_count.leading_zeros());
+        let analysed = fft_size + 1;
+        assert!(recorded < analysed, "precondition: the transform overruns");
+
+        if recorded < analysed {
+            buffer[recorded..analysed].fill(0.0);
+        }
+        assert!(
+            buffer[recorded..analysed].iter().all(|s| *s == 0.0),
+            "the slack the transform reads must be silence"
+        );
+        // …and nothing beyond the analysed span was disturbed.
+        assert_eq!(buffer[analysed], 1.0);
+    }
 
     /// The launch / no-captures state: an empty (prior-only) input must
     /// produce a full bundle without panicking, so the live curve widget can

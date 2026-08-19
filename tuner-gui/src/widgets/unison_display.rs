@@ -63,6 +63,11 @@ pub struct UnisonRow {
     pub amplitude: [f32; MAX_UNISON_LINES],
     /// `2/T` at this partial, in cents — the smallest gap this record resolves.
     pub resolution_cents: f32,
+    /// The same `2/T` in Hz, which is a **beat rate**: two strings this far
+    /// apart beat once per `1/resolution_hz` seconds. It is the slowest beat the
+    /// record can show, and unlike the cents figure it is the same at every key
+    /// — the panel's limit is fixed in Hz while a unison is judged in cents.
+    pub resolution_hz: f32,
 }
 
 /// Which partials the widget draws.
@@ -77,6 +82,11 @@ pub enum UnisonMode {
 /// Height of one partial's row, in pixels. Fixed, so a row appearing or
 /// vanishing moves nothing else.
 pub const ROW_HEIGHT: f32 = 18.0;
+
+/// Fill of the per-row blind zone — the `2/T` band the record cannot separate
+/// inside. Dimmer than [`GRID`] so it reads as absence rather than as content:
+/// nothing is drawn there because nothing there is measurable.
+const BLIND_ZONE: Color = Color::from_rgba8(0x38, 0x38, 0x35, 0.55);
 
 /// Vertical chrome above and below the rows — the axis labels and a margin.
 pub const ROW_CHROME: f32 = 22.0;
@@ -174,17 +184,22 @@ impl<Message> canvas::Program<Message> for UnisonDisplay {
                     });
                 }
 
-                // The resolution bar, centred on the target: the width of the
-                // smallest gap this record can separate.
+                // The blind zone, centred on the target: two lines closer than
+                // this merge into one, so anything the panel could tell you
+                // about the interior is not there to be told. Filled rather
+                // than stroked — a marker outside it was measured, a gap inside
+                // it was not.
                 if row.resolution_cents > 0.0 {
-                    let y = base + 3.0;
                     let (x0, x1) = (
                         x_of(-row.resolution_cents / 2.0),
                         x_of(row.resolution_cents / 2.0),
                     );
-                    frame.stroke(
-                        &Path::line(Point::new(x0, y), Point::new(x1, y)),
-                        Stroke::default().with_width(2.0).with_color(GRID),
+                    frame.fill(
+                        &Path::rectangle(
+                            Point::new(x0, base - ROW_HEIGHT / 2.0 + 2.0),
+                            iced::Size::new((x1 - x0).max(1.0), ROW_HEIGHT - 4.0),
+                        ),
+                        BLIND_ZONE,
                     );
                 }
 

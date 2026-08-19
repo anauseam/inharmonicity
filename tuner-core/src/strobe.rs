@@ -102,7 +102,9 @@ pub struct StrobeResult {
     /// angle. What the D3 gate thresholds, so it is also why a band froze.
     pub amplitude: [f32; MAX_STROBE_REFS],
     /// Per-reference resolved lines, strongest first — the note's individual
-    /// strings ([`unison`]). Valid entries: `[0..line_count[i]]`.
+    /// strings ([`unison`]). Valid entries: `[0..line_count[i]]`. Held while a
+    /// reference is gated, dropped once the Gatekeeper reports silence
+    /// ([`Strobe::process`]).
     pub lines: [[UnisonLine; MAX_UNISON_LINES]; MAX_STROBE_REFS],
     /// Valid entries of [`Self::lines`] per reference.
     pub line_count: [u8; MAX_STROBE_REFS],
@@ -223,6 +225,12 @@ impl Strobe {
     /// that comfortably while the broadband RMS is still below the silence
     /// floor, so without this the band accumulates rumble phase and rotates
     /// with no note playing. Angles are held, not reset (R2).
+    ///
+    /// Silence holds the angle and the band's rate — a frozen band is the last
+    /// verdict on a string's pitch, which the note ending does not revise — but
+    /// drops the resolved lines, which assert what the note's strings are doing
+    /// now. The amplitude gate alone drops neither: a dip below it mid-note must
+    /// not blank the panel.
     pub fn process(
         &mut self,
         frame: &ProcessingFrame,
@@ -273,7 +281,11 @@ impl Strobe {
             let gated = is_silence || amplitude < t_amp || !delta.is_finite();
             if gated {
                 self.band[i].hold();
-                self.unison.hold(i);
+                if is_silence {
+                    self.unison.clear(i);
+                } else {
+                    self.unison.hold(i);
+                }
             } else {
                 let cycles = delta / (2.0 * core::f32::consts::PI);
                 self.angle[i] = (self.angle[i] + cycles).rem_euclid(1.0);
@@ -581,6 +593,49 @@ mod tests {
             let frame = bank.process(&frame_buf, 0.005, false);
             assert!(frame.gated[0], "silence must gate the band");
             assert_eq!(frame.angle[0], angle, "gated angle must hold");
+        }
+    }
+
+    /// A dead note keeps its band but loses its strings: `is_silence` drops the
+    /// published lines, while the angle and the band's rate hold (R2).
+    #[test]
+    fn test_silence_drops_the_unison_lines() {
+        use crate::algorithms::peaks::UNISON_MIN_BINS;
+
+        let fs = 44_100u32;
+        // Warmup costs a hop, and the ring must reach the estimator's minimum.
+        let hops = UNISON_MIN_BINS + 2;
+        let mut bank = Strobe::new(fs);
+        let mut refs = [0.0; MAX_STROBE_REFS];
+        refs[0] = 440.0;
+        bank.retarget(StrobeRefUpdate {
+            count: 1,
+            refs,
+            coarse_index: 1,
+            spacing_hz: refs[0],
+        });
+
+        let signal: Vec<f32> = (0..BASS_WINDOW_SIZE + hops * HOP_SIZE)
+            .map(|i| 0.1 * (2.0 * std::f32::consts::PI * 441.0 * i as f32 / fs as f32).sin())
+            .collect();
+        let mut frame_buf = ProcessingFrame::new();
+        let mut last = StrobeResult::default();
+        for h in 0..hops {
+            frame_buf.audio_buffer[..BASS_WINDOW_SIZE]
+                .copy_from_slice(&signal[h * HOP_SIZE..h * HOP_SIZE + BASS_WINDOW_SIZE]);
+            last = bank.process(&frame_buf, 0.005, false);
+        }
+        assert!(last.line_count[0] > 0, "a filled ring must publish lines");
+        assert!(last.beat_hz[0].is_some(), "past the minimum span");
+
+        // Same audio, Gatekeeper says Silence: the lines go, the band stays.
+        for _ in 0..3 {
+            let frame = bank.process(&frame_buf, 0.005, true);
+            assert_eq!(frame.line_count[0], 0, "silence must drop the lines");
+            assert_eq!(frame.line_resolution_hz[0], 0.0);
+            assert_eq!(frame.verdict, UnisonVerdict::Undetermined);
+            assert_eq!(frame.angle[0], last.angle[0], "the angle holds (R2)");
+            assert_eq!(frame.beat_hz[0], last.beat_hz[0], "the rate holds");
         }
     }
 

@@ -33,6 +33,7 @@ pub fn initialize_done_timer() {
 pub fn make_capture_button(
     capture_state: tuner_core::pipeline::CaptureState,
     capture_message: crate::Message,
+    abortable: bool,
 ) -> Element<'static, crate::Message> {
     // Handle timer logic for "Done" state display
     let should_show_done = {
@@ -70,6 +71,13 @@ pub fn make_capture_button(
                 ("Armed", iced::Color::from_rgb(0.8, 0.6, 0.2), false)
             } // Orange-ish
             // When actively capturing (waiting for stability), indicate progress.
+            // An extended record runs to its full length whatever the note
+            // does, so it is the one state that needs a way out.
+            tuner_core::pipeline::CaptureState::Recording if abortable => (
+                "Stop — drop take",
+                iced::Color::from_rgb(0.8, 0.2, 0.2),
+                true,
+            ),
             tuner_core::pipeline::CaptureState::Recording => {
                 ("Capturing...", iced::Color::from_rgb(0.8, 0.2, 0.2), true)
             } // Red and pulsing

@@ -62,9 +62,9 @@ const PROGRAM_CONFIG: [ButtonConfig; 4] = [
     },
 ];
 
-// Surfaces an ordinary tuning session never touches. Both persist with the
+// Surfaces an ordinary tuning session never touches. All persist with the
 // app rather than the open profile.
-const ADVANCED_CONFIG: [ButtonConfig; 2] = [
+const ADVANCED_CONFIG: [ButtonConfig; 3] = [
     // Swaps the main-view note picker between the piano keyboard and a
     // six-button guitar-string picker. Not a full instrument mode — no
     // inharmonicity is measured for guitar (see `Instrument`).
@@ -76,6 +76,11 @@ const ADVANCED_CONFIG: [ButtonConfig; 2] = [
     ButtonConfig {
         label: "String Isolation",
         message: Some(Message::ToggleStringIsolationPanel),
+        button_type: ButtonType::Standard,
+    },
+    ButtonConfig {
+        label: "Capture Duration",
+        message: Some(Message::ToggleExtendedCapturePanel),
         button_type: ButtonType::Standard,
     },
 ];
@@ -140,6 +145,8 @@ pub fn create_settings_view(
         create_instrument_select_panel(data.instrument)
     } else if data.string_isolation_visible {
         create_string_isolation_panel(data.string_isolation)
+    } else if data.extended_capture_visible {
+        create_capture_duration_panel(data.extended_capture, data.extended_capture_secs)
     } else {
         text("Select a setting to adjust.").size(18).into()
     };
@@ -214,6 +221,80 @@ fn create_string_isolation_panel(enabled: bool) -> Element<'static, Message> {
             segment("On", true, enabled)
         ]
         .spacing(10),
+    ]
+    .spacing(6)
+    .into()
+}
+
+/// The capture-duration panel: whether a capture records past the shipped
+/// 1.5 s, and for how long.
+///
+/// The lengths offered are stored-audio lengths only. What the Worker *measures*
+/// is fixed at [`CAPTURE_ANALYSIS_SAMPLES`](tuner_core::pipeline::CAPTURE_ANALYSIS_SAMPLES)
+/// whatever is chosen here, so a session can take long records without making
+/// its own measurements incomparable with the capture sets.
+fn create_capture_duration_panel(enabled: bool, secs: f32) -> Element<'static, Message> {
+    fn highlight(
+        btn: iced::widget::Button<'static, Message>,
+        active: bool,
+    ) -> iced::widget::Button<'static, Message> {
+        if active {
+            btn.style(|_theme, _status| button::Style {
+                background: Some(iced::Background::Color(iced::Color::from_rgb(
+                    0.325, 0.278, 0.388,
+                ))), // purple — matches the active Settings button
+                text_color: iced::Color::WHITE,
+                ..button::Style::default()
+            })
+        } else {
+            btn
+        }
+    }
+
+    let mode = |label: &'static str, target: bool| {
+        highlight(
+            button(text(label).size(16))
+                .padding([8, 24])
+                .on_press(Message::SetExtendedCapture(target)),
+            enabled == target,
+        )
+    };
+
+    let mut lengths = row![].spacing(10);
+    for choice in [2.0f32, 3.0, 5.0] {
+        let mut btn = highlight(
+            button(text(format!("{choice:.0} s")).size(16)).padding([8, 20]),
+            enabled && (secs - choice).abs() < 0.05,
+        );
+        if enabled {
+            btn = btn.on_press(Message::SetExtendedCaptureSecs(choice));
+        }
+        lengths = lengths.push(btn);
+    }
+
+    column![
+        text("Capture Duration").size(20),
+        Space::new().height(8),
+        text(
+            "A capture normally records 1.5 s and stops early if the note decays. \
+             Extended captures record the full length instead, past the point the \
+             Gatekeeper calls silence — the tail a decay fit needs, and the audio \
+             the offline harnesses read."
+        )
+        .size(13),
+        Space::new().height(8),
+        text(
+            "Only the stored audio grows. Every measurement is still made from the \
+             first 1.5 s, so extended captures stay comparable with the existing \
+             capture sets. Leave this off for tuning: a long record runs for its \
+             whole length whatever happens, so anything else played into it is \
+             part of the recording."
+        )
+        .size(13),
+        Space::new().height(16),
+        row![mode("1.5 s (default)", false), mode("Extended", true)].spacing(10),
+        Space::new().height(12),
+        lengths,
     ]
     .spacing(6)
     .into()
@@ -306,9 +387,12 @@ fn create_settings_sidebar(data: &AppDisplayData) -> Element<'static, Message> {
 
     // Add capture button if in measurement mode
     if data.measurement_mode_active {
+        // Never abortable: this copy is a shortcut back to capturing, not the
+        // live control the take is watched on.
         sections = sections.push(make_capture_button(
             data.capture_state.clone(),
             Message::CaptureButtonClicked,
+            false,
         ));
     }
 

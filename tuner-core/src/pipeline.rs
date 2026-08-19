@@ -55,16 +55,55 @@ use crate::worker::{WorkerJob, WorkerManager, WorkerOutput};
 // the 15-frame (15,360 sample) pre-roll requirement.
 const ONSET_HISTORY_SAMPLES: usize = 32768;
 
+/// Shipped fill target for a capture: 1.5 s.
+///
+/// **Do not move it without an ADR.** Every capture set the project measures
+/// against was recorded at this length (`06-capture-sets.md`), so a changed
+/// default makes new measurements incomparable with all of them. A measurement
+/// session moves the runtime target ([`PipelineAtomics::capture_samples`])
+/// instead, which does not touch what is analysed.
+pub const CAPTURE_DEFAULT_SAMPLES: usize = 3 * SAMPLE_RATE as usize / 2;
+
+/// How much of a record the Worker analyses, however long the record is.
+///
+/// Deliberately **not** defined in terms of [`CAPTURE_DEFAULT_SAMPLES`], though
+/// it holds the same value: this one is pinned to the length the capture sets
+/// were recorded at (`06-capture-sets.md`), so if the default fill ever moves,
+/// the analysed span must stay put or every new measurement silently stops
+/// being comparable with them.
+pub const CAPTURE_ANALYSIS_SAMPLES: usize = 3 * SAMPLE_RATE as usize / 2;
+
+/// Ceiling the pool allocates every buffer to, so raising the fill target never
+/// allocates on the audio thread (`03-dsp-pipeline.md`).
+///
+/// 5 s. Ours, measured (`06-capture-sets.md`): a struck string's usable record
+/// ends when it decays into the noise floor, and past that a longer window adds
+/// noise-only samples, which sharpen no line — a decaying sinusoid's frequency
+/// resolution saturates near its own decay constant. The cost is resident
+/// whatever the knob says: 8 pool buffers × 5 s × 4 B ≈ 7 MB.
+pub const CAPTURE_MAX_SAMPLES: usize = 5 * SAMPLE_RATE as usize;
+
+/// Length of the diagnostic full-event record (pre-roll + attack + decay).
+///
+/// Fixed at 1.5 s and deliberately **not** moved by the fill-target knob: the
+/// stable record is the one that grows, and between them they cover the event
+/// from before the strike to the end of the decay.
+const FULL_EVENT_SAMPLES: usize = CAPTURE_DEFAULT_SAMPLES;
+
 /// Payload dispatched from the pipeline to the Worker thread.
 pub struct CapturePayload {
-    /// 1.5 seconds of high-resolution overlap-added buffer content.
-    pub stable_buffer: Box<[f32; 66150]>,
-    /// Number of valid samples written to the stable buffer.
+    /// High-resolution overlap-added buffer content, [`CAPTURE_MAX_SAMPLES`]
+    /// long and filled to `stable_sample_count`.
+    pub stable_buffer: Box<[f32]>,
+    /// Number of valid samples written to the stable buffer — the fill target
+    /// that stood when recording began, or less if the note decayed first.
+    /// Only the first [`CAPTURE_ANALYSIS_SAMPLES`] are measured; the rest is
+    /// stored audio.
     pub stable_sample_count: usize,
     /// Purely diagnostic buffer containing the full acoustic event (pre-roll, strike, and decay).
     /// This is written to disk for analysis tooling (`diagnose_engine.rs`) and is NEVER
     /// fed back into the Engine or MAT algorithms.
-    pub full_event_buffer: Option<Box<[f32; 66150]>>,
+    pub full_event_buffer: Option<Box<[f32]>>,
     /// Number of valid samples written to the full event buffer.
     pub full_event_sample_count: usize,
     /// The target note index the UI requested, or 255 for Auto.
@@ -139,8 +178,8 @@ pub const STROBE_REF_QUEUE_CAPACITY: usize = 2;
 
 /// Capacity of the capture-dispatch channel (DSP → Worker, crossing #5).
 ///
-/// The real backpressure ceiling is the [`AudioPool`] (8 buffers, each payload
-/// borrowing up to 2 → ≤ 4 payloads outstanding); this channel is subordinate.
+/// The real backpressure ceiling is the [`AudioPool`]
+/// ([`AUDIO_POOL_CAPACITY`]); this channel is subordinate.
 /// Captures are serialised at the source (a note is held ~1.5 s and the worker
 /// finishes well within that), so at most one capture is genuinely in flight.
 /// Two = one being processed + one just-completed slot before the `try_send`
@@ -166,6 +205,16 @@ pub const WORKER_RESULT_QUEUE_CAPACITY: usize = 4;
 /// on receipt. One in-flight compute + this one pending slot is the whole
 /// pipeline depth a curve recompute ever needs.
 pub const WORKER_JOB_QUEUE_CAPACITY: usize = 1;
+
+/// Buffers the [`AudioPool`] holds, sized so a `pop` can never fail.
+///
+/// Starvation is silent — `pop` returning `None` means the capture simply never
+/// starts, with nothing on screen to say so — so the pool is sized to the worst
+/// case rather than the expected one. A capture borrows **two** buffers (the
+/// stable record and the full-event diagnostic), and three can be outstanding
+/// at once: one filling in the pipeline, [`CAPTURE_QUEUE_CAPACITY`] queued for
+/// the worker, and one the worker is processing.
+pub const AUDIO_POOL_CAPACITY: usize = 2 * (1 + CAPTURE_QUEUE_CAPACITY + 1);
 
 /// A single key's recompiled discovery template, in transit UI → DSP (crossing #4).
 ///
@@ -252,13 +301,43 @@ pub enum CaptureState {
     Processing = 3,
 }
 
-/// A lock-free Object Pool for 2-second audio captures.
+/// What a recording in progress is: how long it fills for, and what it is *of*.
 ///
-/// Thread 2 (The Brains) borrows a pre-allocated array from this pool
-/// when the Gatekeeper triggers. Once filled with 1.5 seconds of audio (66,150 samples),
-/// the array is dispatched to Thread 3 (Background Worker) for heavy DSP
-/// (like inharmonicity mapping). Thread 3 returns the array to the pool when finished.
-pub type AudioPool = ArrayQueue<Box<[f32; 66150]>>;
+/// Sampled together at `Armed → Recording` rather than read at dispatch,
+/// because a record can run for seconds and these describe the audio: by the
+/// end the operator may have selected the next key or changed the declaration,
+/// and reading them then would file the record under a later moment.
+struct CaptureLatch {
+    /// Samples to fill to, clamped into `HOP_SIZE..=CAPTURE_MAX_SAMPLES`.
+    target_samples: usize,
+    /// The key the UI had selected; 255 = Auto.
+    target_note: u8,
+    /// The string declaration, packed by [`SoundingStrings::to_bits`]. Carried,
+    /// not consumed — the pipeline is simply the only place that knows when the
+    /// audio began.
+    declared_strings: u8,
+}
+
+impl Default for CaptureLatch {
+    fn default() -> Self {
+        Self {
+            target_samples: CAPTURE_DEFAULT_SAMPLES,
+            target_note: 255,
+            declared_strings: SoundingStrings::UNDECLARED.to_bits(),
+        }
+    }
+}
+
+/// A lock-free Object Pool for audio captures.
+///
+/// Thread 2 (The Brains) borrows a pre-allocated buffer from this pool when the
+/// Gatekeeper triggers. Once filled to the current fill target, the buffer is
+/// dispatched to Thread 3 (Background Worker) for heavy DSP (like inharmonicity
+/// mapping). Thread 3 returns it to the pool when finished.
+///
+/// Every buffer is [`CAPTURE_MAX_SAMPLES`] long regardless of the target, so a
+/// changed target never allocates on the audio thread.
+pub type AudioPool = ArrayQueue<Box<[f32]>>;
 
 /// Thread-Local Scratch Buffers for Thread 2 (The F0 Engine).
 ///
@@ -390,10 +469,19 @@ pub struct PipelineAtomics {
     /// Bidirectional capture lifecycle state.
     /// GUI writes `Armed`, Pipeline writes `Recording`/`Processing`, Worker writes `Idle`.
     pub capture_state: AtomicU8,
+    /// UI → DSP: samples a capture fills to, clamped into
+    /// `HOP_SIZE..=CAPTURE_MAX_SAMPLES` and latched at `Armed → Recording`.
+    /// Above [`CAPTURE_DEFAULT_SAMPLES`] it also suppresses the decay stop.
+    pub capture_samples: AtomicU32,
     /// UI → DSP: the operator's per-capture string declaration, packed by
     /// [`SoundingStrings::to_bits`]. `0` = undeclared, the ordinary state; the
     /// pipeline decodes it onto the [`CapturePayload`] it dispatches.
     pub capture_strings: AtomicU8,
+    /// UI → DSP: drop the recording in progress. A *request*, not a transition
+    /// — the pipeline consumes it and makes the `Recording → Idle` move itself,
+    /// so the baton keeps one writer per transition. Cleared when a recording
+    /// starts, so a stale request cannot kill the next take.
+    pub capture_abort: AtomicBool,
 }
 
 impl Default for PipelineAtomics {
@@ -412,7 +500,9 @@ impl Default for PipelineAtomics {
             },
             shutdown: AtomicBool::new(false),
             capture_state: AtomicU8::new(CaptureState::Idle as u8),
+            capture_samples: AtomicU32::new(CAPTURE_DEFAULT_SAMPLES as u32),
             capture_strings: AtomicU8::new(0), // Default to undeclared
+            capture_abort: AtomicBool::new(false),
         }
     }
 }
@@ -461,10 +551,12 @@ pub struct AudioPipeline {
     pub capture_tx: Sender<CapturePayload>,
 
     // Capture Accumulation State
-    capture_buffer: Option<Box<[f32; 66150]>>,
+    capture_buffer: Option<Box<[f32]>>,
     capture_count: usize,
+    /// What the recording in progress is, sampled at `Armed → Recording`.
+    latch: CaptureLatch,
     /// Parallel accumulator for the diagnostic `full_event_buffer`.
-    full_event_buffer: Option<Box<[f32; 66150]>>,
+    full_event_buffer: Option<Box<[f32]>>,
     full_event_count: usize,
     /// Continuous circular history of the raw audio stream.
     /// Maintained strictly to provide non-causal pre-roll for diagnostic captures.
@@ -544,10 +636,11 @@ impl AudioPipeline {
     /// # Returns
     /// `(AudioPipeline, PipelinePorts)`.
     pub fn new(dump_dir: Option<PathBuf>) -> (Self, PipelinePorts) {
-        let audio_pool = Arc::new(ArrayQueue::new(8));
-        // Pre-fill pool
-        for _ in 0..8 {
-            let _ = audio_pool.push(Box::new([0.0; 66150]));
+        let audio_pool = Arc::new(ArrayQueue::new(AUDIO_POOL_CAPACITY));
+        // Every buffer takes the ceiling, not the current fill target: the
+        // target is a runtime knob and the audio thread allocates nothing.
+        for _ in 0..AUDIO_POOL_CAPACITY {
+            let _ = audio_pool.push(vec![0.0; CAPTURE_MAX_SAMPLES].into_boxed_slice());
         }
 
         let atomics = Arc::new(PipelineAtomics::default());
@@ -621,6 +714,7 @@ impl AudioPipeline {
             capture_tx,
             capture_buffer: None,
             capture_count: 0,
+            latch: CaptureLatch::default(),
             full_event_buffer: None,
             full_event_count: 0,
             history_buffer: vec![0.0f32; ONSET_HISTORY_SAMPLES]
@@ -831,6 +925,15 @@ impl AudioPipeline {
                 self.capture_onset_pending = false;
                 self.capture_buffer = Some(buf);
                 self.capture_count = 0;
+                self.latch = CaptureLatch {
+                    // Clamped, not trusted: another thread writes this.
+                    target_samples: (self.atomics.capture_samples.load(Ordering::Relaxed) as usize)
+                        .clamp(HOP_SIZE, CAPTURE_MAX_SAMPLES),
+                    target_note: self.atomics.config.target_note.load(Ordering::Relaxed),
+                    declared_strings: self.atomics.capture_strings.load(Ordering::Relaxed),
+                };
+                // A request that arrived before this take is not about it.
+                self.atomics.capture_abort.store(false, Ordering::Relaxed);
                 self.atomics
                     .capture_state
                     .store(CaptureState::Recording as u8, Ordering::Relaxed);
@@ -844,7 +947,7 @@ impl AudioPipeline {
         if let Some(mut buf) = self.full_event_buffer.take() {
             let start_idx = BASS_WINDOW_SIZE - HOP_SIZE;
             let src_slice = &self.processing_frame.audio_buffer[start_idx..BASS_WINDOW_SIZE];
-            let remaining = 66150 - self.full_event_count;
+            let remaining = FULL_EVENT_SAMPLES - self.full_event_count;
             let to_copy = src_slice.len().min(remaining);
             buf[self.full_event_count..self.full_event_count + to_copy]
                 .copy_from_slice(&src_slice[..to_copy]);
@@ -852,7 +955,24 @@ impl AudioPipeline {
             self.full_event_buffer = Some(buf);
         }
 
-        if current_capture_state == CaptureState::Recording as u8 {
+        if current_capture_state == CaptureState::Recording as u8
+            && self.atomics.capture_abort.swap(false, Ordering::Relaxed)
+        {
+            // Nothing is dispatched, so the take reaches neither the profile
+            // nor the disk.
+            if let Some(buf) = self.capture_buffer.take() {
+                let _ = self.audio_pool.push(buf);
+            }
+            if let Some(dbuf) = self.full_event_buffer.take() {
+                let _ = self.audio_pool.push(dbuf);
+            }
+            self.capture_count = 0;
+            self.full_event_count = 0;
+            self.latched_auto_key = None;
+            self.atomics
+                .capture_state
+                .store(CaptureState::Idle as u8, Ordering::Relaxed);
+        } else if current_capture_state == CaptureState::Recording as u8 {
             // ── Latch ──
             if let Some(ref result) = pitch_result {
                 self.latched_auto_key = Some(result.key_index);
@@ -863,7 +983,7 @@ impl AudioPipeline {
                 let start_idx = BASS_WINDOW_SIZE - HOP_SIZE;
                 let src_slice = &self.processing_frame.audio_buffer[start_idx..BASS_WINDOW_SIZE];
 
-                let remaining = 66150 - self.capture_count;
+                let remaining = self.latch.target_samples - self.capture_count;
                 let to_copy = src_slice.len().min(remaining);
 
                 buf[self.capture_count..self.capture_count + to_copy]
@@ -871,11 +991,14 @@ impl AudioPipeline {
 
                 self.capture_count += to_copy;
 
-                let done = self.capture_count == 66150;
-                let decayed = gate_result.state == SignalState::Silence;
+                let done = self.capture_count == self.latch.target_samples;
+                // An extended record is a request for the audio past the decay,
+                // so only the shipped length keeps the short-dispatch valve.
+                let decayed = gate_result.state == SignalState::Silence
+                    && self.latch.target_samples <= CAPTURE_DEFAULT_SAMPLES;
 
                 if done || decayed {
-                    let target_note = self.atomics.config.target_note.load(Ordering::Relaxed);
+                    let target_note = self.latch.target_note;
 
                     // ── Dispatch Gate ──
                     let dispatch_note = if target_note == 255 {
@@ -896,7 +1019,7 @@ impl AudioPipeline {
                             measured_f0: self.last_measured_f0,
                             captured_in_auto: target_note == 255,
                             sounding_strings: SoundingStrings::from_bits(
-                                self.atomics.capture_strings.load(Ordering::Relaxed),
+                                self.latch.declared_strings,
                             ),
                         };
                         self.full_event_count = 0; // Clear state after dispatch
@@ -964,6 +1087,13 @@ impl AudioPipeline {
         frame_output.unison_resolution_hz = strobe_result.line_resolution_hz;
         frame_output.unison_verdict = strobe_result.verdict;
         frame_output.coarse_hz = strobe_result.coarse_hz;
+        // The buffer is held only while a record is in progress, so its
+        // presence is exactly the condition a progress figure is meaningful in.
+        frame_output.capture_progress_samples = if self.capture_buffer.is_some() {
+            self.capture_count
+        } else {
+            0
+        };
 
         if let Some(result) = pitch_result {
             frame_output.detected_frequency = result.measured_f0;
@@ -999,6 +1129,20 @@ mod tests {
             captured_in_auto: true,
             sounding_strings: None,
         }
+    }
+
+    /// The capture lengths are *durations* — 1.5 s is the figure every capture
+    /// set was recorded at, and the one ADR 0009's σ model was measured on.
+    #[test]
+    fn capture_lengths_are_the_durations_they_claim() {
+        let secs = |n: usize| n as f32 / SAMPLE_RATE as f32;
+        assert!((secs(CAPTURE_DEFAULT_SAMPLES) - 1.5).abs() < 1e-6);
+        assert!((secs(CAPTURE_MAX_SAMPLES) - 5.0).abs() < 1e-6);
+        assert_eq!(CAPTURE_ANALYSIS_SAMPLES, CAPTURE_DEFAULT_SAMPLES);
+        assert_eq!(FULL_EVENT_SAMPLES, CAPTURE_DEFAULT_SAMPLES);
+        // The pool allocates the ceiling, so nothing the knob can ask for
+        // reaches past a buffer.
+        const { assert!(CAPTURE_DEFAULT_SAMPLES <= CAPTURE_MAX_SAMPLES) };
     }
 
     #[test]

@@ -12,17 +12,29 @@ through `regenerate_partials`, never through raw `analysis.json`.
 
 ## What a capture writes
 
-Every capture produces three files in its own subdirectory of `diagnostics/`,
-named `key_<index>_<note>_<timestamp>` (e.g. `diagnostics/key_001_A#0_1752264903/`).
-The timestamp suffix means repeat captures of one key are all retained rather
-than overwriting each other, which is what the repeat-capture experiments
-consume.
+Every capture produces three files in a subdirectory named
+`key_<index>_<note>_<timestamp>` (e.g. `key_001_A#0_1752264903/`). The timestamp
+suffix means repeat captures of one key are all retained rather than overwriting
+each other, which is what the repeat-capture experiments consume.
+
+Those sit under the instrument's own dump directory — `diagnostics/<instrument
+id>/`, keyed on the opaque `identity.id`, so two instruments never share a
+directory and renaming an instrument moves nothing. Each carries an
+`instrument.json` (id, name, make, model, serial, kind) so a tool can tell whose
+captures these are without opening the profile.
 
 | File | Contents |
 | --- | --- |
-| `audio.raw` | The strictly causal, stable audio buffer that triggered the capture — raw `f32` samples, no header. |
-| `audio_full_event.raw` | The non-causal diagnostic buffer: ~348 ms of pre-roll, the hammer strike, and the decay. |
+| `audio.raw` | The strictly causal, stable audio buffer that triggered the capture — raw `f32` samples, no header. 1.5 s unless the session raised the capture duration, and shorter where the note decayed first. |
+| `audio_full_event.raw` | The non-causal diagnostic buffer: ~348 ms of pre-roll, the hammer strike, and the decay. Always 1.5 s — the capture-duration control moves the stable record only. |
 | `analysis.json` | The Worker's analytical telemetry for that capture. |
+
+A longer `audio.raw` is **stored** audio, not measured audio: the Worker
+analyses the first `CAPTURE_ANALYSIS_SAMPLES` (1.5 s) whatever the record's
+length, so measurements stay comparable across the sets. `regenerate_partials`
+bounds itself the same way, deliberately — reproducing the shipped measurement
+is its job. A harness that wants the whole record (decay τ, deep-bass
+resolution) reads the file directly and says so.
 
 Offline tools discover dumps by the `key_` prefix and read the key identity from
 `analysis.json`, so the directory name is not load-bearing.

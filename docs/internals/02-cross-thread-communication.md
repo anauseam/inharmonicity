@@ -5,10 +5,11 @@ channels (such as `std::sync::mpsc`) are avoided inside the real-time
 pipeline — they can fall back to OS locks, spin-locks, or heap
 allocations under contention or capacity growth.
 
-Every ring buffer is initialised with an explicitly named constant.
+Every ring buffer and pool is initialised with an explicitly named constant.
 Magic-number literals are not used. Each constant carries a doc-comment
 explaining how the value was derived (for example: buffer capacity
-scaled to absorb worst-case OS scheduler latency jitter).
+scaled to absorb worst-case OS scheduler latency jitter, or `AUDIO_POOL_CAPACITY`
+from the worst-case number of buffers outstanding).
 
 The six sanctioned crossings:
 
@@ -67,10 +68,38 @@ The six sanctioned crossings:
   `AtomicU32`, etc.).
 - **Purpose:** adjust individual settings (thresholds, multipliers).
   Use `f32::to_bits()` / `f32::from_bits()` for floats.
-- `ConfigAtomics` holds **DSP parameters only** — every field is read by the
-  DSP on the hot path. An atomic the DSP does not read is not a parameter and
-  belongs elsewhere on `PipelineAtomics`; see the capture-lifecycle atomics
-  under crossing #6.
+**Where a new atomic goes is decided by *when* it is read**, which is the
+property that keeps each struct scannable:
+
+- `ConfigAtomics` — parameters the DSP consults **every hop** (`silence_threshold`,
+  `nhwrsf_threshold`, `ninos2_stability_threshold`, `target_note`). Step 2 of
+  `process_cola_hop` reads the whole struct; that is what it is for.
+- `RuntimeAtomics` — scalar observations several independent consumers may poll.
+  A one-way per-hop snapshot with a single consumer is **not** one of these: it
+  belongs on `FrameOutput` (crossing #2), which the GUI already parses every
+  tick and where a dropped update costs nothing. `capture_progress_samples`
+  rides there for exactly that reason.
+- **The capture-lifecycle atomics** (`capture_state`, `capture_samples`,
+  `capture_strings`, `capture_abort`) — read at lifecycle **transitions**, not
+  per hop. They sit loose on `PipelineAtomics`; see crossing #6.
+
+`capture_samples` is the illustration: it sets how long a record fills for, and
+above the shipped default it also suppresses the decay stop — so the DSP
+genuinely acts on it — but it is read **once, at `Armed → Recording`**, which is
+what puts it with the lifecycle atomics rather than in `ConfigAtomics`. The
+pipeline clamps what it reads (`HOP_SIZE..=CAPTURE_MAX_SAMPLES`) rather than
+trusting the writer.
+- **Everything that labels a capture is latched at that same instant** — the
+  length, `target_note` and `capture_strings`, gathered in `CaptureLatch`. They
+  describe the audio, so they must be sampled when the audio starts, not when it
+  is dispatched: a record can run for seconds, and by the end the operator may
+  be setting up the next capture. Reading them at dispatch would file a record
+  under whatever was selected last.
+- `capture_abort` sits with the capture-lifecycle atomics rather than here: it
+  is a **request**, not a transition. The GUI raises it and the pipeline
+  consumes it and makes the `Recording → Idle` move itself, so the baton keeps
+  one writer per transition (see crossing #6). The pipeline clears it when a
+  recording starts, so a request that arrived earlier cannot kill the next take.
 
 ## 4. Grouped / dependent DSP parameters (UI → DSP)
 
@@ -187,11 +216,13 @@ same producer (Worker), same consumer (UI), no priority split.
   thread; this is the whole reason the curve compute is offloaded rather
   than run inline on load).
 
-- **UI → Worker** — `WorkerJob`, an enum of the jobs the UI can request
-  (today only `Curve(CurveJob)`, a trust-filtered `CurveInput` snapshot +
-  a generation counter). `.try_send()` from the UI via
-  `HostHandle::send_curve_job`. Capacity `WORKER_JOB_QUEUE_CAPACITY = 1`
-  (latest-wins). Results return on crossing #5's `WorkerOutput`.
+- **UI → Worker** — `WorkerJob`, an enum of the jobs the UI can request:
+  `Curve(CurveJob)` (a trust-filtered `CurveInput` snapshot + a generation
+  counter) and `SetDumpDir(Option<PathBuf>)` (where capture dumps are
+  written, so they follow the open instrument). `.try_send()` from the UI
+  via `HostHandle::send_curve_job` / `send_dump_dir`. Capacity
+  `WORKER_JOB_QUEUE_CAPACITY = 1`. Results return on crossing #5's
+  `WorkerOutput`; `SetDumpDir` has no result.
 
 ### Why a distinct crossing, not a reuse of #5
 
@@ -217,15 +248,30 @@ every job and the returned `CurveBundle` echoes it, so a bundle superseded
 by a newer edit is dropped on arrival. The single-slot channel plus a
 `curve_dirty` retry flag on the UI (re-send next tick if the slot was
 full) plus worker-side coalescing (drain to the newest queued job) means
-a burst of edits collapses to one recompute of the final state. Because
+a burst of edits collapses to one recompute of the final state.
+
+**Coalescing is per kind, and that distinction is load-bearing.** A
+superseded curve bundle is worthless, so only the newest survives the
+drain; a superseded `SetDumpDir` is not — dropping one files an
+instrument's captures under another's name, silently. The worker keeps the
+newest of *each* kind and applies the directory first. The UI mirrors that
+asymmetry: `pending_dump_dir` retries every tick until accepted, exactly as
+`curve_dirty` does, because a full slot must not cost the change.
+
+The ordering works in the frontend's favour: captures are drained before
+jobs, so a capture still in flight when the instrument changes is written
+under the old root — which is the instrument it was taken on. Because
 the job carries a read-only `CurveInput` snapshot, a curve recompute can
 never overwrite or race a `KeyMeasurement` — the two ride separate
 channels with separate types.
 
 ### Capture-lifecycle atomics
 
-Two atomics sit on `PipelineAtomics` outside `ConfigAtomics`, because neither
-is a DSP parameter: the `CaptureState` baton below, and `capture_strings` —
+Four atomics sit on `PipelineAtomics` outside `ConfigAtomics`, because none of
+them is read per hop: the `CaptureState` baton below, `capture_samples` (how
+long the record fills for), `capture_abort` — a one-shot request to drop the
+recording in progress, which the pipeline consumes and acts on so the baton
+keeps one writer per transition — and `capture_strings` —
 the operator's declaration of how the tuned key is strung and which of its
 strings are sounding (`06-capture-sets.md`). The declaration is written by the
 GUI at user rate and read by the pipeline **only** as it assembles a

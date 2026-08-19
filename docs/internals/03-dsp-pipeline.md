@@ -49,7 +49,7 @@ truth it judges against.
 | 4 | Treble magnitude spectrum | spectrogram (`FrameOutput`) only | tap |
 | 5 | **Engine** → `Option<PitchResult>`: silence/transient resets → discovery (Stage-A discrete scoring over the bass magnitudes, M-of-N acquisition lock, tracker seeding) or tracking (adaptive Goertzel bank, NP gate, EMA) | telemetry, capture latch | **chain** |
 | 5b | **Strobe** → `StrobeResult`: fixed-reference beat phase, its sliding-window least-squares rate per reference, the per-reference baseband record and the unison lines it resolves (with the discriminator's verdict), and a bounded CFAR-gated coarse spectral readout at the nominated reference partial (skipped during `Silence`) | `FrameOutput` only | tap |
-| 6 | Capture accumulation & dispatch — the `CaptureState` baton: onset pre-roll → `Recording` on Stable → 1.5 s or decay → dispatch gate → `CapturePayload` to the Worker (crossing #5), with backpressure recovery | Worker → MAT → `KeyMeasurement` → profile | **capture limb** (chain branch) |
+| 6 | Capture accumulation & dispatch — the `CaptureState` baton: onset pre-roll → `Recording` on Stable → the latched fill target (1.5 s by default), decay, or an operator abort → dispatch gate → `CapturePayload` to the Worker (crossing #5), with backpressure recovery | Worker → MAT → `KeyMeasurement` → profile | **capture limb** (chain branch) |
 | 7 | `FrameOutput` assembly: treble magnitudes, gate telemetry, pitch fields when locked, strobe fields (angle, gate, rate, amplitude, unison lines + resolution + verdict) + `coarse_hz` unconditionally → triple buffer (crossing #2) | GUI | out |
 
 Two things this table encodes that a "stream → gate → engine" sketch

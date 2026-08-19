@@ -62,6 +62,10 @@ extended 2026-08-07:
   (§5.1 of the note below) — decide when the need is real.
   → [`docs/design/session-persistence-and-profile-library.md`](docs/design/session-persistence-and-profile-library.md)
 - **Capture-dump retention, and a user-settable dump location** — `Planned`.
+  *(Half done 2026-08-15: dumps now follow the open instrument —
+  `diagnostics/<identity.id>/` via `WorkerJob::SetDumpDir`, with an
+  `instrument.json` manifest beside them. What remains is the retention policy
+  and letting the operator choose the root.)*
   Every capture writes raw audio to `data_local_dir()/diagnostics/` and nothing
   ever prunes it, so a working tuner's disk use grows without bound. Needs a
   policy (age or total size) and somewhere to show it, and it is now the *only*

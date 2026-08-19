@@ -23,13 +23,17 @@ For the design rationale and open observations, see [ARCHITECTURE.md](ARCHITECTU
 >   inspector shows every retained measurement of a key and lets you drop or
 >   re-measure it, and the curve marks the keys it doubts — but no automatic
 >   acceptance gate exists, and two candidates have been measured and rejected.
-> - **Unison assist reads out, but rarely names what it sees.** The strings of
->   the selected note are resolved as separate spectral lines with their beat
->   rate, and the panel always states the resolution the reading is worth — but
->   the test that separates a real unison from one string beating with itself
->   returns "undetermined" on most notes. In the bass it withholds the claim
->   almost always, and correctly: those keys carry a second line that is real
->   spectral content but is not a second string, and what it *is* is unsettled.
+> - **Unison assist sees only fast beats, and says so.** The strings of the
+>   selected note are resolved as separate spectral lines with their beat rate,
+>   and the panel leads with the limit it is working under: it cannot see a beat
+>   slower than about 1.5 per second. That limit is fixed in Hz while a unison is
+>   judged in cents, so the same panel resolves ~6 ¢ at A4 and ~40 ¢ at C2 — it
+>   is a coarse-error instrument in the bass and a genuinely fine one in the
+>   treble. Below its limit it hands off rather than guessing. The test that
+>   separates a real unison from one string beating with itself still returns
+>   "undetermined" on most notes, and in the bass it withholds the claim almost
+>   always — correctly: those keys carry a second line that is real spectral
+>   content but is not a second string, and what it *is* is unsettled.
 > - **No pitch-raise over-pull targets.**
 > - **A440 only**, no user-adjustable temperaments.
 >
@@ -89,10 +93,13 @@ for a pure equal-temperament strobe with no stretch curve.
 > **excluded from the tuning curve** by design. A full compass captured in Auto
 > yields a model-only curve with no measurements in it.
 
-Every capture also writes its raw audio and analysis to a `diagnostics/` folder
-in the per-user data directory (path printed at startup; not yet pruned). That
-data exists for development — the format and the offline harnesses that read it
-are documented in [`tuner-core/examples/README.md`](tuner-core/examples/README.md).
+Every capture also writes its raw audio and analysis under the open instrument's
+own dump directory — `diagnostics/<instrument id>/` in the per-user data
+directory, with an `instrument.json` naming whose captures they are (path printed
+at startup; not yet pruned). Keying on the instrument's identity rather than its
+name means renaming an instrument moves nothing. That data exists for
+development — the format and the offline harnesses that read it are documented in
+[`tuner-core/examples/README.md`](tuner-core/examples/README.md).
 
 ## Interface
 
@@ -112,6 +119,7 @@ features live in [TODO.md](TODO.md).
 - **Transient Detection Calibration**: Manual and automatic transient detection calibration
 - **Noise Floor Calibration**: Manual and automatic noise floor calibration
 - **NINOS2 Stability Calibration**: Live oscilloscope with adjustable threshold for tuning the NINOS2 tonal stability gate
+- **Measurement-session controls** (Settings → Advanced, off by default): declare which of a key's strings sounded, so a note can be recorded one string at a time; and record past the shipped 1.5 s when a capture needs the decay tail. Neither changes what is measured — the analysis window is fixed so every measurement stays comparable.
 
 > [!TIP]
 > **Graphics Issues? Check Your Vulkan Drivers**
@@ -213,7 +221,7 @@ The pipeline–GUI relationship follows the **Split / Handle pattern** (the same
 
 A frontend contributor just calls `AudioPipeline::new()`, gets a `PipelinePorts`, and never needs to know about Gatekeeper internals, EMA calculations, or lock management.
 
-The pipeline also manages the **`WorkerManager`** (`worker.rs`), which owns a single dedicated background thread for computationally expensive offline DSP. When the pipeline's capture accumulator fills a 1.5-second buffer (or silence is detected), it dispatches a `CapturePayload` to the worker via a bounded crossbeam channel. The worker runs a high-resolution FFT and CSPE map, takes the note identity from the pipeline (the Engine's real-time discovery lock in Auto mode, or the user-selected key in Manual mode — it does not re-identify the note), and runs MAT to extract the partials and jointly refine the fundamental and the inharmonicity coefficient ($B$). The result is sent to the frontend via `worker_rx`, and the audio buffer is recycled back into the `AudioPool`. The same thread also serves **tuning-curve recomputes** on request (a `WorkerJob` from the UI → a `CurveBundle` back): the curve engines are cold-path but slow (Giordano engine (c) ~1.3 s), so they run here rather than on the GUI thread, with **captures always serviced first**. A single thread is sufficient because captures are infrequent (one stable note at a time), the algorithms complete before the next capture could arrive, and curve jobs are latest-wins (a burst of edits collapses to one recompute).
+The pipeline also manages the **`WorkerManager`** (`worker.rs`), which owns a single dedicated background thread for computationally expensive offline DSP. When the pipeline's capture accumulator reaches its fill target (1.5 s by default, or silence at that length), it dispatches a `CapturePayload` to the worker via a bounded crossbeam channel. The worker runs a high-resolution FFT and CSPE map, takes the note identity from the pipeline (the Engine's real-time discovery lock in Auto mode, or the user-selected key in Manual mode — it does not re-identify the note), and runs MAT to extract the partials and jointly refine the fundamental and the inharmonicity coefficient ($B$). The result is sent to the frontend via `worker_rx`, and the audio buffer is recycled back into the `AudioPool`. The same thread also serves **tuning-curve recomputes** on request (a `WorkerJob` from the UI → a `CurveBundle` back): the curve engines are cold-path but slow (Giordano engine (c) ~1.3 s), so they run here rather than on the GUI thread, with **captures always serviced first**. A single thread is sufficient because captures are infrequent (one stable note at a time), the algorithms complete before the next capture could arrive, and curve jobs are latest-wins (a burst of edits collapses to one recompute).
 
 > [!NOTE]
 > **Module Status**
