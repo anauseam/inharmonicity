@@ -18,15 +18,18 @@ use crate::widgets::unison_display::{UnisonMode, UnisonRow};
 use iced::{self, Element, Subscription, Theme};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use tuner_core::{
     FrameOutput,
     algorithms::curves,
     algorithms::peaks::MAX_UNISON_LINES,
-    audio::{self, AudioSource, HOP_RATE_HZ, HostHandle},
+    audio::{self, AudioSource, HOP_RATE_HZ, HostHandle, SAMPLE_RATE},
     models::{self, CurveInput, InharmonicityProfile, NOTES},
-    pipeline::{CaptureState, PipelineHandle, load_f32, store_f32},
+    pipeline::{
+        CAPTURE_DEFAULT_SAMPLES, CAPTURE_MAX_SAMPLES, CaptureState, PipelineHandle, load_f32,
+        store_f32,
+    },
     strobe::StrobeRefUpdate,
     strobe::unison::UnisonVerdict,
     worker::{self, CurveBundle, CurveJob, WorkerOutput},
@@ -134,6 +137,19 @@ pub enum Message {
     /// the next capture. Takes effect at the *next* dispatch, so it is set
     /// before arming.
     SetSoundingStrings(models::SoundingStrings),
+    // ----------------------------------------------
+
+    // --- Capture duration: how long a capture records for ---
+    /// Show or hide the capture-duration settings panel.
+    ToggleExtendedCapturePanel,
+    /// Record past the shipped 1.5 s, or back to it. Off is the ordinary tuning
+    /// state; what is measured does not change either way.
+    SetExtendedCapture(bool),
+    /// Seconds an extended capture records for.
+    SetExtendedCaptureSecs(f32),
+    /// Drop the recording in progress. Offered only for extended takes, which
+    /// run to their full length whatever the note does.
+    AbortCapture,
     // ----------------------------------------------
 
     // Settings menu items (placeholder for future implementation)
@@ -367,7 +383,7 @@ pub struct UnisonState {
 /// indistinguishable from a string that moved, so a readout whose scale tracks
 /// its own content cannot be read while it changes. The steps span the task —
 /// ±3 ¢ is a unison being finished, ±100 ¢ is one not yet started.
-const UNISON_SPAN_LADDER: [f32; 4] = [3.0, 10.0, 30.0, 100.0];
+pub(crate) const UNISON_SPAN_LADDER: [f32; 4] = [3.0, 10.0, 30.0, 100.0];
 
 /// Fraction of the axis the widest marker may reach before the next step up is
 /// taken. Below 1.0 so a marker never sits on the frame edge, where its position
@@ -594,6 +610,24 @@ pub struct AppDisplayData {
     pub string_isolation: bool,
     /// The string-isolation settings panel is open.
     pub string_isolation_visible: bool,
+    /// The operator has set a count or a sounding string since the control was
+    /// switched on. Presentation only: the count row cannot otherwise tell a
+    /// chosen 3 from the default 3, because both encode as "nothing declared".
+    pub strings_touched: bool,
+    /// Captures record past the shipped 1.5 s; persisted in [`AppSettings`].
+    /// The *measured* span is unchanged — only the stored audio grows.
+    pub extended_capture: bool,
+    /// Seconds an extended capture records for.
+    pub extended_capture_secs: f32,
+    /// The capture-duration settings panel is open.
+    pub extended_capture_visible: bool,
+    /// The tuning curve is being recomputed on the Worker. Captures taken now
+    /// queue behind it, which is why one can take noticeably longer.
+    pub curve_recomputing: bool,
+    /// Seconds recorded so far by a capture in progress; `0.0` otherwise. An
+    /// extended record runs to its full length whatever the note does, so this
+    /// is what says it is running rather than hung.
+    pub capture_progress_secs: f32,
 }
 
 /// Curve-lock state (design §8, D6) — the single source of truth for what
@@ -730,6 +764,15 @@ pub struct TunerApp {
     /// A trusted-set edit has occurred and a fresh recompute has not yet been
     /// accepted by the job queue; the tick loop retries the send while true.
     curve_dirty: bool,
+    /// Dump directory the Worker has not accepted yet; retried every tick.
+    pending_dump_dir: Option<PathBuf>,
+    /// A curve job is with the Worker and its bundle has not come back.
+    ///
+    /// Visible state, not bookkeeping: the Worker services captures ahead of
+    /// jobs but cannot preempt one in progress, so a capture taken during a
+    /// recompute waits it out — and the recompute lengthens as more keys are
+    /// measured. Without this the operator sees only a capture that got slower.
+    curve_in_flight: bool,
     /// Monotonic job generation. Incremented on every trusted-set edit; the
     /// Worker echoes it on the returned bundle so a superseded result is
     /// dropped (latest-wins).
@@ -778,6 +821,8 @@ impl Default for TunerApp {
             app_settings: AppSettings::default(),
             curve_bundle: None,
             curve_dirty: false,
+            pending_dump_dir: None,
+            curve_in_flight: false,
             curve_generation: 0,
             strobe_lock: StrobeLock::Disengaged,
             strobe_pushed: None,
@@ -855,6 +900,12 @@ impl Default for TunerApp {
                 sounding_strings: models::SoundingStrings::UNDECLARED,
                 string_isolation: false,
                 string_isolation_visible: false,
+                strings_touched: false,
+                curve_recomputing: false,
+                extended_capture: false,
+                extended_capture_secs: 5.0,
+                extended_capture_visible: false,
+                capture_progress_secs: 0.0,
             },
         }
     }
@@ -893,6 +944,7 @@ impl TunerApp {
             eprintln!("[MAIN] Could not save app settings: {e}");
         }
         self.sync_identity_mirror();
+        self.sync_dump_dir();
 
         if let Some(host) = self.host_handle.as_mut() {
             host.profiles.update_all(self.session.profile());
@@ -919,6 +971,7 @@ impl TunerApp {
         d.curve_select_visible = false;
         d.instrument_select_visible = false;
         d.string_isolation_visible = false;
+        d.extended_capture_visible = false;
         d.settings_data.rms.visible = false;
         d.settings_data.transient.visible = false;
         d.settings_data.ninos.visible = false;
@@ -985,11 +1038,29 @@ impl TunerApp {
             .store(strings.to_bits(), Ordering::Relaxed);
     }
 
+    /// Publishes the fill target a capture records to. The pipeline latches it
+    /// at `Armed → Recording`, so a change lands on the next capture and never
+    /// on the one in flight; it clamps the value as well, so this side only has
+    /// to stay inside the ceiling.
+    fn apply_capture_duration(&mut self) {
+        let samples = if self.display_data.extended_capture {
+            let requested =
+                (self.display_data.extended_capture_secs * SAMPLE_RATE as f32).round() as usize;
+            requested.clamp(CAPTURE_DEFAULT_SAMPLES, CAPTURE_MAX_SAMPLES)
+        } else {
+            CAPTURE_DEFAULT_SAMPLES
+        };
+        self.pipeline_handle
+            .atomics
+            .capture_samples
+            .store(samples as u32, Ordering::Relaxed);
+    }
+
     /// Deletes a capture's diagnostics dump — the **undo** path only. A drop
     /// distrusts the measurement, not the recording, so it keeps the audio
     /// (design note §5.2).
-    fn remove_dump(measurement: &models::KeyMeasurement) {
-        let dir = library::diagnostics_dir().join(worker::dump_dir_name(measurement));
+    fn remove_dump(root: &Path, measurement: &models::KeyMeasurement) {
+        let dir = root.join(worker::dump_dir_name(measurement));
         if dir.is_dir() {
             match std::fs::remove_dir_all(&dir) {
                 Ok(()) => eprintln!(
@@ -1020,6 +1091,44 @@ impl TunerApp {
         // meaningless against them.
         self.display_data.strobe = StrobeState::default();
         self.display_data.unison = UnisonState::default();
+    }
+
+    /// Points the Worker's dump root at the open instrument's own directory
+    /// (crossing #6).
+    ///
+    /// Called where the open *path* changes, not on every identity edit: the
+    /// job channel is small and shared with curve recomputes, and an
+    /// identity rename does not move the dumps (the directory is named for the
+    /// file stem — [`library::diagnostics_dir_for`]).
+    fn sync_dump_dir(&mut self) {
+        let identity = &self.session.profile().identity;
+        let dir = library::diagnostics_dir_for(&identity.id);
+        library::write_manifest(&dir, identity);
+        eprintln!(
+            "[MAIN] Capture diagnostics → {} ('{}')",
+            dir.display(),
+            identity.name
+        );
+        self.pending_dump_dir = Some(dir);
+        self.pump_dump_dir();
+    }
+
+    /// Hands the Worker the pending dump directory (crossing #6), retrying each
+    /// tick until it is accepted — the same pattern as `curve_dirty`.
+    ///
+    /// It has to retry: the job slot holds one message, so a curve recompute
+    /// queued ahead of this would otherwise drop it, and every capture until
+    /// the next instrument change would be filed under the previous
+    /// instrument's directory. A curve bundle can be dropped; this cannot.
+    fn pump_dump_dir(&mut self) {
+        let Some(dir) = self.pending_dump_dir.clone() else {
+            return;
+        };
+        if let Some(host) = self.host_handle.as_ref()
+            && host.send_dump_dir(Some(dir))
+        {
+            self.pending_dump_dir = None;
+        }
     }
 
     /// Refreshes the display mirror of the open instrument's identity and
@@ -1074,6 +1183,7 @@ impl TunerApp {
             };
             if host.send_curve_job(job) {
                 self.curve_dirty = false;
+                self.curve_in_flight = true;
             }
         }
     }
@@ -1394,6 +1504,7 @@ impl TunerApp {
                 partial: i as u8 + 1,
                 count: lines as u8,
                 resolution_cents: to_cents(frame.unison_resolution_hz[i]),
+                resolution_hz: frame.unison_resolution_hz[i],
                 ..UnisonRow::default()
             };
             for (line, slot) in frame.unison_lines[i][..lines].iter().enumerate() {
@@ -1467,6 +1578,9 @@ impl TunerApp {
         // settings into the display state the same way an explicit open does.
         app.app_settings = AppSettings::load();
         app.display_data.string_isolation = app.app_settings.string_isolation;
+        app.display_data.extended_capture = app.app_settings.extended_capture;
+        app.display_data.extended_capture_secs = app.app_settings.extended_capture_secs;
+        app.apply_capture_duration();
         // The picker only; the profile's own saved `reference_mode` stays
         // authoritative, so this does not run `set_instrument`'s coupling.
         app.display_data.instrument = app.app_settings.instrument;
@@ -1480,6 +1594,7 @@ impl TunerApp {
         let settings = profile.settings.clone();
         app.apply_profile_settings(&settings);
         app.sync_identity_mirror();
+        app.sync_dump_dir();
         app.refresh_inspector();
         // Prior-only curve at launch (design §10): with zero trusted
         // measurements the bundle is the B_ξ-default curve, so the live plot
@@ -1501,10 +1616,9 @@ impl TunerApp {
             return;
         }
 
+        // The root only: the open instrument's own subdirectory is published
+        // once a profile is adopted (`sync_dump_dir`).
         let dump_dir = library::diagnostics_dir();
-        // The dev workflow feeds these to the offline harnesses, which take the
-        // directory as an argument — so it has to be discoverable.
-        eprintln!("[MAIN] Capture diagnostics → {}", dump_dir.display());
 
         match audio::spawn_analysis_thread(AudioSource::Default, Some(dump_dir)) {
             Ok(mut handle) => {
@@ -1622,7 +1736,8 @@ impl TunerApp {
                     // The dump is per-capture (timestamped dir, so repeat
                     // captures are all retained) — an undone capture is the
                     // user declaring it bad, so the dump goes with it.
-                    Self::remove_dump(&bad);
+                    let root = library::diagnostics_dir_for(&self.session.profile().identity.id);
+                    Self::remove_dump(&root, &bad);
                     // Revert the live engine template too (measured B if a prior
                     // measurement remains, else back to the Rigaud prior).
                     if let Some(host) = self.host_handle.as_mut() {
@@ -1675,7 +1790,7 @@ impl TunerApp {
                     // the audio may still yield a good one later.
                     eprintln!(
                         "[MAIN] Capture audio kept at {}",
-                        library::diagnostics_dir()
+                        library::diagnostics_dir_for(&self.session.profile().identity.id)
                             .join(worker::dump_dir_name(&dropped))
                             .display()
                     );
@@ -1720,6 +1835,7 @@ impl TunerApp {
             }
             Message::SetStringIsolation(on) => {
                 self.display_data.string_isolation = on;
+                self.display_data.strings_touched = false;
                 self.app_settings.string_isolation = on;
                 if let Err(e) = self.app_settings.save() {
                     eprintln!("[MAIN] Could not save app settings: {e}");
@@ -1731,7 +1847,40 @@ impl TunerApp {
                     self.set_capture_strings(models::SoundingStrings::UNDECLARED);
                 }
             }
+            Message::ToggleExtendedCapturePanel => {
+                let visible = !self.display_data.extended_capture_visible;
+                self.close_settings_panels();
+                self.display_data.extended_capture_visible = visible;
+                if visible {
+                    self.display_data.settings_view_visible = true;
+                }
+            }
+            Message::SetExtendedCapture(on) => {
+                self.display_data.extended_capture = on;
+                self.app_settings.extended_capture = on;
+                if let Err(e) = self.app_settings.save() {
+                    eprintln!("[MAIN] Could not save app settings: {e}");
+                }
+                self.apply_capture_duration();
+            }
+            Message::SetExtendedCaptureSecs(secs) => {
+                self.display_data.extended_capture_secs = secs;
+                self.app_settings.extended_capture_secs = secs;
+                if let Err(e) = self.app_settings.save() {
+                    eprintln!("[MAIN] Could not save app settings: {e}");
+                }
+                self.apply_capture_duration();
+            }
+            Message::AbortCapture => {
+                // A request, not a transition: the pipeline consumes it and
+                // makes the `Recording → Idle` move itself (`02`, crossing #3).
+                self.pipeline_handle
+                    .atomics
+                    .capture_abort
+                    .store(true, Ordering::Relaxed);
+            }
             Message::SetSoundingStrings(strings) => {
+                self.display_data.strings_touched = true;
                 self.set_capture_strings(strings);
             }
             Message::SaveProfile => {
@@ -2042,6 +2191,8 @@ impl TunerApp {
                 {
                     frame_pushed = true;
                     let frame = frame_rx.read().clone();
+                    self.display_data.capture_progress_secs =
+                        frame.capture_progress_samples as f32 / SAMPLE_RATE as f32;
                     self.display_data.last_frame = Some(frame.clone());
 
                     // 1. Independent Decoupling of Scalar Data
@@ -2184,6 +2335,7 @@ impl TunerApp {
                             }
                         }
                         WorkerOutput::Curve(bundle) => {
+                            self.curve_in_flight = false;
                             // Latest-wins: accept only the bundle matching the most
                             // recent requested generation; an older one is superseded.
                             if bundle.generation == self.curve_generation {
@@ -2194,6 +2346,7 @@ impl TunerApp {
                 }
 
                 // Send a (re)compute job if the trusted set changed this tick.
+                self.pump_dump_dir();
                 self.pump_curve_job();
 
                 self.update_strobe(frame_pushed);

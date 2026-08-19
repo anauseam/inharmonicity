@@ -67,6 +67,55 @@ pub(crate) fn diagnostics_dir() -> PathBuf {
     dir
 }
 
+/// Where one instrument's capture dumps live: a subdirectory of
+/// [`diagnostics_dir`] named for its [`InstrumentIdentity::id`].
+///
+/// The id rather than the display name or the filename because both of those
+/// are renameable, and a directory that moves strands every dump written under
+/// the old name (dumps are matched to captures by directory name —
+/// `worker::dump_dir_name`). The name a human needs is in the directory's own
+/// [`write_manifest`] instead. An id-less profile falls back to the root, which
+/// only happens before [`ProfileSession::adopt`](crate::session::ProfileSession)
+/// has minted one.
+pub(crate) fn diagnostics_dir_for(id: &str) -> PathBuf {
+    let root = diagnostics_dir();
+    let dir = if id.is_empty() { root } else { root.join(id) };
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// Writes `instrument.json` into a dump directory: which instrument these
+/// captures came from, in a form a tool can read without opening the profile.
+///
+/// Refreshed whenever the instrument is opened, so a rename reaches it; the
+/// `id` never changes, which is what the directory name depends on. The
+/// offline harnesses discover dumps by the `key_` prefix, so this file sits
+/// beside them without disturbing anything.
+pub(crate) fn write_manifest(dir: &Path, identity: &models::InstrumentIdentity) {
+    let manifest = serde_json::json!({
+        "id": identity.id,
+        "name": identity.name,
+        "kind": identity.kind,
+        "make": identity.make,
+        "model": identity.model,
+        "serial": identity.serial,
+        "form": identity.form,
+        "written": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or_default(),
+    });
+    let path = dir.join("instrument.json");
+    match serde_json::to_string_pretty(&manifest) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(&path, json) {
+                eprintln!("[LIBRARY] Could not write {}: {e}", path.display());
+            }
+        }
+        Err(e) => eprintln!("[LIBRARY] Could not serialize the manifest: {e}"),
+    }
+}
+
 /// Path of the app-settings document.
 fn settings_path() -> PathBuf {
     project_dirs()
@@ -80,7 +129,7 @@ fn settings_path() -> PathBuf {
 /// its engine, its reference mode — lives in the profile so it travels with the
 /// instrument between machines; what is left here is the pointer to which
 /// profile to reopen, which is by definition not a property of any one of them.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     /// The profile to reopen at launch. `None` on a first run.
     #[serde(default)]
@@ -94,11 +143,43 @@ pub struct AppSettings {
     /// declaration at all.
     #[serde(default)]
     pub string_isolation: bool,
+    /// Record past the shipped 1.5 s, for the offline deliverables a capture
+    /// cannot otherwise serve (per-string decay τ, deep-bass resolution). Off
+    /// for ordinary tuning; the measured span is unchanged either way.
+    #[serde(default)]
+    pub extended_capture: bool,
+    /// Seconds an extended capture records for. Ignored while
+    /// [`Self::extended_capture`] is off.
+    #[serde(default = "default_extended_capture_secs")]
+    pub extended_capture_secs: f32,
     /// Which note picker the main view shows. An operator preference, not a
     /// property of the open instrument — a profile carries its own
     /// [`InstrumentKind`](tuner_core::models::InstrumentKind).
     #[serde(default)]
     pub instrument: Instrument,
+}
+
+/// Seconds an extended capture defaults to.
+///
+/// Also the ceiling ([`CAPTURE_MAX_SAMPLES`](tuner_core::pipeline::CAPTURE_MAX_SAMPLES)):
+/// measured on A0 and C1, the longest-decaying keys, the note is 20 dB down by
+/// 4–5 s and flat into the floor after it, so a longer record only adds
+/// noise-only samples.
+fn default_extended_capture_secs() -> f32 {
+    5.0
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            last_profile: None,
+            recents: Vec::new(),
+            string_isolation: false,
+            extended_capture: false,
+            extended_capture_secs: default_extended_capture_secs(),
+            instrument: Instrument::default(),
+        }
+    }
 }
 
 impl AppSettings {

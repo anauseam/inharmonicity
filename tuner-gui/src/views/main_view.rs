@@ -5,7 +5,7 @@
 
 use crate::Message;
 use crate::advisory;
-use crate::app::{AppDisplayData, Instrument, ReferenceMode, TuningMode};
+use crate::app::{AppDisplayData, Instrument, ReferenceMode, TuningMode, UNISON_SPAN_LADDER};
 use crate::calibration::CALIBRATION_FRAMES;
 use crate::utils::view_utils::{
     ButtonConfig, ButtonType, make_capture_button, make_sidebar_section, make_undo_button,
@@ -111,7 +111,15 @@ pub fn create_main_view(
         data.undo_target_note.clone(),
         capture_message,
         data.reference_mode,
-        data.string_isolation.then_some(data.sounding_strings),
+        SessionStatus {
+            strings: data
+                .string_isolation
+                .then_some((data.sounding_strings, data.strings_touched)),
+            extended_capture: data
+                .extended_capture
+                .then_some((data.extended_capture_secs, data.capture_progress_secs)),
+            curve_recomputing: data.curve_recomputing,
+        },
     );
 
     // Assemble the final layout
@@ -540,11 +548,24 @@ fn create_unison_panel(data: &AppDisplayData) -> Option<Element<'static, Message
             .into()
     };
 
-    // How many strings, how far apart, and how fast they beat.
+    // How many strings, how far apart, and how fast they beat. The limit is
+    // stated as a beat rate because that is the quantity a tuner hears, and
+    // because `2/T` in Hz *is* the slowest beat the record can show.
     let strings = rows.iter().map(|r| r.count).max().unwrap_or(0);
+    let slowest_visible_beat = rows
+        .iter()
+        .map(|r| r.resolution_hz)
+        .fold(f32::NAN, f32::max);
+    let beat_limit = |hz: f32| {
+        if hz.is_finite() && hz > 0.0 {
+            format!("no beat above {hz:.1} Hz")
+        } else {
+            "nothing resolved yet".to_string()
+        }
+    };
     let readout = match (strings, u.beats_hz.first()) {
         (0, _) => "—".to_string(),
-        (1, _) => "one line".to_string(),
+        (1, _) => format!("one line · {}", beat_limit(slowest_visible_beat)),
         (n, Some(beat)) => format!("{n} lines · beat {beat:.2} Hz"),
         (n, None) => format!("{n} lines"),
     };
@@ -553,6 +574,22 @@ fn create_unison_panel(data: &AppDisplayData) -> Option<Element<'static, Message
     } else {
         "resolution unknown".to_string()
     };
+    // Past the finest step the readouts display (`UNISON_SPAN_LADDER[0]`, "a
+    // unison being finished"), the panel cannot contribute at the scale the
+    // rest of the app works at — so the figure is flagged rather than left to
+    // be read as if it were fine.
+    let resolution_color = if resolution.is_finite() && resolution > UNISON_SPAN_LADDER[0] {
+        amber
+    } else {
+        muted
+    };
+    // The handoff: one line means either a clean unison or a beat too slow to
+    // see, and the panel cannot tell them apart. The strobe can — on one
+    // sounding string it reads far finer than this ever will.
+    let handoff = (strings <= 1).then_some(
+        "Slower beats are beyond this display — listen for them, or mute two \
+         strings and tune each one on the strobe.",
+    );
 
     // The verdict is shown, not used to filter: a suppression toggle belongs
     // with a future advanced mode, and until then hiding it would be the panel
@@ -586,10 +623,14 @@ fn create_unison_panel(data: &AppDisplayData) -> Option<Element<'static, Message
             row![
                 text(readout).size(15),
                 Space::new().width(Fill),
-                text(resolution_note).size(12).color(muted),
+                text(resolution_note).size(12).color(resolution_color),
             ]
             .align_y(Alignment::Center),
             text(verdict_text).size(12).color(verdict_color),
+            match handoff {
+                Some(t) => Element::from(text(t).size(11).color(muted)),
+                None => Element::from(Space::new().height(0)),
+            },
         ]
         .width(Fill)
         .spacing(4)
@@ -903,13 +944,16 @@ fn string_chip(
 /// Shown only when string isolation is switched on in Settings. The
 /// declaration is stamped onto the capture as it dispatches, so it applies to
 /// the *next* capture and must be set before arming.
-fn strings_section(strings: models::SoundingStrings) -> Element<'static, Message> {
+fn strings_section(strings: models::SoundingStrings, touched: bool) -> Element<'static, Message> {
     let on_key_row = (1..=models::MAX_STRINGS_PER_KEY as u8).fold(
         row![text("Total").size(13).width(Length::Fixed(70.0))].spacing(4),
         |r, n| {
             r.push(string_chip(
                 n,
-                strings.on_key == n,
+                // An untouched control declares nothing, so it highlights
+                // nothing — the opening 3 is a starting point, not a count the
+                // operator chose.
+                (touched || strings.sounding_count() > 0) && strings.on_key == n,
                 iced::Color::from_rgb(0.25, 0.28, 0.36),
                 Some(Message::SetSoundingStrings(strings.with_on_key(n))),
             ))
@@ -953,6 +997,20 @@ fn strings_section(strings: models::SoundingStrings) -> Element<'static, Message
     .into()
 }
 
+/// What the sidebar reports about a measurement session in progress.
+///
+/// Grouped because they share one condition — measurement mode — and one place
+/// on screen, under the capture button.
+struct SessionStatus {
+    /// The string declaration and whether the operator has touched it; `None`
+    /// while String Isolation is off.
+    strings: Option<(models::SoundingStrings, bool)>,
+    /// An extended take's (target, elapsed) seconds; `None` at the shipped length.
+    extended_capture: Option<(f32, f32)>,
+    /// The curve is recomputing, so captures queue behind it.
+    curve_recomputing: bool,
+}
+
 /// Creates the settings sidebar widget.
 ///
 /// Builds the right-side settings panel containing all application controls
@@ -973,8 +1031,13 @@ fn create_sidebar(
     undo_target_note: Option<String>,
     capture_message: Message,
     reference_mode: ReferenceMode,
-    strings: Option<models::SoundingStrings>,
+    session: SessionStatus,
 ) -> Element<'static, Message> {
+    let SessionStatus {
+        strings,
+        extended_capture,
+        curve_recomputing,
+    } = session;
     let mut sections = column![].spacing(10);
 
     // Add Settings button at the top
@@ -1023,10 +1086,43 @@ fn create_sidebar(
 
     // Add capture button if in measurement mode
     if measurement_mode_active {
-        if let Some(strings) = strings {
-            sections = sections.push(strings_section(strings));
+        if let Some((strings, touched)) = strings {
+            sections = sections.push(strings_section(strings, touched));
         }
-        sections = sections.push(make_capture_button(capture_state, capture_message));
+        let recording = capture_state == CaptureState::Recording;
+        // Only an extended take offers Stop: at 1.5 s the button would be a
+        // way to cancel the capture you just armed, by double-clicking it.
+        let abortable = recording && extended_capture.is_some();
+        sections = sections.push(make_capture_button(
+            capture_state,
+            if abortable {
+                Message::AbortCapture
+            } else {
+                capture_message
+            },
+            abortable,
+        ));
+        // An extended record runs past the decay, so the button's "Capturing…"
+        // alone cannot be told from a hang: say how far along it is.
+        if curve_recomputing {
+            sections = sections.push(
+                text("Recomputing curve — captures queue behind it")
+                    .size(11)
+                    .color(iced::Color::from_rgb(0.55, 0.55, 0.62)),
+            );
+        }
+        if let Some((target_secs, progress_secs)) = extended_capture {
+            let label = if recording {
+                format!("Extended · {progress_secs:.1} / {target_secs:.1} s")
+            } else {
+                format!("Extended · {target_secs:.1} s")
+            };
+            sections = sections.push(
+                text(label)
+                    .size(12)
+                    .color(iced::Color::from_rgb(0.8, 0.6, 0.2)),
+            );
+        }
     }
 
     if let Some(note_name) = undo_target_note {

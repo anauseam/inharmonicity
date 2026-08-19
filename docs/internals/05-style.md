@@ -126,6 +126,25 @@ Pointing at a spec that *governs runtime behaviour* is fine (e.g. naming which
 sanctioned cross-thread crossing a channel implements). Pointing at a spec to
 justify where a file lives or what it is called is not.
 
+### Do not point at anything outside the repository
+
+A doc comment may cite a paper, an ADR, or another repo document — things a
+reader can open. It may state physical or mathematical behaviour ("a decaying
+sinusoid's frequency resolution saturates near its own decay constant"), which
+any reader can check for themselves.
+
+It may **not** assert facts about capture sets, instruments, or measurement
+sessions that exist only on a developer's disk. Those sets are gitignored and
+per-user: a contributor cannot verify the claim, cannot reproduce it, and cannot
+tell when it has gone stale — but the comment reads like evidence. An
+empirically derived constant says *that* it is ours-and-measured and points at
+the repo document recording the derivation (`06-capture-sets.md`, an ADR), which
+is where the data may be described because that file's job is to describe it.
+
+The same rule applies across module boundaries within the crate: a
+`tuner-core` item does not document what the frontend does with it. `tuner-core`
+is headless and cannot keep such a claim true.
+
 ### Document what the code *is*, not what it replaced
 
 Do not narrate superseded implementations ("the former `FOO = 8` hard switch

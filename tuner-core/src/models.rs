@@ -361,6 +361,16 @@ impl std::fmt::Display for InstrumentKind {
 /// and may be identified later, so no field may be required to save one.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct InstrumentIdentity {
+    /// Opaque, stable identity — minted once when the instrument is first
+    /// opened and never changed afterwards.
+    ///
+    /// Everything that must survive a rename keys off this rather than off the
+    /// display name or the filename: capture dumps live in a directory named
+    /// for it, so renaming an instrument moves nothing on disk. Empty on a
+    /// profile written before the field existed; the frontend mints one on
+    /// open, which is also what makes the migration durable.
+    #[serde(default)]
+    pub id: String,
     /// Display name. Auto-generated on creation, renameable.
     pub name: String,
     /// Instrument family — drives display vocabulary only.
@@ -1493,6 +1503,9 @@ mod tests {
             "a v0 file has no thresholds; it must adopt the defaults"
         );
         assert_eq!(loaded.settings.reference_mode, ReferenceMode::Curve);
+        // No identity yet: the field postdates this file, and minting is the
+        // frontend's job on open. What must not happen is a load failure.
+        assert!(loaded.identity.id.is_empty());
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -1506,6 +1519,7 @@ mod tests {
         let path = dir.join("upright.json");
 
         let mut p = InharmonicityProfile::new("Front room upright");
+        p.identity.id = "01930000-0000-7000-8000-000000000000".into();
         p.identity.serial = Some("H1234567".into());
         p.identity.kind = InstrumentKind::Guitar;
         p.settings.engine = EngineChoice::GiordanoMean;
@@ -1529,6 +1543,7 @@ mod tests {
         let back = InharmonicityProfile::from_file(&path).unwrap();
         assert_eq!(back.version, PROFILE_SCHEMA_VERSION);
         assert_eq!(back.identity.name, "Front room upright");
+        assert_eq!(back.identity.id, "01930000-0000-7000-8000-000000000000");
         assert_eq!(back.identity.serial.as_deref(), Some("H1234567"));
         assert_eq!(back.identity.kind, InstrumentKind::Guitar);
         assert_eq!(back.settings.engine, EngineChoice::GiordanoMean);

@@ -113,6 +113,21 @@ fn identity_panel(data: &AppDisplayData) -> Element<'static, crate::Message> {
             id.notes.clone().unwrap_or_default(),
             "Anything worth remembering"
         ),
+        // Not editable: it is what the capture dumps are filed under, so it
+        // outlives every field above it.
+        row![
+            text("Identity").size(13).width(Length::Fixed(90.0)),
+            text(if id.id.is_empty() {
+                "—".to_string()
+            } else {
+                id.id.clone()
+            })
+            .size(11)
+            .font(iced::Font::MONOSPACE)
+            .color(curve_plot::INK_SECONDARY),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center),
     ]
     .spacing(6);
 

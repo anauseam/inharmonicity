@@ -46,7 +46,7 @@ DSP, heavy asynchronous DSP, and rendering all isolated from each other.
 To maintain real-time performance without relying on OS priority elevation, the core system completely avoids dynamic heap allocation during the audio hot-path by using pre-allocated, lock-free structures:
 
 - **The Elastic Ring Buffer:** A lock-free circular buffer connecting Thread 1 and Thread 2. Acts as an elastic shock absorber — if the OS briefly suspends the processing thread, audio samples continue to accumulate safely without drops.
-- **Lock-Free Object Pool (`AudioPool`):** Pre-allocated pool of `Box<[f32; 66150]>` arrays (1.5 seconds at 44.1 kHz). Thread 2 borrows an array to record a stable note and passes it to the background worker, which recycles it back to the pool when finished.
+- **Lock-Free Object Pool (`AudioPool`):** Pre-allocated pool of `Box<[f32]>` buffers, each sized to `CAPTURE_MAX_SAMPLES` (5 s at 44.1 kHz) so a runtime change to the capture length never allocates on the audio thread. Thread 2 borrows one to record a stable note, fills it to the current target (1.5 s by default), and passes it to the background worker, which recycles it back to the pool when finished.
 - **`ProcessingFrame`:** Thread-local scratch buffers for zero-allocation per-frame DSP. All fields are `Box<[T]>` — allocated once in `AudioPipeline::new()` via `vec![..].into_boxed_slice()`, never resized. Includes dedicated `treble_magnitude_buffer` (1024 bins) and `bass_magnitude_buffer` (4096 bins) for the Dual-Track FFT paths. The Engine reads from these directly — no per-frame heap allocation in the correlation + MAT chain.
 - **`CircularFifo` (COLA):** Owned by `AudioPipeline`. A `Box<[f32]>` ring buffer that accumulates samples and triggers a new FFT + pipeline frame on every 50% hop. Invisible to `tuner-gui` — the GUI only calls `pipeline.push_audio(&[f32])`.
 
@@ -116,7 +116,7 @@ This thread constantly consumes data from the Elastic Ring Buffer and executes a
   - _State 1 (ATTACK):_ Uses Normalized Half-Wave Rectified Spectral Flux (NHWRSF) to detect hammer strikes. Sends onset pulse to the Engine to begin pitch detection.
   - _State 2 (TRANSIENT):_ A one-frame buffer state that resolves the `transient_active` flag once NHWRSF drops back below its threshold. Because the entire hammer-string transient is shorter than the 46.4ms FFT window, physical recovery happens rapidly. State 2 serves purely to allow a clean NINOS2 entry on the subsequent frame.
   - _State 3 (HARMONIC DECAY):_ Uses NINOS2 (Normalized Identification of Note Onset based on Spectral Sparsity) to monitor the signal. After the State 2 delay clears, NINOS2 ignores volume swells and identifies the "Golden Window" of pure, stable harmonic decay for capture. It enforces a secondary `required_stable_frames` threshold (e.g. 4 frames) to gracefully bridge any remaining chaos that the fixed delay missed.
-  - _State 4 (RELEASE):_ Caps the capture at 1.5 seconds. The pipeline detects completion (buffer full or silence decay), dispatches the `CapturePayload` to Thread 3 via a bounded crossbeam channel, and transitions `CaptureState` to `Processing` — all without blocking the real-time pipeline.
+  - _State 4 (RELEASE):_ The pipeline detects completion (the latched fill target reached, or silence decay at the shipped length), dispatches the `CapturePayload` to Thread 3 via a bounded crossbeam channel, and transitions `CaptureState` to `Processing` — all without blocking the real-time pipeline. A capture recording past the shipped length ignores the decay stop, since the audio past it is the point; the operator can drop such a take mid-record.
 - **The Engine (TWM Discovery + Goertzel Phase Tracking):** A pitch detection chain that operates as an independent state machine, **synchronously reset** by the Gatekeeper's onset pulse but otherwise decoupled from the Gatekeeper's internal transient delays.
   - **Discovery Phase (State: Unlocked):** Identifies the fundamental frequency from the 8192-pt bass FFT buffer using the canonical Maher & Beauchamp (1994) Two-Way Mismatch algorithm.
     1. **Peak Extraction:** Sub-bin peaks are extracted using the Jacobsen complex-domain estimator (Candan 2015). To establish a statistical minimum magnitude for Additive White Gaussian Noise (AWGN) rejection, a dynamic Neyman-Pearson threshold (Kay 1998) is computed against the pipeline's dynamic noise floor and acts as a floor gate. _(Note: Because the piano's acoustic noise floor during an active note is vastly higher than the room's silence threshold, this AWGN boundary is mathematically sound but practically negligible in effect)._
@@ -143,7 +143,7 @@ This is a single detached worker thread spawned at pipeline construction inside 
   2. Takes the note **identity** from the payload — it does not re-identify the note. In **Auto Mode** that identity is the Engine's real-time TWM discovery lock (`latched_auto_key`); in **Manual Mode** it is the user-selected key.
   3. Seeds from the Engine's Goertzel-tracked _f₀_ (or the key's Equal-Temperament frequency if the tracker never locked).
   4. Runs MAT (Median-Adjustive Trajectories — serial trajectory growth, reading partial frequencies from the CSPE map) to jointly estimate the partials, the refined _f₀_, and the inharmonicity coefficient ($B$) via the median of pairwise partial combinations.
-  5. Writes diagnostic files (`audio.raw` + `analysis.json`) to the `diagnostics/` directory.
+  5. Writes diagnostic files (`audio.raw` + `analysis.json`) to the open instrument's dump directory — `diagnostics/<identity.id>/`, so captures follow the instrument they were taken on rather than its name.
 - **Action (curve job):** When the UI requests a tuning-curve recompute (`WorkerJob::Curve`, carrying a trust-filtered `CurveInput` snapshot), the worker runs all curve engines and returns a `CurveBundle`. This lives on the worker because engine (c)'s Giordano dissonance scans alone take ~1.3 s — far too slow for the GUI thread. Jobs are latest-wins (a `generation` counter drops superseded bundles); the read-only snapshot means a curve recompute can never race the profile a `KeyMeasurement` writes.
 - **Output:** Sends a `WorkerOutput` back to the GUI over one shared result channel — `Measurement(KeyMeasurement)` (partials, $f_0$, $B$) per capture, `Curve(Box<CurveBundle>)` per recompute. After a capture it resets `CaptureState` to `Idle` and recycles the audio buffer into the `AudioPool`; curve jobs touch neither the baton nor the pool.
 
@@ -163,10 +163,10 @@ Because `tuner-core` enforces strict zero-allocation, wait-free real-time audio 
 | **Structural Output** | `triple_buffer`          | DSP (2) → UI (4)              | Lossy continuous viz telemetry (`FrameOutput`).                                                                                                 |
 | **DSP Parameters**    | `Arc<Atomic*>`           | UI (4) ↔ DSP (2)              | Wait-free configuration and metric reads/writes.                                                                                                |
 | **Capture Dispatch**  | crossbeam SPSC (bounded) | DSP (2) → Worker (3)          | `CapturePayload` containing pooled audio buffer + metadata.                                                                                     |
-| **Buffer Recycling**  | Lock-Free Object Pool    | DSP (2) ↔ Worker (3)          | Recycled `Box<[f32; 66150]>` arrays — zero allocation during capture.                                                                           |
-| **Capture Lifecycle** | `AtomicU8` (baton-pass)  | UI (4) → DSP (2) → Worker (3) | `CaptureState`: Idle → Armed → Recording → Processing → Idle.                                                                                   |
+| **Buffer Recycling**  | Lock-Free Object Pool    | DSP (2) ↔ Worker (3)          | Recycled `Box<[f32]>` buffers at the `CAPTURE_MAX_SAMPLES` ceiling — zero allocation during capture.                                             |
+| **Capture Lifecycle** | `AtomicU8` (baton-pass)  | UI (4) → DSP (2) → Worker (3) | `CaptureState`: Idle → Armed → Recording → Processing → Idle, plus Recording → Idle when the operator drops a take.                              |
 | **Worker Results**    | crossbeam SPSC (bounded) | Worker (3) → UI (4)           | `WorkerOutput`: `Measurement(KeyMeasurement)` per capture, `Curve(CurveBundle)` per recompute.                                                  |
-| **Worker Jobs**       | crossbeam SPSC (bounded) | UI (4) → Worker (3)           | `WorkerJob`: curve-recompute requests (`CurveInput` snapshot, latest-wins).                                                                     |
+| **Worker Jobs**       | crossbeam SPSC (bounded) | UI (4) → Worker (3)           | `WorkerJob`: curve recomputes (`CurveInput` snapshot, latest-wins) and the dump directory. Coalescing is per kind — a superseded curve is worthless, a superseded directory misfiles captures. |
 | **Template Update**   | `ringbuf` SPSC           | UI (4) → DSP (2)              | Recompiled `KeyProfile` (measured $B$) into the engine's templates.                                                                             |
 | **Strobe References** | `ringbuf` SPSC           | UI (4) → DSP (2)              | `StrobeRefUpdate` (curve targets + coarse partial) into the `Strobe`. Second instance of the Template-Update crossing class, not a new channel. |
 
@@ -270,14 +270,13 @@ the transitions it owns, and reads are cheap.
 
 The current implementation is convention-only (plain `.store`/
 `.load` with `Ordering::Relaxed`); hardening it to
-`compare_exchange` is tracked as a follow-up in the README's
-Work-in-Progress section.
+`compare_exchange` is tracked as a follow-up in [TODO.md](TODO.md).
 
 ### Hardcoded 44.1kHz Sample Rate Architecture
 
 The pipeline is statically locked to a 44,100 Hz sample rate. This is not just a surface-level parameter; it is deeply baked into the zero-allocation memory layout and temporal math of the DSP chain:
 
-- **Static Buffer Sizes**: The `AudioPool` uses fixed `[f32; 66150]` arrays exactly dimensioned for 1.5 seconds at 44.1kHz.
+- **Static Buffer Sizes**: The `AudioPool`'s buffers are allocated once at startup to a sample-count ceiling derived from 44.1 kHz, and every capture length is a sample count against that rate.
 - **Time/Frame Conversions**: Gatekeeper threshold frames (e.g., `transient_timeout_frames = 20`) mathematically assume a ~46.4ms hop.
 - **Math Constants**: Parameters like EMA smoothing alphas (`rms_ema_alpha = 0.1`) and the Gatekeeper's timing thresholds are calibrated against 44.1kHz timing and frequency bin widths.
 
@@ -310,13 +309,13 @@ rather than argued, and the corner is kept.
   estimator already ignores.
 
 **What would reopen it.** A consumer that actually uses the bottom octave's
-fundamental — the per-bin/per-octave noise floor under the README's Engine TODOs,
+fundamental — the per-bin/per-octave noise floor in [TODO.md](TODO.md),
 or an instrument that genuinely radiates it (both validation pianos are uprights,
 the weak case). If that happens, change the **order**, not α, and note three
 things: cascaded biquads are needed rather than one pole; conditioning at
 `fc/fs ≈ 5.7e-4` puts the poles at radius ≈ 0.9965, where f32 direct-form I is
 marginal (use transposed direct-form II or f64 state); and more filter state
-multiplies the single-state stereo defect in the README's Known Issues.
+multiplies the single-state stereo defect recorded in [TODO.md](TODO.md).
 
 Re-validating any change is possible **without re-recording**: the one-pole
 inverts exactly (`x[n] = y[n] + x[n−1] − α·y[n−1]`, round-tripping to 1e-15

@@ -23,6 +23,7 @@ use rustfft::num_complex::Complex;
 use tuner_core::algorithms::mat::{MAX_PARTIALS, MatOrder, detect_pitch_mat};
 use tuner_core::algorithms::spectral::{cspe, fft, magnitude_spectrum};
 use tuner_core::models::{NOTES, get_expected_beta};
+use tuner_core::pipeline::CAPTURE_ANALYSIS_SAMPLES;
 
 fn largest_pow2_le(n: usize) -> usize {
     if n == 0 {
@@ -72,7 +73,10 @@ fn process(dir: &Path) -> Option<serde_json::Value> {
     if num_samples < 2048 {
         return None;
     }
-    let fft_size = largest_pow2_le(num_samples.max(2048));
+    // Bounded exactly as the Worker bounds it: a dump longer than the analysis
+    // window is a session recording, and analysing all of it would stop this
+    // harness reproducing the shipped measurement.
+    let fft_size = largest_pow2_le(num_samples.clamp(2048, CAPTURE_ANALYSIS_SAMPLES));
     if audio.len() < fft_size + 1 {
         audio.resize(fft_size + 1, 0.0);
     }

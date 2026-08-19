@@ -117,6 +117,8 @@ pub struct FrameOutput {
     ///
     /// A dropped frame costs one update: the ring lives DSP-side and this is a
     /// snapshot of it, not an increment.
+    ///
+    /// Held while a reference is gated; emptied on `is_silence`.
     pub unison_lines: [[models::UnisonLine; algorithms::peaks::MAX_UNISON_LINES]; 12],
     /// Valid entries of `unison_lines` per reference.
     pub unison_line_count: [u8; 12],
@@ -132,6 +134,11 @@ pub struct FrameOutput {
     /// itself — one verdict for the bank, since the test is precisely that the
     /// split is constant *across* partials.
     pub unison_verdict: strobe::unison::UnisonVerdict,
+    /// Samples written to the capture in progress; `0` when none is recording.
+    ///
+    /// A per-hop snapshot like the rest of this struct — a dropped frame costs
+    /// one update of a progress readout and nothing else.
+    pub capture_progress_samples: usize,
     /// Coarse readout: the measured frequency (Hz) of the strobed key's coarse
     /// partial, read straight off the magnitude spectrum
     /// (`algorithms::peaks::coarse_read`) at the partial the
@@ -172,6 +179,7 @@ impl Default for FrameOutput {
             unison_line_count: [0; 12],
             unison_resolution_hz: [0.0; 12],
             unison_verdict: strobe::unison::UnisonVerdict::Undetermined,
+            capture_progress_samples: 0,
             coarse_hz: None,
         }
     }

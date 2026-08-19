@@ -112,6 +112,12 @@ impl DashboardTest {
             sounding_strings: models::SoundingStrings::UNDECLARED,
             string_isolation: false,
             string_isolation_visible: false,
+            strings_touched: false,
+            curve_recomputing: false,
+            extended_capture: false,
+            extended_capture_secs: 5.0,
+            extended_capture_visible: false,
+            capture_progress_secs: 0.0,
             is_stale: false,
         };
 

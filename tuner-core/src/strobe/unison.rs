@@ -9,7 +9,8 @@
 //!
 //! What this file owns is the cross-hop half: one growing baseband ring per
 //! reference, held and restarted on the D3 gate exactly as
-//! [`BandSlope`](super::band_slope) is, and the goodness-of-fit test that decides
+//! [`BandSlope`](super::band_slope) is — and dropped outright when the
+//! Gatekeeper reports silence — and the goodness-of-fit test that decides
 //! whether what it resolved is a unison at all. The estimator itself is stateless
 //! and lives in [`peaks::resolve_lines`].
 //!
@@ -181,6 +182,16 @@ impl Unison {
     /// rather than splicing across the gap.
     pub(super) fn hold(&mut self, i: usize) {
         self.restart[i] = true;
+    }
+
+    /// Silent hop: break the run as [`Self::hold`] does, and drop what was
+    /// published with it. The hold exists for a dip below the gate *within* a
+    /// note; with no note sounding there are no strings for the lines to be
+    /// about.
+    pub(super) fn clear(&mut self, i: usize) {
+        self.hold(i);
+        self.line_count[i] = 0;
+        self.resolution_hz[i] = 0.0;
     }
 
     /// Live hop: append this reference's baseband sample and re-resolve.
@@ -486,5 +497,27 @@ mod tests {
         u.push(0, Complex::new(1.0, 0.0));
         assert_eq!(u.line_count(0), 0, "the re-strike drops the old lines");
         assert_eq!(u.resolution_hz(0), 0.0);
+    }
+
+    /// Silence drops the same lines a gate holds, without waiting for the next
+    /// strike to do it.
+    #[test]
+    fn silence_drops_what_a_gate_holds() {
+        let mut u = Unison::new();
+        for h in 0..UNISON_MIN_BINS + 4 {
+            u.push(
+                0,
+                Complex::new((h as f32 * 0.7).cos(), (h as f32 * 0.7).sin()),
+            );
+        }
+        assert!(u.line_count(0) > 0, "a filled ring must publish");
+
+        u.clear(0);
+        assert_eq!(u.line_count(0), 0);
+        assert_eq!(u.resolution_hz(0), 0.0);
+
+        // And the run is broken, as after a hold: the next strike starts fresh.
+        u.push(0, Complex::new(1.0, 0.0));
+        assert_eq!(u.line_count(0), 0);
     }
 }

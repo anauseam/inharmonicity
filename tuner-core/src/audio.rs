@@ -250,6 +250,19 @@ impl HostHandle {
         self.worker_job_tx.try_send(WorkerJob::Curve(job)).is_ok()
     }
 
+    /// Points capture dumps at `dir` (crossing #6), or at nothing when `None`.
+    ///
+    /// Where files land is host policy, so the frontend owns this; the worker
+    /// applies it to every capture it takes off the queue *after* the one it is
+    /// working on. Unlike a curve job this is never coalesced away — a dropped
+    /// directory change files captures under the wrong instrument — so a full
+    /// slot is worth retrying, which is what `false` reports.
+    pub fn send_dump_dir(&self, dir: Option<std::path::PathBuf>) -> bool {
+        self.worker_job_tx
+            .try_send(WorkerJob::SetDumpDir(dir))
+            .is_ok()
+    }
+
     /// Signals the analysis thread to stop and waits for it to finish.
     ///
     /// This must be called before dropping the handle to ensure the audio
