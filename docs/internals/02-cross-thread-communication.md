@@ -79,27 +79,33 @@ property that keeps each struct scannable:
   belongs on `FrameOutput` (crossing #2), which the GUI already parses every
   tick and where a dropped update costs nothing. `capture_progress_samples`
   rides there for exactly that reason.
-- **The capture-lifecycle atomics** (`capture_state`, `capture_samples`,
-  `capture_strings`, `capture_abort`) — read at lifecycle **transitions**, not
-  per hop. They sit loose on `PipelineAtomics`; see crossing #6.
+- **`capture_in_flight`** — the one scalar that travels **Worker → DSP**, a
+  third direction this struct carries beyond `ConfigAtomics` (UI → DSP) and
+  `RuntimeAtomics` (DSP → consumers). It sits loose on `PipelineAtomics`; see
+  "The capture lifecycle" below.
 
-`capture_samples` is the illustration: it sets how long a record fills for, and
-above the shipped default it also suppresses the decay stop — so the DSP
-genuinely acts on it — but it is read **once, at `Armed → Recording`**, which is
-what puts it with the lifecycle atomics rather than in `ConfigAtomics`. The
-pipeline clamps what it reads (`HOP_SIZE..=CAPTURE_MAX_SAMPLES`) rather than
-trusting the writer.
-- **Everything that labels a capture is latched at that same instant** — the
-  length, `target_note` and `capture_strings`, gathered in `CaptureLatch`. They
-  describe the audio, so they must be sampled when the audio starts, not when it
-  is dispatched: a record can run for seconds, and by the end the operator may
-  be setting up the next capture. Reading them at dispatch would file a record
-  under whatever was selected last.
-- `capture_abort` sits with the capture-lifecycle atomics rather than here: it
-  is a **request**, not a transition. The GUI raises it and the pipeline
-  consumes it and makes the `Recording → Idle` move itself, so the baton keeps
-  one writer per transition (see crossing #6). The pipeline clears it when a
-  recording starts, so a request that arrived earlier cannot kill the next take.
+The capture lifecycle itself is **not** here. It is a `CaptureState` the
+pipeline owns as a plain field and publishes on `FrameOutput` — a one-way
+per-hop snapshot with a single consumer, which is what crossing #2 is for. It
+only needs an atomic for the one fact the pipeline cannot see for itself.
+
+`target_note` is the boundary case, and it stays in `ConfigAtomics` because the
+engine consults it every hop for manual-mode targeting. It is *also* read at
+`Armed → Recording` and held in `CaptureLatch`, which is a second use of a
+genuine per-hop parameter rather than a reason to move it: what a capture is
+*of* has to be sampled when the audio starts, not when it is dispatched. A
+record can run for seconds, and by the end the operator may be setting up the
+next capture; reading it at dispatch would file the record under whatever was
+selected last.
+
+**The rest of what labels a capture — how long it fills for, and the operator's
+string declaration — arrives with the `Arm` command** (crossing #4) instead of
+sitting in an atomic for the pipeline to sample. They are values the frontend
+holds, and the pipeline needs them only when it acts on a command. That also
+retires the stale-request hazard an abort flag carried: a `Cancel` applies in
+the hop it arrives and cannot linger to kill the next take. The pipeline still
+clamps the fill target it is handed (`HOP_SIZE..=CAPTURE_MAX_SAMPLES`) rather
+than trusting the writer.
 
 ## 4. Grouped / dependent DSP parameters (UI → DSP)
 
@@ -109,8 +115,9 @@ trusting the writer.
   DSP frame boundary. The UI hands a recompiled DSP template back to the
   DSP thread for live use.
 
-Two concrete instances share this charter (each on its own SPSC ring):
-the live inharmonicity-template updates and the strobe reference updates.
+Three concrete instances share this charter (each on its own SPSC ring):
+the live inharmonicity-template updates, the strobe reference updates, and the
+capture-lifecycle commands.
 
 ### Live inharmonicity-template updates
 
@@ -152,6 +159,37 @@ Path A), which computes both the beat phase and the coarse readout at step 5b.
 - **Consumer:** `AudioPipeline` drains to the *newest* update at the top of
   `process_cola_hop` (a superseded reference set is worthless) and hands it to
   `Strobe::retarget`, which resets the bank's accumulated angles and rate fits.
+
+### Capture-lifecycle commands
+
+The third instance: the UI asks for the lifecycle transitions an operator
+drives rather than writing them. Arming is a *command*, not a store — the
+pipeline makes `Idle → Armed` on receipt, which is what lets it own the
+lifecycle outright.
+
+- **Payload:** `pipeline::CaptureCommand` — `Arm(ArmRequest)` or `Cancel`.
+  Heap-free and `Copy`. `ArmRequest` carries what the record will be: its fill
+  target, and the operator's `SoundingStrings` declaration (`None` when nothing
+  was declared). One `Cancel` covers both disarming from `Armed` and dropping
+  the take in progress from `Recording`.
+- **Policy direction:** the frontend holds the declaration and the duration and
+  states them with every `Arm`; the DSP holds no standing copy of either. An
+  `Arm` arriving while already `Armed` updates the request and moves nothing,
+  so a declaration made *after* an auto-rearm still reaches the capture it
+  describes. Per-capture metadata has to be ordered against its capture, which
+  is why it rides this crossing and not a `WorkerJob` (crossing #6): the worker
+  drains captures before jobs, so a declaration sent that way could land on a
+  capture it had already processed. Here the lifecycle does the ordering — the
+  request in force at `Armed → Recording` is the one the record carries.
+- **Producer:** `pipeline::CaptureSender`, a single-owner `ringbuf` producer
+  held in `HostHandle`. Pushed on operator actions (user-rate); a full ring
+  returns `false` and the GUI retries next tick. Capacity
+  `CAPTURE_COMMAND_QUEUE_CAPACITY = 2`.
+- **Consumer:** `AudioPipeline` drains to the *newest* command at the top of
+  `process_cola_hop` and applies it at step 6, where the lifecycle it drives
+  lives. Newest-wins is correct for this payload rather than merely cheap: a
+  command supersedes the one before it, so an `Arm` then a `Cancel` leaves
+  nothing armed and the reverse order arms.
 
 ### Heap-allocation invariant
 
@@ -197,10 +235,10 @@ design smell — reconsider the design before implementing it.
   actor pattern, so a new result kind is a variant, not a new channel.
   `.try_send()`, drained with `.try_recv()` in the UI tick loop. Capacity
   `WORKER_RESULT_QUEUE_CAPACITY = 4`.
-- **Worker → AudioPool.** After processing a capture, the worker recycles
-  the buffer back to the `AudioPool` and resets `CaptureState` to `Idle`
-  via the shared `AtomicU8`. Curve jobs touch neither the pool nor the
-  baton.
+- **Worker → AudioPool.** After processing a capture, the worker recycles the
+  buffers back to the `AudioPool` and then clears `capture_in_flight`, which is
+  what ends the capture lifecycle. Curve jobs touch neither the pool nor the
+  flag.
 
 The curve *result* rides this crossing's `WorkerOutput` rather than a
 channel of its own because the reuse test (see crossing #6) is not met —
@@ -241,7 +279,7 @@ The worker drains every pending `CapturePayload` (crossing #5) before
 looking at a `WorkerJob` — measurement latency is user-facing mid-session,
 a curve recompute is not — then blocks on a `select!` over both. A capture
 arriving while a bundle computes simply waits out the ~1.3 s: the
-`Processing` baton state lasts that much longer, once.
+`Processing` state lasts that much longer, once.
 
 Curve jobs are **latest-wins**: the UI stamps a monotonic `generation` on
 every job and the returned `CurveBundle` echoes it, so a bundle superseded
@@ -265,43 +303,49 @@ the job carries a read-only `CurveInput` snapshot, a curve recompute can
 never overwrite or race a `KeyMeasurement` — the two ride separate
 channels with separate types.
 
-### Capture-lifecycle atomics
+### The capture lifecycle
 
-Four atomics sit on `PipelineAtomics` outside `ConfigAtomics`, because none of
-them is read per hop: the `CaptureState` baton below, `capture_samples` (how
-long the record fills for), `capture_abort` — a one-shot request to drop the
-recording in progress, which the pipeline consumes and acts on so the baton
-keeps one writer per transition — and `capture_strings` —
-the operator's declaration of how the tuned key is strung and which of its
-strings are sounding (`06-capture-sets.md`). The declaration is written by the
-GUI at user rate and read by the pipeline **only** as it assembles a
-`CapturePayload`, which is the point: per-capture metadata has to arrive
-*with* its capture, and the payload is the only thing ordered against it. A
-`WorkerJob` (crossing #6) could not do this — the worker drains captures
-before jobs, so a declaration could be applied to a capture that was already
-processed.
+`CaptureState` — Idle → Armed → Recording → Processing → Idle — is **not shared
+state**. The pipeline owns it as a plain field and makes every transition:
 
-It stays a single byte so the string count and the sounding set are updated
-together, which is the atomicity requirement crossing #4 exists to serve; one
-word satisfies it without a ring. It is **not** packed into the baton: the two
-have different writers and different lifecycles, and sharing a word would
-break the baton's single-writer-per-transition partition below.
-
-#### CaptureState baton-pass
-
-`CaptureState` is an `AtomicU8` whose transitions are partitioned among
-three threads by convention. Each thread writes only its own
-transitions:
-
-- **GUI:** `Idle → Armed` (arm), `Armed → Idle` (cancel).
-- **DSP pipeline:** `Armed → Recording` (stability detected),
+- `Idle → Armed` (on `Arm`), `Armed → Idle` and `Recording → Idle` (on
+  `Cancel`), `Armed → Recording` (stability detected),
   `Recording → Processing` (buffer full or silence decay),
-  `Recording → Armed` (worker queue backpressure failure recovery).
-- **Worker:** `Processing → Idle` (computation complete).
+  `Recording → Armed` (no note identity to dispatch under),
+  `Processing → Armed` (worker queue backpressure recovery), and
+  `Processing → Idle` once the Worker reports the capture finished.
 
-This is a convention-only contract (plain `.store(...,
-Ordering::Relaxed)` on each side). Hardening it to `compare_exchange`
-is tracked in the README's Work-in-Progress section.
+Because one thread owns the machine, an out-of-sequence transition has no code
+path to come from: the states are a plain `enum`, every move is an assignment
+through `&mut self`, and the compiler enforces the exclusivity a partitioned
+atomic could only police at runtime. **Prefer that over hardening a shared
+state machine** — a `compare_exchange` detects a mis-sequenced move, ownership
+makes it unrepresentable.
+
+Two threads still need to see it, and each gets what its need actually is:
+
+- **A consumer** reads it off `FrameOutput` (crossing #2) and asks for a
+  transition with a `CaptureCommand` (crossing #4). It never writes, so the
+  display cannot claim a state the DSP disagrees with.
+- **The Worker** signals one fact — the dispatched capture is finished — by
+  clearing `capture_in_flight`, the single `AtomicBool` above. That is the
+  pipeline's one blind spot: it knows when it handed a capture over, not when
+  the Worker was done with it.
+
+The flag needs no `compare_exchange`. The pipeline sets it as it dispatches and
+holds `Processing` until it reads the flag clear, so a second capture cannot be
+dispatched while one is outstanding and the two writers strictly alternate.
+`Relaxed` is sufficient: no data rides the flag, and the payload it refers to
+crossed on channels that carry their own ordering.
+
+**Order matters at both ends, and both orders are the same rule — the fact is
+published last.** The pipeline raises the flag *before* the `try_send` on
+crossing #5, and lowers it again if the send fails; in the other order the
+Worker could finish and clear a flag the pipeline had not yet set, stranding
+the lifecycle in `Processing`. The Worker recycles the buffers into the
+`AudioPool` *before* clearing, so "not in flight" also means the buffers can be
+borrowed again, and sends the `Measurement` *after*, so a consumer that arms on
+that message finds the lifecycle already finished.
 
 ### Heap-allocation exception for the Worker ↔ UI paths
 

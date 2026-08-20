@@ -107,7 +107,7 @@ pub fn create_main_view(
     // Create sidebar
     let sidebar = create_sidebar(
         data.measurement_mode_active,
-        data.capture_state.clone(),
+        data.capture_state,
         data.undo_target_note.clone(),
         capture_message,
         data.reference_mode,

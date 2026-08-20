@@ -60,8 +60,8 @@ const ONSET_HISTORY_SAMPLES: usize = 32768;
 /// **Do not move it without an ADR.** Every capture set the project measures
 /// against was recorded at this length (`06-capture-sets.md`), so a changed
 /// default makes new measurements incomparable with all of them. A measurement
-/// session moves the runtime target ([`PipelineAtomics::capture_samples`])
-/// instead, which does not touch what is analysed.
+/// session moves the runtime target ([`ArmRequest::target_samples`]) instead,
+/// which does not touch what is analysed.
 pub const CAPTURE_DEFAULT_SAMPLES: usize = 3 * SAMPLE_RATE as usize / 2;
 
 /// How much of a record the Worker analyses, however long the record is.
@@ -119,9 +119,9 @@ pub struct CapturePayload {
     /// [`crate::models::KeyMeasurement`] — the tuning curve trusts manual
     /// captures only (ADR 0006 item 3).
     pub captured_in_auto: bool,
-    /// The operator's string declaration, decoded from
-    /// [`PipelineAtomics::capture_strings`] as this payload was assembled;
-    /// `None` when nothing was declared, which is the ordinary case.
+    /// The operator's string declaration, latched from the standing
+    /// [`ArmRequest`] when the audio began; `None` when nothing was declared,
+    /// which is the ordinary case.
     pub sounding_strings: Option<SoundingStrings>,
 }
 
@@ -175,6 +175,15 @@ pub const PROFILE_QUEUE_CAPACITY: usize = 88;
 /// absorb a same-tick change pair; on a full buffer the UI simply re-sends
 /// next tick.
 pub const STROBE_REF_QUEUE_CAPACITY: usize = 2;
+
+/// Ring-buffer capacity for the capture-command channel (UI → DSP, the third
+/// crossing-#4 instance).
+///
+/// Commands are operator actions — an arm, a cancel, a changed declaration —
+/// so they arrive orders of magnitude slower than the hop rate, and the
+/// pipeline drains to the newest each hop. Two slots absorb a same-tick pair;
+/// on a full buffer the caller re-sends next tick.
+pub const CAPTURE_COMMAND_QUEUE_CAPACITY: usize = 2;
 
 /// Capacity of the capture-dispatch channel (DSP → Worker, crossing #5).
 ///
@@ -284,46 +293,98 @@ impl StrobeSender {
     }
 }
 
-/// Capture lifecycle state, communicated via AtomicU8.
-///
-/// Uses a baton-pass pattern — three threads each own a distinct transition:
-///   - **GUI thread** writes `Idle → Armed` (arming) and `Armed → Idle` (cancel).
-///   - **DSP pipeline** writes `Armed → Recording` and `Recording → Processing`.
-///   - **Worker thread** writes `Processing → Idle` (completion).
-///
-/// Full lifecycle: Idle → Armed → Recording → Processing → Idle
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[repr(u8)]
-pub enum CaptureState {
-    Idle = 0,
-    Armed = 1,
-    Recording = 2,
-    Processing = 3,
+/// Frontend-side producer for the capture-command channel (the third
+/// crossing-#4 instance). Lives in [`HostHandle`](crate::audio::HostHandle)
+/// and hides the `ringbuf` producer.
+pub struct CaptureSender {
+    tx: HeapProd<CaptureCommand>,
 }
 
-/// What a recording in progress is: how long it fills for, and what it is *of*.
+impl CaptureSender {
+    /// Pushes one capture-lifecycle command to the DSP thread. Returns `false`
+    /// when the ring is full — the caller re-sends on its next tick, the same
+    /// retry pattern as [`StrobeSender::set_refs`].
+    pub fn send(&mut self, command: CaptureCommand) -> bool {
+        self.tx.try_push(command).is_ok()
+    }
+}
+
+/// Where the capture lifecycle stands: Idle → Armed → Recording → Processing
+/// → Idle.
 ///
-/// Sampled together at `Armed → Recording` rather than read at dispatch,
-/// because a record can run for seconds and these describe the audio: by the
-/// end the operator may have selected the next key or changed the declaration,
-/// and reading them then would file the record under a later moment.
+/// Owned by [`AudioPipeline`], which makes every transition; a consumer reads
+/// it off [`FrameOutput`] and asks for one with a [`CaptureCommand`]. The end
+/// of `Processing` is the exception it cannot see for itself — the Worker
+/// signals that by clearing [`PipelineAtomics::capture_in_flight`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CaptureState {
+    /// Nothing pending.
+    #[default]
+    Idle,
+    /// Waiting for a strike.
+    Armed,
+    /// Filling the record.
+    Recording,
+    /// Dispatched; the Worker still holds it.
+    Processing,
+}
+
+/// What a [`CaptureCommand::Arm`] asks the next record to be: how long it
+/// fills for, and what it is *of*. Heap-free and `Copy`.
+#[derive(Debug, Clone, Copy)]
+pub struct ArmRequest {
+    /// Samples to fill to. Clamped into `HOP_SIZE..=CAPTURE_MAX_SAMPLES` on
+    /// receipt rather than trusted — another thread writes it.
+    pub target_samples: usize,
+    /// The operator's string declaration, or `None` when nothing was declared
+    /// (the ordinary case). Carried, not consumed.
+    pub declared_strings: Option<SoundingStrings>,
+}
+
+impl Default for ArmRequest {
+    fn default() -> Self {
+        Self {
+            target_samples: CAPTURE_DEFAULT_SAMPLES,
+            declared_strings: None,
+        }
+    }
+}
+
+/// A capture-lifecycle command, UI → DSP (crossing #4's third instance).
+/// Heap-free and `Copy`.
+#[derive(Debug, Clone, Copy)]
+pub enum CaptureCommand {
+    /// Arm for one record, and state what that record will be.
+    ///
+    /// Arriving while already `Armed` it updates the request and moves
+    /// nothing, so the last `Arm` before the strike is the one the record
+    /// carries — a sender may restate a changed request without re-arming.
+    Arm(ArmRequest),
+    /// Drop what is pending: disarms from `Armed`, and drops the take in
+    /// progress from `Recording`. Nothing dispatched, so neither the profile
+    /// nor the disk sees it.
+    Cancel,
+}
+
+/// What the recording in progress is: the request that armed it, plus the key
+/// that stood when the string was struck.
+///
+/// `target_note` is sampled at `Armed → Recording` rather than read at
+/// dispatch, because a record can run for seconds: by the end the operator may
+/// have selected the next key, and reading it then would file the record under
+/// a later moment.
 struct CaptureLatch {
-    /// Samples to fill to, clamped into `HOP_SIZE..=CAPTURE_MAX_SAMPLES`.
-    target_samples: usize,
+    /// The request in force when the audio began, already clamped.
+    request: ArmRequest,
     /// The key the UI had selected; 255 = Auto.
     target_note: u8,
-    /// The string declaration, packed by [`SoundingStrings::to_bits`]. Carried,
-    /// not consumed — the pipeline is simply the only place that knows when the
-    /// audio began.
-    declared_strings: u8,
 }
 
 impl Default for CaptureLatch {
     fn default() -> Self {
         Self {
-            target_samples: CAPTURE_DEFAULT_SAMPLES,
+            request: ArmRequest::default(),
             target_note: 255,
-            declared_strings: SoundingStrings::UNDECLARED.to_bits(),
         }
     }
 }
@@ -466,22 +527,21 @@ pub struct PipelineAtomics {
     pub runtime: RuntimeAtomics,
     /// UI → DSP: shutdown signal. The audio thread checks this every loop iteration.
     pub shutdown: AtomicBool,
-    /// Bidirectional capture lifecycle state.
-    /// GUI writes `Armed`, Pipeline writes `Recording`/`Processing`, Worker writes `Idle`.
-    pub capture_state: AtomicU8,
-    /// UI → DSP: samples a capture fills to, clamped into
-    /// `HOP_SIZE..=CAPTURE_MAX_SAMPLES` and latched at `Armed → Recording`.
-    /// Above [`CAPTURE_DEFAULT_SAMPLES`] it also suppresses the decay stop.
-    pub capture_samples: AtomicU32,
-    /// UI → DSP: the operator's per-capture string declaration, packed by
-    /// [`SoundingStrings::to_bits`]. `0` = undeclared, the ordinary state; the
-    /// pipeline decodes it onto the [`CapturePayload`] it dispatches.
-    pub capture_strings: AtomicU8,
-    /// UI → DSP: drop the recording in progress. A *request*, not a transition
-    /// — the pipeline consumes it and makes the `Recording → Idle` move itself,
-    /// so the baton keeps one writer per transition. Cleared when a recording
-    /// starts, so a stale request cannot kill the next take.
-    pub capture_abort: AtomicBool,
+    /// Worker → DSP: a dispatched capture is still with the Worker.
+    ///
+    /// The only scalar that travels this way, and the pipeline's one blind
+    /// spot — it knows when it handed a capture over but not when the Worker
+    /// finished. Set by the pipeline as it dispatches, cleared by the Worker
+    /// once it has recycled the buffers, which is what returns the lifecycle
+    /// to [`CaptureState::Idle`].
+    ///
+    /// Needs no `compare_exchange`: the pipeline holds `Processing` until it
+    /// reads this clear, so a second capture cannot be dispatched while one is
+    /// outstanding and the two writers strictly alternate.
+    ///
+    /// Internal to the pipeline ↔ Worker pair; a frontend reads the lifecycle
+    /// off [`FrameOutput::capture_state`](crate::FrameOutput::capture_state).
+    pub(crate) capture_in_flight: AtomicBool,
 }
 
 impl Default for PipelineAtomics {
@@ -499,10 +559,7 @@ impl Default for PipelineAtomics {
                 current_nhwrsf: AtomicU32::new(0.0_f32.to_bits()),
             },
             shutdown: AtomicBool::new(false),
-            capture_state: AtomicU8::new(CaptureState::Idle as u8),
-            capture_samples: AtomicU32::new(CAPTURE_DEFAULT_SAMPLES as u32),
-            capture_strings: AtomicU8::new(0), // Default to undeclared
-            capture_abort: AtomicBool::new(false),
+            capture_in_flight: AtomicBool::new(false),
         }
     }
 }
@@ -533,6 +590,9 @@ pub struct AudioPipeline {
     /// Crossing-#4-instance consumer for strobe reference updates; drained
     /// (newest wins) into the strobe each hop.
     strobe_rx: HeapCons<StrobeRefUpdate>,
+    /// Crossing-#4-instance consumer for capture-lifecycle commands; drained
+    /// (newest wins) at step 0 and applied at step 6.
+    command_rx: HeapCons<CaptureCommand>,
 
     // Wait-free shared state
     atomics: Arc<PipelineAtomics>,
@@ -551,8 +611,17 @@ pub struct AudioPipeline {
     pub capture_tx: Sender<CapturePayload>,
 
     // Capture Accumulation State
+    /// Where the lifecycle stands. Owned outright — every transition is made
+    /// here, so an out-of-sequence one has no code path to come from.
+    capture_state: CaptureState,
     capture_buffer: Option<Box<[f32]>>,
     capture_count: usize,
+    /// This hop's capture command, drained at step 0 and consumed at step 6 —
+    /// so an arm can start a record on the hop it arrives.
+    pending_command: Option<CaptureCommand>,
+    /// What the *next* record will be: the standing [`CaptureCommand::Arm`],
+    /// already clamped. Latched at `Armed → Recording`.
+    arm: ArmRequest,
     /// What the recording in progress is, sampled at `Armed → Recording`.
     latch: CaptureLatch,
     /// Parallel accumulator for the diagnostic `full_event_buffer`.
@@ -618,6 +687,9 @@ pub struct PipelinePorts {
     /// UI → DSP producer for strobe reference updates (crossing #4's second
     /// instance).
     pub strobe_refs: StrobeSender,
+    /// UI → DSP producer for capture-lifecycle commands (crossing #4's third
+    /// instance).
+    pub capture_commands: CaptureSender,
 }
 
 impl AudioPipeline {
@@ -688,6 +760,10 @@ impl AudioPipeline {
         let (strobe_tx, strobe_rx) =
             HeapRb::<StrobeRefUpdate>::new(STROBE_REF_QUEUE_CAPACITY).split();
 
+        // Crossing #4, third instance: capture-lifecycle commands (UI → DSP).
+        let (command_tx, command_rx) =
+            HeapRb::<CaptureCommand>::new(CAPTURE_COMMAND_QUEUE_CAPACITY).split();
+
         WorkerManager::new(
             Arc::clone(&audio_pool),
             Arc::clone(&atomics),
@@ -705,6 +781,7 @@ impl AudioPipeline {
             profile_rx,
             strobe: Strobe::new(SAMPLE_RATE),
             strobe_rx,
+            command_rx,
             atomics: Arc::clone(&atomics),
             audio_pool,
             cola: CircularFifo::new(BASS_WINDOW_SIZE),
@@ -712,8 +789,11 @@ impl AudioPipeline {
             fft_bass_instance,
             processing_frame: ProcessingFrame::new(),
             capture_tx,
+            capture_state: CaptureState::Idle,
             capture_buffer: None,
             capture_count: 0,
+            pending_command: None,
+            arm: ArmRequest::default(),
             latch: CaptureLatch::default(),
             full_event_buffer: None,
             full_event_count: 0,
@@ -733,6 +813,7 @@ impl AudioPipeline {
             worker_job_tx,
             profiles: ProfileSender { tx: profile_tx },
             strobe_refs: StrobeSender { tx: strobe_tx },
+            capture_commands: CaptureSender { tx: command_tx },
         };
 
         (pipeline, ports)
@@ -750,6 +831,22 @@ impl AudioPipeline {
         } else {
             None
         }
+    }
+
+    /// Returns every buffer the pending take borrowed and clears what it
+    /// accumulated. Nothing is dispatched, so the take reaches neither the
+    /// profile nor the disk.
+    fn abandon_take(&mut self) {
+        if let Some(buf) = self.capture_buffer.take() {
+            let _ = self.audio_pool.push(buf);
+        }
+        if let Some(dbuf) = self.full_event_buffer.take() {
+            let _ = self.audio_pool.push(dbuf);
+        }
+        self.capture_count = 0;
+        self.full_event_count = 0;
+        self.capture_onset_pending = false;
+        self.latched_auto_key = None;
     }
 
     /// Internal helper that processes a single hop of audio data pulled from the COLA.
@@ -772,6 +869,14 @@ impl AudioPipeline {
         }
         if let Some(update) = strobe_update {
             self.strobe.retarget(update);
+        }
+
+        // Capture commands: likewise the newest, because a command supersedes
+        // the one before it — an `Arm` then a `Cancel` leaves nothing armed,
+        // and the reverse order arms. Applied at step 6, where the lifecycle
+        // it drives lives.
+        while let Some(command) = self.command_rx.try_pop() {
+            self.pending_command = Some(command);
         }
 
         // ─── Step 1: COLA & Windowing ───
@@ -880,12 +985,50 @@ impl AudioPipeline {
 
         // ─── Step 6: Capture Accumulation & Worker Dispatch ───
 
-        let current_capture_state = self.atomics.capture_state.load(Ordering::Relaxed);
+        // The Worker owns the end of the lifecycle, so read that before
+        // anything else: a command arriving this hop can then act on a
+        // capture that has just finished.
+        if self.capture_state == CaptureState::Processing
+            && !self.atomics.capture_in_flight.load(Ordering::Relaxed)
+        {
+            self.capture_state = CaptureState::Idle;
+        }
+
+        // Then the hop's command, so an arm can start a record on the hop it
+        // arrives rather than the one after.
+        if let Some(command) = self.pending_command.take() {
+            match command {
+                CaptureCommand::Arm(request) => {
+                    self.arm = ArmRequest {
+                        // Clamped, not trusted: another thread writes this.
+                        target_samples: request.target_samples.clamp(HOP_SIZE, CAPTURE_MAX_SAMPLES),
+                        ..request
+                    };
+                    // A re-arm while armed updates the request above and
+                    // nothing else; from `Recording` or `Processing` it does
+                    // not apply.
+                    if self.capture_state == CaptureState::Idle {
+                        self.capture_state = CaptureState::Armed;
+                    }
+                }
+                CaptureCommand::Cancel => {
+                    // One command for both: disarming before the strike, and
+                    // dropping the take in progress.
+                    if matches!(
+                        self.capture_state,
+                        CaptureState::Armed | CaptureState::Recording
+                    ) {
+                        self.capture_state = CaptureState::Idle;
+                        self.abandon_take();
+                    }
+                }
+            }
+        }
 
         if gate_result.state == SignalState::Silence {
             self.capture_onset_pending = false;
             // Proactively recover diagnostic buffer on false transients
-            if current_capture_state == CaptureState::Armed as u8 {
+            if self.capture_state == CaptureState::Armed {
                 if let Some(dbuf) = self.full_event_buffer.take() {
                     let _ = self.audio_pool.push(dbuf);
                 }
@@ -895,7 +1038,7 @@ impl AudioPipeline {
 
         // ─── MUST Split the original else-if chain into two if blocks here ───
 
-        if current_capture_state == CaptureState::Armed as u8 {
+        if self.capture_state == CaptureState::Armed {
             if gate_result.is_new_onset {
                 self.capture_onset_pending = true;
                 // Prevent memory leak if an old diagnostic buffer was abandoned (e.g. decayed to silence)
@@ -922,21 +1065,14 @@ impl AudioPipeline {
                 && gate_result.state == SignalState::Stable
                 && let Some(buf) = self.audio_pool.pop()
             {
+                self.capture_state = CaptureState::Recording;
                 self.capture_onset_pending = false;
                 self.capture_buffer = Some(buf);
                 self.capture_count = 0;
                 self.latch = CaptureLatch {
-                    // Clamped, not trusted: another thread writes this.
-                    target_samples: (self.atomics.capture_samples.load(Ordering::Relaxed) as usize)
-                        .clamp(HOP_SIZE, CAPTURE_MAX_SAMPLES),
+                    request: self.arm,
                     target_note: self.atomics.config.target_note.load(Ordering::Relaxed),
-                    declared_strings: self.atomics.capture_strings.load(Ordering::Relaxed),
                 };
-                // A request that arrived before this take is not about it.
-                self.atomics.capture_abort.store(false, Ordering::Relaxed);
-                self.atomics
-                    .capture_state
-                    .store(CaptureState::Recording as u8, Ordering::Relaxed);
             }
         }
 
@@ -955,24 +1091,7 @@ impl AudioPipeline {
             self.full_event_buffer = Some(buf);
         }
 
-        if current_capture_state == CaptureState::Recording as u8
-            && self.atomics.capture_abort.swap(false, Ordering::Relaxed)
-        {
-            // Nothing is dispatched, so the take reaches neither the profile
-            // nor the disk.
-            if let Some(buf) = self.capture_buffer.take() {
-                let _ = self.audio_pool.push(buf);
-            }
-            if let Some(dbuf) = self.full_event_buffer.take() {
-                let _ = self.audio_pool.push(dbuf);
-            }
-            self.capture_count = 0;
-            self.full_event_count = 0;
-            self.latched_auto_key = None;
-            self.atomics
-                .capture_state
-                .store(CaptureState::Idle as u8, Ordering::Relaxed);
-        } else if current_capture_state == CaptureState::Recording as u8 {
+        if self.capture_state == CaptureState::Recording {
             // ── Latch ──
             if let Some(ref result) = pitch_result {
                 self.latched_auto_key = Some(result.key_index);
@@ -983,7 +1102,8 @@ impl AudioPipeline {
                 let start_idx = BASS_WINDOW_SIZE - HOP_SIZE;
                 let src_slice = &self.processing_frame.audio_buffer[start_idx..BASS_WINDOW_SIZE];
 
-                let remaining = self.latch.target_samples - self.capture_count;
+                let target_samples = self.latch.request.target_samples;
+                let remaining = target_samples - self.capture_count;
                 let to_copy = src_slice.len().min(remaining);
 
                 buf[self.capture_count..self.capture_count + to_copy]
@@ -991,11 +1111,11 @@ impl AudioPipeline {
 
                 self.capture_count += to_copy;
 
-                let done = self.capture_count == self.latch.target_samples;
+                let done = self.capture_count == target_samples;
                 // An extended record is a request for the audio past the decay,
                 // so only the shipped length keeps the short-dispatch valve.
                 let decayed = gate_result.state == SignalState::Silence
-                    && self.latch.target_samples <= CAPTURE_DEFAULT_SAMPLES;
+                    && target_samples <= CAPTURE_DEFAULT_SAMPLES;
 
                 if done || decayed {
                     let target_note = self.latch.target_note;
@@ -1018,30 +1138,29 @@ impl AudioPipeline {
                             noise_floor: load_f32(&self.atomics.config.silence_threshold),
                             measured_f0: self.last_measured_f0,
                             captured_in_auto: target_note == 255,
-                            sounding_strings: SoundingStrings::from_bits(
-                                self.latch.declared_strings,
-                            ),
+                            sounding_strings: self.latch.request.declared_strings,
                         };
                         self.full_event_count = 0; // Clear state after dispatch
 
-                        // Safely dispatch and recover buffers if the worker is backed up
-                        // Fixes pre-existing bricked-state bug when try_send fails
-                        match self.capture_tx.try_send(payload) {
-                            Ok(()) => {
-                                self.atomics
-                                    .capture_state
-                                    .store(CaptureState::Processing as u8, Ordering::Relaxed);
+                        // Raised before the payload goes over, so the Worker
+                        // cannot clear it before this thread has set it.
+                        self.atomics
+                            .capture_in_flight
+                            .store(true, Ordering::Relaxed);
+                        self.capture_state = CaptureState::Processing;
+
+                        // Recover the buffers if the worker is backed up —
+                        // nothing was handed over, so nothing is in flight.
+                        if let Err(e) = self.capture_tx.try_send(payload) {
+                            let dropped = e.into_inner();
+                            let _ = self.audio_pool.push(dropped.stable_buffer);
+                            if let Some(dbuf) = dropped.full_event_buffer {
+                                let _ = self.audio_pool.push(dbuf);
                             }
-                            Err(e) => {
-                                let dropped = e.into_inner();
-                                let _ = self.audio_pool.push(dropped.stable_buffer);
-                                if let Some(dbuf) = dropped.full_event_buffer {
-                                    let _ = self.audio_pool.push(dbuf);
-                                }
-                                self.atomics
-                                    .capture_state
-                                    .store(CaptureState::Armed as u8, Ordering::Relaxed);
-                            }
+                            self.atomics
+                                .capture_in_flight
+                                .store(false, Ordering::Relaxed);
+                            self.capture_state = CaptureState::Armed;
                         }
                     } else {
                         // Garbage detected (No Lock). Recycle buffer and reset to Armed.
@@ -1050,9 +1169,7 @@ impl AudioPipeline {
                             let _ = self.audio_pool.push(dbuf);
                         }
                         self.full_event_count = 0; // Clear state on garbage
-                        self.atomics
-                            .capture_state
-                            .store(CaptureState::Armed as u8, Ordering::Relaxed);
+                        self.capture_state = CaptureState::Armed;
                     }
                     self.latched_auto_key = None;
                 } else {
@@ -1087,6 +1204,7 @@ impl AudioPipeline {
         frame_output.unison_resolution_hz = strobe_result.line_resolution_hz;
         frame_output.unison_verdict = strobe_result.verdict;
         frame_output.coarse_hz = strobe_result.coarse_hz;
+        frame_output.capture_state = self.capture_state;
         // The buffer is held only while a record is in progress, so its
         // presence is exactly the condition a progress figure is meaningful in.
         frame_output.capture_progress_samples = if self.capture_buffer.is_some() {
@@ -1307,6 +1425,238 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A command asks; the pipeline is what moves the lifecycle, on the hop the
+    /// command arrives — and it publishes where it stands on every frame.
+    #[test]
+    fn arm_and_cancel_commands_move_the_lifecycle() {
+        let (mut pipeline, mut ports) = AudioPipeline::new(None);
+        let hop = [0.0f32; HOP_SIZE];
+
+        assert_eq!(pipeline.capture_state, CaptureState::Idle);
+
+        assert!(ports.capture_commands.send(CaptureCommand::Arm(ArmRequest {
+            target_samples: CAPTURE_DEFAULT_SAMPLES,
+            declared_strings: None,
+        })));
+        let frame = pipeline.push_audio(&hop).expect("a hop's worth of audio");
+        assert_eq!(
+            pipeline.capture_state,
+            CaptureState::Armed,
+            "the pipeline makes Idle → Armed itself"
+        );
+        assert_eq!(
+            frame.capture_state,
+            CaptureState::Armed,
+            "and publishes it on the same frame"
+        );
+
+        assert!(ports.capture_commands.send(CaptureCommand::Cancel));
+        pipeline.push_audio(&hop);
+        assert_eq!(pipeline.capture_state, CaptureState::Idle, "Cancel disarms");
+    }
+
+    /// A command that does not apply in the current state is an ordinary
+    /// outcome: it leaves the lifecycle alone rather than forcing it.
+    #[test]
+    fn a_command_that_does_not_apply_leaves_the_lifecycle_alone() {
+        let (mut pipeline, mut ports) = AudioPipeline::new(None);
+        let hop = [0.0f32; HOP_SIZE];
+
+        // Cancel from Idle: nothing pending, nothing to drop.
+        assert!(ports.capture_commands.send(CaptureCommand::Cancel));
+        pipeline.push_audio(&hop);
+        assert_eq!(pipeline.capture_state, CaptureState::Idle);
+
+        // An Arm cannot jump the queue while the Worker still holds a capture.
+        pipeline.capture_state = CaptureState::Processing;
+        pipeline
+            .atomics
+            .capture_in_flight
+            .store(true, Ordering::Relaxed);
+        assert!(ports.capture_commands.send(CaptureCommand::Arm(ArmRequest {
+            target_samples: CAPTURE_DEFAULT_SAMPLES,
+            declared_strings: None,
+        })));
+        pipeline.push_audio(&hop);
+        assert_eq!(pipeline.capture_state, CaptureState::Processing);
+
+        // Clearing the flag is what ends it — the Worker's only say.
+        pipeline
+            .atomics
+            .capture_in_flight
+            .store(false, Ordering::Relaxed);
+        pipeline.push_audio(&hop);
+        assert_eq!(pipeline.capture_state, CaptureState::Idle);
+    }
+
+    /// A request changed *after* arming must still reach the capture, so a
+    /// second `Arm` restates it without disturbing the lifecycle — which is
+    /// what lets a sender that arms on its own schedule stay correct.
+    #[test]
+    fn a_second_arm_restates_the_request_and_holds_the_lifecycle() {
+        let (mut pipeline, mut ports) = AudioPipeline::new(None);
+        let hop = [0.0f32; HOP_SIZE];
+
+        assert!(ports.capture_commands.send(CaptureCommand::Arm(ArmRequest {
+            target_samples: CAPTURE_DEFAULT_SAMPLES,
+            declared_strings: None,
+        })));
+        pipeline.push_audio(&hop);
+
+        let solo = SoundingStrings::UNDECLARED.toggled(0);
+        assert!(ports.capture_commands.send(CaptureCommand::Arm(ArmRequest {
+            target_samples: 3 * SAMPLE_RATE as usize,
+            declared_strings: solo.declared(),
+        })));
+        pipeline.push_audio(&hop);
+
+        assert_eq!(
+            pipeline.capture_state,
+            CaptureState::Armed,
+            "a re-arm while armed moves nothing"
+        );
+        assert_eq!(pipeline.arm.target_samples, 3 * SAMPLE_RATE as usize);
+        assert_eq!(pipeline.arm.declared_strings, Some(solo));
+    }
+
+    /// The fill target crosses from another thread, so the pipeline clamps it
+    /// rather than trusting it — a buffer is [`CAPTURE_MAX_SAMPLES`] long and
+    /// a hop is the shortest record that can complete.
+    #[test]
+    fn an_arms_fill_target_is_clamped_on_receipt() {
+        let (mut pipeline, mut ports) = AudioPipeline::new(None);
+        let hop = [0.0f32; HOP_SIZE];
+
+        for (asked, expected) in [(1usize, HOP_SIZE), (usize::MAX, CAPTURE_MAX_SAMPLES)] {
+            assert!(ports.capture_commands.send(CaptureCommand::Arm(ArmRequest {
+                target_samples: asked,
+                declared_strings: None,
+            })));
+            pipeline.push_audio(&hop);
+            assert_eq!(pipeline.arm.target_samples, expected);
+        }
+    }
+
+    /// Feeds `secs` of a pure tone one hop at a time, recording every capture
+    /// state the run passes through. Stops early once `stop` says so.
+    fn drive(
+        pipeline: &mut AudioPipeline,
+        hz: f32,
+        secs: f32,
+        n: &mut u64,
+        seen: &mut Vec<CaptureState>,
+        mut stop: impl FnMut(&[CaptureState]) -> bool,
+    ) {
+        let step = 2.0 * std::f64::consts::PI * hz as f64 / SAMPLE_RATE as f64;
+        let mut hop = [0.0f32; HOP_SIZE];
+        for _ in 0..((secs * SAMPLE_RATE as f32) as usize / HOP_SIZE) {
+            for s in hop.iter_mut() {
+                *s = 0.2 * (step * *n as f64).sin() as f32;
+                *n += 1;
+            }
+            pipeline.push_audio(&hop);
+            if seen.last() != Some(&pipeline.capture_state) {
+                seen.push(pipeline.capture_state);
+            }
+            if stop(seen) {
+                return;
+            }
+        }
+    }
+
+    /// The whole lifecycle, end to end: an `Arm` command, a struck note, the
+    /// record filling, and a `KeyMeasurement` back from the Worker.
+    #[test]
+    fn a_capture_runs_from_arm_command_to_measurement() {
+        let (mut pipeline, mut ports) = AudioPipeline::new(None);
+        let atomics = ports.handle.atomics.clone();
+        // Manual mode on A4, so the dispatch gate does not depend on discovery
+        // locking a pure sine.
+        atomics.config.target_note.store(48, Ordering::Relaxed);
+
+        assert!(ports.capture_commands.send(CaptureCommand::Arm(ArmRequest {
+            target_samples: CAPTURE_DEFAULT_SAMPLES,
+            declared_strings: None,
+        })));
+
+        let mut n = 0u64;
+        let mut seen = Vec::new();
+        drive(&mut pipeline, 440.0, 6.0, &mut n, &mut seen, |seen| {
+            seen.contains(&CaptureState::Processing)
+        });
+
+        assert!(seen.contains(&CaptureState::Armed), "lifecycle {seen:?}");
+        assert!(
+            seen.contains(&CaptureState::Recording),
+            "the strike must start a record; lifecycle {seen:?}"
+        );
+        assert!(
+            seen.contains(&CaptureState::Processing),
+            "the filled record must dispatch; lifecycle {seen:?}"
+        );
+
+        match ports
+            .worker_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+        {
+            Ok(WorkerOutput::Measurement(m)) => assert_eq!(m.key_index, 48),
+            other => panic!("expected a measurement, got {:?}", other.is_ok()),
+        }
+
+        // The Worker's completion is a flag, not a state write: the pipeline
+        // reads it on its next hop and ends the lifecycle itself.
+        drive(&mut pipeline, 440.0, 0.1, &mut n, &mut seen, |_| false);
+        assert_eq!(pipeline.capture_state, CaptureState::Idle);
+        assert_eq!(
+            pipeline.audio_pool.len(),
+            AUDIO_POOL_CAPACITY,
+            "and the Worker's buffers are home before it clears"
+        );
+    }
+
+    /// A `Cancel` mid-record: the take is dropped, its buffers go back to the
+    /// pool, and nothing reaches the Worker.
+    #[test]
+    fn cancel_drops_the_record_in_progress() {
+        let (mut pipeline, mut ports) = AudioPipeline::new(None);
+        let atomics = ports.handle.atomics.clone();
+        atomics.config.target_note.store(48, Ordering::Relaxed);
+
+        assert!(ports.capture_commands.send(CaptureCommand::Arm(ArmRequest {
+            // Long enough that the record cannot finish before the Stop.
+            target_samples: CAPTURE_MAX_SAMPLES,
+            declared_strings: None,
+        })));
+
+        let mut n = 0u64;
+        let mut seen = Vec::new();
+        drive(&mut pipeline, 440.0, 4.0, &mut n, &mut seen, |seen| {
+            seen.contains(&CaptureState::Recording)
+        });
+        assert!(
+            seen.contains(&CaptureState::Recording),
+            "lifecycle {seen:?}"
+        );
+
+        assert!(ports.capture_commands.send(CaptureCommand::Cancel));
+        drive(&mut pipeline, 440.0, 0.1, &mut n, &mut seen, |_| false);
+
+        assert_eq!(
+            pipeline.capture_state,
+            CaptureState::Idle,
+            "Cancel drops the take; lifecycle {seen:?}"
+        );
+        assert!(
+            ports.worker_rx.try_recv().is_err(),
+            "a dropped take reaches neither the profile nor the disk"
+        );
+        assert_eq!(
+            pipeline.audio_pool.len(),
+            AUDIO_POOL_CAPACITY,
+            "its buffers go back to the pool"
+        );
     }
 
     #[test]

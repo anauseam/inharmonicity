@@ -212,10 +212,11 @@ The pipeline–GUI relationship follows the **Split / Handle pattern** (the same
   - `handle` — a cloneable `PipelineHandle` carrying `Arc<PipelineAtomics>`:
     - `atomics.config` — wait-free reading and writing of configuration values (e.g., silence threshold, target key)
     - `atomics.runtime` — wait-free polling of runtime observations (e.g., smoothed RMS for the Envelope Viewer)
-    - `atomics.capture_state` — baton-pass `AtomicU8` governing the capture lifecycle across three threads
+    - `atomics.capture_in_flight` — the Worker → DSP flag that ends a capture's lifecycle; the lifecycle itself is a pipeline-owned `CaptureState` published on `FrameOutput`
   - `worker_rx` — crossbeam SPSC receiver for `WorkerOutput` results from the Worker: `Measurement(KeyMeasurement)` per capture and `Curve(CurveBundle)` per curve recompute (one enum stream, so a new result kind is a variant, not a new channel)
   - `worker_job_tx` — crossbeam SPSC sender for `WorkerJob` background requests to the Worker (today curve recomputes; latest-wins). The GUI uses `HostHandle::send_curve_job` so the crossbeam types stay out of the frontend crate
   - `profiles` — `ringbuf` SPSC producer for pushing recompiled inharmonicity templates back to the live engine (UI → DSP; the measured-B discovery path is **gated off** by default — see [TODO.md](TODO.md))
+  - `strobe_refs` / `capture_commands` — the other two `ringbuf` SPSC producers of the same class (UI → DSP): the strobe's reference set, and the capture-lifecycle commands (`Arm` carrying the fill target and string declaration, `Cancel`) the pipeline acts on itself
 
   The single-owner endpoints (`worker_rx`, `worker_job_tx`, `profiles`, `strobe_refs`) cannot be cloned: `spawn_analysis_thread()` folds them, with the handle, into a `HostHandle`.
 

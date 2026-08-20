@@ -40,17 +40,17 @@ truth it judges against.
 
 | # | Step | Feeds | Class |
 | --- | --- | --- | --- |
-| 0 | Drain crossing-#4 rings: profile templates (apply all), strobe references (newest wins) | Engine templates; Strobe | chain input / tap input |
+| 0 | Drain crossing-#4 rings: profile templates (apply all), strobe references and capture commands (newest wins; the command is held for step 6) | Engine templates; Strobe; capture lifecycle | chain input / tap input |
 | 1 | COLA `read_window` (8192) → treble FFT (newest 2048) + bass FFT (8192), hop acknowledge | Gatekeeper (treble complex spectrum), Engine + Strobe (audio) | **chain** |
 | 1b | History-buffer accumulation (newest hop) | diagnostic pre-roll only | tap |
 | 2 | Read config atomics: thresholds, noise floor, `target_note` (crossing #3) | Gatekeeper, Engine, Strobe gate | chain input |
-| 3 | **Gatekeeper** → `GateResult` (5-state machine: RMS/EMA on the time signal, NHWRSF + NINOS² on the treble spectrum); observations synced to runtime atomics | pipeline control flow, Engine resets, capture baton | **chain** |
+| 3 | **Gatekeeper** → `GateResult` (5-state machine: RMS/EMA on the time signal, NHWRSF + NINOS² on the treble spectrum); observations synced to runtime atomics | pipeline control flow, Engine resets, capture lifecycle | **chain** |
 | 4 | Bass magnitude spectrum | **Engine discovery** | **chain** |
 | 4 | Treble magnitude spectrum | spectrogram (`FrameOutput`) only | tap |
 | 5 | **Engine** → `Option<PitchResult>`: silence/transient resets → discovery (Stage-A discrete scoring over the bass magnitudes, M-of-N acquisition lock, tracker seeding) or tracking (adaptive Goertzel bank, NP gate, EMA) | telemetry, capture latch | **chain** |
 | 5b | **Strobe** → `StrobeResult`: fixed-reference beat phase, its sliding-window least-squares rate per reference, the per-reference baseband record and the unison lines it resolves (with the discriminator's verdict), and a bounded CFAR-gated coarse spectral readout at the nominated reference partial (skipped during `Silence`) | `FrameOutput` only | tap |
-| 6 | Capture accumulation & dispatch — the `CaptureState` baton: onset pre-roll → `Recording` on Stable → the latched fill target (1.5 s by default), decay, or an operator abort → dispatch gate → `CapturePayload` to the Worker (crossing #5), with backpressure recovery | Worker → MAT → `KeyMeasurement` → profile | **capture limb** (chain branch) |
-| 7 | `FrameOutput` assembly: treble magnitudes, gate telemetry, pitch fields when locked, strobe fields (angle, gate, rate, amplitude, unison lines + resolution + verdict) + `coarse_hz` unconditionally → triple buffer (crossing #2) | GUI | out |
+| 6 | Capture accumulation & dispatch — the pipeline's own `CaptureState`: the Worker's completion flag → the hop's capture command (`Arm`/`Cancel`) → onset pre-roll → `Recording` on Stable → the latched fill target (1.5 s by default), decay, or a `Cancel` → dispatch gate → `CapturePayload` to the Worker (crossing #5), with backpressure recovery (`02`) | Worker → MAT → `KeyMeasurement` → profile | **capture limb** (chain branch) |
+| 7 | `FrameOutput` assembly: treble magnitudes, gate telemetry, pitch fields when locked, strobe fields (angle, gate, rate, amplitude, unison lines + resolution + verdict) + `coarse_hz` and the `CaptureState` unconditionally → triple buffer (crossing #2) | GUI | out |
 
 Two things this table encodes that a "stream → gate → engine" sketch
 hides: the windowing/FFT front-end is itself a chain stage (the

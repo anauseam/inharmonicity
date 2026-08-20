@@ -107,7 +107,7 @@ pub const MAX_STRINGS_PER_KEY: usize = 3;
 ///
 /// A capture with no string sounding is not a capture, so that state means
 /// "the operator declared nothing" and the capture records `None` — see
-/// [`SoundingStrings::from_bits`].
+/// [`SoundingStrings::declared`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SoundingStrings {
     /// How many strings this key is strung with, in `1..=MAX_STRINGS_PER_KEY`.
@@ -134,36 +134,17 @@ impl SoundingStrings {
     /// only state the unison panel's own reading can be compared against.
     ///
     /// Never true of a declaration with nothing sounding — deserialization
-    /// does not go through [`Self::from_bits`], so `on_key: 0` can reach here
+    /// does not go through [`Self::declared`], so `on_key: 0` can reach here
     /// from a hand-edited profile.
     pub fn is_open(&self) -> bool {
         self.sounding_count() > 0 && self.sounding_count() == self.on_key
     }
 
-    /// Packs into
-    /// [`PipelineAtomics::capture_strings`](crate::pipeline::PipelineAtomics::capture_strings):
-    /// bits 0–2 the sounding set, bits 3–4 `on_key - 1`.
-    pub fn to_bits(&self) -> u8 {
-        let mut bits = (self.on_key.clamp(1, MAX_STRINGS_PER_KEY as u8) - 1) << 3;
-        for (i, s) in self.sounding.iter().enumerate() {
-            if *s {
-                bits |= 1 << i;
-            }
-        }
-        bits
-    }
-
-    /// Unpacks [`Self::to_bits`]. `None` when no string of the key is marked
-    /// sounding — the operator declared nothing, so the capture carries no
-    /// string state at all rather than a fabricated one.
-    pub fn from_bits(bits: u8) -> Option<Self> {
-        let on_key = ((bits >> 3) & 0b11).min(MAX_STRINGS_PER_KEY as u8 - 1) + 1;
-        let mut sounding = [false; MAX_STRINGS_PER_KEY];
-        for (i, s) in sounding.iter_mut().enumerate() {
-            *s = i < on_key as usize && bits & (1 << i) != 0;
-        }
-        let out = Self { on_key, sounding };
-        (out.sounding_count() > 0).then_some(out)
+    /// The declaration as a capture records it: `None` when no string of the
+    /// key is marked sounding — the operator declared nothing, so the capture
+    /// carries no string state at all rather than a fabricated one.
+    pub fn declared(self) -> Option<Self> {
+        (self.sounding_count() > 0).then_some(self)
     }
 
     /// Restrings the key, **clearing the sounding set** if the count changed.
@@ -1227,33 +1208,14 @@ mod tests {
         }
     }
 
-    /// The atomic that carries the declaration to the DSP thread is one byte,
-    /// so every state a session produces must survive the round trip.
-    #[test]
-    fn sounding_strings_round_trip_through_the_atomic() {
-        for on_key in 1..=MAX_STRINGS_PER_KEY as u8 {
-            for mask in 0..8u8 {
-                let mut s = SoundingStrings::UNDECLARED.with_on_key(on_key);
-                for i in 0..MAX_STRINGS_PER_KEY {
-                    if mask & (1 << i) != 0 {
-                        s = s.toggled(i);
-                    }
-                }
-                assert_eq!(
-                    SoundingStrings::from_bits(s.to_bits()),
-                    (s.sounding_count() > 0).then_some(s)
-                );
-            }
-        }
-    }
-
-    /// Silence is not a capture, so "nothing sounding" is the encoding of an
-    /// undeclared capture — the state ordinary use stays in.
+    /// Silence is not a capture, so "nothing sounding" is what an undeclared
+    /// capture looks like — the state ordinary use stays in.
     #[test]
     fn nothing_sounding_is_undeclared() {
-        assert_eq!(SoundingStrings::UNDECLARED.to_bits() & 0b111, 0);
-        assert_eq!(SoundingStrings::from_bits(0), None);
-        assert_eq!(SoundingStrings::from_bits(0b11_000), None);
+        assert_eq!(SoundingStrings::UNDECLARED.declared(), None);
+        assert_eq!(SoundingStrings::UNDECLARED.with_on_key(2).declared(), None);
+        let solo = SoundingStrings::UNDECLARED.toggled(0);
+        assert_eq!(solo.declared(), Some(solo));
     }
 
     /// A key cannot sound a string it does not have — neither by restringing
@@ -1274,7 +1236,7 @@ mod tests {
         );
         assert_eq!(bi.toggled(2).sounding, [false; MAX_STRINGS_PER_KEY]);
 
-        let single = SoundingStrings::from_bits(0b00_101).expect("string 1 sounds");
+        let single = SoundingStrings::UNDECLARED.with_on_key(1);
         assert_eq!(single.on_key, 1);
         assert_eq!(single.sounding, [true, false, false]);
 
@@ -1320,7 +1282,7 @@ mod tests {
         for n in 2..=MAX_STRINGS_PER_KEY as u8 {
             let s = SoundingStrings::UNDECLARED.with_on_key(n);
             assert_eq!(s.sounding_count(), 0, "{n} strings must be declared");
-            assert_eq!(SoundingStrings::from_bits(s.to_bits()), None);
+            assert_eq!(s.declared(), None);
         }
     }
 

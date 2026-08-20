@@ -44,9 +44,7 @@ use crate::algorithms::{
 };
 use crate::audio::BASS_WINDOW_SIZE;
 use crate::models::{self, CurveInput, KeyMeasurement, NOTES, Partial, TuningCurve};
-use crate::pipeline::{
-    AudioPool, CAPTURE_ANALYSIS_SAMPLES, CapturePayload, CaptureState, PipelineAtomics,
-};
+use crate::pipeline::{AudioPool, CAPTURE_ANALYSIS_SAMPLES, CapturePayload, PipelineAtomics};
 use crossbeam_channel::{Receiver, Sender, select};
 use realfft::RealToComplex;
 use rustfft::num_complex::Complex;
@@ -522,19 +520,20 @@ impl WorkerManager {
             mat_f0,
         );
 
-        // Step 5: Clean up and send result
-        let _ = result_tx.try_send(WorkerOutput::Measurement(measurement));
-
-        // Reset capture state back to Idle
-        atomics
-            .capture_state
-            .store(CaptureState::Idle as u8, Ordering::Relaxed);
-
-        // Return boxed arrays to memory pool
+        // Step 5: Clean up and send result.
+        //
+        // Strict order. The buffers go home first, so "not in flight" means the
+        // pipeline can borrow them again; the flag drops next, ending the
+        // lifecycle; the result goes last, so a consumer that arms again on
+        // this `Measurement` finds the lifecycle already finished.
         let _ = audio_pool.push(payload.stable_buffer);
         if let Some(dbuf) = payload.full_event_buffer {
             let _ = audio_pool.push(dbuf);
         }
+
+        atomics.capture_in_flight.store(false, Ordering::Relaxed);
+
+        let _ = result_tx.try_send(WorkerOutput::Measurement(measurement));
     }
 
     #[allow(clippy::too_many_arguments)]
