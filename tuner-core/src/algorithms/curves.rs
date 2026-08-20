@@ -65,27 +65,30 @@ impl CurveInput {
         Self::build(profile, false)
     }
 
-    /// Builds the engine input with the trust filter off, admitting auto-mode
-    /// and string-isolated captures alike. **Diagnostics only** — offline
-    /// harnesses (`examples/curve_compare`) run on regenerated auto-mode
-    /// captures, which are validation data, not curve sources. Never call this
-    /// on the user path.
-    pub fn from_profile_unfiltered(profile: &InharmonicityProfile) -> Self {
+    /// Builds the engine input with **only the auto-mode disqualification
+    /// waived** — a string-isolated capture is still refused, since a curve is
+    /// per note. **Diagnostics only**: the offline harnesses run on regenerated
+    /// auto-mode captures. Never call this on the user path.
+    pub fn from_profile_including_auto(profile: &InharmonicityProfile) -> Self {
         Self::build(profile, true)
     }
 
     /// Trust filter + Eq.-20 F₀ derivation: admits a key only when its
     /// provenance passes, B is finite and positive, it carries ≥ 2 partials,
     /// and the Rigaud Eq.-20 F₀ is solvable.
-    fn build(profile: &InharmonicityProfile, include_untrusted: bool) -> Self {
+    fn build(profile: &InharmonicityProfile, include_auto: bool) -> Self {
         let mut keys: Vec<Option<CurveKeyData>> = (0..88).map(|_| None).collect();
-        // One entry per key — `active` applies the provenance rule over the
-        // key's repeat list (newest trusted, else newest), so an auto-mode
-        // capture can never displace a manual one here.
-        for (idx, m) in profile.active_entries() {
-            if idx >= 88 || (!m.is_trusted() && !include_untrusted) {
-                continue;
-            }
+        // One entry per key. Both resolvers refuse a partial unison; they
+        // differ only in whether an auto-mode capture may stand for the key.
+        let resolved = (0..88u8).filter_map(|idx| {
+            let m = if include_auto {
+                profile.newest_whole_note(idx)?
+            } else {
+                profile.active(idx)?
+            };
+            Some((idx, m))
+        });
+        for (idx, m) in resolved {
             let Some(b) = m
                 .calculated_b
                 .map(f64::from)
@@ -1552,6 +1555,33 @@ mod tests {
         let curve = rigaud_pure(&input, &CurveParams::default());
         assert!(curve.cents.iter().all(|c| c.is_finite()));
         assert!(curve.flags.iter().all(|f| !f.measured));
+
+        // The diagnostics builder waives *this* disqualification and only this
+        // one: the offline harnesses run on regenerated auto-mode captures.
+        let diagnostic = crate::models::CurveInput::from_profile_including_auto(&profile);
+        assert_eq!(diagnostic.measured_count(), 88);
+    }
+
+    /// A string-isolated capture measured one string, not the note, so it feeds
+    /// no curve on **either** path — the diagnostics builder waives auto-mode
+    /// provenance alone (ADR 0012; `docs/internals/06-capture-sets.md`).
+    #[test]
+    fn test_solo_captures_never_feed_a_curve() {
+        let mut profile = synth_profile(0..88);
+        for entries in profile.measurements.values_mut() {
+            for m in entries {
+                m.sounding_strings = Some(crate::models::SoundingStrings::UNDECLARED.toggled(1));
+            }
+        }
+        assert_eq!(
+            crate::models::CurveInput::from_profile(&profile).measured_count(),
+            0
+        );
+        assert_eq!(
+            crate::models::CurveInput::from_profile_including_auto(&profile).measured_count(),
+            0,
+            "a solo is not a stand-in for the note on any path"
+        );
     }
 
     /// §2 detector: a wildly broken measured B (upper of a bass octave far

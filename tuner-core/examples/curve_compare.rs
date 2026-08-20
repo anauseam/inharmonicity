@@ -21,7 +21,7 @@
 //! **These numbers are diagnostics, not selection evidence** (n = 1, no
 //! aurally-tuned reference — §11's honesty clause). The captures are
 //! auto-mode provenance, admitted via
-//! `CurveInput::from_profile_unfiltered` — validation only; the user
+//! `CurveInput::from_profile_including_auto` — validation only; the user
 //! path admits manual captures exclusively.
 //!
 //! Usage:
@@ -153,7 +153,7 @@ fn main() {
         .and_then(|i| args.get(i + 1).cloned());
     let profile = load_profile(&path);
     // Validation data is auto-mode; see module doc.
-    let input = CurveInput::from_profile_unfiltered(&profile);
+    let input = CurveInput::from_profile_including_auto(&profile);
     let bxi = curves::instrument_b_fit(&input);
 
     println!("curve_compare — §11 diagnostics on {path}");

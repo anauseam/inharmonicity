@@ -182,12 +182,12 @@ pub enum WorkerOutput {
 ///
 /// Public because the frontend deletes the dump of a capture the user undoes,
 /// and both sides must agree on the name.
-pub fn dump_dir_name(measurement: &KeyMeasurement) -> String {
-    let (key_name, _) = models::find_nearest_note_by_index(measurement.key_index);
-    format!(
-        "key_{:03}_{}_{}",
-        measurement.key_index, key_name, measurement.last_captured
-    )
+///
+/// Takes the identity, not the measurement: a dump must still be nameable once
+/// its profile entry is gone — retention is bounded, the dumps are not.
+pub fn dump_dir_name(key_index: u8, epoch: &str) -> String {
+    let (key_name, _) = models::find_nearest_note_by_index(key_index);
+    format!("key_{key_index:03}_{key_name}_{epoch}")
 }
 
 /// Manages the lifecycle of the background worker thread.
@@ -550,7 +550,10 @@ impl WorkerManager {
         let Some(dump_dir) = dump_dir else {
             return;
         };
-        let dir = dump_dir.join(dump_dir_name(measurement));
+        let dir = dump_dir.join(dump_dir_name(
+            measurement.key_index,
+            &measurement.last_captured,
+        ));
 
         if let Err(e) = fs::create_dir_all(&dir) {
             eprintln!(

@@ -83,11 +83,16 @@ the three sets above carries and what ordinary tuning writes. **String 1 is the
 leftmost string of the note as the tuner faces the instrument.**
 
 The declaration is offered only when **String Isolation** is switched on in
-Settings (off by default, persisted in the app-settings document). While it is
-off the control is hidden *and* the standing declaration is retracted, so no
-capture can inherit a mute pattern from a session that has ended. A declaration
-carries two facts, and both are needed: how many strings the key is strung with,
-and which of them sounded. Without the count, one string of two and one of three
+Settings (off by default, persisted in the app-settings document) **and the app
+is in Manual mode**. Losing either condition hides the control *and* retracts
+the standing declaration, so no capture can inherit a mute pattern from a
+session that has ended. Manual mode is a condition because the declaration
+asserts which strings of a *named* key were damped: Auto latches the key by
+discovery, so a declaration carried into it would record a human's mute pattern
+against a key nobody named.
+
+A declaration carries two facts, and both are needed: how many strings the key
+is strung with, and which of them sounded. Without the count, one string of two and one of three
 are the same record, and neither "is this the open note" nor "do I have every
 solo" can be answered.
 
@@ -105,11 +110,9 @@ solo" can be answered.
   disqualifies a declared, non-open capture exactly as it disqualifies an
   auto-mode one, and the tuning curve and strobe read the key's open (or
   undeclared) capture instead. A key measured *only* in isolation resolves to
-  its newest solo, and the two consumers then part company: the curve **skips
-  the key** (it admits trusted entries only, so the key falls back to the
-  prior), while the strobe still reads that solo's `B`. A pass that never takes
-  an open capture therefore leaves a hole in the curve, not a wrong point in
-  it.
+  **nothing** — `active` returns `None`, both consumers fall back to the prior,
+  and the key reads as unmeasured. A pass that never takes an open capture
+  therefore leaves a hole in the curve, not a wrong point in it.
 - **`on_key` is declared, not derived.** Where a piano's single/bi/trichord
   breaks fall is instrument-specific, and this set is the first data that
   records them — on piano #2, D3 is still a bichord while A#3 is a trichord.
@@ -118,10 +121,13 @@ solo" can be answered.
   a forgotten mute would record a solo as an open capture. Changing the count
   clears the sounding set for the same reason — a pattern held across the
   change would declare a solo nobody made.
-- **The profile is not the set.** `MAX_MEASUREMENTS_PER_KEY` caps a key at 8
-  retained measurements, so an isolation key with four configurations × four
-  repeats loses most of them from the profile; the audio is unaffected. Read the
-  set from the dumps.
+- **The profile is not the set.** Retention is bounded per key — 8 trusted
+  entries plus a reserve of 4 that no consumer reads — so an isolation key keeps
+  every open capture it has room for and *one row per solo configuration*, not
+  every repeat. The audio is unaffected either way: eviction drops a profile
+  entry, never a dump. Read the set from the dumps. (Before the per-class
+  budgets, a shared cap of 8 let the solos displace the open captures instead:
+  A#3 retained one of its thirteen — see the design note §1.1.)
 - Validation-only like the others, and doubly so until a second instrument's
   worth of it exists.
 

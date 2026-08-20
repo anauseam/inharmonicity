@@ -49,7 +49,7 @@ fn entry_row(key: u8, e: &InspectorRow) -> Element<'static, Message> {
     if let Some(strings) = e.sounding_strings {
         label = label.push(text(strings.to_string()).size(11).color(INK_SECONDARY));
     }
-    if e.is_active {
+    if e.in_use {
         label = label.push(
             text("in use — the entry the curve and strobe read")
                 .size(11)
@@ -144,16 +144,25 @@ pub fn create_inspector_panel(
             // Collapsed to the entry in use: the app already resolves which
             // measurement a key presents, so the history is an override, not a
             // question the user is asked on arrival.
+            let (used, unused): (Vec<_>, Vec<_>) =
+                data.inspector_rows.iter().partition(|e| e.trusted);
             let mut rows = column![].spacing(4);
-            for e in &data.inspector_rows {
-                if data.inspector_expanded || e.is_active {
+            for e in &used {
+                if data.inspector_expanded || e.in_use {
                     rows = rows.push(entry_row(key, e));
                 }
             }
-            if data.inspector_rows.is_empty() {
-                rows = rows.push(text("This key has no retained measurements.").size(13));
+            // "Nothing at all" and "nothing readable" are different answers,
+            // and only the second needs explaining.
+            if used.is_empty() {
+                let line = if unused.is_empty() {
+                    "This key has no retained measurements."
+                } else {
+                    "No measurement in use — this key falls back to the prior."
+                };
+                rows = rows.push(text(line).size(13));
             }
-            let earlier = data.inspector_rows.len().saturating_sub(1);
+            let earlier = used.len().saturating_sub(1);
             if earlier > 0 {
                 let label = if data.inspector_expanded {
                     "Hide earlier measurements".to_string()
@@ -165,6 +174,25 @@ pub fn create_inspector_panel(
                         .padding([3, 8])
                         .on_press(Message::ToggleInspectorHistory),
                 );
+            }
+            // Retained but read by nothing. Filed apart and closed by
+            // default: evidence to go looking for, not part of the review.
+            if !unused.is_empty() {
+                let label = if data.inspector_unused_expanded {
+                    "Hide captures not in use".to_string()
+                } else {
+                    format!("Show {} not in use", unused.len())
+                };
+                rows = rows.push(
+                    button(text(label).size(12))
+                        .padding([3, 8])
+                        .on_press(Message::ToggleInspectorUnused),
+                );
+                if data.inspector_unused_expanded {
+                    for e in &unused {
+                        rows = rows.push(entry_row(key, e));
+                    }
+                }
             }
 
             column![

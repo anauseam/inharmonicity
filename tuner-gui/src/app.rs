@@ -11,7 +11,7 @@
 //! - **Updates**: 60 FPS continuous updates via subscription system
 
 use crate::library::{self, AppSettings, ProfileSort};
-use crate::session::ProfileSession;
+use crate::session::{ProfileSession, UndoneCapture};
 use crate::views::{main_view::create_main_view, settings_view::create_settings_view};
 use crate::widgets::envelope::ENVELOPE_HISTORY_LENGTH;
 use crate::widgets::unison_display::{UnisonMode, UnisonRow};
@@ -121,6 +121,8 @@ pub enum Message {
     ReviewKey(u8),
     /// Show or hide the reviewed key's earlier measurements.
     ToggleInspectorHistory,
+    /// Show or hide the reviewed key's captures that no consumer reads.
+    ToggleInspectorUnused,
     /// Discard one retained measurement of a key. Its audio stays on disk.
     DropMeasurement(u8, usize),
     /// Arm a fresh capture of a key, via the ordinary manual path.
@@ -277,7 +279,11 @@ pub struct InspectorRow {
     /// measures one string, not the note.
     pub sounding_strings: Option<models::SoundingStrings>,
     /// This is the entry [`models::InharmonicityProfile::active`] resolves to.
-    pub is_active: bool,
+    pub in_use: bool,
+    /// Whether any consumer may read this entry — which section the row is
+    /// filed under. Carried rather than re-derived here, so
+    /// `KeyMeasurement::is_trusted` stays the one copy of the rule.
+    pub trusted: bool,
 }
 
 /// The engine and reference-mode selections both persist with the profile
@@ -557,6 +563,9 @@ pub struct AppDisplayData {
     /// Collapsed by default — `active` already resolves which entry a key
     /// presents, so the history is an override rather than a question.
     pub inspector_expanded: bool,
+    /// Show the reviewed key's retained-but-unread captures. Closed by
+    /// default: evidence to go looking for, not part of reviewing the note.
+    pub inspector_unused_expanded: bool,
 
     // --- Curve display state (design §9/§13) ---
     /// The curve gallery is open in the settings main panel.
@@ -861,6 +870,7 @@ impl Default for TunerApp {
                 inspector_key: None,
                 inspector_rows: Vec::new(),
                 inspector_expanded: false,
+                inspector_unused_expanded: false,
                 curve_select_visible: false,
                 curve_detail: None,
                 selected_engine: EngineChoice::MultiBalanced,
@@ -1010,8 +1020,9 @@ impl TunerApp {
                 let entries = profile.measurements.get(&k)?;
                 // Identified by address rather than by value: repeats of one
                 // key differ only in fields the user may legitimately see
-                // repeated.
-                let active = profile.active(k)?;
+                // repeated. `None` when the key holds nothing trusted — its
+                // rows still render, none of them marked in use.
+                let active = profile.active(k);
                 Some(
                     entries
                         .iter()
@@ -1023,7 +1034,8 @@ impl TunerApp {
                             partials: m.partials.len(),
                             b: m.calculated_b,
                             sounding_strings: m.sounding_strings,
-                            is_active: std::ptr::eq(m, active),
+                            in_use: active.is_some_and(|a| std::ptr::eq(m, a)),
+                            trusted: m.is_trusted(),
                         })
                         .collect(),
                 )
@@ -1088,8 +1100,8 @@ impl TunerApp {
     /// Deletes a capture's diagnostics dump — the **undo** path only. A drop
     /// distrusts the measurement, not the recording, so it keeps the audio
     /// (design note §5.2).
-    fn remove_dump(root: &Path, measurement: &models::KeyMeasurement) {
-        let dir = root.join(worker::dump_dir_name(measurement));
+    fn remove_dump(root: &Path, undone: &UndoneCapture) {
+        let dir = root.join(worker::dump_dir_name(undone.key, &undone.epoch));
         if dir.is_dir() {
             match std::fs::remove_dir_all(&dir) {
                 Ok(()) => eprintln!(
@@ -1721,6 +1733,10 @@ impl TunerApp {
                     .target_note
                     .store(255, Ordering::Relaxed);
                 self.display_data.smoothing_buffer.clear();
+                // A declaration names strings of a key the operator named;
+                // Auto latches the key by discovery. Retracted, not just
+                // hidden, or a capture could inherit it.
+                self.set_capture_strings(models::SoundingStrings::UNDECLARED);
             }
             Message::ToggleMeasurementMode => {
                 // This toggles the measurement mode on/off
@@ -1755,12 +1771,13 @@ impl TunerApp {
                 }
             }
             Message::UndoLastCapture => {
-                if let Some((idx, bad)) = self.session.undo() {
+                if let Some(undone) = self.session.undo() {
+                    let idx = undone.key;
                     // The dump is per-capture (timestamped dir, so repeat
                     // captures are all retained) — an undone capture is the
                     // user declaring it bad, so the dump goes with it.
                     let root = library::diagnostics_dir_for(&self.session.profile().identity.id);
-                    Self::remove_dump(&root, &bad);
+                    Self::remove_dump(&root, &undone);
                     // Revert the live engine template too (measured B if a prior
                     // measurement remains, else back to the Rigaud prior).
                     if let Some(host) = self.host_handle.as_mut() {
@@ -1793,17 +1810,23 @@ impl TunerApp {
                 // A different key's history is a different question; re-asking
                 // it is one click.
                 self.display_data.inspector_expanded = false;
+                self.display_data.inspector_unused_expanded = false;
                 self.display_data.inspector_key = Some(key);
                 self.refresh_inspector();
             }
             Message::ToggleInspectorHistory => {
                 self.display_data.inspector_expanded = !self.display_data.inspector_expanded;
             }
+            Message::ToggleInspectorUnused => {
+                self.display_data.inspector_unused_expanded =
+                    !self.display_data.inspector_unused_expanded;
+            }
             Message::ReviewKey(key) => {
                 self.close_settings_panels();
                 self.display_data.inspector_visible = true;
                 self.display_data.settings_view_visible = true;
                 self.display_data.inspector_expanded = false;
+                self.display_data.inspector_unused_expanded = false;
                 self.display_data.inspector_key = Some(key);
                 self.refresh_inspector();
             }
@@ -1814,7 +1837,7 @@ impl TunerApp {
                     eprintln!(
                         "[MAIN] Capture audio kept at {}",
                         library::diagnostics_dir_for(&self.session.profile().identity.id)
-                            .join(worker::dump_dir_name(&dropped))
+                            .join(worker::dump_dir_name(key, &dropped.last_captured))
                             .display()
                     );
                     // The key may now resolve to a different entry, or to none.
@@ -2516,9 +2539,9 @@ mod tests {
         assert!(!state, "an alternating verdict must not switch the source");
     }
 
-    /// The frozen B must be the entry the key presents — newest trusted, else
-    /// newest — so locking cannot silently retarget a key onto an unattended
-    /// capture the curve itself excluded.
+    /// The frozen B must be the entry the key presents — the newest **trusted**
+    /// one — so locking cannot retarget a key onto a capture the curve excluded.
+    /// A key with nothing trusted carries no B and falls back to the prior.
     #[test]
     fn locked_b_snapshots_the_active_entry() {
         let mut profile = InharmonicityProfile::new("test");
@@ -2531,14 +2554,20 @@ mod tests {
             captured_in_auto: auto,
             sounding_strings: None,
         };
+        let solo = |key, b| models::KeyMeasurement {
+            sounding_strings: Some(models::SoundingStrings::UNDECLARED.toggled(1)),
+            ..entry(key, b, false)
+        };
         profile.record(entry(3, 1e-4, false));
         profile.record(entry(3, 9e-4, true)); // newer, but unattended
-        profile.record(entry(4, 2e-4, true)); // auto only: still what key 4 presents
+        profile.record(entry(4, 2e-4, true)); // auto only
+        profile.record(solo(6, 3e-4)); // isolation only
 
         let b = snapshot_b(&profile);
         assert_eq!(b[3], Some(1e-4), "a newer auto entry must not displace it");
-        assert_eq!(b[4], Some(2e-4));
+        assert_eq!(b[4], None, "an auto-only key falls back to the prior");
         assert_eq!(b[5], None, "unmeasured keys carry no B");
+        assert_eq!(b[6], None, "a solo measured one string, not the note");
     }
 
     /// A sustained verdict switches, and only on the full run: one agreeing hop

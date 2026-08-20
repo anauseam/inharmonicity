@@ -300,7 +300,7 @@ fn main() {
     std::fs::create_dir_all(&out_dir).expect("create out dir");
 
     let profile = load_profile(&path);
-    let input = CurveInput::from_profile_unfiltered(&profile);
+    let input = CurveInput::from_profile_including_auto(&profile);
     let bxi = curves::instrument_b_fit(&input);
     println!(
         "auralize — additive resynthesis A/B/C/D on {path}\n\
