@@ -44,6 +44,15 @@ of the key's strings were sounding, or `null` where none was made — which is
 every capture outside the mute-isolation set. `regenerate_partials` passes it
 through.
 
+## Shared code
+
+`examples/common/` is the one loading path — capture discovery, raw `f32`
+reading, the `analysis.json` / `regenerate_partials` schemas,
+`metadata.sounding_strings`, register labels, and the piano-2 ±200 ¢ rule as a
+function a caller cannot forget to apply. Include it with `mod common;`. It is
+harness plumbing and ships in no binary; a `tuner-core` module would be an
+architecture change. Prompt AF moves the remaining harnesses onto it.
+
 ## The harnesses
 
 ### Engine and discovery
@@ -137,6 +146,22 @@ through.
   ```bash
   cargo run --release --example strobe_replay -- diagnostics
   ```
+
+- **`isolation`** — drives the shipped `Strobe` bank over the **mute-isolation
+  set** and reports what the unison panel would show against isolation truth:
+  the false-beat positive control on 193 solo captures (C2), availability per
+  register, and a JSON dump of per-capture line positions for the scoring step.
+  Reproduces ADR 0014 §§3–5; the truth-side tables are
+  `scripts/isolation_truth.py`.
+
+  ```bash
+  cargo run --release --example regenerate_partials -- <dump_dir> > iso.json
+  cargo run --release --example isolation -- iso.json <dump_dir> --json panel.json
+  python3 scripts/isolation_truth.py iso.json panel.json
+  ```
+
+  Requires captures carrying `metadata.sounding_strings`; a capture without a
+  declaration is not part of that set whatever directory it sits in.
 
 - **`auralize`** — renders each candidate tuning curve to a loudness-matched WAV
   by offline additive resynthesis (`tuner_core::synth`), so a stretch can be

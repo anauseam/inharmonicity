@@ -49,23 +49,30 @@ untested premise.
 directory under the instrument's own `identity.id` (profile `Piano2_extended` —
 the same physical instrument as `diagnostics_piano2/`, in its **as-found** state
 before tuning). 555 captures: a full-compass open pass at ~4 repeats per key,
-plus seven complete isolation sets — C2, F2, C3, D3 (bichords) and A#3, A4, C5,
+plus eight complete isolation sets — C2, F2, C3, D3 (bichords) and A#3, A4, C5,
 C6 (trichords) — each with every solo and the open note repeated. Consume it
 through `regenerate_partials`, never the cached `analysis.json`.
 
 **What it established**, and none of the other sets could:
 
-- **Per-string f₀ repeats to 0.04–0.16 ¢** from the bass through the upper mid,
-  so a solo capture's f₀ is a usable tuning target — 6–25× finer than a
-  sub-1-¢ tolerance.
+- **Per-string f₀ repeats to 0.005–0.45 ¢** below C5 (median 0.114 ¢), so a
+  solo capture's f₀ is a usable tuning target — 2–20× finer than a sub-1-¢
+  tolerance. (Published here as 0.04–0.16 ¢ before the failed-solo screen was
+  corrected; A#3 sits at 0.33–0.45 ¢. ADR 0014 §2.)
 - **Precision collapses above C5**, tracking partial count: repeat σ is 0.14 ¢
   (A0–B1, 32 partials), 0.27 ¢ (C4–B4, 17), 0.75 ¢ (C5–B5, 10) and **2.16 ¢
   (C6–B6, 5)**. At C6 the estimator is bistable — its open captures fall into
   two clusters 13 ¢ apart. Per-string work is not feasible above ~C5, and a
   longer analysis window cannot rescue it: the limit is how many partials exist
   above the floor, not observation time.
-- **As-found splits ran 1.0–17.5 ¢**, rising with pitch — 1.0–3.9 ¢ below A3,
-  10.6–17.5 ¢ from A4 up.
+- **As-found splits ran 0.09–18.5 ¢**, rising with pitch — the bass and tenor
+  unisons are *well set* (0.88–3.67 ¢) and A4 upward are not (9.2–18.5 ¢).
+- **The panel's resolution is a beat rate, one number for the whole compass**
+  (`2/T` = 1.54 Hz at the ring cap). Cents figures quoted per key must be taken
+  at the **displayed partial**, not the fundamental: a pair beating at `r` at f₁
+  beats at `n·r` at partial `n`, so the bass floor is 6.7 ¢ at C2's partial 6,
+  not the 40 ¢ a per-fundamental reading gives. ADR 0014 §3 carries the compass
+  curve and the three sawtooth discontinuities at the `n*` breaks.
 - **Per-string B agrees to 0.4 % at A#3 and 1.7–2.5 % at A4/C5, but 4.7–8.3 % in
   the bass bichords** — 10–20× ADR 0009's bass repeat noise. If that survives
   scrutiny, the two strings of a bass unison genuinely differ in B, which would
@@ -100,11 +107,15 @@ solo" can be answered.
 
 - **A capture with `sounding_strings: null` is not part of this set**, whatever
   directory it sits in. The declaration is the set.
-- **Screen bass solos on partial count.** A muted bass string is quiet enough
-  that MAT can lock onto something else entirely: 2 of 8 C2 solo attempts came
-  back with 17–20 partials and a B 30–90× the plausible value, against 32
-  partials in the good captures. A solo whose partial count falls far below its
-  key's open captures is a failed capture, not a measurement.
+- **Screen bass solos on within-key `B` agreement, not on partial count.** A
+  muted bass string is quiet enough that MAT can lock onto something else
+  entirely: 2 of 8 C2 solo attempts came back with 17–20 partials against 32 in
+  the good captures. But **the count alone over-rejects** — D3 has a good
+  24-partial capture whose f₀ and B agree with its siblings — while the failures
+  announce themselves in `B`, disagreeing with their own siblings by 30–90×
+  where good captures agree to a fraction of a percent. Screening on `B` at any
+  cut inside that chasm is what ADR 0014 §1 uses; unscreened, C2's f₀
+  repeatability reads 56.6 ¢ instead of 0.078 ¢.
 - **A solo capture measures one string, not the note**, so the profile retains
   it but never treats it as the key's measurement: `KeyMeasurement::is_trusted`
   disqualifies a declared, non-open capture exactly as it disqualifies an
@@ -169,6 +180,12 @@ instrument (or 2), a difference of a few keys is the McNemar-p ≈ 0.2 class of
 evidence. Report per-register counts and which keys moved; do not tune on them,
 and do not recalibrate the synthetic generator to match them.
 
+The rules for turning what these captures measure into a *decision* — what has to
+be pre-registered, what a threshold may be anchored to, and when a finding is
+only suggestive — are in
+[`07-evidence-and-methodology.md`](07-evidence-and-methodology.md). This file is
+the data; that one is the inference.
+
 **Piano #2 must be consumed through `regenerate_partials`, never through raw
 `analysis.json`.** The deep-bass entries were written before the
 `worker::MAT_SEED_TOLERANCE` fix and carry rumble-seeded garbage — measured:
@@ -211,3 +228,6 @@ capture, are documented in
 - ADR 0011 — the coarse readout: CFAR profile, P_fa calibration, n\* selection
   (both pianos **and** the guitar — the cross-instrument disagreement at n = 5
   is what fixed n\* = 4).
+- ADR 0014 — the unison panel against isolation truth: the operating regime in
+  beats, the false-beat positive control, the coupling bound, and the per-string
+  `B` spread (the mute-isolation set).
