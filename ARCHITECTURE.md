@@ -145,7 +145,7 @@ This is a single detached worker thread spawned at pipeline construction inside 
   4. Runs MAT (Median-Adjustive Trajectories — serial trajectory growth, reading partial frequencies from the CSPE map) to jointly estimate the partials, the refined _f₀_, and the inharmonicity coefficient ($B$) via the median of pairwise partial combinations.
   5. Writes diagnostic files (`audio.raw` + `analysis.json`) to the open instrument's dump directory — `diagnostics/<identity.id>/`, so captures follow the instrument they were taken on rather than its name.
 - **Action (curve job):** When the UI requests a tuning-curve recompute (`WorkerJob::Curve`, carrying a trust-filtered `CurveInput` snapshot), the worker runs all curve engines and returns a `CurveBundle`. This lives on the worker because engine (c)'s Giordano dissonance scans alone take ~1.3 s — far too slow for the GUI thread. Jobs are latest-wins (a `generation` counter drops superseded bundles); the read-only snapshot means a curve recompute can never race the profile a `KeyMeasurement` writes.
-- **Output:** Sends a `WorkerOutput` back to the GUI over one shared result channel — `Measurement(KeyMeasurement)` (partials, $f_0$, $B$) per capture, `Curve(Box<CurveBundle>)` per recompute. After a capture it resets `CaptureState` to `Idle` and recycles the audio buffer into the `AudioPool`; curve jobs touch neither the baton nor the pool.
+- **Output:** Sends a `WorkerOutput` back to the GUI over one shared result channel — `Measurement(KeyMeasurement)` (partials, $f_0$, $B$) per capture, `Curve(Box<CurveBundle>)` per recompute. After a capture it recycles the audio buffers into the `AudioPool`, then clears `capture_in_flight` — which is what ends the capture lifecycle — and only then sends the measurement, so a consumer that arms on it finds the lifecycle already finished. Curve jobs touch neither the pool nor the flag.
 
 #### Thread 4: The UI Thread (The Visual Renderer)
 
@@ -164,11 +164,13 @@ Because `tuner-core` enforces strict zero-allocation, wait-free real-time audio 
 | **DSP Parameters**    | `Arc<Atomic*>`           | UI (4) ↔ DSP (2)              | Wait-free configuration and metric reads/writes.                                                                                                |
 | **Capture Dispatch**  | crossbeam SPSC (bounded) | DSP (2) → Worker (3)          | `CapturePayload` containing pooled audio buffer + metadata.                                                                                     |
 | **Buffer Recycling**  | Lock-Free Object Pool    | DSP (2) ↔ Worker (3)          | Recycled `Box<[f32]>` buffers at the `CAPTURE_MAX_SAMPLES` ceiling — zero allocation during capture.                                             |
-| **Capture Lifecycle** | `AtomicU8` (baton-pass)  | UI (4) → DSP (2) → Worker (3) | `CaptureState`: Idle → Armed → Recording → Processing → Idle, plus Recording → Idle when the operator drops a take.                              |
+| **Capture Lifecycle** | Pipeline-owned `enum`, published on `FrameOutput` | DSP (2) → UI (4) | `CaptureState`: Idle → Armed → Recording → Processing → Idle, plus Recording → Idle when the operator drops a take. Not shared state — one thread makes every transition. |
+| **Capture Completion** | `AtomicBool`             | Worker (3) → DSP (2)          | `capture_in_flight`: the pipeline raises it as it dispatches, the Worker clears it once the buffers are home. The one fact the pipeline cannot observe for itself. |
 | **Worker Results**    | crossbeam SPSC (bounded) | Worker (3) → UI (4)           | `WorkerOutput`: `Measurement(KeyMeasurement)` per capture, `Curve(CurveBundle)` per recompute.                                                  |
 | **Worker Jobs**       | crossbeam SPSC (bounded) | UI (4) → Worker (3)           | `WorkerJob`: curve recomputes (`CurveInput` snapshot, latest-wins) and the dump directory. Coalescing is per kind — a superseded curve is worthless, a superseded directory misfiles captures. |
 | **Template Update**   | `ringbuf` SPSC           | UI (4) → DSP (2)              | Recompiled `KeyProfile` (measured $B$) into the engine's templates.                                                                             |
 | **Strobe References** | `ringbuf` SPSC           | UI (4) → DSP (2)              | `StrobeRefUpdate` (curve targets + coarse partial) into the `Strobe`. Second instance of the Template-Update crossing class, not a new channel. |
+| **Capture Commands**  | `ringbuf` SPSC           | UI (4) → DSP (2)              | `CaptureCommand`: `Arm(ArmRequest)` — fill target + string declaration — and `Cancel`. Third instance of the same class; the pipeline makes the transition itself on receipt. |
 
 The channel-by-channel contract is documented in
 [02-cross-thread-communication.md](docs/internals/02-cross-thread-communication.md).
@@ -258,19 +260,27 @@ deliberately serialised at the source: a stable note is held for
 well within that window. Adding more worker threads would buy
 nothing and would complicate buffer recycling.
 
-### `AtomicU8` baton-pass instead of a channel for `CaptureState`
+### One owner for `CaptureState`, not a shared state machine
 
-`CaptureState` is read by three threads (GUI, DSP, Worker) and
-written by all three at different points in its lifecycle. A
-channel would require either a fan-out fabric (multiple receivers
-need the same value) or polling discipline (each reader handles a
-backlog). A single `AtomicU8` whose transitions are partitioned by
-convention turned out to be much simpler: each thread writes only
-the transitions it owns, and reads are cheap.
+Three threads have a stake in the capture lifecycle — the UI arms and
+cancels, the DSP thread runs the record, the Worker finishes it — so the
+obvious shape is a shared `AtomicU8` whose transitions are partitioned
+between them by convention. That puts a state machine in shared memory,
+and the only way to defend one is to check every transition at runtime.
 
-The current implementation is convention-only (plain `.store`/
-`.load` with `Ordering::Relaxed`); hardening it to
-`compare_exchange` is tracked as a follow-up in [TODO.md](TODO.md).
+`CaptureState` is instead a plain `enum` the pipeline owns. Arming is a
+**command** the UI sends over a `ringbuf` (the Capture Commands row
+above); the Worker reports completion by clearing one `AtomicBool`. With
+one thread making every transition, an out-of-sequence move has no code
+path to come from — the compiler enforces through `&mut self` what a
+`compare_exchange` could only detect afterwards. The state reaches the
+UI on `FrameOutput`, which is where a one-way per-hop snapshot belongs
+anyway.
+
+The general rule this is an instance of: **when a state machine can have
+one owner, give it one owner** — hardening shared mutation is the weaker
+move. The transition table is in
+[02-cross-thread-communication.md](docs/internals/02-cross-thread-communication.md).
 
 ### Hardcoded 44.1kHz Sample Rate Architecture
 

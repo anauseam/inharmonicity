@@ -24,9 +24,9 @@ crossing the GUI never touches):
    Split / Handle pattern. The GUI keeps the ports; the audio thread
    takes the pipeline. (Construction, not a runtime crossing.)
 2. `PipelinePorts.handle.atomics` — wait-free reads of `RuntimeAtomics`
-   and wait-free writes of `ConfigAtomics`, plus the `CaptureState`
-   lifecycle atomic. (`handle` is the cloneable `PipelineHandle`.)
-   Crossing #3.
+   and wait-free writes of `ConfigAtomics`. Nothing capture-related: the
+   lifecycle arrives on `FrameOutput` and leaves as a `CaptureCommand`.
+   (`handle` is the cloneable `PipelineHandle`.) Crossing #3.
 3. `PipelinePorts.worker_rx` — a crossbeam SPSC receiver for `WorkerOutput`
    coming back from the Worker: `Measurement` results per capture and
    `Curve` bundles per recompute (one enum stream). The Worker → UI leg
@@ -34,9 +34,11 @@ crossing the GUI never touches):
 4. `PipelinePorts.worker_job_tx` — a crossbeam SPSC sender for `WorkerJob`
    background requests to the Worker (UI → Worker; today curve recomputes).
    Crossing #6.
-5. `PipelinePorts.profiles` — a `ringbuf` SPSC producer for pushing
-   recompiled `KeyProfile` templates back into the live engine (UI → DSP).
-   Crossing #4.
+5. `PipelinePorts.profiles`, `.strobe_refs`, `.capture_commands` — one
+   `ringbuf` SPSC producer each, all UI → DSP and all crossing #4: the
+   recompiled `KeyProfile` templates the live engine reads, the strobe's
+   reference set, and the capture-lifecycle commands (`Arm` / `Cancel`).
+   Three instances of one shape, not three shapes.
 6. A `triple_buffer` carrying the live, continuous `FrameOutput` from
    the DSP thread to the GUI for visualization. Crossing #2.
 
@@ -165,8 +167,9 @@ Every audio hop runs exactly one function:
    lines, and the coarse spectral readout; receives a `StrobeResult`.
 5. Syncs observations back to the shared atomics and produces a
    `FrameOutput` for the GUI's `triple_buffer`.
-6. Manages capture accumulation: `Armed → Recording → dispatch to
-   Worker` via `CaptureState`.
+6. Manages the capture lifecycle: applies the hop's `CaptureCommand`,
+   then `Armed → Recording → dispatch to Worker`, moving its own
+   `CaptureState` and publishing it on the frame.
 
 New DSP behaviour goes inside this function (or in a component it
 already calls). Bypassing it — for example, having `audio.rs` call into

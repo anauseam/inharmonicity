@@ -27,8 +27,8 @@ use tuner_core::{
     audio::{self, AudioSource, HOP_RATE_HZ, HostHandle, SAMPLE_RATE},
     models::{self, CurveInput, InharmonicityProfile, NOTES},
     pipeline::{
-        CAPTURE_DEFAULT_SAMPLES, CAPTURE_MAX_SAMPLES, CaptureState, PipelineHandle, load_f32,
-        store_f32,
+        ArmRequest, CAPTURE_DEFAULT_SAMPLES, CAPTURE_MAX_SAMPLES, CaptureCommand, CaptureState,
+        PipelineHandle, load_f32, store_f32,
     },
     strobe::StrobeRefUpdate,
     strobe::unison::UnisonVerdict,
@@ -766,6 +766,10 @@ pub struct TunerApp {
     curve_dirty: bool,
     /// Dump directory the Worker has not accepted yet; retried every tick.
     pending_dump_dir: Option<PathBuf>,
+    /// Capture command the DSP ring has not taken yet; retried every tick, the
+    /// same pattern as `pending_dump_dir`. A newer command replaces it — the
+    /// pipeline coalesces to the newest of a hop in the same way.
+    pending_capture_command: Option<CaptureCommand>,
     /// A curve job is with the Worker and its bundle has not come back.
     ///
     /// Visible state, not bookkeeping: the Worker services captures ahead of
@@ -822,6 +826,7 @@ impl Default for TunerApp {
             curve_bundle: None,
             curve_dirty: false,
             pending_dump_dir: None,
+            pending_capture_command: None,
             curve_in_flight: false,
             curve_generation: 0,
             strobe_lock: StrobeLock::Disengaged,
@@ -1027,33 +1032,57 @@ impl TunerApp {
         self.display_data.inspector_rows = rows;
     }
 
-    /// Publishes the string declaration the next capture will carry. The
-    /// pipeline decodes the atomic when it dispatches, so a change lands on
-    /// the next capture and never on the one in flight.
-    fn set_capture_strings(&mut self, strings: models::SoundingStrings) {
-        self.display_data.sounding_strings = strings;
-        self.pipeline_handle
-            .atomics
-            .capture_strings
-            .store(strings.to_bits(), Ordering::Relaxed);
-    }
-
-    /// Publishes the fill target a capture records to. The pipeline latches it
-    /// at `Armed → Recording`, so a change lands on the next capture and never
-    /// on the one in flight; it clamps the value as well, so this side only has
-    /// to stay inside the ceiling.
-    fn apply_capture_duration(&mut self) {
-        let samples = if self.display_data.extended_capture {
+    /// What the next record should be: the fill target the duration control
+    /// sets, and the operator's standing string declaration. Both are held
+    /// here and ride every [`CaptureCommand::Arm`].
+    fn arm_request(&self) -> ArmRequest {
+        let target_samples = if self.display_data.extended_capture {
             let requested =
                 (self.display_data.extended_capture_secs * SAMPLE_RATE as f32).round() as usize;
             requested.clamp(CAPTURE_DEFAULT_SAMPLES, CAPTURE_MAX_SAMPLES)
         } else {
             CAPTURE_DEFAULT_SAMPLES
         };
-        self.pipeline_handle
-            .atomics
-            .capture_samples
-            .store(samples as u32, Ordering::Relaxed);
+        ArmRequest {
+            target_samples,
+            declared_strings: self.display_data.sounding_strings.declared(),
+        }
+    }
+
+    /// Sends a capture-lifecycle command to the DSP thread (crossing #4),
+    /// holding it for the next tick if the ring is full.
+    fn send_capture_command(&mut self, command: CaptureCommand) {
+        self.pending_capture_command = Some(command);
+        self.pump_capture_command();
+    }
+
+    /// Retries the held command, if any.
+    fn pump_capture_command(&mut self) {
+        let Some(command) = self.pending_capture_command else {
+            return;
+        };
+        if let Some(host) = self.host_handle.as_mut()
+            && host.capture_commands.send(command)
+        {
+            self.pending_capture_command = None;
+        }
+    }
+
+    /// Re-states what the pending record is when its parameters change while
+    /// armed. They ride the `Arm`, so a declaration or duration set *after*
+    /// arming — the ordinary rhythm in auto mode, where the app re-arms itself
+    /// the moment a measurement lands — would otherwise reach the capture
+    /// after the next one.
+    fn republish_arm(&mut self) {
+        if self.display_data.capture_state == CaptureState::Armed {
+            self.send_capture_command(CaptureCommand::Arm(self.arm_request()));
+        }
+    }
+
+    /// Records the string declaration the next capture will carry.
+    fn set_capture_strings(&mut self, strings: models::SoundingStrings) {
+        self.display_data.sounding_strings = strings;
+        self.republish_arm();
     }
 
     /// Deletes a capture's diagnostics dump — the **undo** path only. A drop
@@ -1580,7 +1609,6 @@ impl TunerApp {
         app.display_data.string_isolation = app.app_settings.string_isolation;
         app.display_data.extended_capture = app.app_settings.extended_capture;
         app.display_data.extended_capture_secs = app.app_settings.extended_capture_secs;
-        app.apply_capture_duration();
         // The picker only; the profile's own saved `reference_mode` stays
         // authoritative, so this does not run `set_instrument`'s coupling.
         app.display_data.instrument = app.app_settings.instrument;
@@ -1698,37 +1726,32 @@ impl TunerApp {
                 // This toggles the measurement mode on/off
                 self.display_data.measurement_mode_active =
                     !self.display_data.measurement_mode_active;
-                let mut new_state = CaptureState::Idle;
 
                 if self.display_data.measurement_mode_active {
-                    eprintln!("[MAIN] Measurement mode ON - starting in Armed state");
-                    new_state = CaptureState::Armed;
+                    eprintln!("[MAIN] Measurement mode ON - arming");
+                    let request = self.arm_request();
+                    self.send_capture_command(CaptureCommand::Arm(request));
                 } else {
                     eprintln!("[MAIN] Measurement mode OFF");
+                    self.send_capture_command(CaptureCommand::Cancel);
                 }
-
-                self.display_data.capture_state = new_state.clone();
-                self.pipeline_handle
-                    .atomics
-                    .capture_state
-                    .store(new_state as u8, Ordering::Relaxed);
             }
             Message::CaptureButtonClicked => {
-                // Clicked the active button
-                // Wait-free: if we are in measurement mode, and state is Idle, we Arm it.
-                // If it is Armed, we can optionally go to Idle (to cancel), but measurement mode remains active.
+                // The button arms and disarms; the DSP thread owns the
+                // lifecycle, so what it toggles from is the state it reported.
+                // Recording and Processing offer no toggle here — an extended
+                // record's Stop sends `AbortCapture` instead.
                 if self.display_data.measurement_mode_active {
-                    let mut new_state = self.display_data.capture_state.clone();
-                    if new_state == CaptureState::Idle {
-                        new_state = CaptureState::Armed;
-                    } else if new_state == CaptureState::Armed {
-                        new_state = CaptureState::Idle;
+                    match self.display_data.capture_state {
+                        CaptureState::Idle => {
+                            let request = self.arm_request();
+                            self.send_capture_command(CaptureCommand::Arm(request));
+                        }
+                        CaptureState::Armed => {
+                            self.send_capture_command(CaptureCommand::Cancel);
+                        }
+                        CaptureState::Recording | CaptureState::Processing => {}
                     }
-                    self.display_data.capture_state = new_state.clone();
-                    self.pipeline_handle
-                        .atomics
-                        .capture_state
-                        .store(new_state as u8, Ordering::Relaxed);
                 }
             }
             Message::UndoLastCapture => {
@@ -1815,11 +1838,8 @@ impl TunerApp {
                 self.enter_manual_mode(key);
                 self.display_data.inspector_key = Some(key);
                 self.display_data.measurement_mode_active = true;
-                self.display_data.capture_state = CaptureState::Armed;
-                self.pipeline_handle
-                    .atomics
-                    .capture_state
-                    .store(CaptureState::Armed as u8, Ordering::Relaxed);
+                let request = self.arm_request();
+                self.send_capture_command(CaptureCommand::Arm(request));
                 // Back to the measuring surface: the note has to be played, and
                 // the strobe and keyboard live there.
                 self.display_data.settings_view_visible = false;
@@ -1861,7 +1881,7 @@ impl TunerApp {
                 if let Err(e) = self.app_settings.save() {
                     eprintln!("[MAIN] Could not save app settings: {e}");
                 }
-                self.apply_capture_duration();
+                self.republish_arm();
             }
             Message::SetExtendedCaptureSecs(secs) => {
                 self.display_data.extended_capture_secs = secs;
@@ -1869,15 +1889,12 @@ impl TunerApp {
                 if let Err(e) = self.app_settings.save() {
                     eprintln!("[MAIN] Could not save app settings: {e}");
                 }
-                self.apply_capture_duration();
+                self.republish_arm();
             }
             Message::AbortCapture => {
-                // A request, not a transition: the pipeline consumes it and
-                // makes the `Recording → Idle` move itself (`02`, crossing #3).
-                self.pipeline_handle
-                    .atomics
-                    .capture_abort
-                    .store(true, Ordering::Relaxed);
+                // The same command that disarms drops the take in progress —
+                // the pipeline makes the `Recording → Idle` move itself.
+                self.send_capture_command(CaptureCommand::Cancel);
             }
             Message::SetSoundingStrings(strings) => {
                 self.display_data.strings_touched = true;
@@ -2264,18 +2281,7 @@ impl TunerApp {
                         self.display_data.is_stale = false;
                     }
 
-                    // Sync capture state from atomics for UI rendering
-                    let state_val = self
-                        .pipeline_handle
-                        .atomics
-                        .capture_state
-                        .load(Ordering::Relaxed);
-                    self.display_data.capture_state = match state_val {
-                        1 => CaptureState::Armed,
-                        2 => CaptureState::Recording,
-                        3 => CaptureState::Processing,
-                        _ => CaptureState::Idle,
-                    };
+                    self.display_data.capture_state = frame.capture_state;
                 }
 
                 // ── Drain Result Channel from Worker ──
@@ -2327,11 +2333,8 @@ impl TunerApp {
                             // Re-arm automatically if in Auto mode
                             if let TuningMode::Auto = self.display_data.tuning_mode {
                                 eprintln!("[MAIN] Auto-mode rearming...");
-                                self.pipeline_handle
-                                    .atomics
-                                    .capture_state
-                                    .store(CaptureState::Armed as u8, Ordering::Relaxed);
-                                self.display_data.capture_state = CaptureState::Armed;
+                                let request = self.arm_request();
+                                self.send_capture_command(CaptureCommand::Arm(request));
                             }
                         }
                         WorkerOutput::Curve(bundle) => {
@@ -2348,6 +2351,7 @@ impl TunerApp {
                 // Send a (re)compute job if the trusted set changed this tick.
                 self.pump_dump_dir();
                 self.pump_curve_job();
+                self.pump_capture_command();
 
                 self.update_strobe(frame_pushed);
 

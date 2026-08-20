@@ -390,7 +390,7 @@ fn create_settings_sidebar(data: &AppDisplayData) -> Element<'static, Message> {
         // Never abortable: this copy is a shortcut back to capturing, not the
         // live control the take is watched on.
         sections = sections.push(make_capture_button(
-            data.capture_state.clone(),
+            data.capture_state,
             Message::CaptureButtonClicked,
             false,
         ));

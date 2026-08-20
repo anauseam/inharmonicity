@@ -72,9 +72,11 @@ through `regenerate_partials`, never the cached `analysis.json`.
   violate the unison discriminator's own premise exactly where ADR 0013 measured
   `p̂ ≈ 0`.
 
-**The mechanism.** Which strings sounded is the operator's declaration, set
-before arming and stamped onto the capture by the DSP thread as it dispatches
-(`models::SoundingStrings`, `PipelineAtomics::capture_strings`). It reaches disk
+**The mechanism.** Which strings sounded is the operator's declaration, which
+rides the `Arm` command to the DSP thread and is latched onto the capture when
+the audio begins (`models::SoundingStrings`, `pipeline::ArmRequest`). Changing
+it while armed re-states the request, so a declaration made after an auto-rearm
+still lands on the capture it describes. It reaches disk
 in `analysis.json`'s `metadata.sounding_strings` and rides through
 `regenerate_partials`; `null` means undeclared, which is what every capture in
 the three sets above carries and what ordinary tuning writes. **String 1 is the

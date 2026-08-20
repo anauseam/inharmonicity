@@ -18,7 +18,8 @@ extended 2026-08-07:
    irreversible item in this file. Tuning destroys that state; the set state can
    be recreated by tuning again. It doubles as the bass-attribution mute test.
    The capture-metadata mechanism it was waiting on is **built** (which strings
-   sounded, declared before arming — `docs/internals/06-capture-sets.md`), so
+   sounded, declared per capture and changeable while armed —
+   `docs/internals/06-capture-sets.md`), so
    nothing blocks the session: isolation replaces resolution, and the longer
    records the protocol sketched are wanted only for per-string decay τ.
    → ADR 0012 Limitations, [ADR 0013](docs/adr/0013-bass-extra-lines-attribution.md) D3
@@ -200,9 +201,6 @@ extended 2026-08-07:
   still cannot run. New code must read the rate from the single source of truth
   so this stays a one-point change.
   → [`docs/internals/03-dsp-pipeline.md`](docs/internals/03-dsp-pipeline.md)
-- **`CaptureState` `compare_exchange`** — `Planned`. The three-thread baton-pass
-  is convention-only today; `compare_exchange` would enforce it at the atomic
-  level. → [`docs/internals/02-cross-thread-communication.md`](docs/internals/02-cross-thread-communication.md)
 - **Module-boundary pass across `worker.rs`, `audio.rs` and `models.rs`** —
   `Deferred`, and one item rather than three because they would otherwise
   reshuffle each other. Each file now mixes categories that want separating, and

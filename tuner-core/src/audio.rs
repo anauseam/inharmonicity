@@ -33,7 +33,9 @@ use std::sync::atomic::Ordering;
 use std::thread::{self, JoinHandle};
 
 use crate::FrameOutput;
-use crate::pipeline::{AudioPipeline, PipelineHandle, PipelinePorts, ProfileSender, StrobeSender};
+use crate::pipeline::{
+    AudioPipeline, CaptureSender, PipelineHandle, PipelinePorts, ProfileSender, StrobeSender,
+};
 use crate::worker::{CurveJob, WorkerJob, WorkerOutput};
 
 /// The standard analysis window size (samples).
@@ -231,6 +233,10 @@ pub struct HostHandle {
     /// instance). Push on key change / re-lock; `count: 0` clears the bank.
     pub strobe_refs: StrobeSender,
 
+    /// UI → DSP producer for capture-lifecycle commands (crossing #4's third
+    /// instance): arm, re-state what the pending record is, cancel.
+    pub capture_commands: CaptureSender,
+
     /// Keep the CPAL stream alive for the lifetime of the host.
     /// `None` when using `AudioSource::External`.
     _stream: Option<cpal::Stream>,
@@ -362,6 +368,7 @@ pub fn spawn_analysis_thread(
         worker_job_tx,
         profiles,
         strobe_refs,
+        capture_commands,
     } = ports;
 
     // Resolve the audio source — either open CPAL or use the provided consumer.
@@ -448,6 +455,7 @@ pub fn spawn_analysis_thread(
         worker_job_tx,
         profiles,
         strobe_refs,
+        capture_commands,
         _stream: stream,
         thread_handle: Some(thread_handle),
     })

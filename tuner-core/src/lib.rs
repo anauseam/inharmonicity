@@ -134,6 +134,13 @@ pub struct FrameOutput {
     /// itself — one verdict for the bank, since the test is precisely that the
     /// split is constant *across* partials.
     pub unison_verdict: strobe::unison::UnisonVerdict,
+    /// Where the capture lifecycle stands ([`pipeline::CaptureState`]).
+    ///
+    /// The pipeline owns the state machine outright and publishes it here; a
+    /// consumer reads it and asks for a transition with a
+    /// [`pipeline::CaptureCommand`]. A per-hop snapshot like the rest of this
+    /// struct — a dropped frame costs one update.
+    pub capture_state: pipeline::CaptureState,
     /// Samples written to the capture in progress; `0` when none is recording.
     ///
     /// A per-hop snapshot like the rest of this struct — a dropped frame costs
@@ -179,6 +186,7 @@ impl Default for FrameOutput {
             unison_line_count: [0; 12],
             unison_resolution_hz: [0.0; 12],
             unison_verdict: strobe::unison::UnisonVerdict::Undetermined,
+            capture_state: pipeline::CaptureState::Idle,
             capture_progress_samples: 0,
             coarse_hz: None,
         }
@@ -195,6 +203,7 @@ impl std::fmt::Debug for FrameOutput {
             .field("detected_frequency", &self.detected_frequency)
             .field("confidence", &self.confidence)
             .field("tracked_count", &self.tracked_count)
+            .field("capture_state", &self.capture_state)
             .field("coarse_hz", &self.coarse_hz)
             .finish()
     }
