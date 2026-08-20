@@ -102,6 +102,7 @@ docs/internals/
 ├── 04-algorithms-and-models.md          algorithms/ vs models/ layout
 ├── 05-style.md                          Rust style, allocation idioms
 ├── 06-capture-sets.md                   the validation data: what it is, how to consume it
+├── 07-evidence-and-methodology.md       how a measurement becomes a decision
 └── suspected-issues.md                  unreproduced hazards and the defensive code for them
 ```
 

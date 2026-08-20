@@ -48,12 +48,23 @@ extended 2026-08-07:
   measurably not a second string; every remaining candidate needs a capture with
   one string muted, which no set has. ≈10 % of *third* lines remain
   unattributed.
+  *(Partly discharged 2026-08-20 by [ADR 0014](docs/adr/0014-unison-panel-against-isolation-truth.md):
+  the mute-isolation set exists and supplied the positive control — a single
+  string resolves two lines on 65 % of captures — and the near-silence now has a
+  second measured cause, the real 1.7–8.5 % per-string B spread. What remains is
+  the accuracy criterion, which that set cannot score: the piano's as-found
+  unisons are mostly tighter than the panel's own floor, so it is gated on the
+  post-tuning detuning ladder.)*
   → [ADR 0012](docs/adr/0012-unison-line-estimator.md) §§5–6, §8,
-  [ADR 0013](docs/adr/0013-bass-extra-lines-attribution.md)
+  [ADR 0013](docs/adr/0013-bass-extra-lines-attribution.md),
+  [ADR 0014](docs/adr/0014-unison-panel-against-isolation-truth.md)
 - **Unison assist: which panel layout to keep** — `Planned`. Both ship behind a
   toggle (the displayed partial alone, or every resolved partial stacked)
   because the captures cannot answer which reads better while tuning. Drop one
-  once it has been used on a real instrument.
+  once it has been used on a real instrument. *(One measured input since:
+  the two layouts disagree about whether a unison is asserted on 3 of 192 solo
+  captures, because the verdict is bank-wide while `Displayed` shows one row —
+  ADR 0014 §4.)*
 
 - **Profile export / import from an arbitrary path** — `Deferred`. The library
   browser covers new / open / resume / duplicate / delete over the profiles

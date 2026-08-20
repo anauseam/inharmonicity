@@ -252,6 +252,12 @@ neighbouring partials), and the candidates — polarization false beats,
 longitudinal modes, sympathetic resonance from a neighbouring key, soundboard
 coupling — were the subject of a separate investigation.
 
+**[ADR 0014](0014-unison-panel-against-isolation-truth.md) §4 supplies the
+positive control this section lacked.** On 78 single-strung keys — where only one
+string can possibly sound — the estimator resolves two lines on **65 %** of
+captures, which settles by construction that the bass second line is not a second
+string. The discriminator asserts `Unison` on 2.1–3.6 % of all 193 solo captures.
+
 **[ADR 0013](0013-bass-extra-lines-attribution.md) supersedes this section's
 scope wording.** The register ships — the estimator is sound there and the lines
 are not a second string — while what they *are* stays open. The scoping
@@ -304,6 +310,15 @@ Measured, over the best record each capture reached:
 | piano 2 | bass | **4 %** | 38 % | 58 % |
 | piano 2 | tenor | 3 % | 10 % | 87 % |
 | piano 2 | treble | 0 % | 0 % | 100 % |
+
+**[ADR 0014](0014-unison-panel-against-isolation-truth.md) §7 confirms the
+mechanism with ground truth.** A note's strings really do differ in `B` — by
+1.7–8.5 %, exceeding within-string repeat noise by 3.7–8.5× on five of eight
+isolation keys — which tilts the split across partials by 3–48 % of itself. That
+is exactly the physical scatter a σ-based null cannot survive and a
+residual-estimated one absorbs, so the fix below was made for the right reason.
+It also names a second contributor to the near-silence: the tilt is systematic
+rather than random, so absorbing it *inflates* the standard error.
 
 It is **conservative to the point of near-silence**, and that is the deliberate
 trade: `Undetermined` leaves the panel showing its per-partial splits, which is
