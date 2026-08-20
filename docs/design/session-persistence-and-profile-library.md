@@ -57,17 +57,62 @@ refuted** (§5.3): the repeats survive as what the inspector *shows a human*, ke
 by key, which is what shipped.
 
 **The active-entry rule.** `InharmonicityProfile::active` returns the **newest
-trusted entry, else the newest** — ADR 0006 item 3 expressed over a list. Every
+trusted entry, and nothing else** — ADR 0006 item 3 expressed over a list. Every
 consumer reads through it: `CurveInput::from_profile`, the crossing-#4 template
 push, and the strobe's raw-B source. Verified behaviour-preserving on the real
 88-key profile, which migrates to 88 single-entry lists and still yields
 `measured_count = 88`.
 
-Bounded at `MAX_MEASUREMENTS_PER_KEY = 8`, evicting the oldest entry that is not
-the active one — the file is rewritten on every capture, and a few per key is
-all any σ comparison needs.
+It originally ended "**else the newest**", and that fallback was a hole. The
+curve filtered untrusted entries explicitly, but the strobe's B did not: on a
+key holding nothing trusted, `snapshot_b` handed `TuningCurve::strobe_partials`
+an untrusted B, so a discovery false-lock could place a key's partials off
+another key's series. Such a key now reads as unmeasured and falls back to the
+Rigaud prior — better behaved than a confidently-measured wrong series. One
+consequence worth knowing: a **v0** profile's entries are all untrusted by
+migration (`captured_in_auto` defaults true), so a v0 file now presents no
+measured B anywhere. Its measurements still open and are inspectable; the curve
+already refused them.
 
-### 1.1 Rejected: a reserved per-string field
+The two disqualifications are named separately (`KeyMeasurement::is_trusted`,
+`is_partial_unison`) because only one of them is ever waived: the offline
+harnesses admit auto-mode provenance through
+`CurveInput::from_profile_including_auto`, while a string-isolated capture feeds
+no curve on any path — it measured one string, and a curve is per note.
+
+### 1.1 Retention: a budget per class
+
+Each key holds up to `MAX_TRUSTED_MEASUREMENTS_PER_KEY = 8` trusted entries and
+`MAX_UNUSED_MEASUREMENTS_PER_KEY = 4` untrusted ones, evicted **within their own
+class**. The file is rewritten on every capture, and a few per key is all any σ
+comparison needs.
+
+A single shared cap of 8 was the original design, and the mute-isolation session
+(2026-08-15/16) measured what it costs: entries no consumer can read displaced
+the ones that feed the curve. A#3 took 43 captures and kept **one** of its
+thirteen open ones; across the session 67 of 440 trusted captures were evicted
+by untrusted ones. Replaying all 555 dumps through the per-class budgets retains
+420 of 440 trusted (the remainder to the plain cap of 8, not to displacement),
+A#3 keeps its full 8, and the worst key holds 12 entries — 1.23 MB against
+1.14 MB before.
+
+Within the reserve, an entry whose **configuration** — the pair (provenance,
+declaration) — is already represented is dropped before one holding the only
+copy of its own. That is what keeps an isolation pass legible in the inspector:
+on all eight isolation keys of the real session, every solo the operator took is
+still represented by one row, so "have I captured string 1 yet?" is answerable
+without leaving the app.
+
+**Prompt AC proposed a different fix** — evicting per `(key, declaration)` group,
+on the premise that solos deserve profile space per configuration. They do not:
+no consumer reads them, and the offline path is dump-backed through
+`regenerate_partials`. The defect is trusted-displacement, and it is fixed by
+separating the budgets, not by multiplying them.
+
+The active entry needs no explicit guard under this rule: it is the *newest*
+trusted entry, and eviction takes the oldest of a class holding at least two.
+
+### 1.2 Rejected: a reserved per-string field
 
 A `course: Option<u8>` was briefly added on the argument that `key_index` is not
 a sufficient identity on every instrument this tuner targets — a fretted note is
@@ -198,8 +243,26 @@ and after a restart nobody remembers what they meant to undo. The three
 mechanisms divide by timescale: **undo** for the mistake just made, the
 **inspector** for "this key looks wrong" later, the **`.bak`** for catastrophe.
 
-Undo also got simpler: a capture appends, so undoing is popping the entry back
-off (`undo_last`), and the history stores keys rather than displaced values.
+**Undo names captures, not positions.** The history holds
+`UndoneCapture { key, epoch }` and removes through
+`InharmonicityProfile::remove_capture`. Popping the key's tail (`undo_last`, as
+it originally worked) is correct only while eviction removes a *prefix* of a
+key's capture order — the survivors stay a suffix, so the stack's recent slots
+line up with the list's tail entries. The per-class reserve (§1.1) breaks that:
+it drops an entry whose configuration is already represented, from the middle,
+on every repeated solo of an isolation pass. A stale positional handle would
+then delete a trusted capture's dump — as-found audio that cannot be recaptured.
+
+Three mechanisms follow from it:
+
+- **The dump goes even when the entry does not.** Retention is bounded and the
+  dumps are not, so an evicted capture is still the user's to discard.
+- **A drop takes its own undo slot with it**, matched by epoch. A drop keeps the
+  audio deliberately (§5.2), so a later undo must not reach the dump it spared.
+  The previous repair erased the *last* slot for that key, which is not
+  necessarily the one naming the dropped capture.
+- **The undo label reads its target from the stack**, rather than inferring it
+  from whichever entry currently sits at the key's tail.
 
 ---
 
@@ -327,8 +390,10 @@ since k = 2–3 makes a raw sample SD nearly worthless.
 
 ## 6. Consequences and what stays open
 
-- Every capture costs one ~140 KB serialize-and-write, at human cadence,
-  bounded by `MAX_MEASUREMENTS_PER_KEY`.
+- Every capture costs one serialize-and-write of the whole profile, at human
+  cadence, bounded by the per-class budgets of §1.1 — ~140 KB for an ordinary
+  88-key instrument, 1.23 MB for the 555-capture mute-isolation profile, and
+  ~2.9 MB at the per-key ceiling of 12 across all 88 keys.
 - Offline tooling reading profile JSON goes through the new shape;
   `diagnose_engine --profile` (hence `scripts/test_engine_all.py --profile`) was
   updated, and the v0 loader keeps every pre-existing file readable.

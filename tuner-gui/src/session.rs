@@ -38,6 +38,18 @@ const EDIT_FLUSH_QUIET: Duration = Duration::from_millis(700);
 /// is the `.bak`'s.
 const UNDO_HISTORY_DEPTH: usize = 100;
 
+/// One capture the session can still undo, by **identity, never position**:
+/// retention evicts from the middle of a key's list, and undo deletes the
+/// capture's dump, which nothing restores.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UndoneCapture {
+    /// The key the capture measured.
+    pub key: u8,
+    /// The capture's `last_captured` stamp — also its dump directory's name
+    /// (`worker::dump_dir_name`).
+    pub epoch: Box<str>,
+}
+
 /// The instrument currently open, its file, and the write policy around it.
 #[derive(Default)]
 pub struct ProfileSession {
@@ -51,12 +63,10 @@ pub struct ProfileSession {
     /// An interaction-rate edit is pending a write; the clock restarts on each
     /// keystroke so the write lands once the user stops.
     dirty_since: Option<Instant>,
-    /// Keys whose most recent measurement can still be undone, oldest first.
-    ///
-    /// Only the key is stored: a capture *appends* to that key's list, so
-    /// undoing it is popping the entry back off — there is no displaced value
-    /// to carry. Session-scoped and never persisted.
-    undo_history: std::collections::VecDeque<u8>,
+    /// Captures that can still be undone, oldest first. Session-scoped and
+    /// never persisted — an undo deletes the capture's dump, so a restored
+    /// cross-session entry would be a promise the files can no longer keep.
+    undo_history: std::collections::VecDeque<UndoneCapture>,
 }
 
 impl ProfileSession {
@@ -81,15 +91,8 @@ impl ProfileSession {
     /// epoch is the only thing distinguishing which one. Matches the on-disk
     /// `key_<idx>_<note>_<epoch>` dump name.
     pub fn undo_target(&self) -> Option<(u8, Option<&str>)> {
-        let &key = self.undo_history.back()?;
-        let epoch = self
-            .profile
-            .measurements
-            .get(&key)
-            .and_then(|entries| entries.last())
-            .map(|m| m.last_captured.as_str())
-            .filter(|s| !s.is_empty());
-        Some((key, epoch))
+        let undone = self.undo_history.back()?;
+        Some((undone.key, Some(&*undone.epoch).filter(|s| !s.is_empty())))
     }
 
     /// Resolves which instrument the session starts on, recording the choice in
@@ -120,9 +123,9 @@ impl ProfileSession {
     /// Makes `profile` at `path` the open instrument, stamping `last_opened`
     /// and recording it as the one to resume next launch.
     ///
-    /// Undo history is dropped: it indexes measurements of the instrument being
-    /// closed, and replaying it against a different one would write a
-    /// stranger's measurement into this profile.
+    /// Undo history is dropped: it names captures of the instrument being
+    /// closed, and replaying it against a different one would discard a
+    /// stranger's measurement from this profile.
     pub fn adopt(
         &mut self,
         mut profile: InharmonicityProfile,
@@ -163,11 +166,13 @@ impl ProfileSession {
     ///
     /// Appending rather than replacing is what keeps an unattended auto-mode
     /// capture from destroying a manual one: `InharmonicityProfile::active`
-    /// prefers the newest *trusted* entry, so an auto capture adds evidence but
-    /// never displaces a trusted measurement.
+    /// resolves to the newest *trusted* entry, and retention budgets the two
+    /// classes apart.
     pub fn record(&mut self, measurement: KeyMeasurement) {
-        let key = measurement.key_index;
-        self.undo_history.push_back(key);
+        self.undo_history.push_back(UndoneCapture {
+            key: measurement.key_index,
+            epoch: measurement.last_captured.as_str().into(),
+        });
         if self.undo_history.len() > UNDO_HISTORY_DEPTH {
             self.undo_history.pop_front();
         }
@@ -175,27 +180,29 @@ impl ProfileSession {
         self.persist();
     }
 
-    /// Reverts the most recent capture, returning the entry that was removed so
-    /// the caller can delete its diagnostics dump. Persists immediately —
-    /// otherwise an undo would leave the bad measurement on disk.
-    pub fn undo(&mut self) -> Option<(u8, KeyMeasurement)> {
-        let key = self.undo_history.pop_back()?;
-        let removed = self.profile.undo_last(key);
+    /// Reverts the most recent capture, returning **which** one so the caller
+    /// can delete its dump. Persists immediately, or an undo would leave the
+    /// bad measurement on disk.
+    ///
+    /// The dump goes whether or not the entry was still retained. A *dropped*
+    /// capture never reaches here — [`Self::remove`] takes its slot out, which
+    /// is what keeps the drop's promise that the audio is kept.
+    pub fn undo(&mut self) -> Option<UndoneCapture> {
+        let undone = self.undo_history.pop_back()?;
+        self.profile.remove_capture(undone.key, &undone.epoch);
         self.persist();
-        removed.map(|m| (key, m))
+        Some(undone)
     }
 
     /// Discards one retained measurement of `key` — the inspector's drop —
     /// returning it. Persists immediately, for the same reason undo does.
     ///
-    /// One undo of that key is forgotten with it: undo pops the key's tail, so
-    /// leaving the history intact would let a later undo discard a *different*
-    /// measurement than the one it was recorded for.
+    /// Takes that capture's undo slot with it, matched by epoch: a drop keeps
+    /// the audio deliberately, so no later undo may reach the dump it spared.
     pub fn remove(&mut self, key: u8, index: usize) -> Option<KeyMeasurement> {
         let removed = self.profile.remove(key, index)?;
-        if let Some(pos) = self.undo_history.iter().rposition(|&k| k == key) {
-            self.undo_history.remove(pos);
-        }
+        self.undo_history
+            .retain(|u| !(u.key == key && *u.epoch == *removed.last_captured));
         self.persist();
         Some(removed)
     }
@@ -283,6 +290,7 @@ fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tuner_core::models::SoundingStrings;
 
     fn measurement(key: u8, f0: f32) -> KeyMeasurement {
         KeyMeasurement {
@@ -331,9 +339,9 @@ mod tests {
         let on_disk = InharmonicityProfile::from_file(&path).unwrap();
         assert_eq!(on_disk.active(5).unwrap().measured_f0, 100.0);
 
-        let (key, removed) = s.undo().unwrap();
-        assert_eq!(key, 5);
-        assert_eq!(removed.measured_f0, 100.0);
+        let undone = s.undo().unwrap();
+        assert_eq!(undone.key, 5);
+        assert_eq!(&*undone.epoch, "100", "the dump the caller must delete");
         let on_disk = InharmonicityProfile::from_file(&path).unwrap();
         assert!(
             on_disk.active(5).is_none(),
@@ -367,29 +375,72 @@ mod tests {
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
-    /// An inspector drop reaches any entry, writes through, and consumes one
-    /// undo of that key — otherwise the next undo would discard a measurement
-    /// it was never recorded for.
+    /// An inspector drop reaches any entry, writes through, and takes **that
+    /// capture's** undo slot with it. A drop keeps the audio deliberately, so a
+    /// later undo must not be able to reach the dump it decided to spare.
     #[test]
-    fn a_drop_writes_through_and_consumes_one_undo() {
+    fn a_drop_writes_through_and_consumes_its_own_undo() {
         let (mut s, path) = session("drop");
         s.record(measurement(4, 10.0));
         s.record(measurement(4, 20.0));
         assert_eq!(s.undo_history.len(), 2);
 
-        // The older entry — the one undo cannot reach.
+        // The older entry — the one undo would reach last.
         assert_eq!(s.remove(4, 0).unwrap().measured_f0, 10.0);
         let on_disk = InharmonicityProfile::from_file(&path).unwrap();
         assert_eq!(on_disk.measurements[&4].len(), 1);
         assert_eq!(on_disk.active(4).unwrap().measured_f0, 20.0);
-        assert_eq!(s.undo_history.len(), 1, "the drop consumed one undo");
+        assert_eq!(
+            s.undo_history.len(),
+            1,
+            "the drop consumed the slot naming the capture it removed"
+        );
 
-        // The one remaining undo removes the one remaining entry, leaving the
-        // history empty rather than pointing at a key that no longer exists.
-        assert_eq!(s.undo().unwrap().1.measured_f0, 20.0);
+        // The one remaining undo names the entry it was recorded for — not
+        // whichever entry happens to sit at the tail.
+        assert_eq!(&*s.undo().unwrap().epoch, "20");
         assert!(s.undo().is_none());
         assert!(s.remove(4, 0).is_none(), "nothing left to drop");
 
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// The reason undo carries identity: retention evicts from the **middle** of
+    /// a key's list, so a positional handle would come to name a different
+    /// capture — and undoing deletes audio that cannot be recaptured.
+    #[test]
+    fn undo_after_a_middle_eviction_names_its_own_capture() {
+        let (mut s, path) = session("evict");
+        let solo = |f0: f32, string: usize| {
+            let mut e = measurement(4, f0);
+            e.sounding_strings = Some(SoundingStrings::UNDECLARED.toggled(string));
+            e
+        };
+
+        s.record(measurement(4, 10.0)); // the note itself — trusted
+        for round in 0..3 {
+            for string in 0..3 {
+                s.record(solo(100.0 * (round + 1) as f32 + string as f32, string));
+            }
+        }
+        // The reserve has evicted earlier solos from among the retained entries.
+        assert!(s.profile().measurements[&4].len() < 10);
+
+        // Walk the whole stack back. No undo may ever remove the open capture
+        // until the slot that names it comes up — it is the last one recorded.
+        let mut undone = Vec::new();
+        while let Some(u) = s.undo() {
+            undone.push(u.epoch.to_string());
+        }
+        assert_eq!(
+            undone.last().map(String::as_str),
+            Some("10"),
+            "the open capture went last, when its own slot came up"
+        );
+        assert!(
+            !s.profile().measurements.contains_key(&4),
+            "every capture's slot resolved to its own entry"
+        );
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 

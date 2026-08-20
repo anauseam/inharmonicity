@@ -72,6 +72,7 @@ impl DashboardTest {
             inspector_key: None,
             inspector_rows: Vec::new(),
             inspector_expanded: false,
+            inspector_unused_expanded: false,
             curve_select_visible: false,
             curve_detail: None,
             selected_engine: tuner_gui::app::EngineChoice::MultiBalanced,

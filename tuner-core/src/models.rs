@@ -248,22 +248,21 @@ pub struct KeyMeasurement {
 }
 
 impl KeyMeasurement {
-    /// Whether the tuning curve and the strobe may read this entry.
-    ///
-    /// Two independent disqualifications, both meaning "this did not measure
-    /// the note as it is played":
-    ///
-    /// - **auto-mode provenance** — the key identity was latched by discovery
-    ///   rather than named by the user (ADR 0006 Corrections item 3);
-    /// - **a declared partial unison** — strings were damped, so the entry
-    ///   measured one string. A capture that declared nothing is unaffected,
-    ///   which is every capture outside a mute-isolation session
-    ///   (`docs/internals/06-capture-sets.md`).
-    ///
-    /// Untrusted entries are retained and inspectable; they are never active
-    /// while a trusted one exists.
-    pub(crate) fn is_trusted(&self) -> bool {
-        !self.captured_in_auto && self.sounding_strings.is_none_or(|s| s.is_open())
+    /// Strings were damped, so this measured one string rather than the note.
+    /// False when nothing was declared (`docs/internals/06-capture-sets.md`).
+    /// Named apart from [`Self::is_trusted`] because it is never waived, while
+    /// auto provenance is ([`CurveInput::from_profile_including_auto`]).
+    pub(crate) fn is_partial_unison(&self) -> bool {
+        self.sounding_strings.is_some_and(|s| !s.is_open())
+    }
+
+    /// Whether the tuning curve and the strobe may read this entry. Two
+    /// independent disqualifications, both meaning "this did not measure the
+    /// note as it is played": auto-mode provenance (ADR 0006 Corrections
+    /// item 3) and [`Self::is_partial_unison`]. Untrusted entries are retained
+    /// and never read — see [`InharmonicityProfile::active`].
+    pub fn is_trusted(&self) -> bool {
+        !self.captured_in_auto && !self.is_partial_unison()
     }
 }
 
@@ -284,12 +283,21 @@ pub const PROFILE_PATH: &str = "tuning_profile.json";
 /// [`InharmonicityProfile::from_file`].
 pub(crate) const PROFILE_SCHEMA_VERSION: u32 = 1;
 
-/// Measurements retained per key before the oldest is dropped.
+/// Trusted measurements retained per key before the oldest is dropped.
 ///
 /// Ours. Repeats exist to be compared against each other in the inspector,
 /// which needs only a few per key; the bound keeps a file that is rewritten on
 /// every capture from growing without limit.
-pub(crate) const MAX_MEASUREMENTS_PER_KEY: usize = 8;
+pub(crate) const MAX_TRUSTED_MEASUREMENTS_PER_KEY: usize = 8;
+
+/// Untrusted measurements retained per key. Ours, sized to a trichord's three
+/// solos plus one auto-mode entry.
+///
+/// **Do not merge with [`MAX_TRUSTED_MEASUREMENTS_PER_KEY`]** — under one
+/// shared budget an isolation pass's solos evict the note's own captures
+/// (measured; `docs/internals/06-capture-sets.md` and
+/// `docs/design/session-persistence-and-profile-library.md` §1.1).
+pub(crate) const MAX_UNUSED_MEASUREMENTS_PER_KEY: usize = 4;
 
 /// Default NHWRSF onset threshold — the flux a transient must exceed to be
 /// declared a new note event.
@@ -547,7 +555,7 @@ pub struct InharmonicityProfile {
     #[serde(default)]
     pub last_opened: u64,
     /// Maps a key index (0–87) to every measurement taken of it, oldest first.
-    /// Capped at [`MAX_MEASUREMENTS_PER_KEY`].
+    /// Capped per class — see [`Self::record`].
     #[serde(default)]
     pub measurements: BTreeMap<u8, Vec<KeyMeasurement>>,
 }
@@ -598,76 +606,130 @@ impl InharmonicityProfile {
         }
     }
 
-    /// The one measurement consumers read for `key`, or `None` if unmeasured.
+    /// The one measurement consumers read for `key`: **newest trusted, and
+    /// nothing else** — ADR 0006 item 3 over a list.
     ///
-    /// **Newest trusted, else newest** — the ADR 0006 item 3 provenance rule
-    /// over a list. An auto-mode entry never displaces a manual one however
-    /// recent it is, because a discovery false-lock makes MAT confidently
-    /// measure the wrong series under the wrong key; it is retained, not read.
+    /// An untrusted entry never presents, even when it is all the key has: a
+    /// discovery false-lock measures the wrong series under the wrong key, and
+    /// a solo measures one string. Such a key reads as unmeasured, whose
+    /// fallback is the prior ([`get_expected_beta`]).
     pub fn active(&self, key: u8) -> Option<&KeyMeasurement> {
-        let entries = self.measurements.get(&key)?;
-        entries
+        self.measurements
+            .get(&key)?
             .iter()
             .rev()
             .find(|m| m.is_trusted())
-            .or_else(|| entries.last())
     }
 
     /// [`Self::active`] for in-place edits — the inspector's handle on the
     /// entry a key currently presents.
     pub fn active_mut(&mut self, key: u8) -> Option<&mut KeyMeasurement> {
         let entries = self.measurements.get_mut(&key)?;
-        let pos = entries
-            .iter()
-            .rposition(|m| m.is_trusted())
-            .or_else(|| entries.len().checked_sub(1))?;
+        let pos = entries.iter().rposition(|m| m.is_trusted())?;
         entries.get_mut(pos)
     }
 
-    /// Every key that carries a measurement, paired with its active entry.
+    /// Every key that carries a trusted measurement, paired with its active
+    /// entry.
     pub fn active_entries(&self) -> impl Iterator<Item = (u8, &KeyMeasurement)> {
         self.measurements
             .keys()
             .filter_map(|&k| self.active(k).map(|m| (k, m)))
     }
 
-    /// Appends a measurement to its key, evicting the oldest entry that is not
-    /// the active one once [`MAX_MEASUREMENTS_PER_KEY`] is reached.
+    /// The newest entry for `key` that measured the whole note, whatever its
+    /// provenance — [`Self::active`] with only the auto-mode disqualification
+    /// waived, for [`CurveInput::from_profile_including_auto`].
+    ///
+    /// **Do not add a "newest entry, whatever it is" accessor**: a partial
+    /// unison must not be reachable as a stand-in for the note.
+    pub fn newest_whole_note(&self, key: u8) -> Option<&KeyMeasurement> {
+        self.measurements
+            .get(&key)?
+            .iter()
+            .rev()
+            .find(|m| !m.is_partial_unison())
+    }
+
+    /// Appends a measurement, evicting within **its own class** —
+    /// [`MAX_TRUSTED_MEASUREMENTS_PER_KEY`] or
+    /// [`MAX_UNUSED_MEASUREMENTS_PER_KEY`] — so an unread entry never displaces
+    /// one the curve and strobe read.
+    ///
+    /// [`Self::active`] needs no guard here: it is the *newest* trusted entry,
+    /// and eviction takes the oldest of a class holding at least two.
     pub fn record(&mut self, measurement: KeyMeasurement) {
         let key = measurement.key_index;
+        let trusted = measurement.is_trusted();
         let entries = self.measurements.entry(key).or_default();
         entries.push(measurement);
-        while entries.len() > MAX_MEASUREMENTS_PER_KEY {
-            // The active entry is the newest trusted one, so the oldest
-            // droppable entry is the first that is not it.
-            let active_pos = entries
-                .iter()
-                .rposition(|m| m.is_trusted())
-                .unwrap_or(entries.len() - 1);
-            let drop_at = if active_pos == 0 { 1 } else { 0 };
+
+        let cap = if trusted {
+            MAX_TRUSTED_MEASUREMENTS_PER_KEY
+        } else {
+            MAX_UNUSED_MEASUREMENTS_PER_KEY
+        };
+        while entries.iter().filter(|m| m.is_trusted() == trusted).count() > cap {
+            let Some(drop_at) = Self::eviction_target(entries, trusted) else {
+                break;
+            };
             entries.remove(drop_at);
         }
     }
 
-    /// Removes the most recently appended measurement for `key`, returning it.
-    /// Leaves the key absent entirely if that was its only measurement — the
-    /// shape an undo of a first capture must restore.
-    pub fn undo_last(&mut self, key: u8) -> Option<KeyMeasurement> {
+    /// Which entry loses its place when `trusted`'s budget is full: the oldest
+    /// of that class, except that an untrusted entry whose **configuration** is
+    /// already represented goes before one holding the only copy of its own —
+    /// so repeats of one solo cannot crowd out another string entirely.
+    ///
+    /// Configuration is the pair (provenance, declaration), grouped on both so
+    /// a hand-edited profile pairing auto-mode with a declaration does not
+    /// collapse into an ordinary auto entry.
+    fn eviction_target(entries: &[KeyMeasurement], trusted: bool) -> Option<usize> {
+        let of_class = |m: &KeyMeasurement| m.is_trusted() == trusted;
+        if trusted {
+            return entries.iter().position(of_class);
+        }
+        let configuration = |m: &KeyMeasurement| (m.captured_in_auto, m.sounding_strings);
+        let duplicated = |m: &KeyMeasurement| {
+            entries
+                .iter()
+                .filter(|o| of_class(o) && configuration(o) == configuration(m))
+                .count()
+                > 1
+        };
+        entries
+            .iter()
+            .position(|m| of_class(m) && duplicated(m))
+            .or_else(|| entries.iter().position(of_class))
+    }
+
+    /// Removes the capture `epoch` ([`KeyMeasurement::last_captured`])
+    /// identifies within `key`. Leaves the key absent if that was its only
+    /// measurement — the shape an undo of a first capture must restore.
+    ///
+    /// **By identity, never position**: [`Self::record`] evicts from the middle
+    /// of a key's list, so a positional handle held across captures would come
+    /// to name a different capture. `None` means it is no longer retained,
+    /// which is not an error — retention is bounded, the dumps are not.
+    pub fn remove_capture(&mut self, key: u8, epoch: &str) -> Option<KeyMeasurement> {
         let entries = self.measurements.get_mut(&key)?;
-        let popped = entries.pop();
+        let pos = entries.iter().position(|m| m.last_captured == epoch)?;
+        let removed = entries.remove(pos);
         if entries.is_empty() {
             self.measurements.remove(&key);
         }
-        popped
+        Some(removed)
     }
 
     /// Removes the measurement at `index` in `key`'s list, returning it, or
     /// `None` if the key or index does not exist.
     ///
-    /// The reviewing counterpart to [`Self::undo_last`], which can only pop the
-    /// tail: a repeat that looks wrong later is rarely the newest one. Holds the
-    /// same invariant — a key left with no measurements disappears entirely, so
-    /// it reads as unmeasured rather than as an empty list.
+    /// The reviewing counterpart to [`Self::remove_capture`], which an undo
+    /// reaches by the identity it recorded: a repeat that looks wrong later is
+    /// rarely one the undo stack still names. Holds the same invariant — a key
+    /// left with no measurements disappears entirely, so it reads as unmeasured
+    /// rather than as an empty list.
     pub fn remove(&mut self, key: u8, index: usize) -> Option<KeyMeasurement> {
         let entries = self.measurements.get_mut(&key)?;
         if index >= entries.len() {
@@ -1319,11 +1381,16 @@ mod tests {
         p.record(m(5, 300.0, false));
         assert_eq!(p.active(5).unwrap().measured_f0, 300.0);
 
-        // With no manual entry at all, the newest untrusted one is active.
+        // With no manual entry at all the key presents *nothing*: an auto
+        // capture is retained for review and read by no one, so the key reads
+        // as unmeasured and its consumers fall back to the prior. A discovery
+        // false-lock would otherwise place the strobe's partials off a
+        // confidently-measured series belonging to another key.
         let mut q = InharmonicityProfile::default();
         q.record(m(7, 10.0, true));
         q.record(m(7, 20.0, true));
-        assert_eq!(q.active(7).unwrap().measured_f0, 20.0);
+        assert!(q.active(7).is_none());
+        assert_eq!(q.measurements[&7].len(), 2, "retained, not read");
         assert!(q.active(9).is_none());
     }
 
@@ -1359,11 +1426,13 @@ mod tests {
         p.record(open(5, 300.0));
         assert_eq!(p.active(5).unwrap().measured_f0, 300.0);
 
-        // A key measured only in isolation still presents its newest entry:
-        // one string is better than nothing, exactly as for auto-only keys.
+        // A key measured only in isolation presents nothing — one string is not
+        // "better than nothing", it is a different quantity, and the strobe's
+        // fallback is the note's own prior rather than a string's measurement.
         let mut q = InharmonicityProfile::default();
         q.record(solo(7, 10.0));
-        assert_eq!(q.active(7).unwrap().measured_f0, 10.0);
+        assert!(q.active(7).is_none());
+        assert_eq!(q.measurements[&7].len(), 1, "retained, not read");
     }
 
     /// An undeclared capture is unaffected by the string rule — which is every
@@ -1379,10 +1448,14 @@ mod tests {
     fn eviction_never_drops_the_active_entry() {
         let mut p = InharmonicityProfile::default();
         p.record(m(3, 1.0, false)); // the only trusted entry: stays active
-        for i in 0..(MAX_MEASUREMENTS_PER_KEY as u32 * 2) {
+        for i in 0..(MAX_UNUSED_MEASUREMENTS_PER_KEY as u32 * 4) {
             p.record(m(3, 100.0 + i as f32, true));
         }
-        assert_eq!(p.measurements[&3].len(), MAX_MEASUREMENTS_PER_KEY);
+        assert_eq!(
+            p.measurements[&3].len(),
+            1 + MAX_UNUSED_MEASUREMENTS_PER_KEY,
+            "the untrusted flood is bounded by its own budget"
+        );
         assert_eq!(
             p.active(3).unwrap().measured_f0,
             1.0,
@@ -1390,25 +1463,98 @@ mod tests {
         );
     }
 
-    /// Undo pops the appended entry, and a key that never had one disappears
-    /// entirely — the shape the curve's `active_entries` expects.
+    /// The budgets are separate, so an entry no consumer reads can never take a
+    /// trusted one's place. The measured failure this prevents: a mute-isolation
+    /// pass on A#3 left the key one of its thirteen open captures
+    /// (`docs/internals/06-capture-sets.md`).
     #[test]
-    fn undo_last_restores_the_previous_shape() {
+    fn unused_captures_never_displace_trusted_ones() {
+        let solo = |f0: f32| {
+            let mut e = m(9, f0, false);
+            e.sounding_strings = Some(SoundingStrings::UNDECLARED.toggled(1));
+            e
+        };
+        let mut p = InharmonicityProfile::default();
+        for i in 0..MAX_TRUSTED_MEASUREMENTS_PER_KEY {
+            p.record(m(9, 100.0 + i as f32, false));
+        }
+        for i in 0..20 {
+            p.record(solo(200.0 + i as f32));
+        }
+        let trusted = p.measurements[&9].iter().filter(|e| e.is_trusted()).count();
+        assert_eq!(
+            trusted, MAX_TRUSTED_MEASUREMENTS_PER_KEY,
+            "every open capture is still retained"
+        );
+        assert_eq!(
+            p.active(9).unwrap().measured_f0,
+            100.0 + (MAX_TRUSTED_MEASUREMENTS_PER_KEY - 1) as f32
+        );
+    }
+
+    /// The unused reserve keeps one of each configuration, so an isolation pass
+    /// stays legible: "have I captured string 1 yet?" is answerable from the
+    /// key's own rows even after many repeats of every string.
+    #[test]
+    fn the_unused_reserve_keeps_one_of_each_configuration() {
+        let declared = |f0: f32, string: usize| {
+            let mut e = m(11, f0, false);
+            e.sounding_strings = Some(SoundingStrings::UNDECLARED.toggled(string));
+            e
+        };
+        let mut p = InharmonicityProfile::default();
+        p.record(m(11, 1.0, false)); // the note itself
+        // Four repeats of each of three solos, interleaved as a pass runs.
+        for round in 0..4 {
+            for string in 0..3 {
+                p.record(declared(100.0 * (round + 1) as f32 + string as f32, string));
+            }
+        }
+        let unused: Vec<_> = p.measurements[&11]
+            .iter()
+            .filter(|e| !e.is_trusted())
+            .collect();
+        assert!(unused.len() <= MAX_UNUSED_MEASUREMENTS_PER_KEY);
+        for string in 0..3 {
+            let want = Some(SoundingStrings::UNDECLARED.toggled(string));
+            assert!(
+                unused.iter().any(|e| e.sounding_strings == want),
+                "string {} lost every one of its solos",
+                string + 1
+            );
+        }
+        assert_eq!(p.active(11).unwrap().measured_f0, 1.0);
+    }
+
+    /// Undo removes the capture it named — by identity, since eviction can take
+    /// an entry from the middle of a key's list — and a key that loses its last
+    /// one disappears entirely, the shape `active_entries` expects.
+    #[test]
+    fn remove_capture_finds_the_entry_by_epoch() {
         let mut p = InharmonicityProfile::default();
         p.record(m(2, 1.0, false));
         p.record(m(2, 2.0, false));
-        assert_eq!(p.undo_last(2).unwrap().measured_f0, 2.0);
-        assert_eq!(p.active(2).unwrap().measured_f0, 1.0);
-        assert_eq!(p.undo_last(2).unwrap().measured_f0, 1.0);
+        // `m` stamps `last_captured` from f0, so each capture is identifiable.
+        assert_eq!(p.remove_capture(2, "1").unwrap().measured_f0, 1.0);
+        assert_eq!(
+            p.active(2).unwrap().measured_f0,
+            2.0,
+            "the entry undo did not name is untouched"
+        );
+        assert_eq!(p.remove_capture(2, "2").unwrap().measured_f0, 2.0);
         assert!(
             !p.measurements.contains_key(&2),
             "a key with no measurements must not linger as an empty list"
         );
-        assert!(p.undo_last(2).is_none());
+        assert!(
+            p.remove_capture(2, "2").is_none(),
+            "a capture that is no longer retained is not an error — its dump is \
+             still the caller's to delete"
+        );
     }
 
-    /// `remove` reaches any entry, not just the tail, and holds `undo_last`'s
-    /// invariant: emptying a key removes the key.
+    /// `remove` reaches any entry by position — the inspector's handle — and
+    /// holds `remove_capture`'s invariant: emptying a key removes the key.
     #[test]
     fn remove_reaches_any_entry_and_empties_the_key() {
         let mut p = InharmonicityProfile::default();
@@ -1416,7 +1562,7 @@ mod tests {
         p.record(m(6, 2.0, true));
         p.record(m(6, 3.0, true));
 
-        // The middle entry — the one `undo_last` can never reach.
+        // The middle entry — the one an undo would never name.
         assert_eq!(p.remove(6, 1).unwrap().measured_f0, 2.0);
         assert_eq!(p.measurements[&6].len(), 2);
         assert_eq!(
@@ -1453,11 +1599,16 @@ mod tests {
 
         let loaded = InharmonicityProfile::from_file(&path).unwrap();
         assert_eq!(loaded.measurements[&4].len(), 1);
-        assert_eq!(loaded.active(4).unwrap().measured_f0, 55.0);
-        // Pre-flag entries are untrusted, so they can never feed the curve.
-        assert!(loaded.active(4).unwrap().captured_in_auto);
+        let migrated = &loaded.measurements[&4][0];
+        assert_eq!(migrated.measured_f0, 55.0);
+        // Pre-flag entries are untrusted, so nothing reads them: the file opens
+        // and its measurements are inspectable, but a key carrying only
+        // pre-flag data reads as unmeasured rather than as one whose provenance
+        // happens to be unknown.
+        assert!(migrated.captured_in_auto);
+        assert!(loaded.active(4).is_none());
         // And they declared no strings — never "all three".
-        assert_eq!(loaded.active(4).unwrap().sounding_strings, None);
+        assert_eq!(migrated.sounding_strings, None);
         // Named after its file, and carrying today's defaults.
         assert_eq!(loaded.identity.name, "old-upright");
         assert_eq!(

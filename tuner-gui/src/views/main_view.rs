@@ -112,9 +112,11 @@ pub fn create_main_view(
         capture_message,
         data.reference_mode,
         SessionStatus {
-            strings: data
-                .string_isolation
-                .then_some((data.sounding_strings, data.strings_touched)),
+            // Manual only: the declaration names strings of a key the operator
+            // named, and Auto latches the key by discovery instead.
+            strings: (data.string_isolation
+                && matches!(data.tuning_mode, TuningMode::Manual { .. }))
+            .then_some((data.sounding_strings, data.strings_touched)),
             extended_capture: data
                 .extended_capture
                 .then_some((data.extended_capture_secs, data.capture_progress_secs)),
