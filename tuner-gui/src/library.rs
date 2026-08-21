@@ -143,6 +143,12 @@ pub struct AppSettings {
     /// declaration at all.
     #[serde(default)]
     pub string_isolation: bool,
+    /// Show the unison panels, and the Tools entries that hide and show them.
+    /// Off for ordinary tuning: the panels read a note's individual strings,
+    /// which is a measurement surface rather than a tuning one, and their
+    /// resolution floor sits above most set unisons (ADR 0014).
+    #[serde(default)]
+    pub unison_assist: bool,
     /// Record past the shipped 1.5 s, for the offline deliverables a capture
     /// cannot otherwise serve (per-string decay τ, deep-bass resolution). Off
     /// for ordinary tuning; the measured span is unchanged either way.
@@ -175,6 +181,7 @@ impl Default for AppSettings {
             last_profile: None,
             recents: Vec::new(),
             string_isolation: false,
+            unison_assist: false,
             extended_capture: false,
             extended_capture_secs: default_extended_capture_secs(),
             instrument: Instrument::default(),

@@ -23,7 +23,7 @@ use tuner_core::strobe::MAX_STROBE_REFS;
 use tuner_core::strobe::unison::UnisonVerdict;
 use tuner_core::worker::CurveBundle;
 
-const TOOLS_CONFIG: [ButtonConfig; 8] = [
+const TOOLS_CONFIG: [ButtonConfig; 6] = [
     ButtonConfig {
         label: "Spectrogram",
         message: Some(Message::ToggleSpectrogram),
@@ -49,19 +49,6 @@ const TOOLS_CONFIG: [ButtonConfig; 8] = [
     ButtonConfig {
         label: "Strobe",
         message: Some(Message::ToggleStrobe),
-        button_type: ButtonType::Standard,
-    },
-    // The live loop's three panels toggle separately: they answer one question
-    // at three magnifications, and how much of it a tuner wants on screen
-    // changes with the note and with the stage of the job.
-    ButtonConfig {
-        label: "Unison (partial)",
-        message: Some(Message::ToggleUnisonDisplayed),
-        button_type: ButtonType::Standard,
-    },
-    ButtonConfig {
-        label: "Unison (all)",
-        message: Some(Message::ToggleUnisonAll),
         button_type: ButtonType::Standard,
     },
     // ButtonConfig {
@@ -112,6 +99,21 @@ const STROBE_PANEL_HEIGHT: f32 = 300.0;
 /// separation, not resolution: both panels share one cents axis.
 const UNISON_MAGNIFIED_ROW: f32 = 48.0;
 
+/// Tools entries present only while unison assist is enabled in Settings ▸
+/// Advanced. Each panel toggles on its own.
+const UNISON_TOOLS_CONFIG: [ButtonConfig; 2] = [
+    ButtonConfig {
+        label: "Unison (partial)",
+        message: Some(Message::ToggleUnisonDisplayed),
+        button_type: ButtonType::Standard,
+    },
+    ButtonConfig {
+        label: "Unison (all)",
+        message: Some(Message::ToggleUnisonAll),
+        button_type: ButtonType::Standard,
+    },
+];
+
 /// Static main sidebar configuration
 const MAIN_SIDEBAR_CONFIG: [(&str, &[ButtonConfig]); 2] = [
     ("Tools", TOOLS_CONFIG.as_slice()),
@@ -152,6 +154,7 @@ pub fn create_main_view(
         data.undo_target_note.clone(),
         capture_message,
         data.reference_mode,
+        data.unison_assist,
         SessionStatus {
             // Manual only: the declaration names strings of a key the operator
             // named, and Auto latches the key by discovery instead.
@@ -650,7 +653,7 @@ fn create_unison_panel(
     } else {
         data.unison_all_visible
     };
-    if !visible {
+    if !data.unison_assist || !visible {
         return None;
     }
     let title_for = |note: &str| {
@@ -663,19 +666,11 @@ fn create_unison_panel(
     let TuningMode::Manual { note_name, .. } = &data.tuning_mode else {
         // Row slots are fixed, so the empty grid is the panel's own
         // nothing-to-show state. No key is nominated, so no row has a target.
-        let slots = if magnified { 1 } else { MAX_STROBE_REFS };
-        let rows: Vec<_> = (0..slots)
-            .map(|i| unison_display::UnisonRow {
-                partial: i as u8 + 1,
-                ..unison_display::UnisonRow::default()
-            })
-            .collect();
-        let display = UnisonDisplay::new(rows, UNISON_SPAN_LADDER[UNISON_SPAN_LADDER.len() - 1]);
-        let display = if magnified {
-            display.row_height(UNISON_MAGNIFIED_ROW)
-        } else {
-            display
-        };
+        let display = unison_canvas(
+            empty_rows(which),
+            UNISON_SPAN_LADDER[UNISON_SPAN_LADDER.len() - 1],
+            magnified,
+        );
         return Some(
             container(
                 column![
@@ -686,17 +681,22 @@ fn create_unison_panel(
                         .height(Length::Fixed(unison_body_height(which))),
                     Space::new().height(6),
                     on_plot_span(
-                        text(auto_mode_note(data.instrument, "unison display"))
-                            .size(12)
-                            .color(iced::Color::from_rgb8(0xc3, 0xc2, 0xb7))
-                            .into()
+                        container(
+                            text(auto_mode_note(data.instrument, "unison display"))
+                                .size(12)
+                                .color(iced::Color::from_rgb8(0xc3, 0xc2, 0xb7)),
+                        )
+                        .width(Fill)
+                        .height(Length::Fixed(UNISON_FOOTER_HEIGHT))
+                        .into()
                     ),
                 ]
                 .width(Fill)
                 .spacing(4)
-                .padding(15),
+                .padding(PANEL_PADDING),
             )
             .width(Fill)
+            .height(Length::Fixed(unison_panel_height(which)))
             .into(),
         );
     };
@@ -717,29 +717,38 @@ fn create_unison_panel(
     let muted = iced::Color::from_rgb8(0xc3, 0xc2, 0xb7);
     let amber = iced::Color::from_rgb8(0xd9, 0x92, 0x26);
 
-    let body: Element<'static, Message> = if data.strobe.out_of_range {
-        // The band's own verdict, reused: beyond it the lines alias.
-        text("Out of range — bring the string inside ±21.5 Hz of target first.")
-            .size(13)
-            .color(muted)
-            .into()
+    // Why the panel is showing no markers, when it is showing none. The axis and
+    // its row slots stay drawn in every state; only the markers are withheld.
+    let (drawn, blocked) = if data.strobe.out_of_range {
+        // The band's own verdict, reused: beyond it the lines alias, so the
+        // slots are drawn and the markers withheld.
+        (
+            rows.iter()
+                .map(|r| unison_display::UnisonRow { count: 0, ..*r })
+                .collect(),
+            Some("Out of range — bring the string inside ±21.5 Hz of target first."),
+        )
     } else if rows.is_empty() {
-        text("Listening… strike the note and let it ring.")
-            .size(13)
-            .color(muted)
-            .into()
+        (
+            empty_rows(which),
+            Some("Listening… strike the note and let it ring."),
+        )
+    } else if rows.iter().all(|r| r.count == 0) {
+        // Targeted, but nothing resolved on any of them — a decayed note, not a
+        // clean one.
+        (
+            rows.clone(),
+            Some("Listening… strike the note and let it ring."),
+        )
     } else {
-        let display = UnisonDisplay::new(rows.clone(), data.unison.span_cents);
-        let display = if magnified {
-            display.row_height(UNISON_MAGNIFIED_ROW)
-        } else {
-            display
-        };
-        container(display.view())
+        (rows.clone(), None)
+    };
+
+    let body: Element<'static, Message> =
+        container(unison_canvas(drawn, data.unison.span_cents, magnified).view())
             .width(Fill)
             .height(Length::Fixed(body_height))
-            .into()
-    };
+            .into();
 
     // How many strings, how far apart, and how fast they beat. The limit is
     // stated as a beat rate because that is the quantity a tuner hears, and
@@ -766,6 +775,7 @@ fn create_unison_panel(
             format!("{resolved} of {} partials split", rows.len())
         }
     };
+    let readout = blocked.map_or(readout, str::to_string);
     let resolution_note = if resolution.is_finite() && resolution > 0.0 {
         format!("resolved to ±{resolution:.1} ¢")
     } else {
@@ -783,7 +793,7 @@ fn create_unison_panel(
     // The handoff: one line means either a clean unison or a beat too slow to
     // see, and the panel cannot tell them apart. The strobe can — on one
     // sounding string it reads far finer than this ever will.
-    let handoff = (magnified && strings <= 1).then_some(
+    let handoff = (magnified && blocked.is_none() && strings <= 1).then_some(
         "Slower beats are beyond this display — listen for them, or mute two \
          strings and tune each one on the strobe.",
     );
@@ -792,46 +802,120 @@ fn create_unison_panel(
     // attribute is still a line the tuner should see. `Undetermined` states what
     // is known of it — a second line is not a second string (ADR 0013 §4).
     let lines_here = rows.iter().any(|r| r.count >= 2);
-    let verdict: Option<(&str, iced::Color)> = (!magnified).then_some(match u.verdict {
-        UnisonVerdict::Unison if lines_here => ("✓ consistent with a unison", muted),
-        UnisonVerdict::FalseBeat if lines_here => ("✗ false beat — one string, not two", amber),
-        _ if lines_here => (
-            "undetermined — a second line is not proof of a second string; one \
+    let verdict: Option<(&str, iced::Color)> =
+        (!magnified && blocked.is_none()).then_some(match u.verdict {
+            UnisonVerdict::Unison if lines_here => ("✓ consistent with a unison", muted),
+            UnisonVerdict::FalseBeat if lines_here => ("✗ false beat — one string, not two", amber),
+            _ if lines_here => (
+                "undetermined — a second line is not proof of a second string; one \
              string can split this way",
-            muted,
-        ),
-        _ => ("verdict undetermined — too few partials resolved", muted),
-    });
+                muted,
+            ),
+            _ => ("verdict undetermined — too few partials resolved", muted),
+        });
 
-    let mut panel_content = column![
+    // The readout takes a share of the row, not its natural width, so a long
+    // message wraps inside it rather than over the figure beside it. While
+    // blocked there is no figure: the resolution of a reading the panel is not
+    // showing is not a fact about anything on screen.
+    let mut footer = column![
+        row![
+            text(readout).size(15).width(Fill),
+            Space::new().width(8),
+            match blocked {
+                Some(_) => Element::from(Space::new()),
+                None => text(resolution_note)
+                    .size(12)
+                    .color(resolution_color)
+                    .into(),
+            },
+        ]
+        .align_y(Alignment::Center),
+    ]
+    .width(Fill)
+    .spacing(4);
+
+    if let Some((verdict_text, verdict_color)) = verdict {
+        footer = footer.push(text(verdict_text).size(12).color(verdict_color));
+    }
+    if let Some(t) = handoff {
+        footer = footer.push(text(t).size(11).color(muted));
+    }
+
+    let panel_content = column![
         on_plot_span(text(title_for(note_name)).size(18).into()),
         Space::new().height(8),
         body,
         Space::new().height(6),
+        // Fixed, for the same reason the row slots are: a line appearing must
+        // not move the axis above it, and a panel that resizes re-lays out the
+        // column it sits in.
         on_plot_span(
-            row![
-                text(readout).size(15),
-                Space::new().width(Fill),
-                text(resolution_note).size(12).color(resolution_color),
-            ]
-            .align_y(Alignment::Center)
-            .into()
+            container(footer)
+                .width(Fill)
+                .height(Length::Fixed(UNISON_FOOTER_HEIGHT))
+                .into()
         ),
     ]
     .width(Fill)
     .spacing(4)
-    .padding(15);
+    .padding(PANEL_PADDING);
 
-    if let Some((verdict_text, verdict_color)) = verdict {
-        panel_content = panel_content.push(on_plot_span(
-            text(verdict_text).size(12).color(verdict_color).into(),
-        ));
-    }
-    if let Some(t) = handoff {
-        panel_content = panel_content.push(on_plot_span(text(t).size(11).color(muted).into()));
-    }
+    Some(
+        container(panel_content)
+            .width(Fill)
+            .height(Length::Fixed(unison_panel_height(which)))
+            .into(),
+    )
+}
 
-    Some(container(panel_content).width(Fill).into())
+/// Padding inside a panel, between its border and its content.
+const PANEL_PADDING: f32 = 15.0;
+
+/// Height reserved for a unison panel's text, below the plot.
+///
+/// Sized for the longest footer either panel produces: a readout that wraps to
+/// two lines (the out-of-range message is the longest) plus a verdict or a
+/// two-line handoff. Reserved rather than grown, so a line appearing moves
+/// nothing.
+const UNISON_FOOTER_HEIGHT: f32 = 62.0;
+
+/// Overall height of a unison panel — its padding, title row, the plot, and the
+/// text slot beneath it, none of which depend on what is currently resolved.
+fn unison_panel_height(which: UnisonPanel) -> f32 {
+    /// Title row at 18 px, the 8 px and 6 px gaps around the plot, and the
+    /// column's own spacing between the four items.
+    const TITLE_AND_GAPS: f32 = 56.0;
+    2.0 * PANEL_PADDING + TITLE_AND_GAPS + unison_body_height(which) + UNISON_FOOTER_HEIGHT
+}
+
+/// One empty row slot per reference the panel can draw — what the axis looks
+/// like with nothing resolved on it.
+fn empty_rows(which: UnisonPanel) -> Vec<unison_display::UnisonRow> {
+    let slots = match which {
+        UnisonPanel::Displayed => 1,
+        UnisonPanel::AllPartials => MAX_STROBE_REFS,
+    };
+    (0..slots)
+        .map(|i| unison_display::UnisonRow {
+            partial: i as u8 + 1,
+            ..unison_display::UnisonRow::default()
+        })
+        .collect()
+}
+
+/// The unison canvas at the size this panel draws it.
+fn unison_canvas(
+    rows: Vec<unison_display::UnisonRow>,
+    span_cents: f32,
+    magnified: bool,
+) -> UnisonDisplay {
+    let display = UnisonDisplay::new(rows, span_cents);
+    if magnified {
+        display.row_height(UNISON_MAGNIFIED_ROW)
+    } else {
+        display
+    }
 }
 
 /// Height of a unison canvas, in pixels — one fixed row slot per reference the
@@ -892,9 +976,25 @@ fn create_curve_plot_panel(
                 .into(),
             )
         }
+        // The grid draws with no series on it while the first bundle computes.
+        // Non-finite cents draw nothing, so no key reads as measured at 0 ¢.
         None => (
-            "Tuning Curve".to_string(),
-            text("Computing…").size(16).into(),
+            "Tuning Curve — computing…".to_string(),
+            container(
+                CurvePlot::new(
+                    [f32::NAN; 88],
+                    [false; 88],
+                    [false; 88],
+                    PlotMode::Full,
+                    None,
+                )
+                .selected(selected_key)
+                .on_select(Message::KeySelected)
+                .view(),
+            )
+            .width(Fill)
+            .height(Fill)
+            .into(),
         ),
     };
 
@@ -1222,6 +1322,7 @@ fn create_sidebar(
     undo_target_note: Option<String>,
     capture_message: Message,
     reference_mode: ReferenceMode,
+    unison_assist: bool,
     session: SessionStatus,
 ) -> Element<'static, Message> {
     let SessionStatus {
@@ -1252,9 +1353,13 @@ fn create_sidebar(
 
     // Add all settings sections
     for (title, buttons) in MAIN_SIDEBAR_CONFIG {
+        let mut entries: Vec<&ButtonConfig> = buttons.iter().collect();
+        if title == "Tools" && unison_assist {
+            entries.extend(UNISON_TOOLS_CONFIG.iter());
+        }
         sections = sections.push(make_sidebar_section(
             title,
-            buttons,
+            entries,
             measurement_mode_active,
         ));
     }

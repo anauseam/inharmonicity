@@ -172,6 +172,8 @@ pub enum Message {
     ToggleStrobe,                    // Show/hide the strobe panel (design §5)
     ToggleUnisonDisplayed,           // Show/hide the magnified one-partial unison panel
     ToggleUnisonAll,                 // Show/hide the stacked all-partials unison panel
+    ToggleUnisonAssistPanel,         // Open/close the Unison Assist settings panel
+    SetUnisonAssist(bool),           // Enable/disable the unison panels entirely
     SetReferenceMode(ReferenceMode), // Which target function all readouts use (design §5)
     RequestRelock,                   // Open the re-lock confirm modal (design §8)
     ConfirmRelock,                   // Copy the live bundle into the strobe lock (design §8)
@@ -532,6 +534,12 @@ pub struct AppDisplayData {
     pub key_select_visible: bool,
     pub curve_plot_visible: bool,
     pub strobe_visible: bool,
+    /// Unison assist is enabled at all. While off the panels are hidden and
+    /// their Tools entries are absent, so [`Self::unison_displayed_visible`]
+    /// and [`Self::unison_all_visible`] cannot be reached.
+    pub unison_assist: bool,
+    /// The Unison Assist settings panel is the active one.
+    pub unison_assist_visible: bool,
     /// The magnified one-partial unison panel is on screen. Independent of
     /// [`Self::strobe_visible`] — each live-loop panel is toggled on its own.
     pub unison_displayed_visible: bool,
@@ -860,8 +868,10 @@ impl Default for TunerApp {
                 key_select_visible: true,
                 curve_plot_visible: true,
                 strobe_visible: true,
-                unison_displayed_visible: true,
-                unison_all_visible: true,
+                unison_assist: false,
+                unison_assist_visible: false,
+                unison_displayed_visible: false,
+                unison_all_visible: false,
                 // inharmonicity_graph_visible: true,
                 settings_view_visible: false,
                 library_visible: false,
@@ -989,6 +999,7 @@ impl TunerApp {
         d.curve_select_visible = false;
         d.instrument_select_visible = false;
         d.string_isolation_visible = false;
+        d.unison_assist_visible = false;
         d.extended_capture_visible = false;
         d.settings_data.rms.visible = false;
         d.settings_data.transient.visible = false;
@@ -1230,6 +1241,17 @@ impl TunerApp {
                 self.curve_in_flight = true;
             }
         }
+    }
+
+    /// Turns unison assist on or off, and both panels with it.
+    ///
+    /// The panels' own toggles appear and disappear with the mode, so their
+    /// visibility must follow it: a panel left on screen after the mode is off
+    /// could not be dismissed.
+    fn set_unison_assist(&mut self, on: bool) {
+        self.display_data.unison_assist = on;
+        self.display_data.unison_displayed_visible = on;
+        self.display_data.unison_all_visible = on;
     }
 
     /// Swaps the main-view note-select surface (debug convenience) and keeps the
@@ -1637,6 +1659,7 @@ impl TunerApp {
         // settings into the display state the same way an explicit open does.
         app.app_settings = AppSettings::load();
         app.display_data.string_isolation = app.app_settings.string_isolation;
+        app.set_unison_assist(app.app_settings.unison_assist);
         app.display_data.extended_capture = app.app_settings.extended_capture;
         app.display_data.extended_capture_secs = app.app_settings.extended_capture_secs;
         // The picker only; the profile's own saved `reference_mode` stays
@@ -1892,6 +1915,21 @@ impl TunerApp {
                 self.display_data.string_isolation_visible = visible;
                 if visible {
                     self.display_data.settings_view_visible = true;
+                }
+            }
+            Message::ToggleUnisonAssistPanel => {
+                let visible = !self.display_data.unison_assist_visible;
+                self.close_settings_panels();
+                self.display_data.unison_assist_visible = visible;
+                if visible {
+                    self.display_data.settings_view_visible = true;
+                }
+            }
+            Message::SetUnisonAssist(on) => {
+                self.set_unison_assist(on);
+                self.app_settings.unison_assist = on;
+                if let Err(e) = self.app_settings.save() {
+                    eprintln!("[MAIN] Could not save app settings: {e}");
                 }
             }
             Message::SetStringIsolation(on) => {

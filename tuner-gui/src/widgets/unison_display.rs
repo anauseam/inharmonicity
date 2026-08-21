@@ -40,6 +40,7 @@
 
 use iced::alignment::{Horizontal, Vertical};
 use iced::widget::canvas::{self, Canvas, Path, Stroke};
+use iced::widget::text::Wrapping;
 use iced::widget::{Space, column, container, row, text};
 use iced::{Color, Element, Fill, Length, Point, Rectangle, Renderer, Theme, mouse};
 
@@ -118,14 +119,21 @@ pub const PLOT_RIGHT_MARGIN: f32 = 10.0;
 /// bank is not targeting rather than as one that has decayed.
 const MIN_LEVEL: f32 = 0.35;
 
-/// Left gutter, wide enough for the longest row label at the label size — see
-/// [`row_label`], which is kept short so this stays narrow. The label carries
-/// the reference frequency, which is what makes the stacked layout a partials
-/// list as well as a unison display.
+/// Left gutter. Sized for the widest label [`row_label`] can produce — nine
+/// characters (`n12 19875`) at [`LABEL_SIZE`], plus [`LABEL_PAD`]; digit
+/// advance in the default sans face is ≈ 0.55 em.
+///
+/// That is an estimate of a font metric, so it is a *target*, not a guarantee:
+/// the guarantee is [`Wrapping::None`] on the labels themselves, which keeps a
+/// label that outgrows its slot on one line instead of wrapping into the row
+/// below.
 ///
 /// Public because the panels' text and the strobe's band are laid out against
 /// it: everything in the live loop occupies the same span as the plot.
-pub const GUTTER: f32 = 52.0;
+pub const GUTTER: f32 = 9.0 * 0.55 * LABEL_SIZE + LABEL_PAD;
+
+/// Space between a row label and the plot it labels.
+const LABEL_PAD: f32 = 6.0;
 
 /// A row's gutter label: its partial number and that partial's target.
 ///
@@ -204,27 +212,35 @@ impl UnisonDisplay {
                 container(
                     text(label)
                         .size(LABEL_SIZE)
-                        .color(fade(INK_SECONDARY, dim(r.level, r.gated))),
+                        .color(fade(INK_SECONDARY, dim(r.level, r.gated)))
+                        .wrapping(Wrapping::None),
                 )
                 .width(Fill)
                 .height(Length::Fixed(row_height))
                 .align_x(Horizontal::Right)
                 .align_y(Vertical::Bottom)
-                .padding([0.0, 6.0]),
+                .padding(iced::Padding {
+                    top: 0.0,
+                    right: LABEL_PAD,
+                    bottom: 0.0,
+                    left: 0.0,
+                }),
             );
         }
 
         // The ends and the target, over the plot area the canvas draws into.
+        let tick = |label: String| {
+            text(label)
+                .size(LABEL_SIZE)
+                .color(INK_SECONDARY)
+                .wrapping(Wrapping::None)
+        };
         let axis = row![
-            text(format!("{:+.1}", -half))
-                .size(LABEL_SIZE)
-                .color(INK_SECONDARY),
+            tick(format!("{:+.1}", -half)),
             Space::new().width(Fill),
-            text("0 ¢").size(LABEL_SIZE).color(INK_SECONDARY),
+            tick("0 ¢".to_string()),
             Space::new().width(Fill),
-            text(format!("{half:+.1}"))
-                .size(LABEL_SIZE)
-                .color(INK_SECONDARY),
+            tick(format!("{half:+.1}")),
         ]
         .height(Length::Fixed(AXIS_STRIP));
 
