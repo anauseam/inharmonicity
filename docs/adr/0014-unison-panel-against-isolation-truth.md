@@ -427,8 +427,14 @@ published. The screen description gains the `B`-agreement rule.
   positive control, and §6's residual-based SE is vindicated by measurement.
 - ADR 0013 D3's mute test is **discharged**: the single-strung 65 % figure is
   the control it asked for.
-- **Prompt O's value is not raised by this set after all.** The high-treble
-  blocker here is record length, and the D3 attribution is untested.
+- **One motivation for Prompt O weakens; its main case is untouched.** ADR 0012
+  §7 attributed the high-treble failure to the D3 gate, and §8 here shows the
+  blocker in this set is record length, with the two confounded. That was only
+  ever the *unison-availability* argument for O. The σ misspecification's larger
+  exposure is the **engine's** per-partial tracking gate (`engine.rs`), which
+  decides which partials the phase vocoder keeps and so feeds `measured_f0`, the
+  MAT seed and the M-of-N lock — nothing here bears on that, and it remains the
+  reason `suspected-issues.md` carries the entry.
 
 ## 9. What the next session must record
 

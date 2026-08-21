@@ -13,9 +13,9 @@ use crate::utils::view_utils::{
 use crate::views::curve_select;
 use crate::widgets::curve_plot::{CurvePlot, INK_SECONDARY, PlotMode, SUSPECT};
 use crate::widgets::strobe_display::StrobeDisplay;
-use crate::widgets::unison_display::{self, UnisonDisplay, UnisonMode};
+use crate::widgets::unison_display::{self, UnisonDisplay};
 use crate::widgets::{cent_meter, guitar_strings, piano_keyboard, spectrogram};
-use iced::widget::{Space, button, column, container, row, text};
+use iced::widget::{Space, button, column, container, row, scrollable, text};
 use iced::{Alignment, Element, Fill, Length};
 use tuner_core::models::{self, InharmonicityProfile};
 use tuner_core::pipeline::CaptureState;
@@ -23,7 +23,7 @@ use tuner_core::strobe::MAX_STROBE_REFS;
 use tuner_core::strobe::unison::UnisonVerdict;
 use tuner_core::worker::CurveBundle;
 
-const TOOLS_CONFIG: [ButtonConfig; 6] = [
+const TOOLS_CONFIG: [ButtonConfig; 8] = [
     ButtonConfig {
         label: "Spectrogram",
         message: Some(Message::ToggleSpectrogram),
@@ -51,6 +51,19 @@ const TOOLS_CONFIG: [ButtonConfig; 6] = [
         message: Some(Message::ToggleStrobe),
         button_type: ButtonType::Standard,
     },
+    // The live loop's three panels toggle separately: they answer one question
+    // at three magnifications, and how much of it a tuner wants on screen
+    // changes with the note and with the stage of the job.
+    ButtonConfig {
+        label: "Unison (partial)",
+        message: Some(Message::ToggleUnisonDisplayed),
+        button_type: ButtonType::Standard,
+    },
+    ButtonConfig {
+        label: "Unison (all)",
+        message: Some(Message::ToggleUnisonAll),
+        button_type: ButtonType::Standard,
+    },
     // ButtonConfig {
     //     label: "Inharmonicity Graph",
     //     message: Some(Message::ToggleInharmonicityGraph),
@@ -70,6 +83,34 @@ const PROGRAM_CONFIG: [ButtonConfig; 1] = [ButtonConfig {
     message: Some(Message::SaveProfile),
     button_type: ButtonType::Standard,
 }];
+
+/// Width of the live-loop column. Fixed, because the strobe and the unison
+/// axes are read at a glance and a readout that changes width with the window
+/// changes what a marker's position means.
+const LIVE_COLUMN_WIDTH: f32 = 360.0;
+
+/// Which rows a unison panel draws — the displayed partial magnified, or every
+/// partial stacked. The same measurement at two sizes; the panels differ in the
+/// rows they are handed and in which numbers they print beside them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnisonPanel {
+    /// The strobe band's own partial n*, drawn large.
+    Displayed,
+    /// Every reference in the bank, stacked — the discriminator's evidence.
+    AllPartials,
+}
+
+/// Side of the square strobe band.
+const STROBE_BAND: f32 = 150.0;
+
+/// Height of the strobe panel: title, band, the two readout lines beneath it,
+/// and room for the flag advisory and the curve-lock footer.
+const STROBE_PANEL_HEIGHT: f32 = 300.0;
+
+/// Row height of the magnified single-partial panel, against
+/// [`unison_display::ROW_HEIGHT`] in the stack. Magnification buys marker
+/// separation, not resolution: both panels share one cents axis.
+const UNISON_MAGNIFIED_ROW: f32 = 48.0;
 
 /// Static main sidebar configuration
 const MAIN_SIDEBAR_CONFIG: [(&str, &[ButtonConfig]); 2] = [
@@ -125,8 +166,11 @@ pub fn create_main_view(
     );
 
     // Assemble the final layout
+    // Height is filled, not shrunk: the live-loop column scrolls, and a
+    // scrollable in a shrink-height parent has no bound to scroll within.
     let main_content = row![sidebar, Space::new().width(10), widget_area,]
         .align_y(Alignment::Start)
+        .height(Fill)
         .padding(20);
 
     let base = container(main_content).width(Fill).height(Fill);
@@ -191,9 +235,16 @@ pub fn create_main_view(
     }
 }
 
-/// Creates the isolated widget area layout (spectrogram, cent meter, keyboard,
-/// partials, live curve plot). This can be used independently of the settings
-/// sidebar.
+/// Creates the widget area — two columns split by task
+/// ([`docs/design/layout-by-task-design.md`](../../../docs/design/layout-by-task-design.md)).
+///
+/// **Left, context:** what am I tuning and what is the plan — the spectrogram,
+/// the note-select surface, the tuning curve, and the engine's own state.
+/// **Right, the live loop:** what the eye is on while the hand is on the lever
+/// — the strobe, then the same string's unison at two magnifications.
+///
+/// A hidden panel is not pushed, so it costs no space and its neighbours do not
+/// move; a column with nothing in it is omitted and the other takes the width.
 pub fn create_widget_area(
     data: &AppDisplayData,
     curve_bundle: Option<&CurveBundle>,
@@ -217,68 +268,84 @@ pub fn create_widget_area(
     ]
     .align_y(Alignment::Center);
 
-    // Build UI panels using dedicated helper methods
-    let spectrogram_panel = create_spectrogram_panel(data);
-    let cent_meter_panel = create_cent_meter_panel(data);
-    let keyboard_panel = create_keyboard_panel(data, curve_bundle);
-    let curve_plot_panel = create_curve_plot_panel(data, curve_bundle);
-    let strobe_panel = create_strobe_panel(data, curve_bundle);
-    let unison_panel = create_unison_panel(data);
-    let auto_mode_notice = create_auto_mode_notice(data);
-    // let inharmonicity_graph_panel = create_inharmonicity_graph_panel(data, profile);
-
-    // A helper function to safely embed optional widgets into a row/column layout.
-    // If an optional panel (e.g., Spectrogram) is turned off and returns `None`,
-    // this cleanly substitutes it with an invisible `Space` widget, preventing
-    // missing elements from breaking the UI layout.
-    fn wrap_panel(p: Option<Element<'static, Message>>) -> Element<'static, Message> {
-        p.unwrap_or_else(|| Space::new().into())
+    // Left column — context, in the order a session reads it: what the
+    // instrument is doing, which key I am on, where that key sits in the plan.
+    let mut context = column![].width(Fill).spacing(10);
+    let mut context_panels = 0;
+    // The spectrogram and the cent meter share the top row: both answer what the
+    // engine is hearing.
+    let top: Vec<_> = [
+        create_spectrogram_panel(data),
+        create_cent_meter_panel(data),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    context_panels += top.len();
+    if !top.is_empty() {
+        let mut top_row = row![].width(Fill).spacing(10).align_y(Alignment::Start);
+        for panel in top {
+            top_row = top_row.push(panel);
+        }
+        context = context.push(top_row);
+    }
+    for panel in [
+        create_keyboard_panel(data, curve_bundle),
+        create_curve_plot_panel(data, curve_bundle),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        context = context.push(panel);
+        context_panels += 1;
     }
 
-    let top_row = row![
-        wrap_panel(spectrogram_panel),
-        Space::new().width(10),
-        wrap_panel(cent_meter_panel)
+    // Right column — the live loop, in descending magnification of one
+    // question: is this string where I want it.
+    let strobe_panel = create_strobe_panel(data, curve_bundle);
+    let mut live = column![].spacing(10);
+    let mut live_panels = 0;
+    for panel in [
+        create_unison_panel(data, UnisonPanel::Displayed),
+        create_unison_panel(data, UnisonPanel::AllPartials),
     ]
-    .width(Fill)
-    .align_y(Alignment::Start);
+    .into_iter()
+    .flatten()
+    {
+        live = live.push(panel);
+        live_panels += 1;
+    }
 
-    let bottom_row = row![wrap_panel(keyboard_panel)]
-        .width(Fill)
-        .align_y(Alignment::Start);
-
-    // let inharmonicity_graph_row = row![
-    //     wrap_panel(inharmonicity_graph_panel),
-    // ]
-    // .width(Length::Fill)
-    // .align_y(Alignment::Start);
-
-    let curve_row = row![
-        wrap_panel(curve_plot_panel),
-        Space::new().width(10),
-        wrap_panel(strobe_panel),
-        Space::new().width(10),
-        wrap_panel(unison_panel)
-    ]
-    .width(Fill)
-    .align_y(Alignment::Start);
+    let mut columns = row![].height(Fill).align_y(Alignment::Start);
+    if context_panels > 0 {
+        columns = columns.push(scrollable(context).height(Fill));
+    }
+    if strobe_panel.is_some() || live_panels > 0 {
+        // The strobe is pinned above the scroll. It is read without looking away
+        // from the string, so it is the one panel that must not move when the
+        // column below it does.
+        let mut right = column![]
+            .spacing(10)
+            .width(Length::Fixed(LIVE_COLUMN_WIDTH));
+        if let Some(panel) = strobe_panel {
+            right = right.push(panel);
+        }
+        if live_panels > 0 {
+            right = right.push(scrollable(live).height(Fill));
+        }
+        columns = columns.push(Space::new().width(10));
+        columns = columns.push(right);
+    }
 
     // The notice sits last and is pushed rather than wrapped: appearing and
     // disappearing must not move the panels above it, and an empty placeholder
     // would still take a row of the column's spacing.
-    let mut content = column![
-        title,
-        Space::new().height(20),
-        top_row,
-        Space::new().height(10),
-        bottom_row,
-        Space::new().height(10),
-        curve_row,
-    ]
-    .width(Fill)
-    .spacing(10);
+    let mut content = column![title, Space::new().height(20), columns]
+        .width(Fill)
+        .height(Fill)
+        .spacing(10);
 
-    if let Some(notice) = auto_mode_notice {
+    if let Some(notice) = create_auto_mode_notice(data) {
         content = content.push(notice);
     }
 
@@ -313,6 +380,70 @@ fn create_auto_mode_notice(data: &AppDisplayData) -> Option<Element<'static, Mes
     )
 }
 
+/// Puts an element on the same horizontal span as the plots — indented past the
+/// label gutter and inset by the plot's right margin.
+///
+/// A live-loop panel's text is read against its plot, so it starts and ends
+/// where the plot does.
+fn on_plot_span(content: Element<'static, Message>) -> Element<'static, Message> {
+    container(content)
+        .width(Fill)
+        .padding(iced::Padding {
+            top: 0.0,
+            right: unison_display::PLOT_RIGHT_MARGIN,
+            bottom: 0.0,
+            left: unison_display::GUTTER,
+        })
+        .into()
+}
+
+/// The strobe band in the same horizontal span the unison plots use: a gutter
+/// of [`unison_display::GUTTER`], then the plot area, with the band **centred**
+/// in it.
+///
+/// Centred, because the line the panels share is the target: the unison plots
+/// draw it at the midpoint of their plot area (`x_of(0)`) and the band is the
+/// whole of it. Composed from the two gutter constants rather than an offset
+/// fixed here, so band centre and zero line stay the same x at any width.
+fn strobe_row(band: Element<'static, Message>, partial: Option<u8>) -> Element<'static, Message> {
+    let label: Element<'static, Message> = match partial {
+        Some(n) => text(format!("n{n}"))
+            .size(10)
+            .color(iced::Color::from_rgb8(0xc3, 0xc2, 0xb7))
+            .into(),
+        None => Space::new().into(),
+    };
+    row![
+        container(label)
+            .width(Length::Fixed(unison_display::GUTTER))
+            .height(Length::Fixed(STROBE_BAND))
+            .align_x(iced::alignment::Horizontal::Right)
+            .align_y(iced::alignment::Vertical::Bottom)
+            .padding([0.0, 6.0]),
+        container(
+            container(band)
+                .width(Length::Fixed(STROBE_BAND))
+                .height(Length::Fixed(STROBE_BAND))
+        )
+        .width(Fill)
+        .center_x(Fill),
+        Space::new().width(Length::Fixed(unison_display::PLOT_RIGHT_MARGIN)),
+    ]
+    .into()
+}
+
+/// What a live-loop panel says in Auto mode: it is off, and why, and the one
+/// surface that turns it on. The strobe and both unison panels read against a
+/// nominated key's targets, which Auto has not got — the engine identifies the
+/// note it hears, but nothing has said which note is being *tuned*.
+fn auto_mode_note(instrument: Instrument, panel: &str) -> String {
+    let select = match instrument {
+        Instrument::Piano => "a key on the Keyboard Key Select panel",
+        Instrument::Guitar => "a string on the Guitar String Select panel",
+    };
+    format!("Off in Auto mode — the {panel} needs a nominated key. Click {select}.")
+}
+
 /// Creates the strobe panel (design §5). The strobe needs a named key — a
 /// target does not exist without one — so in Auto mode the panel shows a
 /// how-to-enter-manual-mode hint instead of hiding entirely. In Manual mode:
@@ -335,27 +466,27 @@ fn create_strobe_panel(
         key_index,
     } = &data.tuning_mode
     else {
+        // Frozen: the state the band already carries for a partial it cannot
+        // read.
         let panel = container(
             column![
-                text("Strobe").size(18),
+                on_plot_span(text("Strobe").size(18).into()),
                 Space::new().height(10),
-                text(match data.instrument {
-                    Instrument::Piano =>
-                        "Manual mode required — click a key on the on-screen \
-                         Keyboard Key Select panel to choose the note to strobe.",
-                    Instrument::Guitar =>
-                        "Manual mode required — click a string on the on-screen \
-                         Guitar String Select panel to choose the note to strobe.",
-                })
-                .size(14)
-                .color(iced::Color::from_rgb8(0xc3, 0xc2, 0xb7)),
+                strobe_row(StrobeDisplay::new(0.0, true).view(), None),
+                Space::new().height(8),
+                on_plot_span(
+                    text(auto_mode_note(data.instrument, "strobe"))
+                        .size(13)
+                        .color(iced::Color::from_rgb8(0xc3, 0xc2, 0xb7))
+                        .into()
+                ),
             ]
             .width(Fill)
             .spacing(5)
             .padding(15),
         )
-        .width(Length::Fixed(360.0))
-        .height(Length::Fixed(240.0));
+        .width(Fill)
+        .height(Length::Fixed(STROBE_PANEL_HEIGHT));
         return Some(panel.into());
     };
     let s = &data.strobe;
@@ -398,9 +529,10 @@ fn create_strobe_panel(
         format!("Strobe — {note_name} · partial {}", s.n_star)
     };
 
-    let band = container(StrobeDisplay::new(s.beat_phase, s.gated).view())
-        .width(Length::Fixed(150.0))
-        .height(Length::Fixed(150.0));
+    let band = strobe_row(
+        StrobeDisplay::new(s.beat_phase, s.gated).view(),
+        Some(s.n_star),
+    );
 
     // Curve-lock footer (design §8) — curve mode only; ET mode has no curve to
     // lock. Frozen targets are shown with their generation; when the live curve
@@ -462,69 +594,122 @@ fn create_strobe_panel(
 
     let panel = container(
         column![
-            row![text(title).size(18), Space::new().width(Fill)].align_y(Alignment::Center),
+            on_plot_span(text(title).size(18).into()),
             Space::new().height(10),
-            row![
-                band,
-                Space::new().width(15),
-                column![
-                    text(readout).size(20),
-                    Space::new().height(6),
-                    text(target).size(13),
-                ],
-            ]
-            .align_y(Alignment::Center),
+            band,
             Space::new().height(8),
-            flagged,
-            lock_footer,
+            on_plot_span(text(readout).size(20).into()),
+            on_plot_span(text(target).size(13).into()),
+            Space::new().height(8),
+            on_plot_span(flagged),
+            on_plot_span(lock_footer),
         ]
         .width(Fill)
         .spacing(5)
         .padding(15),
     )
-    .width(Length::Fixed(360.0))
-    .height(Length::Fixed(270.0));
+    .width(Fill)
+    .height(Length::Fixed(STROBE_PANEL_HEIGHT));
 
     Some(panel.into())
 }
 
-/// Creates the unison panel (ADR 0012): the selected note's individual strings,
-/// resolved as separate spectral lines and drawn as markers on a cents axis.
+/// Creates one of the two unison panels (ADR 0012): the selected note's
+/// individual strings, resolved as separate spectral lines and drawn as markers
+/// on a cents axis. [`UnisonPanel::Displayed`] magnifies the strobe band's own
+/// partial; [`UnisonPanel::AllPartials`] stacks every reference beneath it.
 ///
-/// Three things it must always carry, and each is measured rather than
+/// Three things the pair must always carry, and each is measured rather than
 /// stylistic:
 ///
 /// - **the current resolution.** Until the DSP-side record is long enough two
 ///   separated strings resolve as one line, which reads as "clean" exactly when
 ///   a tuner is deciding they are done. "Clean to ±3 ¢" is honest; bare "clean"
-///   is not.
+///   is not. Each panel states the resolution of *its own* rows, so where the
+///   two disagree the disagreement is on screen.
 /// - **the pair beats, in Hz.** Positions are cents and rates are Hz, the
 ///   convention the rest of the readout uses, and the beat is what a tuner
-///   counts by ear.
+///   counts by ear. Printed by the magnified panel, whose partial the beats are
+///   computed for.
 /// - **the discriminator's verdict**, visible rather than silently filtering.
 ///   A second line is not proof of a second string: one string beating with
 ///   itself looks identical, and in the bass it is measurably not a second
-///   string (ADR 0013 §4).
+///   string (ADR 0013 §4). Printed by the stack, which is the evidence it is
+///   drawn from — the test is precisely that the split is constant *across*
+///   partials.
 ///
 /// Gated on the strobe's own debounced `out_of_range` flag: past ±21.5 Hz the
 /// baseband folds, so the lines would be real content at fictitious places.
-fn create_unison_panel(data: &AppDisplayData) -> Option<Element<'static, Message>> {
-    if !data.strobe_visible {
+fn create_unison_panel(
+    data: &AppDisplayData,
+    which: UnisonPanel,
+) -> Option<Element<'static, Message>> {
+    let magnified = which == UnisonPanel::Displayed;
+    let visible = if magnified {
+        data.unison_displayed_visible
+    } else {
+        data.unison_all_visible
+    };
+    if !visible {
         return None;
     }
+    let title_for = |note: &str| {
+        if magnified {
+            format!("Unison — {note} · partial {}", data.strobe.n_star)
+        } else {
+            format!("Unison — {note} · all partials")
+        }
+    };
     let TuningMode::Manual { note_name, .. } = &data.tuning_mode else {
-        return None;
+        // Row slots are fixed, so the empty grid is the panel's own
+        // nothing-to-show state. No key is nominated, so no row has a target.
+        let slots = if magnified { 1 } else { MAX_STROBE_REFS };
+        let rows: Vec<_> = (0..slots)
+            .map(|i| unison_display::UnisonRow {
+                partial: i as u8 + 1,
+                ..unison_display::UnisonRow::default()
+            })
+            .collect();
+        let display = UnisonDisplay::new(rows, UNISON_SPAN_LADDER[UNISON_SPAN_LADDER.len() - 1]);
+        let display = if magnified {
+            display.row_height(UNISON_MAGNIFIED_ROW)
+        } else {
+            display
+        };
+        return Some(
+            container(
+                column![
+                    on_plot_span(text(title_for("—")).size(18).into()),
+                    Space::new().height(8),
+                    container(display.view())
+                        .width(Fill)
+                        .height(Length::Fixed(unison_body_height(which))),
+                    Space::new().height(6),
+                    on_plot_span(
+                        text(auto_mode_note(data.instrument, "unison display"))
+                            .size(12)
+                            .color(iced::Color::from_rgb8(0xc3, 0xc2, 0xb7))
+                            .into()
+                    ),
+                ]
+                .width(Fill)
+                .spacing(4)
+                .padding(15),
+            )
+            .width(Fill)
+            .into(),
+        );
     };
 
     let u = &data.unison;
-    let compact = data.unison_mode == UnisonMode::Displayed;
-    let rows: Vec<_> = match (compact, u.displayed) {
+    let rows: Vec<_> = match (magnified, u.displayed) {
         (true, Some(i)) => vec![u.rows[i]],
         (true, None) => Vec::new(),
         (false, _) => u.rows.clone(),
     };
+    let body_height = unison_body_height(which);
 
-    // The resolution the reading is worth, from the row on screen.
+    // The resolution the reading is worth, from the rows on screen.
     let resolution = rows
         .iter()
         .map(|r| r.resolution_cents)
@@ -544,9 +729,15 @@ fn create_unison_panel(data: &AppDisplayData) -> Option<Element<'static, Message
             .color(muted)
             .into()
     } else {
-        container(UnisonDisplay::new(rows.clone(), data.unison_mode, data.unison.span_cents).view())
+        let display = UnisonDisplay::new(rows.clone(), data.unison.span_cents);
+        let display = if magnified {
+            display.row_height(UNISON_MAGNIFIED_ROW)
+        } else {
+            display
+        };
+        container(display.view())
             .width(Fill)
-            .height(Length::Fixed(unison_body_height(compact)))
+            .height(Length::Fixed(body_height))
             .into()
     };
 
@@ -565,11 +756,15 @@ fn create_unison_panel(data: &AppDisplayData) -> Option<Element<'static, Message
             "nothing resolved yet".to_string()
         }
     };
-    let readout = match (strings, u.beats_hz.first()) {
-        (0, _) => "—".to_string(),
-        (1, _) => format!("one line · {}", beat_limit(slowest_visible_beat)),
-        (n, Some(beat)) => format!("{n} lines · beat {beat:.2} Hz"),
-        (n, None) => format!("{n} lines"),
+    let readout = match (magnified, strings, u.beats_hz.first()) {
+        (_, 0, _) => "—".to_string(),
+        (true, 1, _) => format!("one line · {}", beat_limit(slowest_visible_beat)),
+        (true, n, Some(beat)) => format!("{n} lines · beat {beat:.2} Hz"),
+        (true, n, None) => format!("{n} lines"),
+        (false, _, _) => {
+            let resolved = rows.iter().filter(|r| r.count > 1).count();
+            format!("{resolved} of {} partials split", rows.len())
+        }
     };
     let resolution_note = if resolution.is_finite() && resolution > 0.0 {
         format!("resolved to ±{resolution:.1} ¢")
@@ -588,68 +783,67 @@ fn create_unison_panel(data: &AppDisplayData) -> Option<Element<'static, Message
     // The handoff: one line means either a clean unison or a beat too slow to
     // see, and the panel cannot tell them apart. The strobe can — on one
     // sounding string it reads far finer than this ever will.
-    let handoff = (strings <= 1).then_some(
+    let handoff = (magnified && strings <= 1).then_some(
         "Slower beats are beyond this display — listen for them, or mute two \
          strings and tune each one on the strobe.",
     );
 
-    // The verdict is shown, not used to filter: a suppression toggle belongs
-    // with a future advanced mode, and until then hiding it would be the panel
-    // deciding what the tuner is allowed to doubt.
-    let (verdict_text, verdict_color) = match u.verdict {
-        UnisonVerdict::Unison if strings >= 2 => ("✓ consistent with a unison", muted),
-        UnisonVerdict::FalseBeat if strings >= 2 => ("✗ false beat — one string, not two", amber),
+    // Shown, never used to filter: a second line the discriminator cannot
+    // attribute is still a line the tuner should see. `Undetermined` states what
+    // is known of it — a second line is not a second string (ADR 0013 §4).
+    let lines_here = rows.iter().any(|r| r.count >= 2);
+    let verdict: Option<(&str, iced::Color)> = (!magnified).then_some(match u.verdict {
+        UnisonVerdict::Unison if lines_here => ("✓ consistent with a unison", muted),
+        UnisonVerdict::FalseBeat if lines_here => ("✗ false beat — one string, not two", amber),
+        _ if lines_here => (
+            "undetermined — a second line is not proof of a second string; one \
+             string can split this way",
+            muted,
+        ),
         _ => ("verdict undetermined — too few partials resolved", muted),
-    };
+    });
 
-    let panel = container(
-        column![
-            row![
-                text(format!("Unison — {note_name}")).size(18),
-                Space::new().width(Fill),
-                button(
-                    text(if compact {
-                        "All partials"
-                    } else {
-                        "One partial"
-                    })
-                    .size(12)
-                )
-                .padding([3, 8])
-                .on_press(Message::ToggleUnisonMode),
-            ]
-            .align_y(Alignment::Center),
-            Space::new().height(8),
-            body,
-            Space::new().height(6),
+    let mut panel_content = column![
+        on_plot_span(text(title_for(note_name)).size(18).into()),
+        Space::new().height(8),
+        body,
+        Space::new().height(6),
+        on_plot_span(
             row![
                 text(readout).size(15),
                 Space::new().width(Fill),
                 text(resolution_note).size(12).color(resolution_color),
             ]
-            .align_y(Alignment::Center),
-            text(verdict_text).size(12).color(verdict_color),
-            match handoff {
-                Some(t) => Element::from(text(t).size(11).color(muted)),
-                None => Element::from(Space::new().height(0)),
-            },
-        ]
-        .width(Fill)
-        .spacing(4)
-        .padding(15),
-    )
-    .width(Length::Fixed(360.0))
-    .height(Length::Fixed(unison_body_height(compact) + 120.0));
+            .align_y(Alignment::Center)
+            .into()
+        ),
+    ]
+    .width(Fill)
+    .spacing(4)
+    .padding(15);
 
-    Some(panel.into())
+    if let Some((verdict_text, verdict_color)) = verdict {
+        panel_content = panel_content.push(on_plot_span(
+            text(verdict_text).size(12).color(verdict_color).into(),
+        ));
+    }
+    if let Some(t) = handoff {
+        panel_content = panel_content.push(on_plot_span(text(t).size(11).color(muted).into()));
+    }
+
+    Some(container(panel_content).width(Fill).into())
 }
 
-/// Height of the unison canvas, in pixels — one fixed row per possible partial,
-/// so the panel never resizes as partials come and go. Rows past the key's own
-/// reference count are simply not drawn.
-fn unison_body_height(compact: bool) -> f32 {
-    let rows = if compact { 1.0 } else { MAX_STROBE_REFS as f32 };
-    rows * unison_display::ROW_HEIGHT + unison_display::ROW_CHROME
+/// Height of a unison canvas, in pixels — one fixed row slot per reference the
+/// bank can target, so the panel never resizes as partials come and go. Rows
+/// past the key's own reference count are simply not drawn.
+fn unison_body_height(which: UnisonPanel) -> f32 {
+    match which {
+        UnisonPanel::Displayed => UNISON_MAGNIFIED_ROW + unison_display::ROW_CHROME,
+        UnisonPanel::AllPartials => {
+            MAX_STROBE_REFS as f32 * unison_display::ROW_HEIGHT + unison_display::ROW_CHROME
+        }
+    }
 }
 
 /// Creates the live tuning-curve plot panel (strobe design §10): the selected
@@ -750,7 +944,12 @@ fn create_spectrogram_panel(data: &AppDisplayData) -> Option<Element<'static, Me
     Some(panel.into())
 }
 
-/// Creates the cent meter panel
+/// Creates the cent meter — the engine's own readout: detected note, its
+/// frequency, whether it is still tracking, and the deviation as a needle.
+///
+/// It is the only deviation readout **Auto mode** has, the strobe needing a
+/// nominated key. That is also its sunset condition: when Auto mode can strobe,
+/// the panel goes (`layout-by-task-design.md` D4).
 fn create_cent_meter_panel(data: &AppDisplayData) -> Option<Element<'static, Message>> {
     if !data.cent_meter_visible {
         return None;
@@ -765,34 +964,24 @@ fn create_cent_meter_panel(data: &AppDisplayData) -> Option<Element<'static, Mes
         if count > 0.0 { Some(sum / count) } else { None }
     };
 
-    let (note_name, freq_text, confidence) = {
-        let freq_str = if let Some(freq) = data.last_frequency {
-            format!("{:.2} Hz", freq)
+    let note_name = match &data.tuning_mode {
+        TuningMode::Auto => data
+            .last_note_index
+            .map(|idx| models::find_nearest_note_by_index(idx).0)
+            .unwrap_or_else(|| "--".to_string()),
+        TuningMode::Manual { note_name, .. } => note_name.clone(),
+    };
+    let freq_text = data
+        .last_frequency
+        .map_or_else(|| "--".to_string(), |f| format!("{f:.2} Hz"));
+    let status_text = if data.last_note_index.is_some() && !data.is_stale {
+        if data.last_frequency.is_some() {
+            "Tracking".to_string()
         } else {
-            "--".to_string()
-        };
-
-        let note_text = match &data.tuning_mode {
-            TuningMode::Auto => data
-                .last_note_index
-                .map(|idx| {
-                    let (name, _) = models::find_nearest_note_by_index(idx);
-                    name
-                })
-                .unwrap_or_else(|| "--".to_string()),
-            TuningMode::Manual { note_name, .. } => note_name.clone(),
-        };
-        let status_text = if data.last_note_index.is_some() && !data.is_stale {
-            if data.last_frequency.is_some() {
-                "Tracking".to_string()
-            } else {
-                "Dropped".to_string()
-            }
-        } else {
-            "--".to_string()
-        };
-
-        (note_text, freq_str, status_text)
+            "Dropped".to_string()
+        }
+    } else {
+        "--".to_string()
     };
 
     let cent_meter_content: Element<'static, Message> = container(
@@ -800,7 +989,7 @@ fn create_cent_meter_panel(data: &AppDisplayData) -> Option<Element<'static, Mes
             smoothed_cents,
             note_name,
             freq_text,
-            confidence,
+            status_text,
             data.is_stale,
         )
         .view(),
@@ -819,7 +1008,7 @@ fn create_cent_meter_panel(data: &AppDisplayData) -> Option<Element<'static, Mes
         .padding(15),
     )
     .width(Fill)
-    .height(Length::Fixed(200.0));
+    .height(Length::Fixed(250.0));
 
     Some(panel.into())
 }
@@ -978,7 +1167,7 @@ fn strings_section(strings: models::SoundingStrings, touched: bool) -> Element<'
     );
 
     column![
-        text("Strings").size(18),
+        text("Strings").size(14),
         text("on this key, then which sound")
             .size(11)
             .color(INK_SECONDARY),
@@ -1086,8 +1275,10 @@ fn create_sidebar(
         .spacing(5),
     );
 
-    // Add capture button if in measurement mode
+    // The string declaration, the capture control, and what the session is
+    // doing: one heading, under the one condition that governs them all.
     if measurement_mode_active {
+        sections = sections.push(text("Measurement session").size(18));
         if let Some((strings, touched)) = strings {
             sections = sections.push(strings_section(strings, touched));
         }

@@ -58,13 +58,14 @@ extended 2026-08-07:
   → [ADR 0012](docs/adr/0012-unison-line-estimator.md) §§5–6, §8,
   [ADR 0013](docs/adr/0013-bass-extra-lines-attribution.md),
   [ADR 0014](docs/adr/0014-unison-panel-against-isolation-truth.md)
-- **Unison assist: which panel layout to keep** — `Planned`. Both ship behind a
-  toggle (the displayed partial alone, or every resolved partial stacked)
-  because the captures cannot answer which reads better while tuning. Drop one
-  once it has been used on a real instrument. *(One measured input since:
-  the two layouts disagree about whether a unison is asserted on 3 of 192 solo
-  captures, because the verdict is bank-wide while `Displayed` shows one row —
-  ADR 0014 §4.)*
+- **Unison assist: which panel layout to keep** — `Dissolved 2026-08-20`, not
+  answered. The two layouts were rivals behind a toggle; under the task layout
+  they are one measurement at two magnifications and both are on screen, so
+  there is nothing to choose. Their one measured disagreement — whether a unison
+  is asserted on 3 of 192 solo captures, because the verdict is bank-wide while
+  the displayed row shows one partial (ADR 0014 §4) — is now visible rather than
+  hidden by the toggle: each panel states the resolution of its own rows.
+  → [`docs/design/layout-by-task-design.md`](docs/design/layout-by-task-design.md) D1
 
 - **Profile export / import from an arbitrary path** — `Deferred`. The library
   browser covers new / open / resume / duplicate / delete over the profiles
