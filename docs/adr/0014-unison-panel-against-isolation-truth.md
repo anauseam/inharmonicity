@@ -388,26 +388,36 @@ below the 1.5 s default) every file is exactly 5.00 s.
 and publish every time now. **A7 and C8 fail with five seconds in hand**, so for
 them the question becomes why.
 
-**It is the D3 gate, and the margin is not subtle.** The gate is
-`amplitude < noise_floor · K` where `noise_floor` is the *ambient-silence* RMS
-(`pipeline.rs:927`), giving a threshold of 6.55e−4 on these captures. Measured
-against the noise actually present at three off-partial frequencies in the same
-window:
+**It is the D3 gate — and the defect is that the gate is static while the noise
+is not.** The gate is `amplitude < noise_floor · K`, where `noise_floor` is the
+calibrated ambient-silence RMS (`gatekeeper.rs`; measured at startup over 2 s of
+room, max RMS × 1.5). That threshold is **6.55e−4** on these captures and it does
+not move for the life of the note. The noise actually present at the partial does
+— measured at three off-partial frequencies **in the same window, hop by hop**:
 
-| note | real local noise | the gate sits | partial's SNR when the gate closes |
-| --- | --- | --- | --- |
-| E6 | 4.0–5.2e−5 | 6× above it | **7×** |
-| A6 | 2.3–4.8e−5 | 11× above it | **26×** |
-| C#7 | 2.0–3.0e−5 | 18× above it | **24×** |
-| F7 | 1.6–2.4e−5 | 29× above it | **26×** |
-| A7 | 1.3–1.7e−5 | 44× above it | **32×** |
-| C8 | 1.4–2.1e−5 | 40× above it | **18×** |
+| note | gate ÷ real noise at the peak | at the hop it closes | at the note's end | partial's SNR when it closes |
+| --- | --- | --- | --- | --- |
+| E6 | **0.8×** | 11.9× | 10.6× | 5.1× |
+| A6 | **1.7×** | 13.6× | 79.0× | 13.4× |
+| C#7 | **0.9×** | 19.0× | 48.4× | 14.8× |
+| F7 | **0.8×** | 8.0× | 25.9× | 6.6× |
+| A7 | **2.1×** | 13.1× | 43.9× | 10.0× |
+| C8 | **1.4×** | 7.4× | 32.2× | 3.0× |
 
-At the hop the gate declares the partial "below the noise floor", the partial is
-**7–32× above the noise measurably present in that same window**. Three
-independent off-partial probes agree to within 2×, and all sit clear of the
-1024-point Hann main lobe (±86 Hz), so leakage would only *inflate* the noise
-estimate and make this conservative.
+**At the strike the calibrated threshold is right** — within a factor of two of
+the true local noise on all six notes, which is the calibration doing its job.
+Then the note's own leakage subsides: the real noise falls **13–56×** over the
+note while the signal falls 400–7000×, and the fixed threshold is left stranded
+7–19× too high by the time it closes. It shuts off a partial still sitting
+**3–15×** above the noise beside it.
+
+So this is not "ambient σ is the wrong number". The ambient σ is a *correct*
+measurement of the room, and the room is briefly the right reference. The defect
+is that **a static threshold is being asked to track a quantity that moves one to
+two orders of magnitude inside a single note** — and, per ADR 0011's deep-bass
+control, moves the other way in a register where 32 partials leak into each
+other. That is why a startup measurement of any refinement, per-bin included,
+cannot close it: nothing measured before the note begins can follow the note.
 
 **Confirmed by sweeping the threshold** rather than by inference
 (`--noise-floor`):
@@ -436,10 +446,18 @@ strobe's D3 gate, and it refines the entry rather than confirming it:
   tone: few partials, little leakage, so the real per-bin noise is far *below*
   ambient and the same threshold is 6–44× too **high**. Live partials are dropped.
 
-One misspecification, opposite signs, split by register — because the quantity
-being compared is a broadband time-domain RMS against a single-bin amplitude, and
-which way that lands depends on how much of the note's energy sits near the bin.
-(That dimensional reading is inference; the ratios above are measurement.)
+One misspecification, opposite signs, split by register — and the unifying
+statement is **static threshold, dynamic noise**. The in-note noise at a partial's
+bin is dominated by leakage from the note's own other partials, so it rises with
+the strike and falls with the decay. A leakage-rich bass note keeps it above
+ambient for the whole note (under-rejection); a near-pure-tone treble note lets it
+fall far below ambient within a second (over-rejection). Same fixed threshold,
+both failures.
+
+Corrected 2026-08-21: an earlier revision of this section quoted "6–44× above the
+real noise" and "7–32× SNR at closure" from noise medianed over the whole record,
+which is biased low by the quiet tail. The same-hop figures above supersede them;
+the conclusion is unchanged and the mechanism is better stated.
 
 Both directions are fixed by the same change, and ADR 0011 already shipped it for
 the coarse readout: an ordered-statistic CFAR gate against *local* reference
