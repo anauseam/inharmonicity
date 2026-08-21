@@ -88,18 +88,49 @@ fn main() {
         .next()
         .expect("usage: isolation <regen.json> <dump_dir> [--json out]");
     let mut json_out = None;
+    // The isolation set is *defined* by the declaration (`06`), so that is the
+    // default population. `--all` admits undeclared captures because one
+    // question does not need a declaration: whether a note sustains long enough
+    // for the ring to publish at all is answered by any capture of it.
+    let mut include_undeclared = false;
+    let mut noise_floor = 3e-3f32;
     while let Some(a) = args.next() {
-        if a == "--json" {
-            json_out = args.next();
+        match a.as_str() {
+            "--json" => json_out = args.next(),
+            "--all" => include_undeclared = true,
+            // The D3 gate is `noise_floor x K`, and `noise_floor` is the
+            // *ambient silence* RMS, not the noise present at a partial during
+            // a note. Sweeping it is how ADR 0014 §8 separates "the note ended"
+            // from "the gate closed" (`suspected-issues.md`, the Neyman-Pearson
+            // entry; Prompt O).
+            "--noise-floor" => {
+                noise_floor = args
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(noise_floor)
+            }
+            _ => {}
         }
     }
     let root = Path::new(&root);
 
     let (caps, dropped) = load_regen(Path::new(&regen));
-    let declared: Vec<Capture> = caps.into_iter().filter(|c| c.sounding.is_some()).collect();
+    let total = caps.len();
+    let declared: Vec<Capture> = caps
+        .into_iter()
+        .filter(|c| include_undeclared || c.sounding.is_some())
+        .collect();
+    if noise_floor != 3e-3 {
+        println!("D3 gate noise_floor overridden: {noise_floor:e}");
+    }
     println!(
-        "loaded {} declared captures ({dropped} dropped as implausible)",
-        declared.len()
+        "loaded {} of {total} captures ({dropped} dropped as implausible{})",
+        declared.len(),
+        if include_undeclared {
+            ", undeclared admitted via --all"
+        } else {
+            "; undeclared excluded — pass --all to include them"
+        }
     );
 
     let table = default_display_partials();
@@ -116,7 +147,7 @@ fn main() {
         if count < n_star {
             continue; // the displayed partial was never measured on this capture
         }
-        let (best, verdict) = run_unison(&audio, &refs, count, cap.f0, 3e-3);
+        let (best, verdict) = run_unison(&audio, &refs, count, cap.f0, noise_floor);
         readings.push(Reading {
             n_star,
             at_n_star: best[n_star - 1],
@@ -270,14 +301,14 @@ fn write_json(readings: &[Reading], path: &Path) {
     let rows: Vec<serde_json::Value> = readings
         .iter()
         .map(|r| {
-            let s = r.cap.sounding.expect("declared");
+            let s = r.cap.sounding;
             serde_json::json!({
                 "dir": r.cap.dir,
                 "key": r.cap.key,
-                "on_key": s.on_key,
-                "sounding": s.sounding,
-                "is_open": s.is_open(),
-                "is_solo": s.is_solo(),
+                "on_key": s.map(|s| s.on_key),
+                "sounding": s.map(|s| s.sounding),
+                "is_open": s.is_some_and(|s| s.is_open()),
+                "is_solo": s.is_some_and(|s| s.is_solo()),
                 "n_star": r.n_star,
                 "record_hops": r.at_n_star.record,
                 "resolution_hz": r.at_n_star.resolution_hz,
