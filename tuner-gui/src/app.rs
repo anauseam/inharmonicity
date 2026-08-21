@@ -14,7 +14,7 @@ use crate::library::{self, AppSettings, ProfileSort};
 use crate::session::{ProfileSession, UndoneCapture};
 use crate::views::{main_view::create_main_view, settings_view::create_settings_view};
 use crate::widgets::envelope::ENVELOPE_HISTORY_LENGTH;
-use crate::widgets::unison_display::{UnisonMode, UnisonRow};
+use crate::widgets::unison_display::UnisonRow;
 use iced::{self, Element, Subscription, Theme};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -170,7 +170,8 @@ pub enum Message {
     ToggleKeySelect,                 // Show/hide piano keyboard
     ToggleCurvePlot,                 // Show/hide the live tuning-curve plot (design §10)
     ToggleStrobe,                    // Show/hide the strobe panel (design §5)
-    ToggleUnisonMode,                // Compact vs stacked unison layout (ADR 0012)
+    ToggleUnisonDisplayed,           // Show/hide the magnified one-partial unison panel
+    ToggleUnisonAll,                 // Show/hide the stacked all-partials unison panel
     SetReferenceMode(ReferenceMode), // Which target function all readouts use (design §5)
     RequestRelock,                   // Open the re-lock confirm modal (design §8)
     ConfirmRelock,                   // Copy the live bundle into the strobe lock (design §8)
@@ -531,6 +532,11 @@ pub struct AppDisplayData {
     pub key_select_visible: bool,
     pub curve_plot_visible: bool,
     pub strobe_visible: bool,
+    /// The magnified one-partial unison panel is on screen. Independent of
+    /// [`Self::strobe_visible`] — each live-loop panel is toggled on its own.
+    pub unison_displayed_visible: bool,
+    /// The stacked all-partials unison panel is on screen.
+    pub unison_all_visible: bool,
     // pub inharmonicity_graph_visible: bool,
 
     // View state
@@ -579,10 +585,6 @@ pub struct AppDisplayData {
     pub strobe: StrobeState,
     /// Unison panel state — the selected note's individual strings (ADR 0012).
     pub unison: UnisonState,
-    /// Which partials the unison panel draws. Both layouts ship so the choice
-    /// can be made in use rather than argued: the compact one matches the strobe
-    /// band's partial, the stacked one shows the discriminator's own evidence.
-    pub unison_mode: UnisonMode,
     /// Which target function every readout is measured against — the strobe
     /// band, its cents readout, and the cent meter alike.
     pub reference_mode: ReferenceMode,
@@ -858,6 +860,8 @@ impl Default for TunerApp {
                 key_select_visible: true,
                 curve_plot_visible: true,
                 strobe_visible: true,
+                unison_displayed_visible: true,
+                unison_all_visible: true,
                 // inharmonicity_graph_visible: true,
                 settings_view_visible: false,
                 library_visible: false,
@@ -876,7 +880,6 @@ impl Default for TunerApp {
                 selected_engine: EngineChoice::MultiBalanced,
                 strobe: StrobeState::default(),
                 unison: UnisonState::default(),
-                unison_mode: UnisonMode::Displayed,
                 reference_mode: ReferenceMode::default(),
                 strobe_lock_view: None,
                 relock_confirm_open: false,
@@ -1534,6 +1537,14 @@ impl TunerApp {
         // A row per reference the bank is targeting, resolved or not. The set
         // changes only when the key does, so nothing reflows while tuning.
         let live = count.min(frame.strobe_count).min(refs.len());
+        // Rows dim by amplitude relative to the loudest reference on screen, not
+        // by an absolute level: the bank's units are the time signal's, so the
+        // only reading a viewer can take from one row's magnitude is how it
+        // compares with its neighbours.
+        let loudest = frame.strobe_amplitude[..live]
+            .iter()
+            .copied()
+            .fold(0.0f32, f32::max);
         let mut widest = 0.0f32;
         for (i, &f_ref) in refs.iter().enumerate().take(live) {
             if f_ref <= 0.0 {
@@ -1546,6 +1557,13 @@ impl TunerApp {
                 count: lines as u8,
                 resolution_cents: to_cents(frame.unison_resolution_hz[i]),
                 resolution_hz: frame.unison_resolution_hz[i],
+                ref_hz: f_ref,
+                level: if loudest > 0.0 {
+                    frame.strobe_amplitude[i] / loudest
+                } else {
+                    0.0
+                },
+                gated: frame.strobe_gated[i],
                 ..UnisonRow::default()
             };
             for (line, slot) in frame.unison_lines[i][..lines].iter().enumerate() {
@@ -2056,11 +2074,12 @@ impl TunerApp {
             Message::ToggleStrobe => {
                 self.display_data.strobe_visible = !self.display_data.strobe_visible;
             }
-            Message::ToggleUnisonMode => {
-                self.display_data.unison_mode = match self.display_data.unison_mode {
-                    UnisonMode::Displayed => UnisonMode::AllPartials,
-                    UnisonMode::AllPartials => UnisonMode::Displayed,
-                };
+            Message::ToggleUnisonDisplayed => {
+                self.display_data.unison_displayed_visible =
+                    !self.display_data.unison_displayed_visible;
+            }
+            Message::ToggleUnisonAll => {
+                self.display_data.unison_all_visible = !self.display_data.unison_all_visible;
             }
             Message::SetReferenceMode(mode) => {
                 self.display_data.reference_mode = mode;
