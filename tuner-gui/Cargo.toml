@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 # Instrument identity (UUIDv7 — time-ordered, so dump directories sort by
 # creation). Already in the tree via iced; the v7 feature is what we add.
-uuid = { version = "1", features = ["v7"] }
+uuid = { version = "1.24.1", features = ["v7"] }
 # Dependency on the local core logic crate
 tuner-core = { path = "../tuner-core" }
 
@@ -25,9 +25,9 @@ triple_buffer = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
-anyhow = "1.0.102" # For easier error handling
+anyhow = "1.0.104" # For easier error handling
 rustfft.workspace = true
 realfft.workspace = true
-crossbeam-queue = "0.3.12"
+crossbeam-queue = "0.3.13"
 directories = "6"
 
