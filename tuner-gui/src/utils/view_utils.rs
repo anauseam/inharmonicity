@@ -212,21 +212,24 @@ pub fn make_button(
 ///
 /// # Arguments
 /// * `title` - Section title (e.g., "Tools", "Program")
-/// * `buttons` - Array of button configurations for this section
+/// * `buttons` - The section's button configurations, from a static array or
+///   from a list assembled per frame when a section's membership varies
 /// * `in_measurement_mode` - Whether the application is in measurement mode
 ///
 /// # Returns
 /// * `Element` - Complete settings section with title and button list
-pub fn make_sidebar_section(
+pub fn make_sidebar_section<'a>(
     title: &'static str,
-    buttons: &[ButtonConfig],
+    buttons: impl IntoIterator<Item = &'a ButtonConfig>,
     in_measurement_mode: bool,
 ) -> Element<'static, crate::Message> {
     let title_widget = text(title).size(18);
 
-    let items_widget = buttons.iter().fold(column![].spacing(8), |col, config| {
-        col.push(make_button(config, in_measurement_mode))
-    });
+    let items_widget = buttons
+        .into_iter()
+        .fold(column![].spacing(8), |col, config| {
+            col.push(make_button(config, in_measurement_mode))
+        });
 
     column![title_widget, Space::new().height(10), items_widget]
         .spacing(5)

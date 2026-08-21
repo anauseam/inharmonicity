@@ -64,7 +64,7 @@ const PROGRAM_CONFIG: [ButtonConfig; 4] = [
 
 // Surfaces an ordinary tuning session never touches. All persist with the
 // app rather than the open profile.
-const ADVANCED_CONFIG: [ButtonConfig; 3] = [
+const ADVANCED_CONFIG: [ButtonConfig; 4] = [
     // Swaps the main-view note picker between the piano keyboard and a
     // six-button guitar-string picker. Not a full instrument mode — no
     // inharmonicity is measured for guitar (see `Instrument`).
@@ -76,6 +76,11 @@ const ADVANCED_CONFIG: [ButtonConfig; 3] = [
     ButtonConfig {
         label: "String Isolation",
         message: Some(Message::ToggleStringIsolationPanel),
+        button_type: ButtonType::Standard,
+    },
+    ButtonConfig {
+        label: "Unison Assist",
+        message: Some(Message::ToggleUnisonAssistPanel),
         button_type: ButtonType::Standard,
     },
     ButtonConfig {
@@ -145,6 +150,8 @@ pub fn create_settings_view(
         create_instrument_select_panel(data.instrument)
     } else if data.string_isolation_visible {
         create_string_isolation_panel(data.string_isolation)
+    } else if data.unison_assist_visible {
+        create_unison_assist_panel(data.unison_assist)
     } else if data.extended_capture_visible {
         create_capture_duration_panel(data.extended_capture, data.extended_capture_secs)
     } else {
@@ -166,6 +173,66 @@ pub fn create_settings_view(
         .padding(20);
 
     container(main_content).width(Fill).height(Fill).into()
+}
+
+/// The Unison Assist switch: whether the note's individual strings are
+/// resolved on screen at all.
+///
+/// Off by default: the panels answer one narrow question, and cannot answer it
+/// below their own `2/T` floor — which covered most of the compass on the
+/// instrument ADR 0014 measured. Turning it on adds both panels to the live
+/// loop and their entries to Tools.
+fn create_unison_assist_panel(enabled: bool) -> Element<'static, Message> {
+    column![
+        text("Unison Assist").size(20),
+        Space::new().height(8),
+        text(
+            "Resolves the sounding note into its individual strings and draws \
+             them as markers on the same cents axis the strobe reads against — \
+             one panel magnifying the strobe's own partial, one stacking every \
+             partial the bank targets."
+        )
+        .size(13),
+        Space::new().height(8),
+        text(
+            "It answers a narrow question — is this unison set — and it answers \
+             it only above its own resolution floor, which it states on every \
+             reading. Below that floor two strings resolve as one line, so a \
+             clean-looking panel is not proof of a clean unison. Leave it off \
+             for ordinary tuning."
+        )
+        .size(13),
+        Space::new().height(16),
+        row![
+            enable_segment("Off", false, !enabled),
+            Space::new().width(8),
+            enable_segment("On", true, enabled),
+        ],
+    ]
+    .spacing(4)
+    .into()
+}
+
+/// One side of an on/off pair, lit when it is the current setting.
+fn enable_segment(
+    label: &'static str,
+    target: bool,
+    active: bool,
+) -> iced::widget::Button<'static, Message> {
+    let btn = button(text(label).size(16))
+        .padding([8, 24])
+        .on_press(Message::SetUnisonAssist(target));
+    if active {
+        btn.style(|_theme, _status| button::Style {
+            background: Some(iced::Background::Color(iced::Color::from_rgb(
+                0.325, 0.278, 0.388,
+            ))),
+            text_color: iced::Color::WHITE,
+            ..button::Style::default()
+        })
+    } else {
+        btn
+    }
 }
 
 /// The string-isolation panel: what the per-capture string declaration is,

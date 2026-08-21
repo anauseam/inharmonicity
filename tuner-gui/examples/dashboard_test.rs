@@ -61,6 +61,8 @@ impl DashboardTest {
             key_select_visible: true,
             curve_plot_visible: true,
             strobe_visible: true,
+            unison_assist: true,
+            unison_assist_visible: false,
             unison_displayed_visible: true,
             unison_all_visible: true,
             settings_view_visible: false,

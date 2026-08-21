@@ -353,6 +353,91 @@ shrank from 74 px to 52 by shortening what it holds: a row's target drops its
 decimal above 1 kHz, which is also the more honest figure — 0.1 Hz at 4.9 kHz is
 0.035 ¢, far finer than the display can resolve.
 
+### D11 — The axis is never erased
+
+A live-loop panel that cannot show a reading keeps its axis and its row slots
+and says why in its readout line. It does not replace the plot with the
+explanation.
+
+The panels already refuse to reflow while a reading is live — fixed row slots, a
+held cents span — for a reason that does not stop applying when the reading
+stops: the axis is what a returning marker is placed against, and a panel that
+becomes a paragraph reads as a panel that has gone missing. Four states, one
+shape:
+
+| state | drawn | said |
+| --- | --- | --- |
+| out of range | slots, markers withheld — past ±21.5 Hz the lines alias | bring the string inside ±21.5 Hz |
+| no references yet | empty slots | listening, strike the note |
+| targeted, nothing resolved (a decayed note) | the rows, keeping their labels | listening, strike the note |
+| Auto mode | empty slots | off in Auto mode, needs a nominated key |
+
+While blocked the panel also withholds its **verdict** and its handoff line:
+both are claims about markers that are not on screen.
+
+The tuning-curve plot follows the same rule for the ~2 s its first bundle takes
+(§D9's sibling problem, and the one launch always shows): the grid draws with no
+series on it and the title carries "computing…". Non-finite cents draw nothing,
+so no key can read as measured at 0 ¢ while it waits.
+
+### D14 — Unison assist is an Advanced mode, off by default
+
+*Revised 2026-08-21.* D1 put both unison panels on screen permanently. They are
+now behind a **Unison Assist** switch in Settings ▸ Advanced, off by default,
+alongside String Isolation and Capture Duration — the surfaces an ordinary
+tuning session never touches (user, 2026-08-21).
+
+What D1 decided still holds *within* the mode: the two panels are one
+measurement at two magnifications, both on screen, each with its own Tools
+entry. What changed is the audience. The panels answer one narrow question — is
+this unison set — and cannot answer it below their own `2/T` floor, which on the
+instrument ADR 0014 measured covered most of the compass. A surface that is
+silent or amber across two-thirds of the keyboard is not one to hand a tuner by
+default.
+
+The mode owns the panels' visibility outright: enabling it shows both, disabling
+it hides both. That is not a preference but a necessity — the Tools entries that
+toggle them appear and vanish with the mode, so a panel left on screen after the
+mode went off could not be dismissed. The setting persists with the other
+Advanced switches in `AppSettings`.
+
+### D13 — The text slot is reserved, not grown
+
+Reported in use: the panels jump — a verdict or a handoff line appears, the
+panel grows, and everything below it moves. The panels had fixed heights before
+the task layout and lost them in the rewrite; sizing to content was the
+regression.
+
+Restored, and with the rule stated where it belongs: **a unison panel's height
+is fixed, and so is the text slot inside it.** `UNISON_FOOTER_HEIGHT` reserves
+room for the longest footer either panel produces — a readout wrapping to two
+lines plus a verdict or a two-line handoff — and lines appear inside that slot
+rather than pushing it open. It is the same rule the row slots follow, for the
+same reason, applied to the half of the panel that is prose.
+
+The readout also takes a *share* of its row (`width(Fill)`) rather than its
+natural width, so a long message wraps within its share instead of running over
+the resolution figure beside it. While blocked there is no figure at all: the
+resolution of a reading the panel is not showing is not a fact about anything on
+screen.
+
+### D12 — A row label is one line, and the gutter is sized from the label
+
+Reported in use: a row label sometimes wrapped onto a second line and the
+overflow landed on top of the row beneath it. Word wrapping is iced's default,
+and a fixed-height row slot cannot hold two lines.
+
+Both halves are fixed, and they are different kinds of fix:
+
+- **`Wrapping::None` on every label** — the row labels and the axis ticks. This
+  is the invariant: a one-line slot renders one line, so a label that outgrows
+  its slot is clipped rather than folded into its neighbour. Overlap stops being
+  possible rather than becoming unlikely.
+- **`GUTTER` derived from the widest label the format can produce** — nine
+  characters at the label size plus the label padding, rather than a number
+  chosen by eye. It is an estimate of a font metric and is written as one, which
+  is why the first fix carries the guarantee and this one only carries the fit.
+
 ### D9 — Labels are widgets, not canvas text (measured 2026-08-20)
 
 Reported in use: the frame rate drops visibly once the unison panels are on
