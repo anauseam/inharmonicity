@@ -153,7 +153,7 @@ pub fn open_input_stream(capacity: usize) -> Result<(cpal::Stream, AudioConsumer
     let mut dc_prev_y: f32 = 0.0;
 
     let stream = device.build_input_stream(
-        &config,
+        config,
         move |data: &[f32], _: &cpal::InputCallbackInfo| {
             for &sample in data {
                 let filtered = dc_block(sample, &mut dc_prev_x, &mut dc_prev_y);
