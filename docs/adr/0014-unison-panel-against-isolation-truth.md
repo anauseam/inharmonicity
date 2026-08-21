@@ -19,6 +19,10 @@ so §9 routes it to an as-found isolation pass on piano #1 instead.
 No behaviour changes. `examples/isolation` and `examples/common/` are new;
 nothing in `tuner-core/src` or `tuner-gui/src` was touched.
 
+**Amended 2026-08-21** with 30 further captures (six treble notes, open, 5 s).
+They change §8's conclusion and are the first direct measurement of one of the
+two gates `suspected-issues.md` carries as un-measured — see §8a/§8b.
+
 ## Context
 
 Unison assist (ADR 0012) shipped with an acknowledged hole: **there was no
@@ -336,7 +340,7 @@ strings that genuinely differ by up to 8 %, not a property they share. ADR 0009'
 strikes of the same open note and is unaffected, but it is now clear that it
 measures reproducibility, not how well one number describes three strings.
 
-## 8. Availability is record length, not the D3 gate
+## 8. Availability: record length below C7, the D3 gate above it
 
 | register | record length | captures | published |
 | --- | --- | --- | --- |
@@ -350,47 +354,102 @@ Treble notes decay fast and the shipped decay stop cut 104 of them below the
 `UNISON_MIN_BINS` floor, at 0.42–0.56 s. Where the treble was given a full
 record it published **every time**.
 
-**This set cannot test ADR 0012 §7's attribution of the high-treble failure to
-the D3 gate**, because all 48 of its high-treble captures are too short for the
-ring to fill regardless of gating. The two explanations are perfectly
-confounded here.
+As first recorded, this set could **not** separate ADR 0012 §7's attribution of
+the high-treble failure to the D3 gate from simple truncation: all 48 of its
+high-treble captures were too short for the ring to fill regardless of gating.
+Six long captures were taken to break that confound, and §8a does — the answer
+is *both*, split at about C7.
 
 ### What the treble actually needs, which is less than the cap
 
 The floor is a **statistical** requirement, not a resolution one: `UNISON_MIN_BINS`
-= 25 hops comes from Rohling §V solved for record length, so the CFAR reference
-window has cells left over once two interferers occupy it (ADR 0012 §3). The
-*resolution* requirement runs the other way, because a treble split is wide in Hz:
+= 25 hops comes from Rohling §V solved for record length (ADR 0012 §3). The
+*resolution* requirement runs the other way, because a treble split is wide in Hz
+— C6's needs 8 hops, C7's 4, C8's 2. Above ~C5 the panel is held at 0.58 s by its
+own admission test while the split it looks for needs a fifth of that.
 
-| note | split | in Hz | record the split needs | vs the 25-hop floor |
-| --- | --- | --- | --- | --- |
-| A4 | 10.7 ¢ | 2.72 | 32 hops | above it |
-| C5 | 10.9 ¢ | 3.29 | 26 hops | at it |
-| C6 | 18.5 ¢ | 11.19 | **8 hops** | 3× below |
-| C7 | 18.5 ¢ | 22.4 | **4 hops** | 6× below |
-| C8 | 18.5 ¢ | 44.7 | **2 hops** | 12× below |
+### 8a. Six long captures, and the answer is the gate — **measured 2026-08-21**
 
-So above ~C5 the panel is held at 0.58 s by its own admission test while the
-split it is looking for needs a fifth of that. **The treble does not need a long
-record — it needs 0.58 s of sustain, and the notes are dying just short of it:**
+Six notes were re-recorded open at 5 s (**E6, A6, C#7, F7, A7, C8**, 2–8 strikes
+each, 30 captures) specifically to separate "the note ended" from "our capture
+ended". With the decay stop bypassed (`pipeline.rs:1117` — it only applies at or
+below the 1.5 s default) every file is exactly 5.00 s.
 
-| band | captures | median audio | median record achieved |
+| note | captures | published | record achieved (hops) |
 | --- | --- | --- | --- |
-| C#6–D#6 | 76 | 1.06 s | 0.85 s |
-| E6–D#7 | 59 | **0.56 s** | **0.00 s** |
-| E7–C8 | 48 | **0.37 s** | **0.00 s** |
+| E6 | 10 | **10/10** | 43–56 |
+| A6 | 8 | **8/8** | 31–51 |
+| C#7 | 3 | 2/3 | 0, 51, 56 |
+| F7 | 3 | 2/3 | 0, 26, 28 |
+| A7 | 3 | **0/3** | 0, 0, 0 |
+| C8 | 3 | **0/3** | 0, 0, 0 |
 
-E6–D#7 misses the floor by two hops. Whether those notes *can* sustain 0.58 s is
-unknown, because **no note above C6 was ever recorded long**: C6 itself, given a
-5 s record, published on 26 of 26. That is what §9 item 2 buys, and it is the
-difference between "the treble is out of reach" and "our capture stopped too
-early", which are not the same problem and do not have the same fix.
+**E6–C#7 was our capture stopping early** — those notes published nothing before
+and publish every time now. **A7 and C8 fail with five seconds in hand**, so for
+them the question becomes why.
 
-Note the definitional trap the user identified: "how long does the note stay
-above the noise floor" has no threshold-free answer, because `noise_floor` is
-not measured — it is `silence_threshold`, a config constant (`pipeline.rs:927`)
-that the D3 gate scales by the Neyman–Pearson factor. The decay stop is the same
-kind of human-calibrated threshold. `07` §7 records the general rule.
+**It is the D3 gate, and the margin is not subtle.** The gate is
+`amplitude < noise_floor · K` where `noise_floor` is the *ambient-silence* RMS
+(`pipeline.rs:927`), giving a threshold of 6.55e−4 on these captures. Measured
+against the noise actually present at three off-partial frequencies in the same
+window:
+
+| note | real local noise | the gate sits | partial's SNR when the gate closes |
+| --- | --- | --- | --- |
+| E6 | 4.0–5.2e−5 | 6× above it | **7×** |
+| A6 | 2.3–4.8e−5 | 11× above it | **26×** |
+| C#7 | 2.0–3.0e−5 | 18× above it | **24×** |
+| F7 | 1.6–2.4e−5 | 29× above it | **26×** |
+| A7 | 1.3–1.7e−5 | 44× above it | **32×** |
+| C8 | 1.4–2.1e−5 | 40× above it | **18×** |
+
+At the hop the gate declares the partial "below the noise floor", the partial is
+**7–32× above the noise measurably present in that same window**. Three
+independent off-partial probes agree to within 2×, and all sit clear of the
+1024-point Hann main lobe (±86 Hz), so leakage would only *inflate* the noise
+estimate and make this conservative.
+
+**Confirmed by sweeping the threshold** rather than by inference
+(`--noise-floor`):
+
+| `noise_floor` | E6 | A6 | C#7 | F7 | A7 | C8 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 3e−3 (shipped) | 10/10 | 8/8 | 2/3 | 2/3 | **0/3** | **0/3** |
+| 3e−4 | 10/10 | 8/8 | 3/3 | 3/3 | **2/3** | 0/3 |
+| 1e−4 | 10/10 | 8/8 | 3/3 | 3/3 | 2/3 | **1/3** |
+
+3e−4 is still ~20× above the measured local noise and it recovers C#7, F7 and
+A7. **Only C8 is genuinely marginal**: even against real noise its partial holds
+for ~19 hops against the 25-hop floor.
+
+### 8b. This measures a gate `suspected-issues.md` calls unmeasured — and the sign is the opposite
+
+The Neyman–Pearson entry names two shipped gates and says their exposure is
+"confirmed by analogy only". This is a direct measurement of one of them, the
+strobe's D3 gate, and it refines the entry rather than confirming it:
+
+- **The entry predicts under-rejection**: during a sustain, leakage from a note's
+  other partials raises the real noise *above* ambient, so an ambient-σ threshold
+  is too low and dead partials pass. ADR 0011's control demonstrated exactly that
+  in the deep bass — 100 % of ±400 ¢ garbage admitted.
+- **The treble does the reverse.** At `n* = 1` a treble note is nearly a pure
+  tone: few partials, little leakage, so the real per-bin noise is far *below*
+  ambient and the same threshold is 6–44× too **high**. Live partials are dropped.
+
+One misspecification, opposite signs, split by register — because the quantity
+being compared is a broadband time-domain RMS against a single-bin amplitude, and
+which way that lands depends on how much of the note's energy sits near the bin.
+(That dimensional reading is inference; the ratios above are measurement.)
+
+Both directions are fixed by the same change, and ADR 0011 already shipped it for
+the coarse readout: an ordered-statistic CFAR gate against *local* reference
+cells admitted 0 % of the deep-bass junk **and** lifted C8 availability from 42 %
+to 100 %. That second half is this same effect, in a different consumer.
+
+**So Prompt O's value is raised by this set after all — but not for the reason
+ADR 0012 §7 gave.** §7 guessed the D3 gate blocked the high treble; that guess is
+now measured true, with a mechanism and a magnitude, on notes that decay too fast
+for the ambient floor to be a sane reference.
 
 ## Decisions
 
@@ -427,7 +486,12 @@ published. The screen description gains the `B`-agreement rule.
   positive control, and §6's residual-based SE is vindicated by measurement.
 - ADR 0013 D3's mute test is **discharged**: the single-strung 65 % figure is
   the control it asked for.
-- **One motivation for Prompt O weakens; its main case is untouched.** ADR 0012
+- **Prompt O gains a measured motivation** (§8a/§8b): the strobe's D3 gate is
+  6–44× above the real local noise in the treble and drops partials at 7–32×
+  SNR, which is the *opposite sign* to the under-rejection
+  `suspected-issues.md` predicts and is fixed by the same CFAR port. Superseded
+  note follows.
+- ~~**One motivation for Prompt O weakens; its main case is untouched.**~~ ADR 0012
   §7 attributed the high-treble failure to the D3 gate, and §8 here shows the
   blocker in this set is record length, with the two confounded. That was only
   ever the *unison-availability* argument for O. The σ misspecification's larger

@@ -52,6 +52,19 @@ ordered-statistic CFAR gate against *local* reference cells admitted 0 % of the
 same junk at unchanged median accuracy and lifted C8 availability from 42 % to
 100 %.
 
+**Update 2026-08-21 (ADR 0014 §8a/§8b): the strobe's D3 gate is now measured,
+and it fails in the OPPOSITE direction in the treble.** On six 5 s treble
+captures the ambient-σ threshold sits **6–44× above** the noise actually present
+at the partial's own frequency, and the gate closes while the partial is still
+**7–32×** above that noise — dropping live partials rather than admitting dead
+ones. Sweeping `noise_floor` down by 10× recovers C#7, F7 and A7. The mechanism
+is the same misspecification: a broadband time-domain RMS is being compared with
+a single-bin amplitude, and which way it errs depends on how much of the note's
+energy sits near that bin — leakage-rich bass over-admits, near-pure-tone treble
+over-rejects. Both directions are fixed by the same local-reference CFAR port,
+which is why ADR 0011 saw C8 availability go 42 % → 100 % alongside 0 % junk
+admitted. **The engine's tracker gate remains unmeasured.**
+
 That confirms the σ-misspecification mechanism and demonstrates the fix. It
 does **not** measure the two gates named above: they threshold a *Goertzel*
 amplitude (adaptive centre in the engine, fixed reference in the strobe bank),
