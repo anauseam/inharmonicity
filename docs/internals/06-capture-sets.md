@@ -216,6 +216,22 @@ that uses it reads the file directly and states that it did.
 **Release builds.** DSP must be exercised with `--release`; debug builds drop
 audio and change availability figures.
 
+**Which documents may quote these sets.** They are gitignored and per-user: a
+reader outside this machine cannot open one, cannot reproduce a tally, and cannot
+tell when a figure has gone stale — but a number quoted in prose reads like
+evidence either way. The rule that governs code
+([`05-style.md`](05-style.md), *Do not point at anything outside the
+repository*) therefore governs prose too:
+
+- **This file, the ADRs and the audits may.** Describing and interpreting this
+  data is their job, and a reader who wants the evidence is sent here for it.
+- **README, ARCHITECTURE and the rest of `docs/internals/` may not quote raw
+  tallies** — capture totals, dump counts, per-set sizes. They state the
+  *result* and cite the record that holds it.
+- **Naming the instrument is not a tally.** "Both validation uprights", or
+  "instrument 2", stays legible and stays true, and that both pianos are uprights
+  is load-bearing for how far a result generalizes. It is the counts that rot.
+
 **The harnesses that read these sets**, and the on-disk format of a single
 capture, are documented in
 [`tuner-core/examples/README.md`](../../tuner-core/examples/README.md).

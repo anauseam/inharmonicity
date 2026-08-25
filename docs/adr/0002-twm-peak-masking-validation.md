@@ -63,6 +63,6 @@ instability. See `README.md` Known Issues for more detail.
 
 - MOBO parameter tuning (`q`, `r`, `ρ`) against a synthetic dataset to further
   tighten the error margin between the winning key and the runner-up.
-  See [`mobo-tuning.md`](mobo-tuning.md) for the methodology.
+  See [ADR 0001](0001-mobo-tuning.md) for the methodology.
 - Capture samples from non-piano instruments (ukulele, bass guitar) to verify
   the `-30 dB` threshold generalises across different tonal SNR profiles.

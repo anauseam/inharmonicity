@@ -95,6 +95,69 @@ partial table) is outside the paper's scope and already documented.
 4. `mobo-methodology.md` §synthetic: "[Rigaud Fig. 3]" → "(our calibration;
    mis-cited to Rigaud pre-audit — see faithfulness-audit-06)".
 
+## Addendum — the universal treble pair, checked on two uprights (2026-08-25)
+
+The verdict above is that our treble constants **are** the paper's universal
+pair, correctly re-indexed. This addendum asks the next question: is that pair
+right for the pianos we have? It is the load-bearing borrowed assumption in the
+top two octaves, and ADR 0009 analysis 7 shows no local measurement can check it
+up there — so it was checked in the highest band where captures still resolve B.
+
+**Why the paper's claim is physical rather than statistical.** §II.a: *"Down to
+middle C (C4 note, m = 60), the values of B are roughly the same for all the
+pianos … mainly due to the fact that string design in this range is
+standardized, since it is not constrained by the limitation of the piano size."*
+The size constraint lands on the **bass** bridge, which is precisely why
+ξ = (s_B, y_B) is fitted per instrument and (s_T, y_T) is not. The paper's fit is
+an L1 regression over 6 pianos in C4–C8 (4 real grands, 1 upright, 1 sampled
+grand) and lands within 1.9 % of Young 1952's independent physics-based
+derivation (s_T^[Yo52] ≃ 9.44e−2 vs 9.26e−2).
+
+**Fitted on our two uprights**, over keys A4–G#6 where the treble half is ≥ 95 %
+of B_ξ and captures still carry 3–14 partials. Instrument #2 stores several
+repeats per key, and which one the fit reads matters: the curve reads the newest
+(`active()`), while the per-key median over all repeats is the stable estimator.
+
+| | slope s_T | slope SE | resid sd | vs Rigaud |
+| --- | --- | --- | --- | --- |
+| instrument #1 (one capture per key) | 0.0834 | 0.0054 | 0.183 | −1.7 SE |
+| instrument #2, newest capture per key | 0.0903 | 0.0013 | 0.045 | −1.7 SE |
+| instrument #2, median of repeats | **0.0911** | 0.0017 | | **−0.9 SE** |
+| Rigaud (6 pianos) | 0.0926 | | | |
+| Young 1952 (physics) | 0.0944 | | | |
+
+Both uprights read the slope a little *shallow*, and neither difference is
+significant on its own. The point estimate is snapshot-sensitive: a reading of
+instrument #2 three days earlier gave +0.2 SE, and four re-captures in the band
+moved it to −1.7. The direction is the one the estimator's known failure
+predicts — partial count falls from 11 to 3 across the band (r = −0.93 with key),
+and a capture with few partials biases B low, never high, so a shallow fitted
+slope is what the bias would produce even on a piano that matched Rigaud exactly.
+Binned by capture richness across both instruments, keys 48–87:
+**≥ 10 partials → median B/B_universal = 1.02×** (log-SD 0.164); 7–9 → 0.93×
+(0.32); 2–4 → 0.70× (1.19). Rich captures land on the model; poor ones skew low
+and scatter an order of magnitude wider.
+
+**What this bounds.** Propagated 27 semitones from the fit's centroid to C8, the
+measured slope difference is worth **−0.9 to −1.4 ¢** depending on the estimator,
+and the 2-SE prediction interval of the fitted line adds **±1.6–2.1 ¢**. Any
+error in the borrowed asymptote is therefore worth **under ~3 ¢ at C8** — below
+the repeat noise in our own top-octave pitch readings. This is not a precision
+confirmation of Rigaud's value; it is consistency within the estimator's own bias.
+
+**What it does not bound.** Every ≥ 10-partial capture on both instruments lives
+at keys 48–71, and corr(key, #partials) = −0.79 pooled (−0.91 on instrument #1).
+Above G#6 the model is *inferred by extrapolation, not measured*, and any
+apparent departure there is perfectly confounded with the estimator's failure
+direction. Two instruments do not settle it, because both go blind in the same
+place for the same physical reason.
+
+**Not covered: ρ.** This checks B only. The treble octave type ρ_φ is
+`RhoPhi::TYPICAL`, and engine (c)'s calibration accepts zero ρ points above F4
+(key 44) — worth up to 17 ¢ at A7, larger than the whole B uncertainty. ρ is a
+preference rather than a measurable, so it is not an audit question; see
+ARCHITECTURE.md, "What is still open".
+
 ## Audit series status
 
 Item 6 complete. Running table: `faithfulness-audit-01-twm.md`. Remaining:

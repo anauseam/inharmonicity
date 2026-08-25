@@ -104,6 +104,19 @@ architecture change. Prompt AF moves the remaining harnesses onto it.
 - **`pitch_ground_truth`** — computes an independent hi-res DFT pitch truth per
   capture. This, not `measured_f0`, is the reference for estimator-accuracy work.
 
+  `--np-set <label> <regen.json> <dump_root>` (repeatable) is the ambient-σ gate
+  study behind [ADR 0015](../../docs/adr/0015-ambient-sigma-gates-measured.md):
+  per hop and per partial it measures the signal and the noise present beside it
+  in the *same* window, classifies the partial live/dead against that, and scores
+  all three shipped gates over a σ sweep. Several populations in one run so their
+  columns are directly comparable.
+
+  ```bash
+  cargo run --release --example pitch_ground_truth -- \
+    --np-set piano2 p2.json diagnostics_piano2 \
+    --np-set piano2-extended p2ext.json <Piano2_extended dump>
+  ```
+
 ### Curve and strobe
 
 - **`curve_compare`** — runs all four curve engines on a regenerated-partials

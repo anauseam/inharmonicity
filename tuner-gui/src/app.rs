@@ -63,8 +63,9 @@ pub fn main() -> iced::Result {
         .title("Inharmonicity")
         .subscription(TunerApp::subscription)
         .theme(TunerApp::theme)
-        // Disable instant exit on close to allow the audio thread
-        // to cleanly join/drop without causing a CPAL/ALSA segfault.
+        // Disable instant exit on close so the audio thread joins and the CPAL
+        // stream drops cleanly. This fixed a shutdown segfault on Linux/ALSA;
+        // do not re-enable without testing exit there.
         .window(iced::window::Settings {
             exit_on_close_request: false,
             ..Default::default()

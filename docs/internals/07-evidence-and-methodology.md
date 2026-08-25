@@ -135,7 +135,37 @@ The way out is one of:
 
 Naming the reference is not a caveat. It is the result.
 
-## 8. What the record is for
+## 8. A profile holds repeats; the product reads one and a statistic reads all
+
+`InharmonicityProfile::active()` returns the **newest** trusted capture of a key,
+and that is what the curve and the strobe consume. It is a deliberate choice, not
+an omission: the piano is a changing object, and a key that was re-tuned or
+re-strung should be represented by its current state, not by a median that
+spans weeks. Whether to pool *within a session* is a design question that is
+open; on the current evidence it would not move the curve (four re-captures in
+A4–G#6 reproduced engine (d) to 0.01 ¢ at C8), because bass and mid repeat
+noise is 0.14–0.48 % and the treble is shrinkage-dominated.
+
+A **validation statistic** is a different consumer and must not inherit that
+choice. Fitting the treble asymptote on instrument 2 gave +0.2 SE from Rigaud on
+one day and −1.7 SE three days later, with the curve unchanged between them: the
+only thing that moved was which capture was newest in four keys. Two rules
+follow.
+
+- **Pool repeats per key, by median, before fitting or comparing.** The
+  estimator's failure is one-sided — a starved capture collapses `B` toward
+  zero, never toward infinity — so a mean inherits the collapse and a median
+  discards it. The pooled fit reads −0.9 SE and is stable across days.
+- **Treat a nominal SE as optimistic when the input is one capture per key.**
+  It counts scatter about the fitted line and nothing else: not which capture
+  was active, not the collapse bias. A z-score computed from it overstates
+  significance in both directions.
+
+Anyone taking several captures of a key — which is every validation session —
+should know that the profile keeps them (bounded per class, [`06`](06-capture-sets.md))
+and the app reads one. The repeats exist for the statistics, not for the curve.
+
+## 9. What the record is for
 
 An ADR argues a decision; the code applies it. An audit
 ([`../audits/README.md`](../audits/README.md)) checks a port against its source

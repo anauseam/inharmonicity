@@ -92,7 +92,7 @@ pub type AudioConsumer = ringbuf::HeapCons<f32>;
 /// availability 93.3 → 87.4 %, |e| 0.70 → 1.85 ¢. If the bottom octave is ever
 /// worth recovering, the lever is the filter's **order**, not α; the measured
 /// trade and the conditions that would justify it are in `ARCHITECTURE.md`,
-/// "The DC blocker's corner sits at 35 Hz, above A0".
+/// "Why the DC blocker corner sits above A0".
 const DC_BLOCK_ALPHA: f32 = 0.995;
 
 // ─── Shared CPAL Stream Setup ────────────────────────────────────────────────

@@ -760,7 +760,7 @@ instance and its `HostHandle` endpoint. Findings:
   `Engine` (Step 5), the chain never reads `StrobeResult`, and it writes only
   `FrameOutput` — deletable, gating/detection/measurement bit-identical.
 - **NP amplitude gate** (band, ambient-σ during sustain) remains a documented
-  suspected issue (`docs/internals/suspected-issues.md`), not a blocker: the
+  issue (measured in ADR 0015), not a blocker: the
   band validates, the coarse read already uses the CFAR fix. Reopens only if
   late-gating proves a problem in use.
 - **Module layout** (the strobe feature spans `strobe.rs` / `peaks` coarse /
@@ -811,8 +811,8 @@ The re-review is informed by the hands-on validation protocol:
 4. **Bass steadiness (R3):** compare band stability on a string below the
    ≈ 86 Hz window boundary (guitar E2) vs above (A2) — the long-window path
    vs the short one — and against the known-erratic cent-meter behavior.
-5. **Decay gating (D3, with the standing σ caveat —
-   `docs/internals/suspected-issues.md`):** on decay, note when the band
+5. **Decay gating (D3, with the standing σ caveat — ADR 0015):** on decay,
+   note when the band
    freezes/dims vs keeps spinning on noise; judge the *band*, not the gate —
    the gate is a known revision target shared with the engine tracker.
 6. **Re-strike continuity:** after gating, a fresh strike must resume
@@ -867,7 +867,7 @@ silence state.
 D3's standing σ caveat is also now **measured** rather than suspected, and a
 correctly-specified local-noise gate exists to port from — but has deliberately
 *not* been ported to the band or the engine tracker, which need the 87-capture
-revalidation first (`docs/internals/suspected-issues.md`).
+revalidation first (ADR 0015).
 
 **ET reference mode (2026-07-19).** The strobe targets the piano tuning curve
 by default; a `Ref: Curve / ET` toggle switches it to pure equal temperament,

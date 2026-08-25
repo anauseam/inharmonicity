@@ -34,8 +34,23 @@ For the design rationale and open observations, see [ARCHITECTURE.md](ARCHITECTU
 >   "undetermined" on most notes, and in the bass it withholds the claim almost
 >   always — correctly: those keys carry a second line that is real spectral
 >   content but is not a second string, and what it *is* is unsettled.
+> - **The top two octaves are modelled, not measured.** Above A6 a string's
+>   partials are 30–60 dB below its own fundamental and partly above Nyquist, so
+>   no capture can resolve their inharmonicity; the curve shrinks continuously
+>   onto a parametric model there. That model has been checked on both
+>   validation uprights and any error in it is worth **under ~3 ¢ at C8**, and
+>   the strobe target in that register is inharmonicity-immune — so it costs
+>   accuracy in the curve, not in what you read at the pin. See
+>   [ARCHITECTURE.md](ARCHITECTURE.md#what-the-tuning-curve-is-grounded-on).
+> - **Which curve is "best" is not settled.** The five engines agree across the
+>   temperament region but disagree by over 30 ¢ at A0, and no measurement
+>   resolves it — octave, fifth and twelfth beats are mutually incompatible
+>   objectives. Engine (d) Balanced is the default; the comparison gallery and the
+>   offline auralization exist so the choice can be made by ear.
 > - **No pitch-raise over-pull targets.**
-> - **A440 only**, no user-adjustable temperaments.
+> - **A440 only**, no user-adjustable temperaments. On a piano sitting well below
+>   pitch the app therefore prescribes a full pitch raise with no way to tune the
+>   instrument to itself instead.
 >
 > The full backlog, with what each item is blocked on, is in [TODO.md](TODO.md).
 
@@ -222,7 +237,7 @@ The pipeline–GUI relationship follows the **Split / Handle pattern** (the same
 
 A frontend contributor just calls `AudioPipeline::new()`, gets a `PipelinePorts`, and never needs to know about Gatekeeper internals, EMA calculations, or lock management.
 
-The pipeline also manages the **`WorkerManager`** (`worker.rs`), which owns a single dedicated background thread for computationally expensive offline DSP. When the pipeline's capture accumulator reaches its fill target (1.5 s by default, or silence at that length), it dispatches a `CapturePayload` to the worker via a bounded crossbeam channel. The worker runs a high-resolution FFT and CSPE map, takes the note identity from the pipeline (the Engine's real-time discovery lock in Auto mode, or the user-selected key in Manual mode — it does not re-identify the note), and runs MAT to extract the partials and jointly refine the fundamental and the inharmonicity coefficient ($B$). The result is sent to the frontend via `worker_rx`, and the audio buffer is recycled back into the `AudioPool`. The same thread also serves **tuning-curve recomputes** on request (a `WorkerJob` from the UI → a `CurveBundle` back): the curve engines are cold-path but slow (Giordano engine (c) ~1.3 s), so they run here rather than on the GUI thread, with **captures always serviced first**. A single thread is sufficient because captures are infrequent (one stable note at a time), the algorithms complete before the next capture could arrive, and curve jobs are latest-wins (a burst of edits collapses to one recompute).
+The pipeline also manages the **`WorkerManager`** (`worker.rs`), which owns a single dedicated background thread for the heavy, non-realtime DSP. A filled capture reaches it as a `CapturePayload`; the worker runs a high-resolution FFT and CSPE map and then MAT, producing the key's partials, refined fundamental and inharmonicity coefficient ($B$). It returns a `KeyMeasurement` on `worker_rx` and recycles the audio buffer into the `AudioPool`. The same thread also serves **tuning-curve recomputes** requested by the UI (`WorkerJob` → `CurveBundle`), with **captures always serviced first**. Why that work is off-thread, and why one thread is enough, is argued in [ARCHITECTURE.md](ARCHITECTURE.md#heavy-dsp-runs-off-thread-in-the-worker).
 
 > [!NOTE]
 > **Module Status**

@@ -7,6 +7,18 @@ cited published method**, not a bespoke assembly (the rule in
 algorithm against its source paper — the record of *what has been confirmed
 correct, what was fixed, and what was reclassified*.
 
+> **What these audits do not establish: that a faithfully ported model is
+> *true for our instruments*.** Faithfulness and validity are different claims,
+> and only the first is in scope here. Audit 06's verdict on Rigaud's treble pair
+> — "exactly the paper's universal fit, correctly re-indexed" — would read the
+> same whether or not that universal pair describes an upright piano. Validity
+> questions belong to the ADRs and to `ARCHITECTURE.md`; the treble asymptote's
+> is answered under "The universal treble asymptote, checked where the uprights
+> can test it" (fitted on both uprights, each within ~2 SE of the paper in the
+> direction the estimator's bias predicts, worth under ~3 ¢ at C8). Reach for a
+> validity study, not an audit, when the question is "is this right *here*"
+> rather than "did we port it correctly".
+
 Each audit classifies every deviation as **(a) faithful**, **(b) deliberate
 documented adaptation**, or **(c) undocumented deviation / bespoke addition**
 (flagged, then documented or removed). The running status table also lives at the
