@@ -24,6 +24,19 @@ use crate::pipeline::ProcessingFrame;
 const LOCK_VOTES_M: usize = 7;
 const LOCK_WINDOW_N: usize = 8;
 
+// ── Adaptive Tracking Seed (Phase Vocoder Feedback) ──
+// Rate at which each partial's Goertzel evaluation centre drifts toward its
+// measured instantaneous frequency (Dolson 1986, Computer Music Journal), so the
+// tracker follows a detuned string without losing coherent integration energy.
+//
+// The value is ours and unswept — no experiment has compared it against a
+// neighbouring one. What is on record (ADR 0011) bounds it rather than confirms
+// it: this EMA is also the lobe-centering loop, and α = 1 at N = 4096 makes that
+// loop unstable (|z| = √2); the τ ≈ 0.46 s this value gives is outrun by a
+// turning peg (152–387 ¢ of tracker aliasing at 200–400 ¢/s), which is why the
+// coarse readout exists rather than a faster tracker.
+const TRACKER_SEED_ALPHA: f32 = 0.05;
+
 /// Result of a successful pitch detection frame.
 #[derive(Debug, Clone)]
 pub struct PitchResult {
@@ -408,12 +421,10 @@ impl Engine {
             };
 
             if weight > 0.0 {
-                // ── Adaptive Tracking Seed (Phase Vocoder Feedback) ──
-                // Foundation: Dolson, M. (1986). The Phase Vocoder: A Tutorial. Computer Music Journal.
-                // Slowly adapts the Goertzel evaluation center toward the measured physical frequency.
-                // We only adapt when the signal survives the SNR gate, ensuring we track the physical
-                // string and not phase-unwrapping noise.
-                self.tracking_targets[i] = 0.95 * self.tracking_targets[i] + 0.05 * f_inst;
+                // Adapt only on partials that survived the SNR gate, so the seed
+                // follows the physical string and not phase-unwrapping noise.
+                self.tracking_targets[i] = (1.0 - TRACKER_SEED_ALPHA) * self.tracking_targets[i]
+                    + TRACKER_SEED_ALPHA * f_inst;
 
                 result.partial_freqs[live_partials] = f_inst;
                 result.partial_amplitudes[live_partials] = amplitude;

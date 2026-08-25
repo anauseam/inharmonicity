@@ -1065,10 +1065,8 @@ fn process_real_key(
         0.0
     };
 
-    let audio_pool = Arc::new(crossbeam_queue::ArrayQueue::new(1));
-    let mut gatekeeper = Gatekeeper::new(audio_pool);
+    let mut gatekeeper = Gatekeeper::new();
     gatekeeper.config.silence_threshold = noise_floor;
-    gatekeeper.capture_mode_enabled = true; // traverse to Stable, as the 74/87 pipeline does
 
     let mut pf = ProcessingFrame::new();
     let mut time = vec![0.0f32; BASS_WINDOW_SIZE];

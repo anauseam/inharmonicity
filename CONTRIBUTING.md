@@ -12,7 +12,6 @@ context lives in the docs it points at.
 | [`README.md`](README.md)                                                   | Users       | What the project is, how to run it, current status.                    |
 | [`ARCHITECTURE.md`](ARCHITECTURE.md)                                       | Maintainers | Why the project is shaped the way it is (design rationale, tradeoffs). |
 | [`docs/internals/`](docs/internals/)                                       | Maintainers | Internal architecture, constraints, and hardware contracts.            |
-| [`docs/internals/suspected-issues.md`](docs/internals/suspected-issues.md) | Maintainers | Descriptive notes on unreproduced defensive code.                      |
 
 If you're touching DSP code, [`docs/internals/03-dsp-pipeline.md`](docs/internals/03-dsp-pipeline.md)
 and [`docs/internals/04-algorithms-and-models.md`](docs/internals/04-algorithms-and-models.md)

@@ -157,11 +157,14 @@ extended 2026-08-07:
 - **Per-bin noise floor** — `Planned`. The Neyman–Pearson gate uses a single
   broadband floor measured during silence; real room noise is coloured, so the
   scalar is too permissive in the bass and too strict in the treble.
-- **Neyman–Pearson σ misspecification** — `Investigating`. The engine tracker's
-  and strobe bank's amplitude gates threshold against ambient-silence σ while
-  running during sustain. Mechanism confirmed; the two gates are unmeasured and
-  the CFAR fix is deliberately not ported yet.
-  → [`docs/internals/suspected-issues.md`](docs/internals/suspected-issues.md)
+- **Neyman–Pearson σ misspecification** — `Measured, replacement open`. Three
+  gates (discovery's peak floor, the tracker's per-partial gate, the strobe
+  bank's decay gate) threshold against one ambient σ that is near-right in the
+  bass and ~50× too high in the top octave; no single σ fixes both. The CFAR fix
+  ADR 0011 demonstrated ships only in the coarse read — the three gates are
+  load-bearing for the 87-capture baselines and stay untouched until a
+  replacement is designed.
+  → [ADR 0015](docs/adr/0015-ambient-sigma-gates-measured.md)
 
 ## Worker and measurement
 
@@ -278,7 +281,7 @@ These are measured and understood, not defects awaiting a fix.
   raising it is actively harmful, and a steeper filter changes MAT's $B$ by a
   median of 0.00 %. Reopens only if a consumer starts using the bottom octave's
   fundamental.
-  → [ARCHITECTURE.md](ARCHITECTURE.md#the-dc-blockers-corner-sits-at-35-hz-above-a0)
+  → [ARCHITECTURE.md](ARCHITECTURE.md#why-the-dc-blocker-corner-sits-above-a0)
 - **Stereo DC blocker (latent).** Unreachable through `open_input_stream`, which
   accepts mono `f32` configs only; live only for `AudioSource::External`.
 - **No automatic bad-capture detector.** Two candidates have been measured and
@@ -289,8 +292,7 @@ These are measured and understood, not defects awaiting a fix.
   → [`docs/design/session-persistence-and-profile-library.md`](docs/design/session-persistence-and-profile-library.md) §5.3
 - **Coarse readout caveats.** Bounded and measured — the search loss correction,
   the register where the gate degenerates to a ratio test, and the motion tail.
-  → [`docs/internals/suspected-issues.md`](docs/internals/suspected-issues.md),
-  [ADR 0011](docs/adr/0011-coarse-spectral-readout.md)
+  → [ADR 0011](docs/adr/0011-coarse-spectral-readout.md)
 - **Unison assist is resolution-bound, and says so.** A split resolves only once
   it clears `2/T`; at or below the limit the *reported* separation collapses onto
   the limit rather than the truth, and it is unreliable either way out to ≈1.6 ×.
@@ -309,6 +311,18 @@ These are measured and understood, not defects awaiting a fix.
 
 ## No ETA
 
+- **CPAL/ALSA shutdown workaround, unverified against current CPAL.** The GUI
+  sets `exit_on_close_request: false` and `HostHandle::stop()` joins the analysis
+  thread before the stream drops. Both were the fix for a shutdown segfault on
+  Linux/ALSA, and there has been none since. Whether current CPAL still needs
+  them is untested, and testing it means deliberately reintroducing a crash on
+  exit — so it stays as is until something gives a reason to look.
+  → `tuner-gui/src/app.rs`, `tuner-core/src/audio.rs` (`HostHandle::stop`)
+- **Treble capture-window placement.** Treble upper partials run 20–45 dB
+  stronger before the Golden Window opens than inside it, so up there the
+  gatekeeper may be selecting the least informative segment of the note. Offline
+  test against the full-event dumps; a negative result closes it.
+  → [ADR 0009](docs/adr/0009-repeat-capture-noise-decomposition.md) analysis 7
 - **Curve comparison metrics.** The offline `curve_compare` harness already
   computes beat-rate smoothness, leave-keys-out prediction error, Giordano
   cross-scoring and curvature. Surfacing them in-GUI is held because the

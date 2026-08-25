@@ -717,7 +717,7 @@ impl AudioPipeline {
 
         let atomics = Arc::new(PipelineAtomics::default());
 
-        let gatekeeper = Gatekeeper::new(Arc::clone(&audio_pool));
+        let gatekeeper = Gatekeeper::new();
         let engine = Engine::new(44100);
 
         // Rigaud prior by default. When the measured-B path is enabled (see

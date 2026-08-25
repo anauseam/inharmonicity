@@ -158,3 +158,62 @@ top candidates, never escape toward a sub-harmonic (1200 cents away).
 - Discovery-phase residuals after scale refinement show systematic $B$-mismatch
   structure (motivates promoting a second refinement dimension — joint $(f_0, B)$ —
   i.e., a bounded MAT-like step inside Discovery).
+
+## Amendment 2026-08-25 — the measurement lineage, read
+
+The lineage paragraph above placed Partial Frequencies Deviation (Rauhala,
+Lehtonen & Välimäki 2007) by structure, without the paper. It and its 2025
+descendant (Miljković et al., harp mPFD) have now been read and evaluated
+against the shipped MAT path; the PDFs are in `resources/worker/`. The
+lineage placement stands. What follows is the verdict the paragraph lacked.
+
+**Rank by layer, not by name.** Every estimator in this lineage is three stacked
+layers, and comparing whole algorithms hides which layer is binding:
+
+| layer | MAT (shipped) | PFD | standing |
+| --- | --- | --- | --- |
+| frequency precision | CSPE super-resolution | 3-point parabolic interpolation on a zero-padded Blackman FFT | ours is finer |
+| peak selection | predict from $(f_0,B)$, snap to the strongest peak within $\pm f_0/4$ | predict from $(f_1,\hat B)$, snap to the strongest peak within $\pm 0.4 f_1$ | the same mechanism; ours is the tighter band |
+| combiner | median of the $K(K-1)/2$ pairwise $B$ (Eq. 8) | sign-majority of $\operatorname{sign}(D_{k+1}-D_k)$ driving a halving step in $\log \hat B$ | both rank-based, bounded-influence; parity |
+
+PFD's claim is speed against Galembo's comb filter (58 s vs 946 s on 35 keys),
+irrelevant to a Worker-side estimator; on synthetic tones its own Table 1 rates
+the three methods equal (RMS 1.19e-6 vs 1.19e-6 vs 1.16e-6), and its real-tone
+margin is against hand-read values with the footnote "the correct
+inharmonicity value is unknown". It was validated on keys 1–35 only — the
+register where MAT already has 24–32 partials and 0.4 % repeat noise (ADR 0009)
+— and never where we lose, the treble. There, its band is wider than ours, and
+band width is what admits the contaminant (primer §6). **Swapping MAT for PFD
+is refuted on the paper's own evidence.** The earlier claim in this project's
+notes that PFD "minimises an aggregate deviation" and is therefore not
+bounded-influence was wrong; the combiner is a vote.
+
+**The binding layer is peak selection, and no combiner repairs it.** A spectral
+line at exactly $n f_1$ is not an outlier for a median to out-vote; it is a
+valid measurement of $B = 0$, and enough of them carry the median with them
+(primer §5: 12–23 % of stored partials above A6 sit there, on two independent
+capture sets). MAT, PFD and mPFD all feed the combiner the same peaks. The only
+thing that could beat the shipped path is a *different front end* — Galembo &
+Askenfelt's inharmonic comb filter, which never indexes a line and so cannot be
+told that a product at $4 f_1$ is partial 4, or Rigaud's NMF. Both are offline
+and neither is cheap; the ADR 0006 note that only a different-front-end
+estimator is an informative check is reaffirmed.
+
+**mPFD is the right shape aimed at the wrong frequency.** Its contribution is a
+front-end filter — predict where the contaminant is, delete candidates near it,
+take the strongest survivor — with the exclusion window scaling as $k^3$, the
+same exponent the path review derived for an adaptive band. But it predicts
+Conklin phantoms at $f_i + f_j$, and on this instrument the contaminant is
+measured to be harmonic distortion at $n f_1$ (37 : 3 by a two-sided test,
+primer §5), 60–160 Hz from where mPFD would look. The candidate for Prompt AH
+is therefore mPFD's structure with $n f_1$ as the predicted location, which
+costs no new constant.
+
+Decision 3 is unchanged. The revisit condition "a different front end" is added
+below; it is not met.
+
+### Revisit conditions (added)
+
+- An offline comb-filter or NMF run on both instruments shows treble $B$ that
+  MAT's repeat-capture upper tail does not reach (would motivate a second
+  front end in the Worker, not a change of combiner).

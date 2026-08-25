@@ -248,6 +248,114 @@ tenths of a percent while integrating drift/unison beating and outliving
 treble sustain. Contingency closed; the stable window stays 66,150
 samples / 2¹⁶ FFT.
 
+## Analysis 7 — The top-octave B ceiling: amplitude, not bandwidth (added 2026-08-25)
+
+Recorded after acceptance; it moves no shipped value. Analysis 1 measured the
+treble as the information floor (median 26 %, worst key 38 ¢). This is the
+mechanism behind that number, the levers measured against it, and the one lever
+still open.
+
+**The bandwidth explanation is the obvious one, and it is wrong.** Nyquist caps
+the partial count independently of capture technique:
+
+| key | f₁ (Hz) | max n @ 44.1 kHz | @ 96 kHz |
+| --- | --- | --- | --- |
+| A6  | 1760 | 9 | 16 |
+| D#7 | 2489 | 7 | 11 |
+| A7  | 3520 | 5 | 8 |
+| C8  | 4186 | 4 | 7 |
+
+so the ~7 partials the σ_m ≤ σ_p crossover needs are unreachable above D#7
+(key 78) at 44.1 kHz. But count is a *proxy* in the σ_m law, not the cause: a
+capture holds few partials because the ones beyond it were too quiet to detect.
+Measured over instrument #2's captures, relative to each key's own fundamental:
+
+| n | treble (keys 62–87) | bass/tenor (keys 0–47) |
+| --- | --- | --- |
+| 2  | −28.3 dB | **+8.2 dB** |
+| 3  | −40.7 dB | +5.2 dB |
+| 4  | −49.8 dB | +3.9 dB |
+| 5  | −53.0 dB | — |
+| 6+ | −56 to −60 dB | +2.4 dB (n = 6) |
+
+A treble string radiates almost everything through its fundamental; a bass
+string puts *more* energy into its upper partials than into f₁. That 35–55 dB
+swing, not the band edge, is why B collapses above A6 — and it means a higher
+sample rate would buy partials at **−53 to −60 dB, weaker than the ones already
+failing**. Nothing here establishes that 96 kHz would recover treble B, and the
+amplitude trend argues it would not: the sample rate is not the binding
+constraint, and raising it is not a measured fix. That is a statement about the
+*curve*. A selectable rate is planned for its own reasons (ARCHITECTURE.md,
+"Hardcoded 44.1kHz"), and more treble partials on record would still serve
+analysis even where they cannot move the curve. Raw evidence from the same
+captures — partial 1 repeats to ±0.2 Hz at A6 (1.1e-4 relative) while partial 2
+of those captures scatters across 30 Hz.
+
+**What arrives where the amplitude goes.** The collapse is not noise winning an
+empty band; it is a specific competitor. Normalising every stored partial's
+position (0 = the exact harmonic n·f₁, 1 = the model-stretched position): below
+A6, 0–1 % of located partials sit at the exact harmonic and 83 % near the model;
+from A6 up, **24–27 % sit at exact integer multiples of f₁**, to the hertz,
+identically across captures — A#6's partials 3, 4, 5 land within ±2 Hz of 3f₁,
+4f₁, 5f₁ where its own partials belong +158, +391, +771 Hz higher. A string's
+partial is never harmonic and noise does not repeat; exact harmonics of a
+dominant fundamental are a **nonlinear product** of it — from the recording
+chain or from the instrument (phantom partials), which this data does not
+separate. A product at n·f₁ reads as B = 0, so it can only pull the median
+toward zero, and MAT's median cannot save the capture: one wrong partial poisons
+K−1 pairs, and A#6's one correct pair (6.6e-3, on the model) loses 14 to 1.
+
+A dedicated primer on this mechanism — the full derivation, with figures — is
+planned, and is the right place to read the maths at length. Until it lands,
+this analysis is the record.
+
+**Levers measured, both marginal.**
+
+* **Estimator form.** Replacing MAT's full-trajectory median with a
+  pre-registered single-pair B (fixed n = 3) moves the treble repeat log-SD from
+  0.137 to 0.102 and the count of keys beating the prior from 9/25 to 10/25. A
+  *post-hoc best pair per key* looks 3.7× better; that is selection on the test
+  statistic and does not survive pre-registration
+  ([`07-evidence-and-methodology.md`](../internals/07-evidence-and-methodology.md)).
+* **Pooling repeats.** The profile stores 3–8 captures per key and the curve
+  reads exactly one (`active()`). Taking the median across them gives
+  9/25 → 11/25. It cannot rescue the keys that fail hardest (A#6, B6, G#7, A7
+  all sit above 0.9 log-SD, where √N buys nothing). It is what stabilises the
+  treble-asymptote fit: reading the newest capture per key instead of the per-key
+  median moves that fit's slope by 0.9 SE
+  ([faithfulness-audit-06](../audits/faithfulness-audit-06-b-prior.md)).
+
+**Lever not yet tested: the MAT search band.** MAT admits a partial within
+±f₀/4 of its predicted position — wide enough to admit these nonlinear products
+where a tighter band would exclude them. A uniform tightening is not available:
+the bass needs the band that wide for an unrelated reason, since its bootstrap
+pair can land ~300 % off and the wide band absorbs the error. An
+uncertainty-sized band is the candidate form.
+
+**What the ceiling costs.** Sweeping the treble B across 0.5×–2× of the model
+moves engine (d)'s C8 target by **29.9 ¢** and A7 by **21.3 ¢** on instrument
+#2. That is the size of the top-octave modelling assumption. It does not reach
+the operator's readout: above key 48 the strobe and the coarse read both target
+n = 1, and f₁* carries no B.
+
+**The one lever still open: window placement.** Treble upper partials decay far
+faster than their fundamental, and the Golden Window (NINOS2, State 3) waits for
+post-attack stability — which up there lands after the collapse. Measured on
+instrument #2's full-event dumps, in dB relative to the fundamental at each
+instant: A6's partials 2–6 sit at **−2 to −8 dB** through the first 0.1 s and
+fall to −25/−37/−39/−42/−45 by t = 0.19 s; C8's partial 3 is **+15 dB** — louder
+than f₁ — at the attack and −33 dB by t = 0.28 s. The informative segment up
+there really is early, by 20–45 dB.
+
+Two caveats before acting on it. The first ~0.1 s contains the broadband hammer
+transient, so part of that energy is not resolved partials at all; and A6's
+collapse by t = 0.19 s means the gap between "transient over" and "partials
+gone" may be too narrow to use. A negative result — that the treble has no
+window which is both post-transient and partial-rich — is a real outcome and
+would close the question. The test is offline against the piano-#2 full-event
+dumps (every treble key is covered) and changes no gatekeeper code unless it
+succeeds.
+
 ## Re-verification checklist (Prompt-G completion gate)
 
 * `CURVE_B_MIN_PARTIALS` / treble ±5 ¢ sensitivity — **resolved by

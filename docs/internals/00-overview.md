@@ -102,8 +102,7 @@ docs/internals/
 ├── 04-algorithms-and-models.md          algorithms/ vs models/ layout
 ├── 05-style.md                          Rust style, allocation idioms
 ├── 06-capture-sets.md                   the validation data: what it is, how to consume it
-├── 07-evidence-and-methodology.md       how a measurement becomes a decision
-└── suspected-issues.md                  unreproduced hazards and the defensive code for them
+└── 07-evidence-and-methodology.md       how a measurement becomes a decision
 ```
 
 ```text
@@ -120,7 +119,9 @@ docs/adr/
 ├── 0010-m-of-n-lock-rule-replay.md            M-of-N acquisition lock; two-instrument replay
 ├── 0011-coarse-spectral-readout.md            Strobe coarse readout: CFAR gate, n* selection
 ├── 0012-unison-line-estimator.md              Unison assist: baseband zoom DFT, OS-CFAR lines
-└── 0013-bass-extra-lines-attribution.md       Bass second lines: attribution, the window
+├── 0013-bass-extra-lines-attribution.md       Bass second lines: attribution, the window
+├── 0014-unison-panel-against-isolation-truth.md  Unison panel vs mute-isolation truth
+└── 0015-ambient-sigma-gates-measured.md       The ambient-σ Neyman–Pearson gates, measured
 ```
 
 Each file is self-contained, and section headings are stable enough to be

@@ -6,8 +6,6 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
 
-use crossbeam_queue::ArrayQueue;
-use std::sync::Arc;
 use tuner_core::algorithms::peaks::extract_peaks;
 use tuner_core::algorithms::spectral::{fft, magnitude_spectrum};
 use tuner_core::audio::{BASS_WINDOW_SIZE, HOP_SIZE, WINDOW_SIZE};
@@ -175,8 +173,7 @@ fn main() -> Result<()> {
 
     let fft_gatekeeper = planner.plan_fft_forward(WINDOW_SIZE);
     let mut processing_frame = ProcessingFrame::new();
-    let audio_pool = Arc::new(ArrayQueue::new(1));
-    let mut gatekeeper = Gatekeeper::new(audio_pool);
+    let mut gatekeeper = Gatekeeper::new();
     gatekeeper.config.silence_threshold = noise_floor;
 
     let mut engine = Engine::new(44100);

@@ -66,3 +66,9 @@ scripts/__pycache__/
 replay_cache/
 # Draft commit message (review scratch; point `git commit -F` at it, don't track)
 /COMMIT_MSG.txt
+
+# Primers under review — not yet part of the documented tree
+docs/primers/
+
+# Presentation build tree (figures, PDF, drafts) — not part of the app
+scripts/presentation/

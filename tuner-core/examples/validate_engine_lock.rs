@@ -22,7 +22,6 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
-use crossbeam_queue::ArrayQueue;
 use tuner_core::algorithms::spectral::{fft, magnitude_spectrum};
 use tuner_core::audio::{BASS_WINDOW_SIZE, HOP_SIZE, WINDOW_SIZE};
 use tuner_core::engine::Engine;
@@ -80,8 +79,7 @@ fn first_lock(
     }
 
     let mut frame = ProcessingFrame::new();
-    let gk_pool = Arc::new(ArrayQueue::new(1));
-    let mut gk = Gatekeeper::new(gk_pool);
+    let mut gk = Gatekeeper::new();
     gk.config.silence_threshold = noise_floor;
     let mut engine = Engine::new(44100);
     engine.noise_floor = noise_floor;

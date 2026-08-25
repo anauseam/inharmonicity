@@ -1,11 +1,9 @@
 use anyhow::{Context, Result, anyhow};
-use crossbeam_queue::ArrayQueue;
 use realfft::RealFftPlanner;
 use std::env;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
-use std::sync::Arc;
 
 use tuner_core::algorithms::spectral::fft;
 use tuner_core::audio::{BASS_WINDOW_SIZE, HOP_SIZE, WINDOW_SIZE};
@@ -76,12 +74,9 @@ fn main() -> Result<()> {
 
     let mut processing_frame = ProcessingFrame::new();
 
-    // Create a dummy AudioPool for the Gatekeeper
-    let audio_pool = Arc::new(ArrayQueue::new(1));
-    let mut gatekeeper = Gatekeeper::new(audio_pool);
+    let mut gatekeeper = Gatekeeper::new();
     // Explicitly set the silence threshold from the JSON
     gatekeeper.config.silence_threshold = noise_floor;
-    gatekeeper.capture_mode_enabled = true; // So it can traverse all 5 states
 
     // Setup output files
     let mut gatekeeper_csv = File::create(parent_dir.join("gatekeeper.csv"))?;
