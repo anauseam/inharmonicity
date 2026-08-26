@@ -575,6 +575,21 @@ Agreed layout (user, 2026-07-16): a **master–detail gallery**.
 - **Selection = display only.** Choosing an engine sets which curve the strobe
   and the live plot show; it never triggers a recompute (all engines are in the
   bundle, D7).
+- **Which engines the gallery offers (2026-08-25).** Only **(a)** and the two
+  **(d)** presets. (b) and (c) are computed and stay in the bundle — the curve
+  harnesses and the auralization read all five — but they are not offered as
+  tuning targets while their validity is open (ARCHITECTURE.md, "What the GUI
+  offers is a subset of what the worker computes"; ADR 0007, ADR 0008).
+- **Withheld, not hidden.** Their sections stay in the gallery as greyed cards
+  reading **"withheld"**, reusing the missing-feature card the ρ Low/High slots
+  already use; the status word separates the two kinds — *deferred* = not
+  computed, *withheld* = computed but not a target. Greying keeps the panel a
+  record of the decision, and keeps the gallery a static layout rather than a
+  conditional build. The set is the frontend's alone (`GALLERY_ENGINES`, private
+  to `curve_select`) and re-offering an engine is a one-line change to it.
+  `EngineChoice` stays the full enum and `CurveBundle::curve` is total over it,
+  so a profile saved on (b) or (c) still loads and still plots; no load-time
+  fallback, since nothing in the app can select a withheld engine.
 
 ---
 
