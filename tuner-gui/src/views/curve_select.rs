@@ -3,14 +3,17 @@
 //! The master–detail gallery of strobe design note §9: four sections, one per
 //! engine class (a)–(d), with sparkline thumbnails; clicking one opens the
 //! detail view — full plot plus the deferred **metrics** and **listen** slots
-//! (greyed shells until those efforts land). The (c) ρ Low/High presets are
-//! greyed "deferred" placeholders until (c)'s Giordano calibration is factored
-//! out of the per-preset path (§14 step 6).
+//! (greyed shells until those efforts land).
+//!
+//! A card the gallery does not offer is greyed in place, its status word saying
+//! which kind it is — **deferred** (not computed) or **withheld** (computed,
+//! but not a tuning target).
 //!
 //! Per R7, the sub-class-less (a)/(b) render as plain wide cards, not
 //! single-item thumbnail rows. Selection is **display-only** (D7): it sets
 //! which curve the live plot (and later the strobe) shows — never a recompute.
-//! All thumbnails share one y-range so the engines' shapes compare honestly.
+//! All offered thumbnails share one y-range so the engines' shapes compare
+//! honestly.
 
 use crate::Message;
 use crate::advisory;
@@ -23,6 +26,21 @@ use tuner_core::worker::CurveBundle;
 
 /// Muted ink for deferred/disabled affordances (house Disabled grey).
 const INK_DISABLED: Color = Color::from_rgb(0.6, 0.6, 0.6);
+
+/// The engines the gallery offers; any other card renders withheld. (b) and (c)
+/// are computed and in the bundle, but are not offered as tuning targets while
+/// their validity is open (ARCHITECTURE.md, "What the GUI offers is a subset of
+/// what the worker computes"; design note §9).
+const GALLERY_ENGINES: [EngineChoice; 3] = [
+    EngineChoice::RigaudPure,
+    EngineChoice::MultiBalanced,
+    EngineChoice::MultiPureTwelfths,
+];
+
+/// Whether the gallery offers `choice` as a tuning target.
+fn is_offered(choice: EngineChoice) -> bool {
+    GALLERY_ENGINES.contains(&choice)
+}
 
 /// Entry point for the settings main panel: gallery, or detail if one is open.
 pub fn create_curve_select_panel(
@@ -159,8 +177,9 @@ fn create_detail(
     .into()
 }
 
-/// A clickable curve thumbnail (small sparkline card). `wide` renders the
-/// R7 plain-card format used by the sub-class-less (a)/(b).
+/// A clickable curve thumbnail (small sparkline card), or the greyed
+/// **withheld** card when [`GALLERY_ENGINES`] does not offer `choice`. `wide`
+/// renders the R7 plain-card format used by the sub-class-less (a)/(b).
 fn thumb(
     bundle: &CurveBundle,
     choice: EngineChoice,
@@ -168,8 +187,12 @@ fn thumb(
     y_range: (f32, f32),
     wide: bool,
 ) -> Element<'static, Message> {
+    if !is_offered(choice) {
+        return placeholder_thumb("withheld", choice.short_label(), wide);
+    }
+
     let (cents, measured, suspect) = plot_inputs(bundle.curve(choice));
-    let (w, h) = if wide { (330.0, 64.0) } else { (155.0, 54.0) };
+    let (w, h) = card_size(wide);
 
     let plot = container(
         CurvePlot::new(cents, measured, suspect, PlotMode::Sparkline, Some(y_range)).view(),
@@ -208,16 +231,28 @@ fn thumb(
     .into()
 }
 
-/// Greyed placeholder for a preset that is not computed yet (§9: the (c)
-/// ρ Low/High trio slots — the idiomatic missing-feature card).
-fn deferred_thumb(name: &'static str) -> Element<'static, Message> {
+/// Plot size of a gallery card: the R7 plain wide card, or a thumbnail.
+fn card_size(wide: bool) -> (f32, f32) {
+    if wide { (330.0, 64.0) } else { (155.0, 54.0) }
+}
+
+/// Greyed placeholder for a curve the gallery shows but does not offer (§9 —
+/// the idiomatic missing-feature card, matching the settings sidebar's
+/// `ButtonType::Disabled`). `status` names which kind it is: `"deferred"` for a
+/// preset that is not computed, `"withheld"` for an engine that is.
+fn placeholder_thumb(
+    status: &'static str,
+    name: &'static str,
+    wide: bool,
+) -> Element<'static, Message> {
+    let (w, h) = card_size(wide);
     container(
         column![
-            container(text("deferred").size(12).color(INK_DISABLED))
-                .width(Length::Fixed(155.0))
-                .height(Length::Fixed(54.0))
-                .center_x(Length::Fixed(155.0))
-                .center_y(Length::Fixed(54.0)),
+            container(text(status).size(12).color(INK_DISABLED))
+                .width(Length::Fixed(w))
+                .height(Length::Fixed(h))
+                .center_x(Length::Fixed(w))
+                .center_y(Length::Fixed(h)),
             text(name).size(13).color(INK_DISABLED),
         ]
         .spacing(4)
@@ -236,6 +271,11 @@ fn deferred_thumb(name: &'static str) -> Element<'static, Message> {
     .into()
 }
 
+/// The (c) ρ Low/High slots: presets with no computation path yet (§14 step 6).
+fn deferred_thumb(name: &'static str) -> Element<'static, Message> {
+    placeholder_thumb("deferred", name, false)
+}
+
 /// Cents, measured flags and suspect marks of a curve, in the plot widget's
 /// input form.
 pub fn plot_inputs(curve: &TuningCurve) -> ([f32; 88], [bool; 88], [bool; 88]) {
@@ -246,12 +286,13 @@ pub fn plot_inputs(curve: &TuningCurve) -> ([f32; 88], [bool; 88], [bool; 88]) {
     (curve.cents, measured, advisory::suspect_keys(&curve.flags))
 }
 
-/// One y-range across every engine in the bundle, so the gallery's
-/// thumbnails compare shapes on a common scale.
+/// One y-range across every offered engine, so the gallery's thumbnails
+/// compare shapes on a common scale. Withheld cards plot nothing and so do not
+/// widen it.
 fn shared_thumb_range(bundle: &CurveBundle) -> (f32, f32) {
     let mut lo = f32::MAX;
     let mut hi = f32::MIN;
-    for choice in EngineChoice::ALL {
+    for choice in GALLERY_ENGINES {
         let (l, h) = curve_plot::auto_y_range(&bundle.curve(choice).cents);
         lo = lo.min(l);
         hi = hi.max(h);
