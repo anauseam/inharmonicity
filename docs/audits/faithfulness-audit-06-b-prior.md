@@ -27,9 +27,10 @@ piano." JASA 133(5), 3107–3118 — primary source read
   parameter set, estimated per piano (their per-piano results appear as
   curves in Figs 7/8/10; their algorithm-initialization example uses
   s_B = −8.9·10⁻², y_B = −7).
-- **No scatter statistics**: the paper contains no per-note B dispersion
+- **No scatter statistics**: the JASA paper contains no per-note B dispersion
   values; its Fig. 3 is an algorithm initialization/result spectrum figure,
-  not a B-scatter plot.
+  not a B-scatter plot. *(But the DAFx-11 precursor does — see the 2026-08-27
+  addendum, which reverses finding 4.)*
 
 ## Verdict summary
 
@@ -38,7 +39,7 @@ piano." JASA 133(5), 3107–3118 — primary source read
 | 1 | Model form: dual-exponential additive, log-linear asymptotes | (a) faithful (Eqs 7–8) |
 | 2 | Treble constants (0.0926, −11.788 in 1-indexed keys) | (a) **exactly** the paper's universal fit, correctly re-indexed |
 | 3 | Bass constants (−0.066, −9.211 in 1-indexed keys) | (b) OURS by necessity — the paper defines them as piano-specific; provenance was undocumented |
-| 4 | σ_B = 0.157/0.116 "[Rigaud Fig. 3]" | (c) **false attribution** — not in the paper; the constants are ours |
+| 4 | σ_B = 0.157/0.116 "[Rigaud Fig. 3]" | ~~(c) false attribution~~ → **(a) faithful**; the JASA paper dropped them, the DAFx-11 precursor has them verbatim (see Addendum 2026-08-27) |
 | 5 | Bass-domain validity | documented limitation, not a deviation (ADR 0006: real upright bass B is 7–25× this prior) |
 
 ## Findings
@@ -94,6 +95,73 @@ partial table) is outside the paper's scope and already documented.
 3. `joint_b_refine_diagnostic.rs` σ helper comment: same correction.
 4. `mobo-methodology.md` §synthetic: "[Rigaud Fig. 3]" → "(our calibration;
    mis-cited to Rigaud pre-audit — see faithfulness-audit-06)".
+
+## Addendum — finding 4 reversed: σ_B is Rigaud's, from DAFx-11 (2026-08-27)
+
+Finding 4 above is **wrong**, and the error is one of edition, not of reading.
+This audit's source of truth was the 2013 JASA paper, whose Fig. 3 is indeed a
+spectrum figure containing no scatter statistics. The values were taken from the
+**DAFx-11 precursor** (`resources/curve/53_e.pdf`), §3.2, whose Fig. 3 *is* the
+relative-deviation histogram:
+
+> "We present on Figure 3 the histograms of the relative deviation between
+> B\*(m) and B_θ(m) computed in A0-B4 (m ∈ [21, 71]) and C4-C8 ranges. In C4-C8
+> range, the mean and the standard deviation are respectively equal to
+> −4.2·10⁻³ and **1.16·10⁻¹**. In A0-B4 range we have respectively 4.6·10⁻³ and
+> **1.57·10⁻¹**." — DAFx-11 §3.2
+
+Both constants match to three digits, over the 5-piano corpus the original
+`mobo_evaluator.rs` header already named. The split point corroborates it
+independently: the code's `key <= 50` is MIDI 71 = B4, exactly the paper's
+`m ∈ [21, 71]` boundary — not a value anyone would land on by eyeballing figures.
+So σ_B and its split are **the paper's**, and the pre-audit citation was right;
+it merely pointed at the wrong edition. Reclassified (a) faithful.
+
+Two caveats to carry with the citation:
+
+1. **The DAFx-11 paper is internally inconsistent about the label.** Its Fig. 3
+   caption says "A0-B3" while §3.2's body says "A0-B4 (m ∈ [21, 71])"; the body's
+   m-range is the unambiguous one and is what our code follows. The body's
+   companion label "C4-C8 (m ∈ [72, 108])" is likewise off — m = 72 is C5 — while
+   the *same* section earlier writes "C4-C8 (m ∈ [60, 108])" for the treble fit.
+   Cite the m-ranges, not the note names.
+2. **σ_B measures model-vs-data residual, not per-note physical scatter.** It is
+   the dispersion of (B\*(m) − B_θ(m))/B_θ(m) after a 3-note bass fit, with treble
+   outliers manually removed. Using it as a per-note draw — which the synthetic
+   generator does — is the right order of magnitude for "how far a real note sits
+   off the two-bridge curve," which is exactly the mismatch the MOBO synthetic
+   wanted; it is not a claim about repeat-measurement noise. Our own measured
+   repeat-noise figure is the separate σ_lnB(n) of ADR 0009.
+
+**An unlooked-for corroboration of ADR 0009.** Rigaud's σ_B is the dispersion of
+(B\*(m) − B_θ(m))/B_θ(m) — measured data against the fitted two-bridge curve.
+That is the *same quantity* as `curves::sigma_prior`, the robust SD of
+ln(B_meas/B_ξ) over low-noise keys (to first order ln(1+x) ≈ x, so the two are
+comparable to within ~10 % at these magnitudes). Ours is self-calibrated per
+instrument at 0.186 (upright #1) and 0.062 (upright #2), with
+`SIGMA_PRIOR_DEFAULT = 0.12` picked as the midpoint for profiles too sparse to
+calibrate. Rigaud's pooled 5-piano figures — 0.157 bass / 0.116 treble — fall
+inside our two-instrument bracket, and the treble value lands on our interpolated
+fallback almost exactly. So the ADR-0009 claim that σ_p is instrument-specific
+and O(10 %) has an independent 5-piano anchor it did not have before, and the
+`n = 2` fallback constant is better supported than "midpoint of two uprights."
+One asymmetry stands unexploited: Rigaud's σ is **register-split** (bass scatter
+~35 % larger), while `sigma_prior` returns one scalar per instrument. Splitting
+it would raise w in the treble and lower it in the bass — a candidate refinement,
+not taken here, and gated on the same evidence bar as anything else touching the
+shrinkage.
+
+No behavioral consequence, as before: nothing on the hot path or in the tuning
+curve reads these constants; they scale synthetic B draws in two offline
+harnesses. The four remediations listed in "Fixes applied" have been reverted to
+cite `Rigaud DAFx-11 §3.2/Fig. 3`.
+
+**Lesson for the series:** this audit's own header records the DAFx-11 paper as
+the precursor, and audit 09 explicitly judged it "not needed; the JASA paper is
+self-contained." That judgement is true of the *model* and false of everything
+the journal version dropped — the σ statistics here, and the λ·B semitone
+recursion that `models.rs::railsback_stretch_curve` still uses. When a port
+cites a journal paper with a conference precursor, both editions are in scope.
 
 ## Addendum — the universal treble pair, checked on two uprights (2026-08-25)
 

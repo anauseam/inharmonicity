@@ -11,7 +11,7 @@
 //!   engine already uses (`get_expected_beta`), treble bridge fixed across
 //!   pianos, bass bridge piano-dependent.       [Rigaud, David, Daudet DAFx-11]
 //! - Per-note B scatter: ×(1+N(0,σ)), σ ≈ 0.157 (A0–B4) / 0.116 (C4–C8).
-//!   [Rigaud Fig. 3, 5 pianos]
+//!   [Rigaud DAFx-11 §3.2/Fig. 3, 5 pianos]
 //! - B↔f0 coupling under detuning: ΔB/B = −2·Δf0/f0.        [Rigaud fn. 1]
 //! - Baseline tuning = ET × Railsback stretch via the ρ-type-octave recursion
 //!   (m0≈64, α≈24, K≈4.51; per-piano variants).  [Rigaud §4.2, Fig. 4–5]
@@ -252,9 +252,8 @@ fn emit_partial_cluster(
 }
 
 fn gen_frame(rng: &mut Rng, piano: &Piano, key: usize, hard: bool) -> Frame {
-    // OUR synthetic-calibration constants and split point (mis-cited to "Rigaud
-    // Fig. 3" pre-audit; the paper contains no scatter statistics — see
-    // docs/audits/faithfulness-audit-06-b-prior.md).
+    // Model-vs-data relative-B scatter, DAFx-11 §3.2/Fig. 3: σ = 1.57e-1 over
+    // A0–B4 (m ∈ [21,71] ⇒ key ≤ 50) and 1.16e-1 above.
     let sigma_b = if key <= 50 { 0.157 } else { 0.116 };
     let b_note = (piano.b_curve[key] * (1.0 + sigma_b * rng.normal())).max(1e-7);
 

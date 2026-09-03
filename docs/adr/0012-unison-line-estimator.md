@@ -284,8 +284,9 @@ beats.** The mechanism is not subtle once measured: the *physical* scatter of th
 split across partials runs several times the estimator's precision — the strings
 of a unison differ slightly in B as well as in f₀, and Weinreich coupling moves
 them — so a null built from the instrument's precision rejects almost everything.
-This is the same class of defect as the Neyman–Pearson σ entry in
-`suspected-issues.md`: a correctly-derived threshold against the wrong noise.
+This is the same class of defect as the Neyman–Pearson σ entry (then in
+`suspected-issues.md`, since retired; now [ADR 0015](0015-ambient-sigma-gates-measured.md)):
+a correctly-derived threshold against the wrong noise.
 
 The shipped test avoids assuming σ at all. Both hypotheses are members of one
 family,

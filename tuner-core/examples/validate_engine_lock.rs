@@ -13,20 +13,33 @@
 //! (7,8) number the Python replica reports — piano-1 **81/87**. Any deviation is
 //! an integration bug between the engine and the replayed semantics.
 //!
+//! `--from-onset` runs the counterfactual instead: the gatekeeper withholds the
+//! engine's vote until `Stable`, a fixed five hops (116 ms) after the NHWRSF
+//! onset, on the stated ground that the attack is broadband. Nothing here scored
+//! what that wait buys, because both this harness and `diagnose_gatekeeper` only
+//! ever observe the *gated* path. In this mode the Stage-A scan — the same
+//! `discovery::discover` call `Engine::process` makes, on the same 8192-point bass
+//! spectrum — runs on **every** hop from the onset hop onward regardless of gate
+//! state, and each hop's winner is scored against the capture's key, bucketed by
+//! hops since onset. The gate's own verdict is carried per hop, so the shipped
+//! policy sits inside the table rather than bounding it.
+//!
 //! Usage: cargo run --release --example validate_engine_lock -- [BASE_DIR]
+//!        cargo run --release --example validate_engine_lock -- diagnostics_piano2 --from-onset
 
 use anyhow::{Context, Result, anyhow};
 use realfft::{RealFftPlanner, RealToComplex};
 use std::env;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tuner_core::algorithms::spectral::{fft, magnitude_spectrum};
-use tuner_core::audio::{BASS_WINDOW_SIZE, HOP_SIZE, WINDOW_SIZE};
+use tuner_core::algorithms::{discovery, peaks, twm};
+use tuner_core::audio::{BASS_WINDOW_SIZE, HOP_SIZE, SAMPLE_RATE, WINDOW_SIZE};
 use tuner_core::engine::Engine;
-use tuner_core::gatekeeper::{Gatekeeper, SignalState};
-use tuner_core::models::{KeyProfile, NOTES, get_expected_beta};
+use tuner_core::gatekeeper::{GateResult, Gatekeeper, SignalState};
+use tuner_core::models::{KeyProfile, NOTES, SpectralPeak, get_expected_beta};
 use tuner_core::pipeline::ProcessingFrame;
 
 fn register(key: usize) -> usize {
@@ -39,6 +52,241 @@ fn register(key: usize) -> usize {
     }
 }
 
+/// Finer split for the onset sweep than [`register`]: what the gate's wait buys
+/// separates on attack timbre, which is a treble-versus-everything-else story
+/// that the lock report's three-way split blurs.
+const ONSET_REGISTERS: [(&str, u8, u8); 4] = [
+    ("bass A0-B1", 0, 14),
+    ("tenor C2-B3", 15, 38),
+    ("mid C4-B5", 39, 62),
+    ("treble C6-C8", 63, 87),
+];
+
+/// Hops after the onset hop that get their own bucket; later hops pool.
+const MAX_HOP: usize = 24;
+
+/// Capture directories under `root`, at either the top level
+/// (`diagnostics_piano2/key_*`) or one level down (`diagnostics/<instrument
+/// id>/key_*`).
+fn find_captures(root: &Path) -> Result<Vec<PathBuf>> {
+    let is_capture = |p: &Path| {
+        p.file_name()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| s.starts_with("key_"))
+    };
+    let mut out = Vec::new();
+    for entry in fs::read_dir(root)?.flatten() {
+        let p = entry.path();
+        if !p.is_dir() {
+            continue;
+        }
+        if is_capture(&p) {
+            out.push(p);
+        } else {
+            for sub in fs::read_dir(&p).into_iter().flatten().flatten() {
+                let p2 = sub.path();
+                if p2.is_dir() && is_capture(&p2) {
+                    out.push(p2);
+                }
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// The key a capture directory is named for.
+fn key_from_dirname(dir: &Path) -> Option<u8> {
+    dir.file_name()
+        .and_then(|s| s.to_str())?
+        .strip_prefix("key_")?
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .ok()
+}
+
+/// The capture's calibrated ambient RMS, or the 0.001 fallback where the dump
+/// carries none.
+fn capture_noise_floor(dir: &Path) -> f32 {
+    fs::read_to_string(dir.join("analysis.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|j| j["metadata"]["noise_floor"].as_f64())
+        .map(|v| v as f32)
+        .filter(|v| *v > 0.0)
+        .unwrap_or(0.001)
+}
+
+/// Raw `f32` samples from `name` under `dir`.
+fn read_raw(dir: &Path, name: &str) -> Option<Vec<f32>> {
+    let bytes = fs::read(dir.join(name)).ok()?;
+    if bytes.is_empty() || bytes.len() % 4 != 0 {
+        return None;
+    }
+    let mut out = vec![0.0f32; bytes.len() / 4];
+    // SAFETY: f32 has no invalid bit patterns and the length is a multiple of 4.
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.as_mut_ptr() as *mut u8, bytes.len());
+    }
+    Some(out)
+}
+
+/// Populate `frame` from one hop's bass window and run the gatekeeper over it,
+/// exactly as `AudioPipeline::process_cola_hop` does: the gate's verdict comes
+/// from a treble FFT over the newest `WINDOW_SIZE` samples.
+fn gate_hop(
+    frame: &mut ProcessingFrame,
+    win: &[f32],
+    gk: &mut Gatekeeper,
+    fft_gate: &Arc<dyn RealToComplex<f32>>,
+) -> GateResult {
+    frame.audio_buffer[..BASS_WINDOW_SIZE].copy_from_slice(win);
+    let newest = BASS_WINDOW_SIZE - WINDOW_SIZE;
+    fft(
+        &frame.audio_buffer[newest..BASS_WINDOW_SIZE],
+        &mut frame.time_buffer[..WINDOW_SIZE],
+        &mut frame.frequency_buffer[..],
+        fft_gate,
+        WINDOW_SIZE,
+    );
+    gk.process_frame(frame)
+}
+
+/// The bass FFT and magnitude spectrum discovery reads. Split out of
+/// [`gate_hop`] so the sweep can skip it on hops it will not score.
+fn bass_spectrum(frame: &mut ProcessingFrame, fft_bass: &Arc<dyn RealToComplex<f32>>) {
+    fft(
+        &frame.audio_buffer[..BASS_WINDOW_SIZE],
+        &mut frame.time_buffer[..BASS_WINDOW_SIZE],
+        &mut frame.bass_frequency_buffer[..],
+        fft_bass,
+        BASS_WINDOW_SIZE,
+    );
+    magnitude_spectrum(
+        &frame.bass_frequency_buffer,
+        BASS_WINDOW_SIZE,
+        &mut frame.bass_magnitude_buffer[..BASS_WINDOW_SIZE / 2],
+    );
+}
+
+/// One scored hop of the onset sweep.
+struct Hop {
+    key: u8,
+    since_onset: usize,
+    stable: bool,
+    winner: u8,
+}
+
+/// Stage-A's winner on every hop from the onset, gate state ignored.
+fn score_from_onset(
+    dir: &Path,
+    key: u8,
+    fft_bass: &Arc<dyn RealToComplex<f32>>,
+    fft_gate: &Arc<dyn RealToComplex<f32>>,
+    profiles: &[KeyProfile; 88],
+) -> Vec<Hop> {
+    let mut out = Vec::new();
+    let Some(audio) = read_raw(dir, "audio_full_event.raw") else {
+        return out;
+    };
+    if audio.len() < BASS_WINDOW_SIZE {
+        return out;
+    }
+    let nf = capture_noise_floor(dir);
+    let mut frame = ProcessingFrame::new();
+    let mut gk = Gatekeeper::new();
+    gk.config.silence_threshold = nf;
+    let mut scratch = vec![SpectralPeak::default(); 64];
+    let cfg = twm::TwmConfig::default();
+    // The engine's Neyman-Pearson magnitude gate (engine.rs, P_fa = 0.001).
+    let p_bin = nf * nf * 0.375 * BASS_WINDOW_SIZE as f32;
+    let min_magnitude = if p_bin > 0.0 {
+        (-p_bin * 0.001_f32.ln()).sqrt()
+    } else {
+        0.0
+    };
+
+    let mut onset_hop: Option<usize> = None;
+    let mut hop = 0usize;
+    let mut cursor = 0usize;
+    while cursor + BASS_WINDOW_SIZE <= audio.len() {
+        let win = &audio[cursor..cursor + BASS_WINDOW_SIZE];
+        cursor += HOP_SIZE;
+        hop += 1;
+        let gate = gate_hop(&mut frame, win, &mut gk, fft_gate);
+        if gate.is_new_onset && onset_hop.is_none() {
+            onset_hop = Some(hop);
+        }
+        let Some(h0) = onset_hop else {
+            continue;
+        };
+        if gate.state == SignalState::Silence {
+            break;
+        }
+        bass_spectrum(&mut frame, fft_bass);
+        let n = peaks::extract_peaks(
+            &frame.bass_magnitude_buffer[..BASS_WINDOW_SIZE / 2],
+            &frame.bass_frequency_buffer[..],
+            SAMPLE_RATE,
+            BASS_WINDOW_SIZE,
+            min_magnitude,
+            &mut scratch,
+        );
+        let valid = peaks::mask_peaks(&mut scratch[..n.min(64)]);
+        out.push(Hop {
+            key,
+            since_onset: hop - h0,
+            stable: gate.state == SignalState::Stable,
+            winner: discovery::discover(&scratch[..valid], profiles, &cfg, true).key_index,
+        });
+    }
+    out
+}
+
+fn from_onset_report(base: &Path, captures: usize, hops: &[Hop]) {
+    println!(
+        "\n{}: {captures} captures, {} scored hops. Stage-A winner == key, % per hop since onset (hop = 23.2 ms; 'S' = gate Stable on ≥ half of that bucket's hops)",
+        base.display(),
+        hops.len()
+    );
+    print!("{:14}", "register");
+    for h in 0..=MAX_HOP {
+        print!("{h:>6}");
+    }
+    println!("{:>7}", "25+");
+    for (name, lo, hi) in ONSET_REGISTERS {
+        let sel: Vec<&Hop> = hops.iter().filter(|h| h.key >= lo && h.key <= hi).collect();
+        if sel.is_empty() {
+            continue;
+        }
+        print!("{name:14}");
+        let bucket = |pred: &dyn Fn(usize) -> bool| {
+            let b: Vec<&&Hop> = sel.iter().filter(|h| pred(h.since_onset)).collect();
+            if b.is_empty() {
+                return None;
+            }
+            let correct = b.iter().filter(|h| h.winner == h.key).count();
+            let stable = b.iter().filter(|h| h.stable).count();
+            Some((
+                100.0 * correct as f32 / b.len() as f32,
+                stable * 2 >= b.len(),
+            ))
+        };
+        for h in 0..=MAX_HOP {
+            match bucket(&|x| x == h) {
+                Some((pct, st)) => print!("{:>5.0}{}", pct, if st { "S" } else { " " }),
+                None => print!("{:>6}", "-"),
+            }
+        }
+        match bucket(&|x| x > MAX_HOP) {
+            Some((pct, st)) => println!("{:>6.0}{}", pct, if st { "S" } else { " " }),
+            None => println!("{:>7}", "-"),
+        }
+    }
+}
+
 /// Drive the real auto-mode engine over one capture; return the first latched key.
 fn first_lock(
     key_dir: &Path,
@@ -46,34 +294,13 @@ fn first_lock(
     fft_gate: &Arc<dyn RealToComplex<f32>>,
     profiles: &[KeyProfile; 88],
 ) -> Result<Option<Option<u8>>> {
-    let mut raw = key_dir.join("audio_full_event.raw");
-    if !raw.exists() {
-        raw = key_dir.join("audio.raw");
-    }
-    if !raw.exists() {
+    let Some(audio) =
+        read_raw(key_dir, "audio_full_event.raw").or_else(|| read_raw(key_dir, "audio.raw"))
+    else {
         return Ok(None);
-    }
-
-    let mut noise_floor = 0.0f32;
-    if let Ok(json_str) = fs::read_to_string(key_dir.join("analysis.json"))
-        && let Ok(json) = serde_json::from_str::<serde_json::Value>(&json_str)
-        && let Some(nf) = json["metadata"]["noise_floor"].as_f64()
-    {
-        noise_floor = nf as f32;
-    }
-    if noise_floor <= 0.0 {
-        noise_floor = 0.001;
-    }
-
-    let bytes = fs::read(&raw).context("read raw")?;
-    if bytes.len() % 4 != 0 {
-        return Err(anyhow!("raw not f32-aligned"));
-    }
-    let n = bytes.len() / 4;
-    let mut audio = vec![0.0f32; n];
-    unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), audio.as_mut_ptr() as *mut u8, bytes.len());
-    }
+    };
+    let noise_floor = capture_noise_floor(key_dir);
+    let n = audio.len();
     if n < BASS_WINDOW_SIZE {
         return Ok(None);
     }
@@ -89,33 +316,8 @@ fn first_lock(
         let win = &audio[cursor..cursor + BASS_WINDOW_SIZE];
         cursor += HOP_SIZE;
 
-        // Populate the frame exactly as AudioPipeline::process_cola_hop does:
-        // full bass window in audio_buffer, treble FFT for the gatekeeper, bass
-        // FFT + magnitude for discovery.
-        frame.audio_buffer[..BASS_WINDOW_SIZE].copy_from_slice(win);
-        let newest = BASS_WINDOW_SIZE - WINDOW_SIZE;
-        fft(
-            &frame.audio_buffer[newest..BASS_WINDOW_SIZE],
-            &mut frame.time_buffer[..WINDOW_SIZE],
-            &mut frame.frequency_buffer[..],
-            fft_gate,
-            WINDOW_SIZE,
-        );
-        let gate = gk.process_frame(&frame);
-
-        fft(
-            &frame.audio_buffer[..BASS_WINDOW_SIZE],
-            &mut frame.time_buffer[..BASS_WINDOW_SIZE],
-            &mut frame.bass_frequency_buffer[..],
-            fft_bass,
-            BASS_WINDOW_SIZE,
-        );
-        let mag_count = BASS_WINDOW_SIZE / 2;
-        magnitude_spectrum(
-            &frame.bass_frequency_buffer,
-            BASS_WINDOW_SIZE,
-            &mut frame.bass_magnitude_buffer[..mag_count],
-        );
+        let gate = gate_hop(&mut frame, win, &mut gk, fft_gate);
+        bass_spectrum(&mut frame, fft_bass);
 
         let is_silence = gate.state == SignalState::Silence;
         let is_stable = gate.state == SignalState::Stable;
@@ -138,9 +340,19 @@ fn first_lock(
 }
 
 fn main() -> Result<()> {
-    let base = env::args()
-        .nth(1)
-        .unwrap_or_else(|| "diagnostics_piano_1".to_string());
+    let mut base = "diagnostics_piano_1".to_string();
+    let mut from_onset = false;
+    let mut saw_base = false;
+    for arg in env::args().skip(1) {
+        match arg.as_str() {
+            "--from-onset" => from_onset = true,
+            _ if !saw_base => {
+                base = arg;
+                saw_base = true;
+            }
+            other => return Err(anyhow!("unexpected argument {other:?}")),
+        }
+    }
     let base = Path::new(&base);
 
     let mut planner = RealFftPlanner::<f32>::new();
@@ -156,16 +368,19 @@ fn main() -> Result<()> {
     }
     let profiles: [KeyProfile; 88] = profiles_vec.try_into().unwrap();
 
-    let mut dirs: Vec<_> = fs::read_dir(base)?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| {
-            p.file_name()
-                .and_then(|s| s.to_str())
-                .map(|s| s.starts_with("key_"))
-                .unwrap_or(false)
-        })
-        .collect();
-    dirs.sort();
+    let dirs = find_captures(base).with_context(|| format!("read dir {}", base.display()))?;
+
+    if from_onset {
+        let mut hops = Vec::new();
+        for d in &dirs {
+            let Some(key) = key_from_dirname(d) else {
+                continue;
+            };
+            hops.extend(score_from_onset(d, key, &fft_bass, &fft_gate, &profiles));
+        }
+        from_onset_report(base, dirs.len(), &hops);
+        return Ok(());
+    }
 
     println!(
         "engine auto-lock validation | base={} | {} captures | shipped (M,N)=(7,8)",
@@ -179,12 +394,7 @@ fn main() -> Result<()> {
     let mut fails = Vec::new();
 
     for d in &dirs {
-        let expected: usize = d
-            .file_name()
-            .and_then(|s| s.to_str())
-            .and_then(|s| s.split('_').nth(1))
-            .and_then(|s| s.parse().ok())
-            .ok_or_else(|| anyhow!("bad dir name"))?;
+        let expected = key_from_dirname(d).ok_or_else(|| anyhow!("bad dir name"))? as usize;
         let Some(lock) = first_lock(d, &fft_bass, &fft_gate, &profiles)? else {
             continue;
         };

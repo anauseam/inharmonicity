@@ -839,7 +839,8 @@ enum Gate {
     /// **The shipped gate.** Kay 1998 Neyman–Pearson against the *ambient*
     /// silence RMS (`engine.rs`, `strobe.rs`, discovery's peak threshold).
     /// Its H₀ is a quiet room, which is the wrong null during a sustain —
-    /// see `docs/internals/suspected-issues.md`. Present here as the control.
+    /// see [ADR 0015](../../docs/adr/0015-ambient-sigma-gates-measured.md).
+    /// Present here as the control.
     Ambient,
     /// **Ordered-statistic CFAR** against a *local* noise estimate taken from
     /// reference cells around the peak (Rohling 1983).
@@ -3201,6 +3202,19 @@ const NOISE_PAD: usize = 4;
 /// unmeasurable and is reported as such rather than defaulted.
 const MIN_GAP_BINS: usize = 3;
 
+/// Median magnitude → the P_fa = 10⁻³ threshold, for Rayleigh bins:
+/// `T/median = √(ln(1/P_fa) / ln 2) = 3.157`. This is [`cfar_multiplier`] at the
+/// median quantile — the same conversion the coarse read's OS-CFAR gate uses, so
+/// the two are calibrated alike rather than merely similar.
+///
+/// Without it a threshold compared against `N_local` is being compared against
+/// the noise's *median*, which a correctly-specified detector must sit 3.157×
+/// above. An earlier revision of ADR 0015 omitted it and so read the bass
+/// threshold as "0.77× — nearly right" when it is ≈ 4× too **low**.
+fn threshold_for_median(n_local: f32) -> f32 {
+    n_local * cfar_multiplier(0.5)
+}
+
 /// `SNR_gate` below which a partial counts as **dead** — indistinguishable from
 /// its own neighbourhood in the window the gate actually uses.
 const SNR_DEAD: f32 = 1.0;
@@ -3511,12 +3525,20 @@ struct GateStudy {
     sigma: Vec<f32>,
     /// `[gate][register][σ]` — the pre-registered rates.
     tally: Vec<Vec<Vec<Tally>>>,
-    /// `[gate][register][t_bucket]` — `T / N_gate` at each capture's own
-    /// recorded σ: the threshold against the noise it should be tracking.
+    /// `[gate][register][t_bucket]` — the shipped threshold ÷ the correctly
+    /// specified one at the same P_fa, `σ_rec·K(N) / (3.157·N_local)`. **1.0 is
+    /// correct**; > 1 over-rejects, < 1 over-admits. Verified against AWGN of
+    /// known σ, where it reads 0.97–0.99.
     ratio: Vec<Vec<Vec<Vec<f32>>>>,
     /// `[gate][register][t_bucket]` — SNR_gate over the same rows, so a
     /// stranded threshold can be told from a partial that simply died.
     snr: Vec<Vec<Vec<Vec<f32>>>>,
+    /// The shipped gate's verdict on each of those rows. Paired with `snr`, it
+    /// lets the **live cut be swept after the fact** — necessary because the
+    /// pre-registered cut of 3 turns out to sit at a correctly-specified gate's
+    /// own threshold (3.157× the noise median), so it cannot separate a
+    /// stranded partial from one at the detection limit.
+    snr_pass: Vec<Vec<Vec<Vec<bool>>>>,
     /// `[register][t_bucket]` — the σ that would put the threshold exactly at
     /// the noise present, so the registers can be compared without the
     /// calibration each session happened to hold.
@@ -3527,11 +3549,26 @@ struct GateStudy {
     /// entirely; where it is defined it resolves the attack the 186 ms probe
     /// window cannot see, and cross-checks the √(N_T/N) scaling.
     sigma_local_win: Vec<Vec<Vec<f32>>>,
+    /// **Candidate C** (ADR 0015 §12): the per-bin startup floor, built once per
+    /// set from the odd-indexed silence-screened pre-roll hops of every capture.
+    /// Empty when the set kept no usable pre-roll.
+    floor_bins: Vec<f32>,
+    /// `[register][t_bucket]` — `T_C ÷ T_ideal`, which reduces to
+    /// `floor(f_n) / N_local`: how well a floor measured before the strike
+    /// predicts the noise actually beside the partial during the note.
+    ratio_c: Vec<Vec<Vec<f32>>>,
+    /// Held-out silence (even-indexed pre-roll hops) under C — the guard that
+    /// stops a floor built from silence being scored on the silence it saw.
+    c_holdout_rows: u64,
+    c_holdout_pass: u64,
     /// `[register]` — σ_local measured by the *same* probe on pre-onset silence.
     /// The control that decides whether the in-note figure is the room's own
     /// floor or an artifact of the probe: if the note's tail agrees with this,
     /// the noise has already reached the room and cannot fall further.
     sigma_local_silence: Vec<Vec<f32>>,
+    /// `[gate][register][t_bucket]` at the recorded σ — Task 1 item 2 asks for
+    /// the rates against time-since-onset, not just the threshold ratio.
+    shipped_t: Vec<Vec<Vec<Tally>>>,
     /// `[gate][register]` at each capture's own recorded σ — the gate as it
     /// actually shipped on that instrument. No single point on the sweep grid
     /// represents it, because the calibration differs from session to session.
@@ -3554,6 +3591,12 @@ struct GateStudy {
     /// dead partials during a bass-dominated sustain".
     bass_hi_dead: Vec<u64>,
     bass_hi_dead_pass: Vec<u64>,
+    /// Gate #3 fidelity: hops where the **shipped** `Strobe::process` and this
+    /// harness's replica of its amplitude test agree / disagree on `gated`, at
+    /// the recorded σ with `is_silence = false`. The replica has no standing
+    /// unless this is ~100 % — the check ADR 0011 ran as `--verify-shipped`.
+    strobe_agree: u64,
+    strobe_disagree: u64,
     /// Tracker rows the non-physical-`f_inst` guard rejected while the
     /// amplitude test would have passed them — the part of `#2` that is not σ.
     finst_only: u64,
@@ -3568,10 +3611,19 @@ impl GateStudy {
             tally: vec![vec![vec![Tally::default(); ns]; REGISTERS.len()]; GATES.len()],
             ratio: vec![vec![vec![Vec::new(); T_EDGES.len()]; REGISTERS.len()]; GATES.len()],
             snr: vec![vec![vec![Vec::new(); T_EDGES.len()]; REGISTERS.len()]; GATES.len()],
+            snr_pass: vec![vec![vec![Vec::new(); T_EDGES.len()]; REGISTERS.len()]; GATES.len()],
             sigma_local: vec![vec![Vec::new(); T_EDGES.len()]; REGISTERS.len()],
             sigma_local_win: vec![vec![Vec::new(); T_EDGES.len()]; REGISTERS.len()],
             sigma_local_silence: vec![Vec::new(); REGISTERS.len()],
+            floor_bins: Vec::new(),
+            ratio_c: vec![vec![Vec::new(); T_EDGES.len()]; REGISTERS.len()],
+            c_holdout_rows: 0,
+            c_holdout_pass: 0,
             shipped: vec![vec![Tally::default(); REGISTERS.len()]; GATES.len()],
+            shipped_t: vec![
+                vec![vec![Tally::default(); T_EDGES.len()]; REGISTERS.len()];
+                GATES.len()
+            ],
             sigma,
             captures: 0,
             sigmas: Vec::new(),
@@ -3583,6 +3635,8 @@ impl GateStudy {
             bass_hi_dead: vec![0; GATES.len()],
             bass_hi_dead_pass: vec![0; GATES.len()],
             finst_only: 0,
+            strobe_agree: 0,
+            strobe_disagree: 0,
         }
     }
 }
@@ -3616,6 +3670,87 @@ fn preroll(root: &Path, dir: &str, kept: &[f32]) -> Option<Vec<f32>> {
     Some(full[..lead].to_vec())
 }
 
+/// **Candidate C's floor.** Per-bin median of the probe spectrum over the
+/// odd-indexed silence-screened pre-roll hops of every capture in the set —
+/// the offline stand-in for the calibration recording the app already takes and
+/// currently reduces to a single scalar (ADR 0015 §12).
+///
+/// Parity split rather than a random one so the build and holdout halves are
+/// interleaved in time and neither gets a quieter stretch of the session.
+fn build_startup_floor(
+    caps: &[Capture],
+    root: &Path,
+    hann_probe: &[f32],
+    planner: &mut RealFftPlanner<f32>,
+    quantile: f32,
+) -> (Vec<f32>, usize) {
+    let mut cols: Vec<Vec<f32>> = Vec::new();
+    let mut hops = 0usize;
+    let mut fft_scratch = Vec::new();
+    for cap in caps {
+        let Some(audio) = cap.audio(root) else {
+            continue;
+        };
+        let sigma_rec = recorded_sigma(root, &cap.dir).unwrap_or(2.9e-3);
+        let Some(pre) = preroll(root, &cap.dir, &audio) else {
+            continue;
+        };
+        let usable = pre.len().saturating_sub(4 * HOP_SIZE);
+        let mut c = 0usize;
+        let mut idx = 0usize;
+        while c + NOISE_WIN <= usable {
+            let end = c + NOISE_WIN;
+            c += HOP_SIZE;
+            let sl = &pre[end - NOISE_WIN..end];
+            let rms = (sl[NOISE_WIN - HOP_SIZE..]
+                .iter()
+                .map(|x| x * x)
+                .sum::<f32>()
+                / HOP_SIZE as f32)
+                .sqrt();
+            if rms >= sigma_rec {
+                continue;
+            }
+            idx += 1;
+            if idx.is_multiple_of(2) {
+                continue; // even hops are the holdout
+            }
+            let Some(spec) = probe_spectrum(&pre, end, hann_probe, planner, &mut fft_scratch)
+            else {
+                continue;
+            };
+            if cols.is_empty() {
+                cols = vec![Vec::new(); spec.mag.len()];
+            }
+            for (col, m) in cols.iter_mut().zip(&spec.mag) {
+                col.push(*m);
+            }
+            hops += 1;
+        }
+    }
+    let floor = cols
+        .into_iter()
+        .map(|mut v| {
+            if v.is_empty() {
+                return 0.0;
+            }
+            v.sort_by(f32::total_cmp);
+            let i = ((v.len() - 1) as f32 * quantile).round() as usize;
+            let q = v[i.min(v.len() - 1)];
+            // At the median the Rayleigh conversion applies. Above it the
+            // quantile IS the threshold: a q-quantile of the silence admits
+            // (1 − q) of it by construction, so the budget is set empirically
+            // rather than by assuming a tail shape the room does not have.
+            if quantile <= 0.5 {
+                threshold_for_median(q)
+            } else {
+                q
+            }
+        })
+        .collect();
+    (floor, hops)
+}
+
 /// One capture's contribution to the study.
 fn study_capture(
     st: &mut GateStudy,
@@ -3623,6 +3758,7 @@ fn study_capture(
     root: &Path,
     hann_probe: &[f32],
     planner: &mut RealFftPlanner<f32>,
+    snr_live: f32,
 ) {
     let Some(audio) = cap.audio(root) else { return };
     if audio.len() < NOISE_WIN + HOP_SIZE || cap.f0 <= 0.0 {
@@ -3668,6 +3804,19 @@ fn study_capture(
     let mut prev_phase = vec![0.0f32; ns.len()];
     let mut warm = false;
     let t_hop = HOP_SIZE as f32 / SAMPLE_RATE as f32;
+
+    // The shipped bank, driven over the same audio on the same hop grid.
+    let mut strobe = Strobe::new(SAMPLE_RATE);
+    let mut strobe_refs = [0.0f32; MAX_STROBE_REFS];
+    strobe_refs[..ns.len()].copy_from_slice(&f_meas);
+    strobe.retarget(StrobeRefUpdate {
+        count: ns.len(),
+        refs: strobe_refs,
+        coarse_index: 0,
+        spacing_hz: f_meas[0],
+    });
+    let mut frame_buf = tuner_core::pipeline::ProcessingFrame::new();
+    let mut strobe_warm = false;
 
     let mut scratch = Vec::new();
     let mut fft_scratch = Vec::new();
@@ -3716,6 +3865,25 @@ fn study_capture(
             continue;
         }
 
+        // Shipped-bank verdicts, once a full buffer exists. Its first call is
+        // its own warm-up, so the comparison starts one hop later.
+        if end >= BASS_WINDOW_SIZE {
+            frame_buf.audio_buffer[..BASS_WINDOW_SIZE]
+                .copy_from_slice(&audio[end - BASS_WINDOW_SIZE..end]);
+            let fr = strobe.process(&frame_buf, sigma_rec, false);
+            if strobe_warm {
+                for (i, &a) in amp_strobe.iter().enumerate() {
+                    let replica_gated = a < sigma_rec * k_gate;
+                    if fr.gated[i] == replica_gated {
+                        st.strobe_agree += 1;
+                    } else {
+                        st.strobe_disagree += 1;
+                    }
+                }
+            }
+            strobe_warm = true;
+        }
+
         let t_since = (end as f32 - onset as f32) / SAMPLE_RATE as f32;
         if t_since < 0.0 {
             continue;
@@ -3736,8 +3904,11 @@ fn study_capture(
                         && nl > 0.0
                     {
                         // Expressed at the probe window's scale so it is
-                        // directly comparable with `sigma_local`.
-                        st.sigma_local_win[reg][tb].push(nl / (k_peaks * noise_scale));
+                        // directly comparable with `sigma_local`. Both carry
+                        // the same median → P_fa conversion; omitting it here
+                        // read this column 3.157× low.
+                        st.sigma_local_win[reg][tb]
+                            .push(threshold_for_median(nl) / (k_peaks * noise_scale));
                     }
                 }
             }
@@ -3759,7 +3930,17 @@ fn study_capture(
                 continue;
             }
             st.rows += 1;
-            st.sigma_local[reg][tb].push(n_local / k_peaks);
+            st.sigma_local[reg][tb].push(threshold_for_median(n_local) / k_peaks);
+            // Candidate C: T_C ÷ T_ideal = floor(f_n) ÷ N_local, the 3.157
+            // cancelling between the two.
+            if !st.floor_bins.is_empty() {
+                let b = (f_n / spec.hz_per_bin).round() as usize;
+                if let Some(&fl) = st.floor_bins.get(b)
+                    && fl > 0.0
+                {
+                    st.ratio_c[reg][tb].push(fl / threshold_for_median(n_local));
+                }
+            }
 
             let snr_true = s / n_local;
             let present = snr_true >= SNR_DEAD;
@@ -3780,7 +3961,7 @@ fn study_capture(
                 };
                 let class = if snr_g < SNR_DEAD {
                     0
-                } else if snr_g < SNR_LIVE {
+                } else if snr_g < snr_live {
                     1
                 } else {
                     2
@@ -3790,10 +3971,12 @@ fn study_capture(
                 } else {
                     n_at_gate
                 };
-                st.ratio[gi][reg][tb].push(sigma_rec * k / noise_here);
+                st.ratio[gi][reg][tb].push(sigma_rec * k / threshold_for_median(noise_here));
                 st.snr[gi][reg][tb].push(snr_g);
+                st.snr_pass[gi][reg][tb].push(amp >= sigma_rec * k);
 
                 st.shipped[gi][reg].add(class, present, amp >= sigma_rec * k);
+                st.shipped_t[gi][reg][tb].add(class, present, amp >= sigma_rec * k);
                 for (si, &sg) in st.sigma.iter().enumerate() {
                     st.tally[gi][reg][si].add(class, present, amp >= sg * k);
                 }
@@ -3814,6 +3997,7 @@ fn study_capture(
         // "silence" being scored is the note.
         let usable = pre.len().saturating_sub(4 * HOP_SIZE);
         let mut c = 0usize;
+        let mut sil_idx = 0usize;
         while c + NOISE_WIN <= usable {
             let end = c + NOISE_WIN;
             c += HOP_SIZE;
@@ -3833,17 +4017,28 @@ fn study_capture(
             if rms >= sigma_rec {
                 continue;
             }
+            sil_idx += 1;
             let Some(spec) = probe_spectrum(&pre, end, hann_probe, planner, &mut fft_scratch)
             else {
                 continue;
             };
             for (i, &f) in f_meas.iter().enumerate() {
                 st.silence_rows[reg] += 1;
+                if !st.floor_bins.is_empty() && sil_idx.is_multiple_of(2) {
+                    let b = (f / spec.hz_per_bin).round() as usize;
+                    if let Some(&fl) = st.floor_bins.get(b)
+                        && fl > 0.0
+                    {
+                        st.c_holdout_rows += 1;
+                        let a_p = spec.peak_coarse(f - lobe_probe, f + lobe_probe);
+                        st.c_holdout_pass += u64::from(a_p >= fl);
+                    }
+                }
                 let (f_lo, f_hi) = neighbour_bounds(cap, &f_meas, i, ns[i]);
                 if let Some((_, nl)) = partial_probe(&spec, f, f_lo, f_hi, &mut scratch)
                     && nl > 0.0
                 {
-                    st.sigma_local_silence[reg].push(nl / k_peaks);
+                    st.sigma_local_silence[reg].push(threshold_for_median(nl) / k_peaks);
                 }
                 let (a_s, _) = goertzel_windowed(sl, SAMPLE_RATE, f, &hann_gate);
                 let a_p = spec.peak_coarse(f - lobe_probe, f + lobe_probe);
@@ -3921,12 +4116,22 @@ fn report(st: &GateStudy) {
             if t.h0 + t.live + t.blind + t.ambig == 0 {
                 continue;
             }
+            // Gate #1 thresholds the very spectrum the H₀ label is derived from
+            // (a lobe max below a gap median), so every H₀ row is a guaranteed
+            // rejection and its rate carries no information. Gates #2/#3 read a
+            // different window, so theirs is a real dead-partial pass rate —
+            // verified at 1.9e-3 against a 1e-3 nominal on AWGN.
+            let pfa = if matches!(gate, GateSite::Peaks) {
+                f32::NAN
+            } else {
+                pct(t.h0_pass, t.h0) / 100.0
+            };
             println!(
                 "  {:<11} {:<12} {:>8} {:>9.2e} {:>8} {:>7.1}% {:>7.1}% {:>8}",
                 gate.label(),
                 rname,
                 t.h0,
-                pct(t.h0_pass, t.h0) / 100.0,
+                pfa,
                 t.live,
                 pct(t.live_miss, t.live),
                 pct(t.blind_pass, t.blind),
@@ -3934,12 +4139,17 @@ fn report(st: &GateStudy) {
             );
         }
         let t = pool(&st.shipped[gi]);
+        let pfa_all = if matches!(gate, GateSite::Peaks) {
+            f32::NAN
+        } else {
+            pct(t.h0_pass, t.h0) / 100.0
+        };
         println!(
             "  {:<11} {:<12} {:>8} {:>9.2e} {:>8} {:>7.1}% {:>7.1}% {:>8}   (nominal P_fa 1.00e-3)",
             "",
             "ALL",
             t.h0,
-            pct(t.h0_pass, t.h0) / 100.0,
+            pfa_all,
             t.live,
             pct(t.live_miss, t.live),
             pct(t.blind_pass, t.blind),
@@ -4014,20 +4224,81 @@ fn report(st: &GateStudy) {
         }
     }
 
-    println!("\n  ── T ÷ N_local: the threshold against the noise it should be tracking ──");
+    println!("\n  ── Miss rate vs the live cut (EXPLORATORY — pre-registered cut is 3) ──");
     println!(
-        "     window-independent (K ∝ 1/√N cancels the noise's own 1/√N). \
-         > 1 = threshold above the local noise.\n     SNR columns: at the {NOISE_WIN} probe window \
-         (= gate #1) and at each key's register window (= gates #2/#3)."
+        "     The cut of 3 sits at a correct gate's OWN threshold (3.157× the noise median), so it\n     \
+         admits partials a well-specified detector rejects half the time. Cuts far above it\n     \
+         separate a stranded partial from one at the detection limit."
+    );
+    let cuts = [3.0f32, 6.3, 10.0, 20.0, 50.0];
+    print!("  {:<11} {:<12}", "gate", "register");
+    for c in cuts.iter() {
+        print!("  {:>9}", format!("≥{c:.0}×"));
+    }
+    println!("     rows ≥50×");
+    for (gi, gate) in GATES.iter().enumerate() {
+        for (ri, rname) in REGISTERS.iter().enumerate() {
+            if st.snr[gi][ri].iter().all(|v| v.is_empty()) {
+                continue;
+            }
+            print!("  {:<11} {:<12}", gate.label(), rname);
+            let mut widest = 0u64;
+            for &c in cuts.iter() {
+                let (mut n, mut missed) = (0u64, 0u64);
+                for tb in 0..T_EDGES.len() {
+                    for (v, p) in st.snr[gi][ri][tb].iter().zip(&st.snr_pass[gi][ri][tb]) {
+                        if *v >= c {
+                            n += 1;
+                            missed += u64::from(!*p);
+                        }
+                    }
+                }
+                widest = n;
+                print!("  {:>8.1}%", pct(missed, n));
+            }
+            println!("     {widest}");
+        }
+    }
+
+    println!("\n  ── Miss rate vs time since onset, at the shipped σ (Task 1 item 2) ──");
+    print!("  {:<11} {:<12}", "gate", "register");
+    for l in T_LABELS.iter() {
+        print!(" {l:>9}");
+    }
+    println!();
+    for (gi, gate) in GATES.iter().enumerate() {
+        for (ri, rname) in REGISTERS.iter().enumerate() {
+            if st.shipped_t[gi][ri].iter().all(|t| t.live == 0) {
+                continue;
+            }
+            print!("  {:<11} {:<12}", gate.label(), rname);
+            for tb in 0..T_EDGES.len() {
+                let t = st.shipped_t[gi][ri][tb];
+                if t.live == 0 {
+                    print!(" {:>9}", "—");
+                } else {
+                    print!(" {:>8.1}%", pct(t.live_miss, t.live));
+                }
+            }
+            println!();
+        }
+    }
+
+    println!("\n  ── T ÷ T_ideal: the shipped threshold against the correctly specified one ──");
+    println!(
+        "     T_ideal = 3.157·N_local, the P_fa = 1e-3 threshold for the noise measured beside the\n     \
+         partial. **1.0 is correct**; > 1 over-rejects, < 1 over-admits. Reads 0.96–0.99 on AWGN of\n     \
+         known σ, and σ_local recovers that σ to 4 % — the calibration of these two columns."
     );
     println!(
-        "     σ_local = N_local ÷ K({NOISE_WIN}) — the ambient σ that would place the threshold \
-         exactly at\n     the noise actually present. Its spread across registers is the \
-         misspecification, in the units of the slider that is wrong."
+        "     The 1/√N cancellation that makes T÷T_ideal window-independent holds for INCOHERENT\n     \
+         noise. In the bass the gaps sit inside neighbouring skirts, so N_local is coherent leakage\n     \
+         and the two probe columns diverge; σ_l@win also carries a measured 1.26× sidelobe inflation\n     \
+         in the first bucket. Read σ_l@win for the attack, σ_local for the tail."
     );
     println!(
         "  {:<12} {:<8} {:>9} {:>10} {:>10} {:>10} {:>10} {:>10}",
-        "register", "t (s)", "rows", "T÷N_local", "σ_local", "σ_l@win", "SNR@probe", "SNR@win"
+        "register", "t (s)", "rows", "T÷T_ideal", "σ_local", "σ_l@win", "SNR@probe", "SNR@win"
     );
     for (ri, rname) in REGISTERS.iter().enumerate() {
         for (tb, tlabel) in T_LABELS.iter().enumerate() {
@@ -4077,14 +4348,77 @@ fn report(st: &GateStudy) {
         }
     }
 
+    if !st.ratio_c[0].iter().all(|v| v.is_empty()) || !st.ratio_c[3].iter().all(|v| v.is_empty()) {
+        println!("\n  ── Candidate C: the per-bin startup floor (ADR 0015 §12) ──");
+        println!(
+            "     T_C ÷ T_ideal = floor(f_n) ÷ N_local. **1.0 is correct.** Compared against the\n     \
+             shipped gate's own T ÷ T_ideal on the identical rows."
+        );
+        println!(
+            "  {:<12} {:>10} {:>10} {:>12} {:>12} {:>9}",
+            "register", "A shipped", "C floor", "|log10| A", "|log10| C", "rows"
+        );
+        let mut spread: Vec<f32> = Vec::new();
+        for (ri, rname) in REGISTERS.iter().enumerate() {
+            let (mut a, mut c) = (Vec::new(), Vec::new());
+            for tb in 0..T_EDGES.len() {
+                a.extend_from_slice(&st.ratio[0][ri][tb]);
+                c.extend_from_slice(&st.ratio_c[ri][tb]);
+            }
+            if c.is_empty() {
+                continue;
+            }
+            let med_c = med_of(&c);
+            spread.push(med_c);
+            let la: Vec<f32> = a.iter().map(|v| v.log10().abs()).collect();
+            let lc: Vec<f32> = c.iter().map(|v| v.log10().abs()).collect();
+            println!(
+                "  {:<12} {:>10.2} {:>10.2} {:>12.2} {:>12.2} {:>9}",
+                rname,
+                med_of(&a),
+                med_c,
+                med_of(&la),
+                med_of(&lc),
+                c.len()
+            );
+        }
+        if spread.len() > 1 {
+            let hi = spread.iter().copied().fold(f32::MIN, f32::max);
+            let lo = spread.iter().copied().fold(f32::MAX, f32::min);
+            println!(
+                "  compass spread of median T_C÷T_ideal: {:.2}× (criterion 1: < 5×) over {} registers",
+                hi / lo,
+                spread.len()
+            );
+        } else {
+            println!(
+                "  compass spread: NOT EVALUABLE — only {} register has pre-roll",
+                spread.len()
+            );
+        }
+        println!(
+            "  held-out silence under C: {:.3e} admitted ({} of {} even-indexed probes; guard: ≤ 1e-3)",
+            if st.c_holdout_rows == 0 {
+                f32::NAN
+            } else {
+                st.c_holdout_pass as f32 / st.c_holdout_rows as f32
+            },
+            st.c_holdout_pass,
+            st.c_holdout_rows
+        );
+    }
+
     println!("\n  ── What the gates buy ──");
     let sil_total: u64 = st.silence_rows.iter().sum();
     if sil_total > 0 {
         println!(
-            "  pre-onset room noise admitted at the shipped σ (nominal 0.1 %); {sil_total} \
-             (hop, partial) probes drawn from the pre-roll hops that passed the Gatekeeper \
-             silence screen, out of {} pre-roll hops seen:",
-            st.preroll_rows
+            "  pre-onset room noise admitted at the shipped σ; {sil_total} (hop, partial) probes \
+             from the\n  pre-roll hops passing the Gatekeeper silence screen, out of {} seen. \
+             Nominal P_fa = 1e-3\n  predicts ≈{:.0} admissions: a rate FAR below nominal is the \
+             same over-rejection seen from the\n  silent side, not a virtue. The bar a \
+             replacement must clear is ≤ nominal, not 0.",
+            st.preroll_rows,
+            sil_total as f32 * 1e-3
         );
         print!("  {:<11}", "gate");
         for (ri, rname) in REGISTERS.iter().enumerate() {
@@ -4122,12 +4456,21 @@ fn report(st: &GateStudy) {
         "  #2 tracker: {} rows where the non-physical-f_inst guard rejected what the amplitude test admitted",
         st.finst_only
     );
+    println!(
+        "  #3 strobe fidelity: shipped Strobe::process vs replica agree on {} of {} (hop, ref) verdicts ({:.3} % disagree)",
+        st.strobe_agree,
+        st.strobe_agree + st.strobe_disagree,
+        pct(st.strobe_disagree, st.strobe_agree + st.strobe_disagree)
+    );
 }
 
 /// **Task 1 — the three ambient-σ gates, measured as they ship** (ADR 0015).
-fn np_gate_study(sets: &[(String, PathBuf, PathBuf)]) {
+fn np_gate_study(sets: &[(String, PathBuf, PathBuf)], snr_live: f32, floor_q: f32) {
     let mut planner = RealFftPlanner::<f32>::new();
     let hann_probe = hann_vec(NOISE_WIN);
+    if snr_live != SNR_LIVE {
+        println!("EXPLORATORY: live cut overridden to {snr_live} (pre-registered {SNR_LIVE}).\n");
+    }
 
     println!(
         "Ambient-σ gate measurement (ADR 0015, pre-registered).\n\
@@ -4142,8 +4485,16 @@ fn np_gate_study(sets: &[(String, PathBuf, PathBuf)]) {
     for (label, regen, root) in sets {
         let (caps, dropped) = load_regen(regen);
         let mut st = GateStudy::new(label);
+        let (floor, floor_hops) =
+            build_startup_floor(&caps, root, &hann_probe, &mut planner, floor_q);
+        st.floor_bins = floor;
+        if floor_hops > 0 {
+            println!(
+                "[{label}] Candidate C floor: {floor_hops} odd-indexed silence hops, quantile {floor_q}"
+            );
+        }
         for cap in &caps {
-            study_capture(&mut st, cap, root, &hann_probe, &mut planner);
+            study_capture(&mut st, cap, root, &hann_probe, &mut planner, snr_live);
         }
         println!(
             "\n[{}] {} captures loaded, {dropped} dropped as implausible (±{:.0} ¢ rule)",
@@ -4174,6 +4525,8 @@ fn main() {
     let mut chatter_mode = false;
     let mut pfa_mode = false;
     let mut np_sets: Vec<(String, PathBuf, PathBuf)> = Vec::new();
+    let mut np_live = SNR_LIVE;
+    let mut np_floor_q = 0.5f32;
     let mut fft_size = 8192usize;
     let mut flank_hz = FLANK_MIN_HZ;
     let mut profile_max_n = MAX_BASS_PARTIAL;
@@ -4240,6 +4593,20 @@ fn main() {
                 np_sets.push((label, regen, root));
                 i += 3;
             }
+            // `--np-live <snr>`: the live cut, for the sensitivity sweep the
+            // ADR 0015 review asked for. The default is the pre-registered
+            // value; anything else is exploratory and labelled as such.
+            "--np-live" => {
+                i += 1;
+                np_live = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(SNR_LIVE);
+            }
+            // `--np-floor-q <q>`: Candidate C's floor quantile. 0.5 is the
+            // pre-registered form (median × 3.157); above it the quantile is
+            // the threshold directly.
+            "--np-floor-q" => {
+                i += 1;
+                np_floor_q = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(0.5);
+            }
             "--pfa" => pfa_mode = true,
             "--measured-b" => measured_b = true,
             "--partial" => {
@@ -4266,7 +4633,7 @@ fn main() {
     }
 
     if !np_sets.is_empty() {
-        np_gate_study(&np_sets);
+        np_gate_study(&np_sets, np_live, np_floor_q);
         return;
     }
 

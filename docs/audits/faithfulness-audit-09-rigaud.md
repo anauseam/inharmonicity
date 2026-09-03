@@ -6,8 +6,12 @@ running table in `faithfulness-audit-01-twm.md`), item 2 of 5.
 **Source of truth:** Rigaud, F., David, B. & Daudet, L. (2013). "A parametric
 model and estimation techniques for the inharmonicity and tuning of the
 piano." JASA 133(5), 3107–3118 — primary source read in full
-(`resources/moba/2013_a_parametric_model...pdf`). DAFx-11 precursor in-tree
-(`resources/moba/53_e.pdf`) — not needed; the JASA paper is self-contained.
+(`resources/moba/2013_a_parametric_model...pdf`; published typeset copy at
+`resources/curve/Rigaud_2013a.pdf`). DAFx-11 precursor in-tree
+(`resources/curve/53_e.pdf`) — self-contained for the *model* audited here, but
+the journal version dropped two things the tree still uses: the σ_B relative-
+deviation statistics (audit 06's 2026-08-27 addendum) and the λ·B semitone
+recursion behind `models.rs::railsback_stretch_curve`. Cite DAFx-11 for those.
 **Scope:** the whole module — `erf`, `S_T`/`Y_T`, `BXi`/`fit_b_xi`,
 `RhoPhi`/`fit_rho_phi`, `invert_rho`, `f0_from_partials`, `midi_from_key`,
 and the module-doc conventions. (This audits the *tuning-curve port* of the

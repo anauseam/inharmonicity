@@ -21,7 +21,15 @@ nothing in `tuner-core/src` or `tuner-gui/src` was touched.
 
 **Amended 2026-08-21** with 30 further captures (six treble notes, open, 5 s).
 They change §8's conclusion and are the first direct measurement of one of the
-two gates `suspected-issues.md` carries as un-measured — see §8a/§8b.
+two gates then carried as un-measured in `suspected-issues.md` (since retired;
+now [ADR 0015](0015-ambient-sigma-gates-measured.md)) — see §8a/§8b.
+
+**Amended 2026-08-22 by [ADR 0015](0015-ambient-sigma-gates-measured.md).** §8a's
+*direction* — the gate is what closes the top octave — is confirmed and
+strengthened. Its **in-note noise trajectory is superseded**: "real noise falls
+13–56× across the note" is measured at **2.2–2.9×** on these same six keys, and
+§8b's framing of the mechanism as primarily temporal is superseded by a
+primarily **spectral** one. See §8c.
 
 ## Context
 
@@ -432,7 +440,7 @@ cannot close it: nothing measured before the note begins can follow the note.
 A7. **Only C8 is genuinely marginal**: even against real noise its partial holds
 for ~19 hops against the 25-hop floor.
 
-### 8b. This measures a gate `suspected-issues.md` calls unmeasured — and the sign is the opposite
+### 8b. This measures a gate the σ-misspecification entry called unmeasured — and the sign is the opposite
 
 The Neyman–Pearson entry names two shipped gates and says their exposure is
 "confirmed by analogy only". This is a direct measurement of one of them, the
@@ -458,6 +466,53 @@ Corrected 2026-08-21: an earlier revision of this section quoted "6–44× above
 real noise" and "7–32× SNR at closure" from noise medianed over the whole record,
 which is biased low by the quiet tail. The same-hop figures above supersede them;
 the conclusion is unchanged and the mechanism is better stated.
+
+### 8c. Superseded by ADR 0015: the noise trajectory, and what it means
+
+**Added 2026-08-22.** [ADR 0015](0015-ambient-sigma-gates-measured.md) re-measured
+this gate across 986 383 (capture, hop, partial) rows on three populations,
+including **these same six keys and these same 30 captures**. What it confirms and
+what it overturns are different halves of §8a/§8b:
+
+**Confirmed, and strengthened.** The gate is what closes the top octave; the
+threshold is far above the noise present there; the failure is bidirectional with
+the deep bass. ADR 0015 puts the top-octave miss rate at 56–65 % of partials
+standing ≥ 3× above their own local noise, on both piano #2 sets, and adds a third
+site sharing the same σ (`engine.rs:252`, discovery's peak floor).
+
+**Superseded: "the real noise falls 13–56× over the note".** Measured with a probe
+that excludes both the target's and the neighbours' Hann main lobes, and resolved
+at the gate's own 23 ms window, `σ_local` on these six keys falls **2.9× (treble)
+and 2.2× (high octave)** from the first 50 ms to the tail — not 13–56×. Three
+checks support the smaller figure:
+
+- the same probe on **pre-onset silence** agrees with the note's own tail within
+  0.86–1.35× on these keys, so the tail has reached the room floor and cannot fall
+  further;
+- two independent probe windows agree to 1–3 % once past the attack;
+- on **AWGN of known σ** the probe recovers that σ to 4 %.
+
+**The likely cause of the discrepancy, offered as a hypothesis.** §8a's three
+off-partial probes are not in the repository — commit `f578aa7` added only
+`--noise-floor` — so they cannot be diffed. A probe inside the target's own main
+lobe (±86 Hz at the 1024 window) measures the *signal's* skirt, which falls with
+the signal (400–7000×) and would yield a figure of exactly §8a's order. ADR 0015
+demonstrates the mechanism in its **own** harness: its 1024-sample probe reads
+**1.26× high** in the first bucket from live-partial sidelobes, and that bias is
+removed from the figures above. This is evidence that the mechanism is real and
+available; it is not proof that §8a's probe suffered from it.
+
+**Superseded: "static threshold, dynamic noise" as the primary framing.** The
+temporal term is the smaller one. The σ that would correctly specify the threshold
+spans **21–56× across registers at one instant** against **1.4–4.7× within a
+note** — because the broadband ambient RMS is loaded by low-frequency room rumble
+and then applied flat. The sharper statement is **one flat threshold against a
+spectrum that is not flat**, with a secondary decay term.
+
+That distinction is not cosmetic: it is what decides whether a startup per-bin
+spectral floor can help. §8b said nothing measured before the note begins can
+follow it; on the revised figures such a floor addresses the dominant term and
+leaves a residual concentrated in the first ~0.5 s. See ADR 0015 §8.
 
 Both directions are fixed by the same change, and ADR 0011 already shipped it for
 the coarse readout: an ordered-statistic CFAR gate against *local* reference
@@ -507,7 +562,7 @@ published. The screen description gains the `B`-agreement rule.
 - **Prompt O gains a measured motivation** (§8a/§8b): the strobe's D3 gate is
   6–44× above the real local noise in the treble and drops partials at 7–32×
   SNR, which is the *opposite sign* to the under-rejection
-  `suspected-issues.md` predicts and is fixed by the same CFAR port. Superseded
+  the σ-misspecification entry predicts and is fixed by the same CFAR port. Superseded
   note follows.
 - ~~**One motivation for Prompt O weakens; its main case is untouched.**~~ ADR 0012
   §7 attributed the high-treble failure to the D3 gate, and §8 here shows the
@@ -516,7 +571,7 @@ published. The screen description gains the `B`-agreement rule.
   exposure is the **engine's** per-partial tracking gate (`engine.rs`), which
   decides which partials the phase vocoder keeps and so feeds `measured_f0`, the
   MAT seed and the M-of-N lock — nothing here bears on that, and it remains the
-  reason `suspected-issues.md` carries the entry.
+  reason that entry existed; it is measured in [ADR 0015](0015-ambient-sigma-gates-measured.md) §6.
 
 ## 9. What the next session must record
 

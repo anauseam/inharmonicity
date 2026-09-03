@@ -39,7 +39,7 @@
 use std::collections::BTreeMap;
 
 use tuner_core::algorithms::curves::{
-    self, BALANCED_INTERVALS, CurveParams, PURE_TWELFTHS_INTERVALS, StretchPreset,
+    self, BALANCED_INTERVALS, CurveBSource, CurveParams, PURE_TWELFTHS_INTERVALS, StretchPreset,
 };
 use tuner_core::algorithms::rigaud;
 use tuner_core::audio::SAMPLE_RATE;
@@ -80,6 +80,16 @@ fn load_profile(path: &str) -> InharmonicityProfile {
     let mut by_key: BTreeMap<u8, Vec<RawEntry>> = BTreeMap::new();
     for e in &raw {
         let key_index = e["key_index"].as_u64().expect("key_index") as u8;
+        // A string-isolated capture is not the note (`is_partial_unison`),
+        // so a solo must not enter the per-key median.
+        if let Some(s) = e["sounding_strings"].as_object() {
+            let sounding = s["sounding"].as_array().map_or(0, |a| {
+                a.iter().filter(|v| v.as_bool().unwrap_or(false)).count()
+            });
+            if sounding as u64 != s["on_key"].as_u64().unwrap_or(0) {
+                continue;
+            }
+        }
         let partials: Vec<(u32, f64, f64)> = e["partials"]
             .as_array()
             .map(|arr| {
@@ -347,6 +357,19 @@ fn main() {
             "d_pure-12ths.wav",
             "d: multi-interval (pure 12ths)".into(),
             curves::multi_interval(&input, &base, PURE_TWELFTHS_INTERVALS, None),
+        ),
+        (
+            "d_model-b.wav",
+            "d: multi-interval (balanced, model-B widths)".into(),
+            curves::multi_interval(
+                &input,
+                &CurveParams {
+                    b_source: CurveBSource::Model,
+                    ..base
+                },
+                BALANCED_INTERVALS,
+                None,
+            ),
         ),
     ];
 

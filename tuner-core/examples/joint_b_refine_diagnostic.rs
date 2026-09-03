@@ -68,11 +68,10 @@ fn reg_of(key: usize) -> usize {
         2
     }
 }
-/// Per-note relative B scatter σ_B — OUR calibration constants, the same values
-/// `gen_frame` draws the synthetic per-note B with (mis-cited to "Rigaud Fig. 3"
-/// pre-audit; see docs/audits/faithfulness-audit-06-b-prior.md). The ±n·σ_B
-/// refinement bound is expressed in these units so the search window matches the
-/// prior's own uncertainty model.
+/// Per-note relative B scatter σ_B (Rigaud DAFx-11 §3.2/Fig. 3), the same values
+/// `gen_frame` draws the synthetic per-note B with. The ±n·σ_B refinement bound is
+/// expressed in these units so the search window matches the prior's own
+/// uncertainty model.
 fn sigma_b(key: usize) -> f32 {
     if key <= 50 { 0.157 } else { 0.116 }
 }

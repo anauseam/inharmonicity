@@ -105,8 +105,9 @@ is retired.
 The shipped Neyman–Pearson gates test against the calibrated *silence* RMS. Its
 H₀ is a quiet room, which is the wrong null while a note is sounding — and the
 consequence is not subtle: the ambient gate admitted **100 % of ±400 ¢ deep-bass
-garbage**. This confirms by measurement the σ-misspecification recorded in
-`docs/internals/suspected-issues.md`.
+garbage**. This confirms by measurement the σ-misspecification then recorded in
+`docs/internals/suspected-issues.md` — a file since retired; the entry and its
+full measurement are now [ADR 0015](0015-ambient-sigma-gates-measured.md).
 
 Ordered-statistic CFAR (Rohling 1983; Finn & Johnson 1968 lineage) estimates the
 threshold from the neighbourhood of the cell under test. Settled configuration,

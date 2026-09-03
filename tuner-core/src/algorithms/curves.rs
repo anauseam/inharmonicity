@@ -170,6 +170,18 @@ impl StretchPreset {
     }
 }
 
+/// Which per-key B engine (d)'s interval widths are computed from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CurveBSource {
+    /// The precision-weighted blend of the key's measured B and the B_ξ
+    /// fit (ADR 0009).
+    #[default]
+    Blend,
+    /// The Eq.-29 fit B_ξ alone (Rigaud's model; per-key deviations from
+    /// the fit do not enter the widths).
+    Model,
+}
+
 /// Parameters shared by all engines.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CurveParams {
@@ -181,6 +193,9 @@ pub struct CurveParams {
     /// Global deviation d_g in cents (reference-pitch offset; carried on
     /// the output curve, not baked into its shape).
     pub d_g: f64,
+    /// B the multi-interval widths read (engine (d) only; the chain
+    /// engines always use the blend).
+    pub b_source: CurveBSource,
 }
 
 impl Default for CurveParams {
@@ -189,6 +204,7 @@ impl Default for CurveParams {
             rho: RhoPhi::TYPICAL,
             preset: StretchPreset::Mean,
             d_g: 0.0,
+            b_source: CurveBSource::Blend,
         }
     }
 }
@@ -465,6 +481,8 @@ struct CurveBasis {
     /// Engine (a)'s curve — the prior every other engine corrects.
     prior: [f64; 88],
     flags: [CurveKeyFlags; 88],
+    /// The Eq.-29 fit the blend shrinks toward.
+    bxi: BXi,
 }
 
 fn curve_basis(input: &CurveInput, params: &CurveParams) -> CurveBasis {
@@ -538,6 +556,7 @@ fn curve_basis(input: &CurveInput, params: &CurveParams) -> CurveBasis {
         b_is_measured,
         prior,
         flags,
+        bxi,
     }
 }
 
@@ -951,6 +970,7 @@ type IntervalSolve = (Vec<f64>, Vec<f64>);
 ///   + λ ∑_m (Δ² x_m)²,
 ///
 /// a banded SPD system (half-bandwidth ≤ 24) solved by the shared Cholesky.
+/// The beatless widths t_{m,k} read the B named by `params.b_source`.
 /// Data rows exist only where **both** endpoints carry measured curve-B and
 /// **both** coincident partials are measured; W_{m,k} is **derived** —
 /// the preset's taste multiplier × the Form-2 Giordano sensitivity
@@ -1032,8 +1052,11 @@ pub fn multi_interval(
             if !(sens.is_finite() && sens > 0.0) {
                 continue;
             }
-            let c =
-                interval_width_cents(basis.curve_b[m], basis.curve_b[u], spec.p, spec.q, spec.k);
+            let (b_m, b_u) = match params.b_source {
+                CurveBSource::Blend => (basis.curve_b[m], basis.curve_b[u]),
+                CurveBSource::Model => (basis.bxi.b_at_key(m), basis.bxi.b_at_key(u)),
+            };
+            let c = interval_width_cents(b_m, b_u, spec.p, spec.q, spec.k);
             let t = c + spec.tau() - (basis.prior[u] - basis.prior[m]);
             let (mut cols, mut coefs) = (Vec::with_capacity(2), Vec::with_capacity(2));
             if let Some(cm) = col(m) {

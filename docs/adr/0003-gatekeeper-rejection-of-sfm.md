@@ -92,6 +92,49 @@ Therefore, the decision was expanded to **completely eradicate SFM from the Gate
 - Added a failsafe: if NHWRSF spikes > threshold (`is_new_onset`), the capture state is unconditionally reset to prevent mixing rapid strikes.
 - Renamed the transient tracking flag to `transient_active` (formerly `sfm_has_settled`).
 
+## Amendment 2026-09-02 — the wait, measured
+
+`validate_engine_lock --from-onset` scores Stage-A's winner on **every** hop from
+the onset with the gate ignored, over the 595 piano-2 captures (28 894 scored
+hops). It prices the wait this ADR's architecture settled on, which nothing had
+measured: both this harness's default path and `diagnose_gatekeeper` only ever
+observe the *gated* side.
+
+**The decision holds.** Identification climbs from 5–23 % at the onset hop to
+88–93 % by hop 5 in bass, tenor and mid. Whatever the transient does, the gate
+releases the vote where those registers have arrived, and nothing in the table
+argues for reinstating a settling derivative.
+
+**The "adapting to each note's register" claim below is wrong.** `Stable` lands
+on hop 5 in every register — a fixed stopwatch in hop units, not an adaptive
+verdict. That would be harmless if the registers arrived together. They do not:
+
+| register     | Stage-A correct at `Stable` (hop 5) | first hop ≥ 80 % |
+| ------------ | ----------------------------------- | ---------------- |
+| bass A0–B1   | 91 %                                | 3 (70 ms)        |
+| tenor C2–B3  | 93 %                                | 3 (70 ms)        |
+| mid C4–B5    | 88 %                                | 5 (116 ms)       |
+| treble C6–C8 | **24 %**                            | **20 (464 ms)**  |
+
+So the wait is simultaneously ~2 hops too long for bass and tenor and **four
+times too short for treble**, which is released at an accuracy the other three
+registers passed before the gate opened. The architecture is not mis-conceived;
+it is uniformly sized in a place it claims to adapt, and the register that most
+needs the adaptation is the one that suffers.
+
+Note what this does *not* say. The climb from hop 0 is not evidence about the
+broadband precursor argued in **Root Cause** — at the onset hop the 8192-sample
+bass window is still mostly pre-onset audio, so window fill and transient
+settling are confounded here and this measurement cannot separate them. The
+claim it refutes is the adaptivity one in **Consequences**, which is directly
+readable off the `S` markers.
+
+Consequence for the tree: none yet. The treble climb belongs to
+[ADR 0010](0010-m-of-n-lock-rule-replay.md)'s M-of-N window rather than to SFM —
+the vote the gate releases is what the (7, 8) rule accumulates — and re-sizing
+the wait per register is gated on the same second-instrument bar as everything
+else touching discovery. No code changed.
+
 ## Consequences
 
 - The Gatekeeper architecture is radically simplified and relies purely on:

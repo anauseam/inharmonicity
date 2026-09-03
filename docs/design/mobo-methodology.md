@@ -87,8 +87,8 @@ Per frame, `gen_frame` builds a peak list intended to match the engine's
 - **Inharmonic partials** `f_n = n·f₀·√(1+B·n²)`, n up to 64 / 9 kHz.
 - **B (inharmonicity):** Rigaud two-bridge curve, with the **piano-dependent bass
   bridge** varied per instrument (slope ±10%, intercept spread) and **per-note
-  Gaussian scatter** σ=0.157 (bass) / 0.116 (treble) (our calibration; was
-  mis-cited to "Rigaud Fig. 3" pre-audit — see faithfulness-audit-06), plus
+  Gaussian scatter** σ=0.157 (bass) / 0.116 (treble) (Rigaud DAFx-11 §3.2/Fig. 3;
+  the split at key 50 is the paper's own m ∈ [21,71] boundary), plus
   **B↔f₀ coupling** ΔB/B = −2·Δf₀/f₀ under detuning. **Critically, the scorer's
   template B is the smooth prior `get_expected_beta` — so every frame is scored
   under a realistic prior-vs-truth B mismatch** (see Threats §8).

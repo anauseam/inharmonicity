@@ -356,6 +356,168 @@ would close the question. The test is offline against the piano-#2 full-event
 dumps (every treble key is covered) and changes no gatekeeper code unless it
 succeeds.
 
+## Analysis 8 — Engine (d) on the model's B instead of the blend (Prompt AK, added 2026-08-26)
+
+Recorded after acceptance; it moves no shipped value. Decision 1 made the
+curve-side B a blend of the key's measurement and the B_ξ fit — ours, not
+Rigaud's — and engine (d) builds every interval width from it. The
+paper-backed alternative is to build the widths from $B_\xi$ alone, and it had
+never been run. This is the run.
+
+**Build.** `CurveBSource::{Blend, Model}` on `CurveParams` (default `Blend`,
+so the shipped curve is unchanged), read only by `multi_interval`'s width
+computation; `b_is_measured` (row existence), the Form-2 amplitude weights, the
+§2 pre-exclusion and the prior all stay on the blend, so the one difference is
+the B the widths read. Harness rows: `curve_compare` "d: model-B widths",
+`auralize` `d_model-b.wav`.
+
+**Data — the two instrument-#2 sessions, and only those.** `diagnostics_piano2/`
+(595 dumps, 5–6 repeats/key, ADR 0009's own set — "A" below) and the extended
+as-found set under the app's dump directory for profile `Piano2_extended`
+(587 dumps, ~4 repeats/key, 8 isolation series — "B"). Instrument #1 is excluded
+on the user's instruction: one capture per key cannot separate a string's real
+deviation from a bad capture, which is the whole question here. Both sets are
+the same physical piano in its as-found state, captured about a month apart,
+which makes a **cross-session** test possible for the first time.
+
+Two harness loaders had to be fixed first: `curve_compare` and `auralize` both
+discarded `sounding_strings`, so an isolation solo could stand for the note
+(`KeyMeasurement::is_partial_unison`, which the shipped path honours). Set B
+has 8 isolation series; the loaders now carry the declaration through.
+Full-unison captures: 594 (A) and 464 (B).
+
+### The measurement that decides it: do the strings' deviations reproduce?
+
+The blend exists to let a key's measured B pull its widths away from the smooth
+fit. That is worth having only if the pull is the *string*, not the capture. Two
+independent sessions answer it directly — per-key median $\ln(B/B_\xi)$
+residual in each, correlated across keys:
+
+| register       | r (A vs B) | slope | median \|residual\|    |
+| -------------- | ---------- | ----- | ---------------------- |
+| bass (0–27)    | **+0.993** | 1.004 | 0.064 → **6.6 % in B** |
+| mid (28–62)    | **+0.958** | 0.938 | 0.034 → 3.4 %          |
+| treble (63–87) | +0.514     | 2.331 | 0.102 → 10.8 %         |
+
+σ_p is 0.077 (A) and 0.074 (B) — the two sessions agree on the scatter as well
+as on its per-key pattern. Keys 12/13 sit at +2.8/+3.2 σ_p in A and +3.0/+3.5 in
+B; keys 30/31 at −3.4/−4.6 and −3.4/−4.4. **In bass and mid the deviations from
+the fit are a reproducible property of the strings, not capture noise** — a
+slope of 1.00 with r = 0.99 across sessions is as clean as this project's data
+gets. The treble is the opposite (r = 0.51, slope 2.3), which is what σ_m(n)
+already says; and it is precisely where the blend hands over to the model
+(w < ½ above key 73), so the shrinkage is doing the right thing at both ends.
+
+One caveat the correlation alone cannot dismiss: a *systematic* estimator error
+— a partial mis-numbered the same way every time — would also reproduce across
+sessions. Analysis 5 is what rules it out for the largest deviators here. The
+reproducing bass/mid outliers (keys 28–31, −3.4 to −4.6 σ_p) are exactly the
+below-fit zone Analysis 5 attributed to string design, on the cross-instrument
+argument that a MAT bias would sit at the same keys on both pianos and does not.
+Reproducibility across sessions plus non-reproducibility across instruments is
+the pair of facts that makes it the strings.
+
+**This is the answer to "the blend is ours and unexamined".** It is ours, and
+what it carries in bass and mid is signal.
+
+### What that is worth on the curve
+
+| \|d_Model − d_Blend\| (¢), 24 resampled draws | bass        | mid         | treble      |
+| --------------------------------------------- | ----------- | ----------- | ----------- |
+| set A: median (max)                           | 0.14 (0.23) | 0.05 (0.24) | 0.07 (0.07) |
+| set B: median (max)                           | 0.23 (0.56) | 0.03 (0.19) | 0.01 (0.02) |
+| ratio to the same set's draw-to-draw SD       | 2.5–5.8×    | 1.0–2.7×    | 0.0–0.5×    |
+
+Resampling (one capture per key, 24 draws) re-measures Analysis 4's noise floor
+on each set instead of quoting it: SD of the (d)-Balanced curve is 0.020 ¢ (A)
+and 0.135 ¢ (B) in the bass. So the pre-registered rule is met in the bass — the
+difference is 2.5–5.8× the noise, real and not a resampling artifact — and it is
+**not** met in the treble, where the difference is smaller than the noise and
+has no stable sign. The earlier claim (from the instrument-#1 run) of a
+systematic treble offset does not survive the better data: the treble effect is
+draw noise.
+
+**The chain, end to end.** A bass string sits ~6.6 % off the fit in B →
+that changes one 2:1 octave row's beatless width by a median of **0.036 ¢**
+(max 0.18) → the least-squares solution accumulates those small row differences
+across the compass into a **0.14–0.23 ¢** curve difference → which is worth
+**0.016–0.037 Hz** of 2:1 octave beat rate, against bass octaves that beat at
+0.147–0.229 Hz under either curve. One extra beat every 27–60 seconds, on notes
+that do not sound that long. For scale, the app's own unison panel cannot
+resolve a bass string finer than ≈5–16 ¢ (ADR 0014); this choice is two orders
+of magnitude under that.
+
+### Outcome
+
+The pre-registered rule says a bass difference above the noise floor is a
+listening decision, and it is above it. But the size is now known: **0.2 ¢, or
+1/30 Hz of beat rate**, and the two candidate curves differ by less in the bass
+than two capture sessions of the same piano differ from each other in set B
+(SD 0.135 ¢). Both sides of the original argument survive intact and neither is
+refuted by a number:
+
+- for `Model` — it is what Rigaud supports, and a single bad capture cannot
+  reach the widths;
+- for `Blend` — in bass and mid the per-key deviations are demonstrably the
+  strings (r = 0.99 across sessions), and they are what an aural tuner is
+  tuning.
+
+n = 1 instrument cannot select between them (07 §5), and no metric here can:
+the beat-rate table is engine (d)'s own objective and LKO's reference is the
+chain's. The WAVs are `auralize_out/piano2{,_extended}/d_balanced.wav` against
+`d_model-b.wav`. If `Model` ships it is a **product judgment** — that an
+unexplained layer should not sit under the default curve — and it is recorded
+as one, with the cost stated: it discards a reproducible 6.6 % per-key signal
+to buy immunity to bad captures worth 0.2 ¢.
+
+## Analysis 9 — where the analysis window starts (added 2026-09-02)
+
+Recorded after acceptance; it moves no shipped value. The capture begins at the
+gatekeeper's `Stable` verdict, ~116 ms after the onset, so the loudest part of
+the note is never measured. The literature's reason for skipping it is that the
+attack's frequencies are unsettled and its energy would drag the peak positions
+the B fit reads. That had never been tested on our own dumps — and this ADR's
+σ_lnB is exactly the yardstick the test needs, because the question is whether a
+window shift moves B by more than two captures of the same key already differ.
+
+**Build.** `validate_mat --offset-ms 0,116,300` re-measures each capture on a
+32768-sample window cut at each offset from the **physical** onset — an RMS rule
+independent of the gatekeeper, whose verdict is the quantity under test — with
+the ET seed held across offsets so the comparison is paired within a capture.
+595 piano-2 captures, none skipped. The window is half the shipped 65536 because
+the full-event dumps hold only ~1.15 s after the pre-roll, so the attack's share
+of it is twice production: conservative against admitting it.
+
+**Result — the attack is inert.** Paired ΔB against the 116 ms reference, beside
+the same set's repeat scatter recomputed on the same rows:
+
+| register | ΔB at 0 ms (attack in) | ΔB at 300 ms       | repeat SD of ln B |
+| -------- | ---------------------- | ------------------ | ----------------- |
+| bass     | +0.11 % (IQR 0.46)     | +0.08 % (IQR 0.67) | **0.44 %**        |
+| mid      | −0.04 % (IQR 0.95)     | −0.01 % (IQR 1.45) | **0.59 %**        |
+| treble   | −2.48 % (IQR 25.7)     | +2.00 % (IQR 19.4) | **17.1 %**        |
+
+In the bass the paired shift is *smaller* than the scatter between two captures
+of the same key, which is what a null looks like once pairing has cancelled the
+between-capture term. Mid is at parity. **Treble resolves nothing in either
+direction**: its 17 % repeat scatter on a median of five located partials swamps
+any offset effect, and the extreme tail — |ΔB| > 5 % on 62–67 % of treble
+captures — is the index mis-numbering the MAT path review names, not window
+position. The treble row is reported because omitting it would overstate the
+result, not because it decides anything.
+
+**What does move is the partial count.** Median located partials in the mid
+register fall 18 → 17 → 15 across 0 → 116 → 300 ms. The argument against waiting
+*longer* is that the note is decaying, not that the attack is dirty.
+
+**Consequence: none, and that is the finding.** The shipped start is vindicated
+for a different reason than the one on record. Admitting the attack does not
+corrupt the fit at this window length; there is simply nothing to gain by moving
+the start in either direction, and partials to lose by moving it late. A later
+argument for starting the capture earlier — latency, say — has its bass and mid
+answer here already; the treble question cannot even be asked until an estimator
+with better repeat scatter exists there.
+
 ## Re-verification checklist (Prompt-G completion gate)
 
 * `CURVE_B_MIN_PARTIALS` / treble ±5 ¢ sensitivity — **resolved by

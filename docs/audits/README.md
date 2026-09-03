@@ -33,7 +33,7 @@ bottom of audit 01.
 | 3 | `spectral.rs` `jacobsen` vs Candan 2015 | **REAL BUG → FIXED** — bespoke (−1)^m + missing c_N≈2 biased every Discovery peak ~−2.5·δ bins; fixed per Candan Eq 1+12 (regression test) | [03](faithfulness-audit-03-jacobsen.md) |
 | 4 | `peaks.rs` (`extract_peaks`, `mask_peaks`) | **Fixed cites** — `mask_peaks` Gómez citation fabricated → reclassified validated-bespoke (ADR 0002); phantom "Miron 2014" removed; Cano 40→30 dB documented | [04](faithfulness-audit-04-peaks.md) |
 | 5 | `metrics.rs` (gatekeeper metrics) | **Fixed cites** — `ninos2` misattributed → relabeled ours (N/N_eff); nhwrsf lineage + band de-hardcoded; A/B built (`sparsity_ab`) | [05](faithfulness-audit-05-metrics.md) |
-| 6 | `models.rs` `get_expected_beta` (Discovery B prior) vs Rigaud 2013 | **Faithful form** — treble constants = paper's universal fit exactly; bass = ours by design; σ_B "Fig. 3" attribution corrected | [06](faithfulness-audit-06-b-prior.md) |
+| 6 | `models.rs` `get_expected_beta` (Discovery B prior) vs Rigaud 2013 | **Faithful form** — treble constants = paper's universal fit exactly; bass = ours by design; σ_B traced to the DAFx-11 precursor §3.2 (2026-08-27 addendum reverses the "false attribution" verdict) | [06](faithfulness-audit-06-b-prior.md) |
 | 7 | `mat.rs` re-check vs Hodgkinson DAFx-09 | **Faithful** — all Eq/§ citations verified except phantom "§7" (→ Conclusion §4); OUR-constants documented | [07](faithfulness-audit-07-mat.md) |
 | 8 | Goertzel + phase-vocoder tracking in `engine.rs` | **Faithful** — recurrence textbook-correct; phase-offset constraint documented; NEYMAN_PEARSON_K re-derived exact | [08](faithfulness-audit-08-goertzel.md) |
 
