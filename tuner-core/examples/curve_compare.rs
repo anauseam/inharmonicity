@@ -34,10 +34,13 @@
 //! one-image curve comparison (`curve_analysis.png`) for a capture set.
 
 use tuner_core::algorithms::curves::{
-    self, BALANCED_INTERVALS, CurveParams, IntervalSpec, PURE_TWELFTHS_INTERVALS,
+    self, BALANCED_INTERVALS, CurveBSource, CurveParams, IntervalSpec, PURE_TWELFTHS_INTERVALS,
 };
 use tuner_core::algorithms::{giordano, rigaud};
-use tuner_core::models::{CurveInput, InharmonicityProfile, KeyMeasurement, Partial, TuningCurve};
+use tuner_core::models::{
+    CurveInput, InharmonicityProfile, KeyMeasurement, MAX_STRINGS_PER_KEY, Partial,
+    SoundingStrings, TuningCurve,
+};
 
 /// Register split used throughout the report (stated per §11: bass =
 /// A0–C#3 wound strings region, treble = C6 up where partial counts thin).
@@ -88,7 +91,20 @@ fn load_profile(path: &str) -> InharmonicityProfile {
             last_captured: String::new(),
             // Honest provenance: these are auto-mode captures.
             captured_in_auto: true,
-            sounding_strings: None,
+            // Carried through so a string-isolated capture cannot stand for
+            // the note — `newest_whole_note` refuses a partial unison.
+            sounding_strings: e["sounding_strings"].as_object().map(|s| SoundingStrings {
+                on_key: s["on_key"].as_u64().unwrap_or(3) as u8,
+                sounding: {
+                    let mut out = [false; MAX_STRINGS_PER_KEY];
+                    if let Some(arr) = s["sounding"].as_array() {
+                        for (i, v) in arr.iter().take(MAX_STRINGS_PER_KEY).enumerate() {
+                            out[i] = v.as_bool().unwrap_or(false);
+                        }
+                    }
+                    out
+                },
+            }),
         });
     }
     profile
@@ -121,6 +137,16 @@ fn engines(params: CurveParams) -> Vec<(&'static str, Engine)> {
             "d: pure-12ths preset",
             Box::new(move |i: &CurveInput| {
                 curves::multi_interval(i, &params, PURE_TWELFTHS_INTERVALS, None)
+            }),
+        ),
+        (
+            "d: model-B widths",
+            Box::new(move |i: &CurveInput| {
+                let p = CurveParams {
+                    b_source: CurveBSource::Model,
+                    ..params
+                };
+                curves::multi_interval(i, &p, BALANCED_INTERVALS, None)
             }),
         ),
     ]
@@ -320,6 +346,41 @@ fn main() {
                 max,
                 median(jag)
             );
+        }
+    }
+
+    // ── 5b. Engine (d): model-B widths vs blend widths ──
+    // The 0.02 ¢ per-key listing threshold is ADR 0009 analysis 4's
+    // (d)-Balanced curve-noise SD: below it, a difference is draw noise.
+    if let (Some((_, blend)), Some((_, model))) = (
+        runs.iter().find(|(n, _)| *n == "d: multi-interval"),
+        runs.iter().find(|(n, _)| *n == "d: model-B widths"),
+    ) {
+        println!("\n── engine (d): |model-B − blend-B| curves (¢; median / max / argmax key) ──");
+        for reg in ["bass", "mid", "treble"] {
+            let diffs: Vec<(usize, f64)> = (0..88)
+                .filter(|&k| register(k) == reg)
+                .map(|k| (k, (model.cents[k] as f64 - blend.cents[k] as f64).abs()))
+                .collect();
+            let (kmax, max) = diffs
+                .iter()
+                .cloned()
+                .fold((0, 0.0), |acc, x| if x.1 > acc.1 { x } else { acc });
+            println!(
+                "  {reg:<7} median {:>7.3}  max {:>7.3}  at key {kmax}",
+                median(diffs.iter().map(|&(_, d)| d).collect()),
+                max
+            );
+        }
+        println!("  per-key (key: blend / model / diff), measured keys with |diff| > 0.02 ¢:");
+        for k in 0..88 {
+            let d = model.cents[k] as f64 - blend.cents[k] as f64;
+            if input.keys[k].is_some() && d.abs() > 0.02 {
+                println!(
+                    "    {k:>2}: {:>7.2} / {:>7.2} / {d:>+6.2}",
+                    blend.cents[k], model.cents[k]
+                );
+            }
         }
     }
 

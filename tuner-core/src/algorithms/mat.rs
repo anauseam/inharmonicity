@@ -649,23 +649,26 @@ fn median_f32(values: &mut [f32]) -> f32 {
 
 /// Pairwise $B$ (Eq. 8) and $f_0$ (Eq. 6) from two partials $(f_m, m)$ and $(f_n, n)$.
 ///
-/// Writing $K_m = (f_m/m)^2$ and $K_n = (f_n/n)^2$, Eq. (8) reduces algebraically to
-/// $B = (K_n - K_m) / (K_m n^2 - K_n m^2)$ (it cancels a common $m^2$, see the module
-/// equation block), and Eq. (6) back-calculates $f_0 = f_m / (m\sqrt{1 + B m^2})$.
+/// Writing $\nu_m = f_m/m$ — the fundamental partial $m$ would imply were the string
+/// harmonic — Eq. (1) squared is $\nu_m^2 = f_0^2(1 + Bm^2)$, and Eq. (8) reduces to
+/// $B = (\nu_n^2 - \nu_m^2) / (n^2\nu_m^2 - m^2\nu_n^2)$: the module block's printed form with
+/// a common $m^2$ cancelled. Eq. (6) then back-calculates $f_0 = f_m / (m\sqrt{1 + B m^2})$.
+/// ($\nu$ is our shorthand; the paper writes Eq. (8) out in $f_m$, $f_n$ and reserves $K$
+/// for the partial count of Eq. (9).)
 fn compute_pair(f_m: f32, n_m: u32, f_n: f32, n_n: u32) -> Option<(f32, f32)> {
     if n_m == n_n || n_m == 0 || n_n == 0 {
         return None;
     }
-    // Eq. (8): B = (K_n − K_m) / (K_m·n² − K_n·m²),  K = (f/index)².
-    let k_m = (f_m / n_m as f32).powi(2);
-    let k_n = (f_n / n_n as f32).powi(2);
-    let denom = k_m * (n_n as f32).powi(2) - k_n * (n_m as f32).powi(2);
+    // Eq. (8): B = (ν_n² − ν_m²) / (n²·ν_m² − m²·ν_n²),  ν = f/index.
+    let nu_m_sq = (f_m / n_m as f32).powi(2);
+    let nu_n_sq = (f_n / n_n as f32).powi(2);
+    let denom = (n_n as f32).powi(2) * nu_m_sq - (n_m as f32).powi(2) * nu_n_sq;
 
     if denom.abs() < 1e-8 {
         return None;
     }
 
-    let b = (k_n - k_m) / denom;
+    let b = (nu_n_sq - nu_m_sq) / denom;
 
     // Drop physically impossible pairs (e.g. from mis-numbering) before the median. The
     // ceiling is deliberately generous so genuine treble inharmonicity is not filtered out.
@@ -732,6 +735,28 @@ mod tests {
         cspe(&x0, &x1, FFT_SIZE, SAMPLE_RATE, &mut cspe_map);
 
         (mags, cspe_map)
+    }
+
+    /// The reduced ν-form `compute_pair` evaluates is Eq. (8) as printed, with a common m²
+    /// cancelled: both forms give the same B on a synthetic pair, and Eq. (6) returns its f0.
+    #[test]
+    fn pair_form_matches_printed_eq8() {
+        let (f0, b) = (440.0_f32, 7.6e-4_f32);
+        let (m, n) = (2u32, 5u32);
+        let f_m = m as f32 * f0 * (1.0 + b * (m * m) as f32).sqrt();
+        let f_n = n as f32 * f0 * (1.0 + b * (n * n) as f32).sqrt();
+
+        // DAFx-09 Eq. (8) verbatim: ((f_n·m/n)² − f_m²) / (n²·f_m² − m²·(f_n·m/n)²).
+        let r = f_n * m as f32 / n as f32;
+        let printed = (r * r - f_m * f_m) / ((n * n) as f32 * f_m * f_m - (m * m) as f32 * r * r);
+
+        let (b_pair, f0_pair) = compute_pair(f_m, m, f_n, n).expect("valid pair");
+        assert!(
+            (b_pair - printed).abs() / b < 1e-4,
+            "reduced {b_pair} vs printed {printed}"
+        );
+        assert!((b_pair - b).abs() / b < 1e-3, "B {b_pair} vs truth {b}");
+        assert!((f0_pair - f0).abs() < 1e-2, "f0 {f0_pair} vs truth {f0}");
     }
 
     #[test]

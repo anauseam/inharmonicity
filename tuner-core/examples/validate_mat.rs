@@ -5,15 +5,25 @@
 //! the Rigaud prior. The FFT path mirrors `worker::process_payload`: largest power-of-two
 //! window ≤ the stable sample count, Hann window, magnitude spectrum.
 //!
+//! `--offset-ms <list>` runs a second experiment instead: the same estimator over
+//! same-length windows cut from `audio_full_event.raw` at several offsets from the
+//! *physical* onset. The shipped capture begins at the gatekeeper's `Stable` verdict
+//! (~116 ms), so the loudest part of the note is never measured; the literature's
+//! reason for skipping it is that the attack's frequencies are unsettled and its
+//! energy would drag the peak positions the B fit reads. This prices that, paired
+//! per capture and read against the same set's repeat scatter (ADR 0009).
+//!
 //! Usage:
 //!   cargo run --release --example validate_mat -- [diagnostics_dir]   (default: diagnostics)
+//!   cargo run --release --example validate_mat -- diagnostics_piano2 --offset-ms 0,116,300
 
 use anyhow::{Context, Result};
 use realfft::RealFftPlanner;
 use rustfft::num_complex::Complex;
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use tuner_core::algorithms::mat::{MAX_PARTIALS, MatOrder, detect_pitch_mat};
 use tuner_core::algorithms::spectral::{cspe, fft, magnitude_spectrum};
@@ -22,6 +32,306 @@ use tuner_core::models::{NOTES, get_expected_beta};
 /// Largest power of two ≤ `n` (matches the Worker's FFT sizing).
 fn largest_pow2_le(n: usize) -> usize {
     1usize << (usize::BITS - 1 - n.max(1).leading_zeros())
+}
+
+/// Window for the offset sweep. 32768 samples (0.74 s), not the shipped 65536,
+/// because the full-event dumps hold only ~1.15 s of note after the pre-roll.
+/// The attack's share of the window is therefore twice what it is in production
+/// — a conservative test against admitting it.
+const OFFSET_FFT_SIZE: usize = 32768;
+
+/// Where the shipped capture starts: the gatekeeper's `Stable` verdict, five
+/// hops after the NHWRSF onset. Offsets are reported against it.
+const SHIPPED_OFFSET_MS: u32 = 116;
+
+/// Register split, as `curve_compare` uses it: bass = A0–C#3, the wound-string
+/// region; treble = C6 up, where partial counts thin.
+fn register(key: u8) -> &'static str {
+    match key {
+        0..=27 => "bass",
+        28..=62 => "mid",
+        _ => "treble",
+    }
+}
+
+const REGISTERS: [&str; 3] = ["bass", "mid", "treble"];
+
+/// Capture directories under `root`, at either the top level
+/// (`diagnostics_piano2/key_*`) or one level down (`diagnostics/<instrument
+/// id>/key_*`). Key identity is read from each `analysis.json`, never from the
+/// directory name, per `examples/README.md`.
+fn find_captures(root: &Path) -> Result<Vec<PathBuf>> {
+    let is_capture = |p: &Path| {
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("key_"))
+    };
+    let mut out = Vec::new();
+    let rd = fs::read_dir(root).with_context(|| format!("read dir {}", root.display()))?;
+    for entry in rd.flatten() {
+        let p = entry.path();
+        if !p.is_dir() {
+            continue;
+        }
+        if is_capture(&p) {
+            out.push(p);
+        } else {
+            for sub in fs::read_dir(&p).into_iter().flatten().flatten() {
+                let p2 = sub.path();
+                if p2.is_dir() && is_capture(&p2) {
+                    out.push(p2);
+                }
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// The non-causal diagnostic buffer: pre-roll, strike and decay. The offset
+/// sweep needs it because `audio.raw` begins at the very verdict under test.
+fn read_full_event(dir: &Path) -> Option<Vec<f32>> {
+    let bytes = fs::read(dir.join("audio_full_event.raw")).ok()?;
+    if bytes.is_empty() || bytes.len() % 4 != 0 {
+        return None;
+    }
+    let mut out = vec![0.0f32; bytes.len() / 4];
+    // SAFETY: f32 has no invalid bit patterns and the length is a multiple of 4.
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.as_mut_ptr() as *mut u8, bytes.len());
+    }
+    Some(out)
+}
+
+/// Physical onset: the first 1 ms frame whose RMS clears both −20 dB re the
+/// event's peak and 4× the pre-roll ambient. Deliberately independent of the
+/// gatekeeper — the gate's own verdict is the quantity under test.
+fn find_onset(x: &[f32], sample_rate: u32) -> Option<usize> {
+    let (w, h) = (sample_rate as usize / 1000, sample_rate as usize / 2000);
+    if x.len() <= w || h == 0 {
+        return None;
+    }
+    let n = (x.len() - w) / h;
+    let rms: Vec<f32> = (0..n)
+        .map(|i| (x[i * h..i * h + w].iter().map(|v| v * v).sum::<f32>() / w as f32).sqrt())
+        .collect();
+    if rms.is_empty() {
+        return None;
+    }
+    let amb_n = (0.25 * sample_rate as f32 / h as f32) as usize;
+    let mut amb: Vec<f32> = rms[..amb_n.min(rms.len())].to_vec();
+    amb.sort_by(f32::total_cmp);
+    let amb = amb[amb.len() / 2];
+    let (peak_i, peak) = rms
+        .iter()
+        .enumerate()
+        .fold((0, 0.0f32), |m, (i, &v)| if v > m.1 { (i, v) } else { m });
+    let thr = (0.1 * peak).max(4.0 * amb);
+    (0..=peak_i).find(|&i| rms[i] > thr).map(|i| i * h)
+}
+
+/// One capture's fitted B and located-partial count at each swept offset;
+/// `None` where the window ran past the record or MAT returned no usable fit.
+struct OffsetRow {
+    key: u8,
+    by_offset: Vec<Option<(f32, usize)>>,
+}
+
+/// Median of `v`, sorting it in place. Callers guarantee non-empty.
+fn median(v: &mut [f32]) -> f32 {
+    v.sort_by(f32::total_cmp);
+    v[v.len() / 2]
+}
+
+/// Sample SD, or `None` below three points — the repeat scatter needs enough
+/// captures of one key to mean anything.
+fn stdev(v: &[f32]) -> Option<f32> {
+    if v.len() < 3 {
+        return None;
+    }
+    let n = v.len() as f32;
+    let mean = v.iter().sum::<f32>() / n;
+    Some((v.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / (n - 1.0)).sqrt())
+}
+
+fn offset_sweep(dirs: &[PathBuf], offsets: &[u32]) -> Result<()> {
+    let mut planner = RealFftPlanner::<f32>::new();
+    let r2c = planner.plan_fft_forward(OFFSET_FFT_SIZE);
+    let mut time_buffer = vec![0.0f32; OFFSET_FFT_SIZE];
+    let mut freq_buffer = vec![Complex { re: 0.0, im: 0.0 }; OFFSET_FFT_SIZE / 2 + 1];
+    let mut freq_buffer_shifted = vec![Complex { re: 0.0, im: 0.0 }; OFFSET_FFT_SIZE / 2 + 1];
+    let mut magnitudes = vec![0.0f32; OFFSET_FFT_SIZE / 2];
+    let mut cspe_map = vec![0.0f32; OFFSET_FFT_SIZE / 2];
+
+    let mut rows: Vec<OffsetRow> = Vec::new();
+    let mut skipped = 0u32;
+    for dir in dirs {
+        let (Some(audio), Ok(text)) = (
+            read_full_event(dir),
+            fs::read_to_string(dir.join("analysis.json")),
+        ) else {
+            skipped += 1;
+            continue;
+        };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+            skipped += 1;
+            continue;
+        };
+        let Some(key) = json["metadata"]["key_index"].as_u64() else {
+            skipped += 1;
+            continue;
+        };
+        let key = key as u8;
+        let sample_rate = json["metadata"]["sample_rate"].as_u64().unwrap_or(44100) as u32;
+        let Some(onset) = find_onset(&audio, sample_rate) else {
+            skipped += 1;
+            continue;
+        };
+        // The ET seed, not `measured_f0`: one seed has to serve every offset,
+        // and `measured_f0` is itself a product of the shipped window.
+        let seed = NOTES[key as usize].frequency;
+
+        let mut by_offset = Vec::with_capacity(offsets.len());
+        for &off in offsets {
+            let start = onset + (off as usize * sample_rate as usize) / 1000;
+            if start + OFFSET_FFT_SIZE + 1 > audio.len() {
+                by_offset.push(None);
+                continue;
+            }
+            let seg = &audio[start..start + OFFSET_FFT_SIZE + 1];
+            fft(
+                &seg[..OFFSET_FFT_SIZE],
+                &mut time_buffer,
+                &mut freq_buffer,
+                &r2c,
+                OFFSET_FFT_SIZE,
+            );
+            magnitude_spectrum(&freq_buffer, OFFSET_FFT_SIZE, &mut magnitudes);
+            fft(
+                &seg[1..],
+                &mut time_buffer,
+                &mut freq_buffer_shifted,
+                &r2c,
+                OFFSET_FFT_SIZE,
+            );
+            cspe(
+                &freq_buffer,
+                &freq_buffer_shifted,
+                OFFSET_FFT_SIZE,
+                sample_rate,
+                &mut cspe_map,
+            );
+            let mut freqs = [0.0f32; MAX_PARTIALS];
+            let mut ns = [0u32; MAX_PARTIALS];
+            by_offset.push(
+                detect_pitch_mat(
+                    &magnitudes,
+                    &cspe_map,
+                    sample_rate,
+                    seed,
+                    MatOrder::Serial,
+                    &mut freqs,
+                    &mut ns,
+                )
+                // Non-positive B carries no log ratio; deep-bass fits do land
+                // there, so they are dropped and counted, not clamped.
+                .filter(|e| e.b > 0.0)
+                .map(|e| (e.b, e.partial_count)),
+            );
+        }
+        rows.push(OffsetRow { key, by_offset });
+    }
+
+    offset_report(&rows, offsets, skipped);
+    Ok(())
+}
+
+fn offset_report(rows: &[OffsetRow], offsets: &[u32], skipped: u32) {
+    let ref_i = offsets
+        .iter()
+        .position(|&o| o == SHIPPED_OFFSET_MS)
+        .unwrap_or(0);
+    let ref_ms = offsets[ref_i];
+
+    println!("── MAT against where the analysis window starts ──");
+    println!(
+        "   {} captures ({skipped} skipped: no full-event dump, no key, or no onset), each\n   \
+         re-measured on a {OFFSET_FFT_SIZE}-sample window cut at each offset from the physical\n   \
+         onset. ΔB is paired against the {ref_ms} ms reference — the gatekeeper's Stable\n   \
+         verdict, where the shipped capture begins. Read ΔB against the repeat scatter\n   \
+         printed below it: a shift smaller than the spread between two captures of the same\n   \
+         key is not a shift.",
+        rows.len()
+    );
+    println!(
+        "\n  {:<8} {:>8} {:>9} {:>12} {:>9} {:>10} {:>10}",
+        "register", "offset", "captures", "median ΔB %", "IQR %", "|ΔB|>5 %", "partials"
+    );
+    for reg in REGISTERS {
+        for (oi, &off) in offsets.iter().enumerate() {
+            let mut shifts = Vec::new();
+            let mut partials = Vec::new();
+            for r in rows.iter().filter(|r| register(r.key) == reg) {
+                let (Some((b, p)), Some((b_ref, _))) = (r.by_offset[oi], r.by_offset[ref_i]) else {
+                    continue;
+                };
+                shifts.push(100.0 * (b / b_ref - 1.0));
+                partials.push(p as f32);
+            }
+            if shifts.is_empty() {
+                continue;
+            }
+            let n = shifts.len();
+            let big = 100.0 * shifts.iter().filter(|s| s.abs() > 5.0).count() as f32 / n as f32;
+            let mut sorted = shifts.clone();
+            sorted.sort_by(f32::total_cmp);
+            let iqr = sorted[(0.75 * n as f32) as usize % n] - sorted[(0.25 * n as f32) as usize];
+            let tag = if oi == ref_i {
+                format!("{off} ms *")
+            } else {
+                format!("{off} ms")
+            };
+            println!(
+                "  {:<8} {:>8} {:>9} {:>12.2} {:>9.2} {:>9.1}% {:>10.1}",
+                reg,
+                tag,
+                n,
+                median(&mut shifts),
+                iqr,
+                big,
+                median(&mut partials)
+            );
+        }
+    }
+    println!("  * the reference offset: its own row is ΔB against itself, and prices nothing.");
+
+    // Repeat scatter at the reference offset — ADR 0009's yardstick, recomputed
+    // here so the comparison is against this set rather than a quoted figure.
+    let mut per_key: BTreeMap<u8, Vec<f32>> = BTreeMap::new();
+    for r in rows {
+        if let Some((b, _)) = r.by_offset[ref_i] {
+            per_key.entry(r.key).or_default().push(b.ln());
+        }
+    }
+    println!(
+        "\n  repeat scatter of ln B at {ref_ms} ms (same key, different captures, keys with ≥3):"
+    );
+    for reg in REGISTERS {
+        let mut sds: Vec<f32> = per_key
+            .iter()
+            .filter(|(k, _)| register(**k) == reg)
+            .filter_map(|(_, v)| stdev(v))
+            .collect();
+        if sds.is_empty() {
+            continue;
+        }
+        println!(
+            "    {:<8} {:>6.2} %   over {} keys",
+            reg,
+            100.0 * median(&mut sds),
+            sds.len()
+        );
+    }
 }
 
 /// One MAT order's outcome for a key, including the fitted model and its located partials.
@@ -181,23 +491,38 @@ fn process_capture(dir: &Path) -> Result<Option<KeyRow>> {
 }
 
 fn main() -> Result<()> {
-    let root = env::args()
-        .nth(1)
-        .unwrap_or_else(|| "diagnostics".to_string());
+    let mut root = "diagnostics".to_string();
+    let mut offsets: Option<Vec<u32>> = None;
+    let mut saw_root = false;
+    let mut args = env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--offset-ms" => {
+                let list = args
+                    .next()
+                    .context("--offset-ms needs a comma-separated list, e.g. 0,116,300")?;
+                let parsed: Vec<u32> = list
+                    .split(',')
+                    .filter_map(|s| s.trim().parse().ok())
+                    .collect();
+                if parsed.is_empty() {
+                    anyhow::bail!("--offset-ms parsed no offsets from {list:?}");
+                }
+                offsets = Some(parsed);
+            }
+            _ if !saw_root => {
+                root = arg;
+                saw_root = true;
+            }
+            other => anyhow::bail!("unexpected argument {other:?}"),
+        }
+    }
     let root = Path::new(&root);
+    let dirs = find_captures(root)?;
 
-    let mut dirs: Vec<_> = fs::read_dir(root)
-        .with_context(|| format!("read dir {}", root.display()))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| {
-            p.is_dir()
-                && p.file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| n.starts_with("key_"))
-                    .unwrap_or(false)
-        })
-        .collect();
-    dirs.sort();
+    if let Some(offsets) = offsets {
+        return offset_sweep(&dirs, &offsets);
+    }
 
     // Per-mode cell: (B, ratio-to-prior, confidence, partials).
     let fmt = |m: &ModeResult, prior: f32| -> (String, String) {

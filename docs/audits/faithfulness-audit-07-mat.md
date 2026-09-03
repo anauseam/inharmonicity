@@ -17,7 +17,7 @@ against the paper — four of six prior audits found citation defects.
 | --- | --- | --- |
 | Eq 1: f_k = k·f₀·√(1+βk²) | Eq (1) | ✓ |
 | Eq 6: f₀ = f_m/(m√(1+βm²)) | Eq (6) | ✓ |
-| Eq 8 reduction in `compute_pair`: B = (K_n−K_m)/(K_m·n²−K_n·m²), K=(f/idx)² | Eq (8); the m² cancellation verified algebraically (numerator m²(K_n−K_m), denominator m²(k²K_m−m²K_n)) | ✓ **exact** |
+| Eq 8 reduction in `compute_pair`: B = (ν_n²−ν_m²)/(n²·ν_m²−m²·ν_n²), ν=f/idx | Eq (8); the m² cancellation verified algebraically (numerator m²(ν_n²−ν_m²), denominator m²(n²ν_m²−m²ν_n²)) | ✓ **exact** — and now regression-tested |
 | Eq 9: E = (K²−K)/2 | Eq (9) | ✓ |
 | §2.2 significance gate = magnitude-spectrum average | §2.2, verbatim ("empirically determined most convenient to use the average of the magnitude spectrum") | ✓ |
 | §2.2 stop when partials fade | §2.2 ("allows the latter to stop when no more significant partials are found") | ✓ (our 3-miss tolerance is a documented generous variant) |
@@ -36,6 +36,24 @@ Two staleness defects also found and **FIXED**:
   both orders currently use f₀/4 (the tight band was tested and reverted, as
   the `BAND_HALFWIDTH_F0_FRAC_SERIAL` doc itself records). The two comments
   predated that reversion.
+
+
+## Addendum — the Eq-8 shorthand renamed, and the reduction pinned by a test (2026-09-02)
+
+The row above was verified by hand at audit time and has now been given a test,
+`mat::tests::pair_form_matches_printed_eq8`, which evaluates DAFx-09 Eq. (8)
+*as printed* on a synthetic pair and asserts `compute_pair`'s reduced form agrees
+to 1e-4 relative, recovering the known B and f₀. What the audit checked
+algebraically is now checked mechanically on every run.
+
+One naming defect surfaced in the process and is fixed. `compute_pair` wrote the
+squared per-partial fundamental as `K_m = (f_m/m)²` — but the paper reserves **K
+for the partial count** in Eq. (9), `E = (K²−K)/2`, which this same module cites
+two rows above. Two different quantities under one symbol, one of them the
+paper's and one ours, is exactly the collision `05-style` forbids. Renamed to ν
+(ours, and flagged as ours in the doc-comment), so K keeps the paper's meaning
+throughout the module. The arithmetic is untouched: the operands commute, so the
+result is bit-identical.
 
 ## OUR-constant classification (the handoff's explicit ask)
 

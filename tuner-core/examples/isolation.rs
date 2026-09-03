@@ -101,8 +101,8 @@ fn main() {
             // The D3 gate is `noise_floor x K`, and `noise_floor` is the
             // *ambient silence* RMS, not the noise present at a partial during
             // a note. Sweeping it is how ADR 0014 §8 separates "the note ended"
-            // from "the gate closed" (`suspected-issues.md`, the Neyman-Pearson
-            // entry; Prompt O).
+            // from "the gate closed" (ADR 0015, which measured all three
+            // gates that share this scalar).
             "--noise-floor" => {
                 noise_floor = args
                     .next()

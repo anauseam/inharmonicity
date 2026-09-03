@@ -69,6 +69,17 @@ architecture change. Prompt AF moves the remaining harnesses onto it.
 
 - **`validate_engine_lock`** — the same path in *auto* mode: end-to-end
   validation of the shipped discovery lock, including the M-of-N rule.
+
+  `--from-onset` scores Stage-A's winner on **every** hop from the onset with the
+  gate ignored, so what the gatekeeper's `Stable` wait buys can be read per
+  register rather than assumed — the measurement behind ADR 0003's 2026-09-02
+  amendment. The default path is unaffected and must keep reproducing piano-1
+  **81/87**; a change there is an integration bug, not a new result.
+
+  ```bash
+  cargo run --release --example validate_engine_lock -- diagnostics_piano2 --from-onset
+  ```
+
 - **`twm_breakdown`** — decomposes a TWM score into its forward, reverse and
   normalized error terms for one candidate.
 - **`pitch_reach_sweep`** — the 1 ¢-resolution detuning sweep behind ADR 0006's
@@ -86,6 +97,18 @@ architecture change. Prompt AF moves the remaining harnesses onto it.
 
   ```bash
   cargo run --release --example validate_mat
+  ```
+
+  `--offset-ms <list>` runs a different experiment through the same estimator:
+  each capture re-measured on same-length windows cut at those offsets from the
+  *physical* onset, paired per capture and read against the set's own repeat
+  scatter. This is what prices the gatekeeper's `Stable` start against the B fit
+  ([ADR 0009](../../docs/adr/0009-repeat-capture-noise-decomposition.md)
+  analysis 9). Needs `audio_full_event.raw`, since `audio.raw` begins at the
+  verdict under test.
+
+  ```bash
+  cargo run --release --example validate_mat -- diagnostics_piano2 --offset-ms 0,116,300
   ```
 
 - **`regenerate_partials`** — re-derives per-key partials from the kept audio
@@ -116,6 +139,14 @@ architecture change. Prompt AF moves the remaining harnesses onto it.
     --np-set piano2 p2.json diagnostics_piano2 \
     --np-set piano2-extended p2ext.json <Piano2_extended dump>
   ```
+
+  Two knobs on that study, both defaulting to the pre-registered value and both
+  announcing themselves as exploratory when moved: `--np-live <snr>` sweeps the
+  live cut (the pre-registered 3 sits at a correctly specified gate's own
+  threshold, so it cannot separate a stranded partial from one at the detection
+  limit — ADR 0015 §6), and `--np-floor-q <q>` sets Candidate C's floor quantile
+  (§12; at 0.5 the Rayleigh median conversion applies, above it the quantile is
+  the threshold directly).
 
 ### Curve and strobe
 
@@ -191,3 +222,8 @@ architecture change. Prompt AF moves the remaining harnesses onto it.
   dumps its per-frame metrics to CSV.
 - **`sparsity_ab`** — head-to-head between our spectral-sparsity gate and
   faithful Mounir NINOS² variants (faithfulness audit 05).
+
+The third gatekeeper measurement — what the `Stable` wait actually buys — is
+`validate_engine_lock --from-onset`, listed above. It needs the engine's own
+Stage-A scan, so it lives with the harness that already drives it rather than
+here.
