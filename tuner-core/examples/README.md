@@ -51,7 +51,8 @@ reading, the `analysis.json` / `regenerate_partials` schemas,
 `metadata.sounding_strings`, register labels, and the piano-2 ±200 ¢ rule as a
 function a caller cannot forget to apply. Include it with `mod common;`. It is
 harness plumbing and ships in no binary; a `tuner-core` module would be an
-architecture change. Prompt AF moves the remaining harnesses onto it.
+architecture change. It is interim: Prompt AM replaces it with `tuner-lab`'s
+own module tree when the harnesses move out of `examples/`.
 
 ## The harnesses
 
