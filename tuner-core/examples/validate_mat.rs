@@ -45,8 +45,11 @@ const OFFSET_FFT_SIZE: usize = 32768;
 const SHIPPED_OFFSET_MS: u32 = 116;
 
 /// Register split, as `curve_compare` uses it: bass = A0–C#3, the wound-string
-/// region; treble = C6 up, where partial counts thin.
-fn register(key: u8) -> &'static str {
+/// region; treble = C6 up, where partial counts thin. Deliberately **not**
+/// `common::register`, which carries `strobe_replay`'s finer four-band split —
+/// same idea, different boundaries, and the offset sweep is read against
+/// curve-side figures.
+fn curve_register(key: u8) -> &'static str {
     match key {
         0..=27 => "bass",
         28..=62 => "mid",
@@ -271,7 +274,7 @@ fn offset_report(rows: &[OffsetRow], offsets: &[u32], skipped: u32) {
         for (oi, &off) in offsets.iter().enumerate() {
             let mut shifts = Vec::new();
             let mut partials = Vec::new();
-            for r in rows.iter().filter(|r| register(r.key) == reg) {
+            for r in rows.iter().filter(|r| curve_register(r.key) == reg) {
                 let (Some((b, p)), Some((b_ref, _))) = (r.by_offset[oi], r.by_offset[ref_i]) else {
                     continue;
                 };
@@ -319,7 +322,7 @@ fn offset_report(rows: &[OffsetRow], offsets: &[u32], skipped: u32) {
     for reg in REGISTERS {
         let mut sds: Vec<f32> = per_key
             .iter()
-            .filter(|(k, _)| register(**k) == reg)
+            .filter(|(k, _)| curve_register(**k) == reg)
             .filter_map(|(_, v)| stdev(v))
             .collect();
         if sds.is_empty() {
