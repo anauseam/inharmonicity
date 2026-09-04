@@ -16,7 +16,7 @@ post-tuning detuning ladder (Prompt W part 3), which is the only instrument that
 can place splits at chosen sizes — but piano #2 is not available for that,
 so §9 routes it to an as-found isolation pass on piano #1 instead.
 
-No behaviour changes. `examples/isolation` and `examples/common/` are new;
+No behaviour changes. `examples/isolation` and `examples/common/` were new;
 nothing in `tuner-core/src` or `tuner-gui/src` was touched.
 
 **Amended 2026-08-21** with 30 further captures (six treble notes, open, 5 s).
@@ -549,7 +549,8 @@ published. The screen description gains the `B`-agreement rule.
 ## Consequences
 
 - Two new harnesses: `examples/isolation` (the shipped panel over the set) and
-  `examples/common/` (the shared loader Prompt AF sweeps the rest onto). The
+  `examples/common/` (the shared loader), now `cargo lab strobe isolation` and
+  the lab's `capture`/`raw`/`regen` modules (ADR 0016). The
   truth-side statistics are `scripts/isolation_truth.py`, the same split as
   `scripts/audit_captures.py`.
 - `common/` carries a second copy of `strobe_replay`'s `run_unison`. They must
@@ -656,8 +657,8 @@ turns up on piano #1, or on any instrument, that key is worth an isolation set.
 ## Artifacts & reproduction
 
 ```bash
-cargo run --release --example regenerate_partials -- <dump_dir> > iso.json
-cargo run --release --example isolation -- iso.json <dump_dir> --json panel.json
+cargo lab mat regen <dump_dir> > iso.json
+cargo lab strobe isolation iso.json <dump_dir> --json panel.json
 python3 scripts/isolation_truth.py iso.json panel.json
 ```
 

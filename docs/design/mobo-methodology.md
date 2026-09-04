@@ -17,7 +17,7 @@ read before any conclusion drawn from a MOBO run is treated as load-bearing.
 
 | Artifact | Role | Tracked? |
 | --- | --- | --- |
-| `tuner-core/examples/mobo_evaluator.rs` | Synthetic dataset + objective evaluator (`--serve` stdin/stdout protocol) | modified, **uncommitted** |
+| `tuner-lab/src/engine/mobo.rs` (`cargo lab engine mobo`) | Synthetic dataset + objective evaluator (`--serve` stdin/stdout protocol) | modified, **uncommitted** |
 | `scripts/optimize_twm.py` | Optuna NSGA-II orchestrator (5 arms) | **untracked** |
 | `scripts/validate_config.py` | Real-capture validator (the decision gate) | untracked |
 | `twm_mobo.db` | Optuna SQLite study storage (resumable) | untracked |
@@ -32,7 +32,7 @@ read before any conclusion drawn from a MOBO run is treated as load-bearing.
 
 ```bash
 # 1. Build the evaluator (release; the sweep is hours even parallelised).
-cargo build --release --example mobo_evaluator
+cargo build --release -p tuner-lab
 
 # 2. Run the 5-arm sweep. Refuses to clobber an existing db (see resume guard).
 python3 scripts/optimize_twm.py            # fresh run (errors if twm_mobo.db exists)
@@ -45,7 +45,7 @@ python3 scripts/validate_config.py --refine --config "0.5 3.88 1.426 0.298 18"
 The evaluator can also be driven directly (one trial per stdin line):
 
 ```bash
-./target/release/examples/mobo_evaluator --serve
+./target/release/tuner-lab engine mobo --serve
 # then write:  "<mode> <p> <q> <r> <rho> <lambda>\n"   mode ∈ {refine, discrete}
 # reads back:  {"objA":..., "objB":..., "fl_bass":..., ...}
 ```
@@ -67,7 +67,7 @@ overfit a single instrument otherwise — see ADR 0006).
 - **Dataset fingerprint** (FNV-fold over every frame's key, d_cents, and all peak
   freq/mag bits): expected `e11fea90889dee30`. A changed fingerprint means the
   dataset drifted — any cross-run comparison is then invalid. Printed by the no-arg
-  diagnostic mode: `./target/release/examples/mobo_evaluator` (look for the
+  diagnostic mode: `./target/release/tuner-lab engine mobo` (look for the
   `fingerprint …` line); note `--serve` mode does **not** print it.
 
 ### 3.2 Sampling structure
@@ -215,8 +215,8 @@ real.**
 
 ## 7. Reproduction checklist
 
-- [ ] Evaluator rebuilt (`--example mobo_evaluator`, release).
-- [ ] Dataset fingerprint == `e11fea90889dee30` (run `./target/release/examples/mobo_evaluator` no-arg).
+- [ ] Evaluator rebuilt (`cargo build --release -p tuner-lab`).
+- [ ] Dataset fingerprint == `e11fea90889dee30` (run `cargo lab engine mobo`).
 - [ ] Sanity: M&B default → overall prod_fl ≈ 0.308 (asserted by the orchestrator).
 - [ ] `twm_mobo.db` absent (fresh) or `--resume` intended.
 - [ ] Python deps: `pip install -r scripts/requirements.txt` (Optuna pinned) in the .venv.

@@ -35,7 +35,8 @@ assumed, and pre-registered a three-way comparison (tracker as-is / tracker with
 the Defect-1 window fix / spectral read) on availability, accuracy against an
 independent hi-res DFT truth, and behavior under simulated detuning.
 
-The instrument for all of it is `examples/pitch_ground_truth.rs`.
+The instrument for all of it is `cargo lab strobe` (and `cargo lab gates` for
+the admission gate).
 
 ## Decisions and the measurements that forced them
 
@@ -499,7 +500,7 @@ reproduces both sections' tables on all three sets after the move. The debounce
 
 ## Artifacts & reproduction
 
-Harness: `examples/pitch_ground_truth.rs` (kept — the standing instrument).
+Harness: `cargo lab strobe` / `cargo lab gates` (kept — the standing instrument).
 Modes used: `--readout --detune --bass-partials --gate-ab --span --min-bins
 --partial --cfar-profile --pfa --fft --flank-hz --max-n`.
 

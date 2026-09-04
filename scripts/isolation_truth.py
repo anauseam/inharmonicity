@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Isolation-set truth side — every table in ADR 0014 that is not the panel's.
 
-The panel's own readings come from `examples/isolation` (it drives the shipped
+The panel's own readings come from `cargo lab strobe isolation` (it drives the shipped
 Strobe, which only Rust can do); everything here is post-processing of
 `regenerate_partials` output, the same split as `audit_captures.py`.
 
-    cargo run --release --example regenerate_partials -- <dump_dir> > iso.json
-    cargo run --release --example isolation -- iso.json <dump_dir> --json panel.json
+    cargo lab mat regen <dump_dir> > iso.json
+    cargo lab strobe isolation iso.json <dump_dir> --json panel.json
     python3 scripts/isolation_truth.py iso.json panel.json
 
 Sections map to the ADR: 1 the screen, 2 per-string truth, 3 the regime in

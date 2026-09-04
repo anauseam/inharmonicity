@@ -13,7 +13,7 @@
 //! (7,8) number the Python replica reports — piano-1 **81/87**. Any deviation is
 //! an integration bug between the engine and the replayed semantics.
 //!
-//! `--from-onset` runs the counterfactual instead: the gatekeeper withholds the
+//! The `from-onset` mode runs the counterfactual instead: the gatekeeper withholds the
 //! engine's vote until `Stable`, a fixed five hops (116 ms) after the NHWRSF
 //! onset, on the stated ground that the attack is broadband. Nothing here scored
 //! what that wait buys, because both this harness and `diagnose_gatekeeper` only
@@ -24,14 +24,13 @@
 //! hops since onset. The gate's own verdict is carried per hop, so the shipped
 //! policy sits inside the table rather than bounding it.
 //!
-//! Usage: cargo run --release --example validate_engine_lock -- [BASE_DIR]
-//!        cargo run --release --example validate_engine_lock -- diagnostics_piano2 --from-onset
+//! Usage: `cargo lab engine lock [BASE_DIR]`
+//!        `cargo lab engine from-onset diagnostics_piano2`
 
 use anyhow::{Context, Result, anyhow};
 use realfft::{RealFftPlanner, RealToComplex};
-use std::env;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use tuner_core::algorithms::spectral::{fft, magnitude_spectrum};
@@ -65,48 +64,6 @@ const ONSET_REGISTERS: [(&str, u8, u8); 4] = [
 /// Hops after the onset hop that get their own bucket; later hops pool.
 const MAX_HOP: usize = 24;
 
-/// Capture directories under `root`, at either the top level
-/// (`diagnostics_piano2/key_*`) or one level down (`diagnostics/<instrument
-/// id>/key_*`).
-fn find_captures(root: &Path) -> Result<Vec<PathBuf>> {
-    let is_capture = |p: &Path| {
-        p.file_name()
-            .and_then(|s| s.to_str())
-            .is_some_and(|s| s.starts_with("key_"))
-    };
-    let mut out = Vec::new();
-    for entry in fs::read_dir(root)?.flatten() {
-        let p = entry.path();
-        if !p.is_dir() {
-            continue;
-        }
-        if is_capture(&p) {
-            out.push(p);
-        } else {
-            for sub in fs::read_dir(&p).into_iter().flatten().flatten() {
-                let p2 = sub.path();
-                if p2.is_dir() && is_capture(&p2) {
-                    out.push(p2);
-                }
-            }
-        }
-    }
-    out.sort();
-    Ok(out)
-}
-
-/// The key a capture directory is named for.
-fn key_from_dirname(dir: &Path) -> Option<u8> {
-    dir.file_name()
-        .and_then(|s| s.to_str())?
-        .strip_prefix("key_")?
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .collect::<String>()
-        .parse()
-        .ok()
-}
-
 /// The capture's calibrated ambient RMS, or the 0.001 fallback where the dump
 /// carries none.
 fn capture_noise_floor(dir: &Path) -> f32 {
@@ -117,20 +74,6 @@ fn capture_noise_floor(dir: &Path) -> f32 {
         .map(|v| v as f32)
         .filter(|v| *v > 0.0)
         .unwrap_or(0.001)
-}
-
-/// Raw `f32` samples from `name` under `dir`.
-fn read_raw(dir: &Path, name: &str) -> Option<Vec<f32>> {
-    let bytes = fs::read(dir.join(name)).ok()?;
-    if bytes.is_empty() || bytes.len() % 4 != 0 {
-        return None;
-    }
-    let mut out = vec![0.0f32; bytes.len() / 4];
-    // SAFETY: f32 has no invalid bit patterns and the length is a multiple of 4.
-    unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.as_mut_ptr() as *mut u8, bytes.len());
-    }
-    Some(out)
 }
 
 /// Populate `frame` from one hop's bass window and run the gatekeeper over it,
@@ -188,7 +131,7 @@ fn score_from_onset(
     profiles: &[KeyProfile; 88],
 ) -> Vec<Hop> {
     let mut out = Vec::new();
-    let Some(audio) = read_raw(dir, "audio_full_event.raw") else {
+    let Some(audio) = crate::raw::full_event(dir) else {
         return out;
     };
     if audio.len() < BASS_WINDOW_SIZE {
@@ -294,8 +237,7 @@ fn first_lock(
     fft_gate: &Arc<dyn RealToComplex<f32>>,
     profiles: &[KeyProfile; 88],
 ) -> Result<Option<Option<u8>>> {
-    let Some(audio) =
-        read_raw(key_dir, "audio_full_event.raw").or_else(|| read_raw(key_dir, "audio.raw"))
+    let Some(audio) = crate::raw::full_event(key_dir).or_else(|| crate::raw::stable(key_dir))
     else {
         return Ok(None);
     };
@@ -339,22 +281,7 @@ fn first_lock(
     Ok(Some(None)) // never locked
 }
 
-fn main() -> Result<()> {
-    let mut base = "diagnostics_piano_1".to_string();
-    let mut from_onset = false;
-    let mut saw_base = false;
-    for arg in env::args().skip(1) {
-        match arg.as_str() {
-            "--from-onset" => from_onset = true,
-            _ if !saw_base => {
-                base = arg;
-                saw_base = true;
-            }
-            other => return Err(anyhow!("unexpected argument {other:?}")),
-        }
-    }
-    let base = Path::new(&base);
-
+pub fn run(base: &Path, from_onset: bool) -> Result<()> {
     let mut planner = RealFftPlanner::<f32>::new();
     let fft_bass = planner.plan_fft_forward(BASS_WINDOW_SIZE);
     let fft_gate = planner.plan_fft_forward(WINDOW_SIZE);
@@ -368,12 +295,13 @@ fn main() -> Result<()> {
     }
     let profiles: [KeyProfile; 88] = profiles_vec.try_into().unwrap();
 
-    let dirs = find_captures(base).with_context(|| format!("read dir {}", base.display()))?;
+    let dirs =
+        crate::capture::find(base).with_context(|| format!("read dir {}", base.display()))?;
 
     if from_onset {
         let mut hops = Vec::new();
         for d in &dirs {
-            let Some(key) = key_from_dirname(d) else {
+            let Some(key) = crate::capture::key_of(d) else {
                 continue;
             };
             hops.extend(score_from_onset(d, key, &fft_bass, &fft_gate, &profiles));
@@ -394,7 +322,7 @@ fn main() -> Result<()> {
     let mut fails = Vec::new();
 
     for d in &dirs {
-        let expected = key_from_dirname(d).ok_or_else(|| anyhow!("bad dir name"))? as usize;
+        let expected = crate::capture::key_of(d).ok_or_else(|| anyhow!("bad dir name"))? as usize;
         let Some(lock) = first_lock(d, &fft_bass, &fft_gate, &profiles)? else {
             continue;
         };

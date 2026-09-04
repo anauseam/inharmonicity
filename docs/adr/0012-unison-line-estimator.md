@@ -11,7 +11,9 @@ decisions and the numbers the Rust port itself produces.
 
 Shipped: `algorithms::peaks::resolve_lines` (stateless), `strobe::unison` (the
 per-reference ring and the discriminator), a widened crossing #2, and a GUI
-panel. The port is validated by `examples/strobe_replay` experiments **E6–E9**,
+panel. The port is validated by `cargo lab strobe replay` experiments **E6–E8**
+(E6's law is also asserted in `tuner-core/tests/unison_resolution.rs`) and by
+`cargo bench -p tuner-core` for E9's per-hop cost,
 run on both pianos. The band-slope and coarse readouts are **bit-identical**
 before and after (E1–E5 diffed against `HEAD`), which is the property the tap
 doctrine requires.
@@ -488,8 +490,8 @@ was never derived and no such constant exists.
 ## Artifacts & reproduction
 
 ```bash
-cargo run --release --example strobe_replay -- diagnostics_piano_1
-cargo run --release --example strobe_replay -- diagnostics_piano2
+cargo lab strobe replay diagnostics_piano_1
+cargo lab strobe replay diagnostics_piano2
 ```
 
 E6 is synthetic (resolution law, accuracy, null); E7 is availability,

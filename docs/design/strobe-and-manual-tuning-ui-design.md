@@ -788,7 +788,7 @@ Docs reconciled in the re-review: `02` (pipeline no longer retains the
 reference set — the `Strobe` does) and `03` (`coarse_scratch` is owned by
 `Strobe`, not the pipeline).
 
-**Offline evidence (2026-07-19, `examples/strobe_replay.rs`).** The shipped
+**Offline evidence (2026-07-19, `cargo lab strobe replay`).** The shipped
 `Strobe` was replayed over real detuned-piano captures (595 piano-2 + a
 piano-1 set), which are exactly the far-from-ET regime the strobe claims to
 serve. Findings that inform the re-review:

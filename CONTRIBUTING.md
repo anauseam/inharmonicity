@@ -22,16 +22,19 @@ is the contract.
 ## Building and running
 
 ```bash
-# Build everything
+# Build the product (the lab is a workspace member, not a default one)
 cargo build
 
 # Run the GUI
 cargo run -p tuner-gui
 
 # Run tests
-cargo test
+cargo test --workspace
 
-# Run a single example (see tuner-core/examples and tuner-gui/examples)
+# Run a measurement harness (see tuner-lab/README.md)
+cargo lab engine lock
+
+# Run a GUI widget example (see tuner-gui/examples)
 cargo run -p tuner-gui --example dashboard_test
 ```
 

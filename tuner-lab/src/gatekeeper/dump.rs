@@ -1,6 +1,8 @@
+//! Replays a capture through the 5-state signal validator and dumps its
+//! per-frame metrics to `gatekeeper.csv` beside the audio.
+
 use anyhow::{Context, Result, anyhow};
 use realfft::RealFftPlanner;
-use std::env;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
@@ -10,16 +12,8 @@ use tuner_core::audio::{BASS_WINDOW_SIZE, HOP_SIZE, WINDOW_SIZE};
 use tuner_core::gatekeeper::{Gatekeeper, SignalState};
 use tuner_core::pipeline::ProcessingFrame;
 
-fn main() -> Result<()> {
-    let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        println!("Usage: cargo run --example diagnose_gatekeeper -- <path_to_audio.raw>");
-        return Ok(());
-    }
-
-    let file_path = &args[1];
-
-    let path = Path::new(file_path);
+pub fn run(file_path: &Path) -> Result<()> {
+    let path = file_path;
     let parent_dir = path.parent().unwrap_or(Path::new(""));
     let json_path = parent_dir.join("analysis.json");
 
@@ -38,7 +32,7 @@ fn main() -> Result<()> {
         noise_floor = 0.005;
     }
 
-    println!("Loading file: {}", file_path);
+    println!("Loading file: {}", file_path.display());
     println!("Using noise floor: {:.6} (from analysis.json)", noise_floor);
 
     let audio_bytes = fs::read(file_path).context("Failed to read audio.raw")?;

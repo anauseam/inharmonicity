@@ -1,6 +1,6 @@
 # Architecture & Module Boundaries
 
-This file documents the structural decisions that are stable: how the two
+This file documents the structural decisions that are stable: how the
 crates relate, how the pipeline's components are owned, and what each
 component is allowed to know about the rest of the system.
 
@@ -44,6 +44,21 @@ crossing the GUI never touches):
 
 Anything that doesn't fit one of these six shapes is a sign that the
 boundary is being violated.
+
+## The third crate: `tuner-lab`
+
+`tuner-lab` holds the measurement harnesses ([ADR
+0016](../adr/0016-measurement-harnesses-as-a-crate.md)). It ships in nothing —
+`publish = false`, and the workspace's `default-members` leave it out of a plain
+`cargo build` — and it depends on **`tuner-core` only, never `tuner-gui`**.
+
+A harness that reached into `tuner-gui` would measure the frontend's copy of a
+decision rather than the core's — a deleted harness once replayed the GUI's
+readout logic and scored itself. A decision worth replaying offline belongs in
+`tuner-core`, where the app and the lab read the one implementation.
+
+The lab drives the public API and nothing else: a harness that needs something
+private has found a `tuner-core` API question.
 
 ## Cold-path modules and the future audio-out crossing
 

@@ -38,7 +38,7 @@
 //! mis-association signature — *low self-residual yet wrong B* (the A#0→279× band-tightening
 //! failure) — is visible as a number.
 //!
-//! Usage:  `cargo run --release --example mat_b_recovery`
+//! Usage:  `cargo lab mat recovery`
 
 use std::f32::consts::PI;
 
@@ -466,7 +466,7 @@ fn sweep_row(ratio_to_prior: f32, true_b: f32, ser: &Stat, sim: &Stat) {
     );
 }
 
-fn main() {
+pub fn run() {
     println!(
         "MAT (f₀, B) ground-truth recovery — FFT {FFT_SIZE} ({:.3} Hz/bin), SNR {SNR_DB} dB, SR {SAMPLE_RATE}",
         SAMPLE_RATE as f32 / FFT_SIZE as f32

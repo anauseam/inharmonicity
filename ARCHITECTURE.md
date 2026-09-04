@@ -74,7 +74,7 @@ real-time side safe to reset at any moment:
 
 The Worker also writes files: each capture's raw audio and analysis. These are
 **diagnostic output, not program state** — nothing in the app reads one back,
-they exist for the offline harnesses (`tuner-core/examples/`), and the frontend
+they exist for the offline harnesses (`tuner-lab/`), and the frontend
 can switch them off by handing the Worker `None`. Where they land is thread-4
 policy (`WorkerJob::SetDumpDir`), so `tuner-core` stays headless and resolves no
 paths of its own.

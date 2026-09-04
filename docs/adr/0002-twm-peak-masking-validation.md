@@ -14,7 +14,7 @@ following two major architectural changes made during this session:
 
 ## Method
 
-`cargo run --example diagnose_engine` was run against all 8 real acoustic piano
+`cargo lab engine dump` was run against all 8 real acoustic piano
 captures stored in `diagnostics/`. Each run replays the raw audio frame-by-frame
 through the full peak extraction → `mask_peaks` → TWM scoring → Viterbi tracking
 chain, identical to what the live engine executes.

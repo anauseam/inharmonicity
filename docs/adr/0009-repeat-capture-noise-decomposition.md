@@ -41,10 +41,10 @@ B = 0 and is excluded by the standing validity rules. **Consumption rule**
 (load-bearing): deep-bass `analysis.json` files written before the
 `worker::MAT_SEED_TOLERANCE` fix carry rumble-seeded garbage — all
 analysis reads the audio through
-`cargo run --release --example regenerate_partials -- diagnostics`,
+`cargo lab mat regen diagnostics`,
 never the raw JSONs. Audit: `scripts/audit_captures.py` on the regen JSON.
 
-**The harness.** `examples/repeat_noise.rs` (new, kept — the standing
+**The harness.** `cargo lab mat repeats` (kept — the standing
 consumer for repeat sets): per-octave-pair capture-combination sweeps
 through the exact engine-(c) path (gate → coincidence-bracket scan →
 Eq.-30 inversion), strike-strength regressions, and 24 deterministic

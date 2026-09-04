@@ -7,7 +7,7 @@ import os
 
 EXPECTED_FINGERPRINT = "e11fea90889dee30"
 
-EVALUATOR_BIN = "./target/release/examples/mobo_evaluator"
+EVALUATOR_BIN = "./target/release/tuner-lab"
 DB_PATH = "twm_mobo.db"
 
 # Multi-start seeds (review §8.11): the synthetic optimum LOCATION is seed-noise, so
@@ -30,7 +30,7 @@ class Evaluator:
             raise RuntimeError(f"Evaluator binary not found at {EVALUATOR_BIN}. Please build it first.")
 
         self.proc = subprocess.Popen(
-            [EVALUATOR_BIN, "--serve"],
+            [EVALUATOR_BIN, "engine", "mobo", "--serve"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -241,7 +241,7 @@ def main():
         # / protocol regression — fail loud now, not after a multi-hour sweep.
         assert abs(d["prod_fl"] - 0.308) < 0.02, (
             f"Sanity check failed: prod_fl={d['prod_fl']:.5f}, expected ~0.308. "
-            "Rebuild the evaluator (cargo build --release --example mobo_evaluator) "
+            "Rebuild the evaluator (cargo build --release -p tuner-lab) "
             "and confirm the protocol before running the sweep."
         )
 

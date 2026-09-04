@@ -200,7 +200,7 @@ statement that it was done.
 
 ## Results — Task 1
 
-Measured 2026-08-22 with `examples/pitch_ground_truth --np-set`. Nothing in
+Measured 2026-08-22 with what is now `cargo lab gates ambient`. Nothing in
 §§1–3 was changed after the first run. **Revised the same day** after a review
 pass; §4.1 records what the review corrected and why the first numbers were
 wrong.
@@ -624,16 +624,16 @@ samples per decision**, not **fresher ones**.
 ## Artifacts & reproduction
 
 ```bash
-cargo run --release --example regenerate_partials -- diagnostics_piano2 > p2.json
-cargo run --release --example regenerate_partials -- <Piano2_extended dump> > p2ext.json
-cargo run --release --example regenerate_partials -- diagnostics_piano_1 > p1.json
-cargo run --release --example pitch_ground_truth -- \
-  --np-set piano2 p2.json diagnostics_piano2 \
-  --np-set piano2-extended p2ext.json <Piano2_extended dump> \
-  --np-set piano1-secondary p1.json diagnostics_piano_1
+cargo lab mat regen diagnostics_piano2 > p2.json
+cargo lab mat regen <Piano2_extended dump> > p2ext.json
+cargo lab mat regen diagnostics_piano_1 > p1.json
+cargo lab gates ambient \
+  --set piano2 p2.json diagnostics_piano2 \
+  --set piano2-extended p2ext.json <Piano2_extended dump> \
+  --set piano1-secondary p1.json diagnostics_piano_1
 # calibration and the live-cut sensitivity sweep
-cargo run --release --example pitch_ground_truth -- --np-set awgn <synth>/regen.json <synth>
-cargo run --release --example pitch_ground_truth -- --np-live 20 --np-set piano2 p2.json diagnostics_piano2
+cargo lab gates ambient --set awgn <synth>/regen.json <synth>
+cargo lab gates ambient --live 20 --set piano2 p2.json diagnostics_piano2
 ```
 
 The extended set is not in the repository; `06` says where it lives, and §5 pins

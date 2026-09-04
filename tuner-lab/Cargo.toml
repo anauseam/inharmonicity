@@ -1,0 +1,20 @@
+[package]
+name = "tuner-lab"
+version.workspace = true
+edition = "2024"
+publish = false
+
+[features]
+# `engine dump` writes `goertzel.csv` only with this on; `cargo lab-telemetry`
+# is the alias that enables it.
+telemetry = ["tuner-core/telemetry"]
+
+[dependencies]
+tuner-core = { path = "../tuner-core" }
+
+anyhow = { workspace = true }
+clap = { version = "4.5", features = ["derive"] }
+realfft = { workspace = true }
+rustfft = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

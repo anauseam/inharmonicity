@@ -1,10 +1,15 @@
+//! Replays a capture through the engine in *manual* mode and dumps what the
+//! STFT, peak extractor and TWM scorer saw at every frame into `spectrum.csv`
+//! and `peaks.csv` beside the audio. With `--features telemetry` it also writes
+//! `goertzel.csv` (per-partial amplitude and Neyman–Pearson threshold per
+//! tracking frame).
+
 use anyhow::{Context, Result, anyhow};
 use realfft::RealFftPlanner;
 use rustfft::num_complex::Complex;
-use std::env;
 use std::fs::{self, File};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use tuner_core::algorithms::peaks::extract_peaks;
 use tuner_core::algorithms::spectral::{fft, magnitude_spectrum};
@@ -15,88 +20,82 @@ use tuner_core::models::SpectralPeak;
 use tuner_core::models::{KeyProfile, NOTES, get_expected_beta};
 use tuner_core::pipeline::ProcessingFrame;
 
-fn main() -> Result<()> {
-    let args: Vec<String> = env::args().collect();
-    let mut file_path = String::new();
-    let mut refine = false;
-    let mut use_stretch = false;
-    let mut profile_path: Option<String> = None;
-    let mut cfg = tuner_core::algorithms::twm::TwmConfig::default();
+use clap::Args;
 
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--refine" => refine = true,
-            // EXPERIMENT (test #1): sum the forward error instead of averaging (/N).
-            "--sum-forward" => cfg.sum_forward = true,
-            // EXPERIMENT (test #2a): stretched (Railsback) template reference.
-            "--stretch" => use_stretch = true,
-            // EXPERIMENT (n-kernel): forward-error B-deadzone scaling c.
-            "--b-deadzone" => {
-                i += 1;
-                cfg.b_deadzone = args
-                    .get(i)
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(cfg.b_deadzone);
-            }
-            // EXPERIMENT (Duan non-peak): per-hallucinated-partial penalty.
-            "--nonpeak" => {
-                i += 1;
-                cfg.nonpeak_penalty = args
-                    .get(i)
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(cfg.nonpeak_penalty);
-            }
-            // EXPERIMENT (Emiya smoothness): matched-partial amplitude-incoherence penalty.
-            "--smoothness" => {
-                i += 1;
-                cfg.smoothness_penalty = args
-                    .get(i)
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(cfg.smoothness_penalty);
-            }
-            // `--config "p q r rho lambda"` (one space-separated arg; lambda may be `inf`).
-            // Lets the real-capture harness score MOBO candidate constants without
-            // recompiling the hardcoded default.
-            "--config" => {
-                i += 1;
-                let parts: Vec<&str> = args
-                    .get(i)
-                    .map(|s| s.split_whitespace().collect())
-                    .unwrap_or_default();
-                if parts.len() == 5 {
-                    cfg = tuner_core::algorithms::twm::TwmConfig {
-                        p: parts[0].parse().unwrap_or(cfg.p),
-                        q: parts[1].parse().unwrap_or(cfg.q),
-                        r: parts[2].parse().unwrap_or(cfg.r),
-                        rho: parts[3].parse().unwrap_or(cfg.rho),
-                        lambda_penalty: parts[4].parse().unwrap_or(cfg.lambda_penalty),
-                        ..cfg
-                    };
-                } else {
-                    return Err(anyhow!("--config needs 5 floats: \"p q r rho lambda\""));
-                }
-            }
-            // VALIDATION: seed each measured key's discovery template with its
-            // measured B from a persisted InharmonicityProfile (via the same
-            // `KeyProfile::from_measurement` the live pipeline uses). Lets the
-            // real-capture harness confirm the oracle-B bass false-lock drop.
-            "--profile" => {
-                i += 1;
-                profile_path = args.get(i).cloned();
-            }
-            a if !a.starts_with("--") => file_path = a.to_string(),
-            _ => {}
+/// `engine dump`'s arguments. The TWM knobs are experiment switches: each names
+/// the paper term it moves, and the default is the shipped configuration.
+#[derive(Args)]
+pub struct DumpArgs {
+    /// Path to an `audio.raw` or `audio_full_event.raw`.
+    pub audio: PathBuf,
+    /// Run Stage-B refinement on the winner.
+    #[arg(long)]
+    pub refine: bool,
+    /// Sum the forward error instead of averaging it (M&B test #1).
+    #[arg(long)]
+    pub sum_forward: bool,
+    /// Stretched (Railsback) template reference (test #2a).
+    #[arg(long)]
+    pub stretch: bool,
+    /// Forward-error B-deadzone scaling c (n-kernel).
+    #[arg(long, value_name = "C")]
+    pub b_deadzone: Option<f32>,
+    /// Per-hallucinated-partial penalty (Duan non-peak).
+    #[arg(long, value_name = "W")]
+    pub nonpeak: Option<f32>,
+    /// Matched-partial amplitude-incoherence penalty (Emiya smoothness).
+    #[arg(long, value_name = "W")]
+    pub smoothness: Option<f32>,
+    /// Five space-separated floats, `"p q r rho lambda"` — scores a MOBO
+    /// candidate without recompiling the default. `lambda` may be `inf`.
+    #[arg(long, value_name = "P Q R RHO LAMBDA")]
+    pub config: Option<String>,
+    /// Seed each measured key's discovery template with its measured B from a
+    /// persisted `InharmonicityProfile`, through the same
+    /// `KeyProfile::from_measurement` the live pipeline uses.
+    #[arg(long, value_name = "PATH")]
+    pub profile: Option<PathBuf>,
+}
+
+pub fn run(args: DumpArgs) -> Result<()> {
+    let DumpArgs {
+        audio,
+        refine,
+        sum_forward,
+        stretch: use_stretch,
+        b_deadzone,
+        nonpeak,
+        smoothness,
+        config,
+        profile: profile_path,
+    } = args;
+    let file_path = audio.to_string_lossy().into_owned();
+    let mut cfg = tuner_core::algorithms::twm::TwmConfig {
+        sum_forward,
+        b_deadzone: b_deadzone
+            .unwrap_or(tuner_core::algorithms::twm::TwmConfig::default().b_deadzone),
+        nonpeak_penalty: nonpeak
+            .unwrap_or(tuner_core::algorithms::twm::TwmConfig::default().nonpeak_penalty),
+        smoothness_penalty: smoothness
+            .unwrap_or(tuner_core::algorithms::twm::TwmConfig::default().smoothness_penalty),
+        ..tuner_core::algorithms::twm::TwmConfig::default()
+    };
+    if let Some(spec) = &config {
+        let parts: Vec<&str> = spec.split_whitespace().collect();
+        if parts.len() == 5 {
+            cfg = tuner_core::algorithms::twm::TwmConfig {
+                p: parts[0].parse().unwrap_or(cfg.p),
+                q: parts[1].parse().unwrap_or(cfg.q),
+                r: parts[2].parse().unwrap_or(cfg.r),
+                rho: parts[3].parse().unwrap_or(cfg.rho),
+                lambda_penalty: parts[4].parse().unwrap_or(cfg.lambda_penalty),
+                ..cfg
+            };
+        } else {
+            return Err(anyhow!("--config needs 5 floats: \"p q r rho lambda\""));
         }
-        i += 1;
     }
-
-    if file_path.is_empty() {
-        println!(
-            "Usage: cargo run --example diagnose_engine -- <path_to_audio.raw> [--refine] [--config \"p q r rho lambda\"]"
-        );
-        return Ok(());
-    }
+    let profile_path = profile_path.map(|p| p.to_string_lossy().into_owned());
     eprintln!(
         "[CONFIG] p={} q={} r={} rho={} lambda={} b_deadzone={} nonpeak={} sum_forward={} stretch={} refine={}",
         cfg.p,

@@ -290,7 +290,7 @@ sides after the removal.
 - `peaks.rs` tests: `coarse_cfar_multiplier_table_ii` added.
 - ADR 0011 §4: quantile and guard entries annotated with this audit; flank-floor
   mechanism corrected.
-- `examples/pitch_ground_truth.rs`: `--refset` mode added (T5 — reference-set
+- `pitch_ground_truth`'s `--refset` mode added, now `cargo lab gates refset` (T5 — reference-set
   anatomy + guard sweep); `ref_window` extracted so the anatomy report cannot
   drift from the gate it describes; `shipping_gate_hz` and the two flanking sweeps
   set to `guard_bins: 0` to track the shipped read (the in-band control keeps 2);
@@ -300,11 +300,11 @@ sides after the removal.
 
 ```bash
 cargo test -p tuner-core --release coarse_cfar          # Table II + the pinned ranks
-cargo run --release --example pitch_ground_truth -- diagnostics_piano_1 --refset --keys 0,1,2,4,6,8,12,16
-cargo run --release --example pitch_ground_truth -- diagnostics --refset
-cargo run --release --example pitch_ground_truth -- diagnostics_piano2  --refset --keys 0,1,3
-cargo run --release --example pitch_ground_truth -- diagnostics_piano_1 --verify-shipped
-cargo run --release --example pitch_ground_truth -- diagnostics_piano_1 --pfa --fft 8192
+cargo lab gates refset diagnostics_piano_1 --keys 0,1,2,4,6,8,12,16
+cargo lab gates refset diagnostics
+cargo lab gates refset diagnostics_piano2 --keys 0,1,3
+cargo lab gates verify diagnostics_piano_1
+cargo lab gates pfa diagnostics_piano_1 --fft 8192
 ```
 
 The guard sweep is reproducible after the removal because `CfarCfg::guard_bins`

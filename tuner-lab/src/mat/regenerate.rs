@@ -12,8 +12,9 @@
 //! emits one JSON array over all keys to **stdout** — it writes no repo files, so it
 //! cannot clobber the validation captures. Redirect it where you like.
 //!
-//! Usage: cargo run --release --example regenerate_partials -- [diagnostics_dir] > out.json
+//! Usage: `cargo lab mat regen [diagnostics_dir] > out.json`
 
+use anyhow::Result;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -145,25 +146,10 @@ fn process(dir: &Path) -> Option<serde_json::Value> {
     }))
 }
 
-fn main() {
-    let root = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "diagnostics".into());
-    let root = Path::new(&root);
-    let mut dirs: Vec<_> = std::fs::read_dir(root)
-        .expect("read diagnostics dir")
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| {
-            p.is_dir()
-                && p.file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| n.starts_with("key_"))
-                    .unwrap_or(false)
-        })
-        .collect();
-    dirs.sort();
-
+pub fn run(root: &Path) -> Result<()> {
+    let dirs = crate::capture::find(root)?;
     let out: Vec<_> = dirs.iter().filter_map(|d| process(d)).collect();
     println!("{}", serde_json::to_string_pretty(&out).unwrap());
     eprintln!("regenerated {} keys", out.len());
+    Ok(())
 }

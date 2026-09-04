@@ -30,10 +30,11 @@
 //! is validation data (n = 1 instrument at a time).
 //!
 //! Usage:
-//!   cargo run --release --example regenerate_partials -- diagnostics > p2.json
-//!   cargo run --release --example repeat_noise -- p2.json > repeat_report.json
+//!   cargo lab mat regen diagnostics > p2.json
+//!   cargo lab mat repeats p2.json > repeat_report.json
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use tuner_core::algorithms::curves::{self, BALANCED_INTERVALS, CurveParams, IntervalSpec};
 use tuner_core::algorithms::{giordano, rigaud};
@@ -79,7 +80,7 @@ struct Capture {
     source_dir: String,
 }
 
-fn load_captures(path: &str) -> BTreeMap<usize, Vec<Capture>> {
+fn load_captures(path: &Path) -> BTreeMap<usize, Vec<Capture>> {
     let text = std::fs::read_to_string(path).expect("read partials JSON");
     let entries: Vec<serde_json::Value> = serde_json::from_str(&text).expect("parse JSON");
     let mut keys: BTreeMap<usize, Vec<Capture>> = BTreeMap::new();
@@ -184,11 +185,7 @@ impl Rng {
     }
 }
 
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let path = args
-        .get(1)
-        .expect("usage: repeat_noise <per-capture partials.json>");
+pub fn run(path: &Path) {
     let keys = load_captures(path);
     let params = CurveParams::default();
 

@@ -10,12 +10,12 @@ def main():
     # Compile the example first
     print("Compiling diagnose_gatekeeper...")
     subprocess.run(
-        ["cargo", "build", "--example", "diagnose_gatekeeper"],
+        ["cargo", "build", "--release", "-p", "tuner-lab"],
         check=True,
         stdout=subprocess.DEVNULL,
     )
 
-    executable = "./target/debug/examples/diagnose_gatekeeper"
+    executable = ["./target/release/tuner-lab", "gatekeeper", "dump"]
 
     keys = []
     for d in os.listdir(base_dir):
@@ -38,7 +38,7 @@ def main():
         # Run the executable
         try:
             subprocess.run(
-                [executable, raw_file],
+                executable + [raw_file],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 check=True,

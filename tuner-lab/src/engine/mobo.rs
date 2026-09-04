@@ -1094,9 +1094,7 @@ fn report(frames: &[Frame], profiles: &[KeyProfile; 88]) {
     }
 }
 
-fn main() {
-    let serve_mode = std::env::args().any(|a| a == "--serve");
-
+pub fn run(serve_mode: bool) {
     let frames = generate_dataset(FIXED_SEED);
     // Determinism gate: byte-identical regeneration (catches any nondeterminism
     // before a multi-hour sweep trusts the dataset).

@@ -3,7 +3,7 @@
 ## Status
 
 **INVESTIGATION COMPLETE 2026-08-12 (Prompt T). No code change.** The
-experiments are `examples/strobe_replay` **E10–E12**, run on both pianos; they
+experiments are `cargo lab strobe replay` **E10–E12**, run on both pianos; they
 join E1–E9 as standing regression material.
 
 ADR 0012 §5 kept the bass out of unison assist's claimed scope because keys 0–27
@@ -418,8 +418,8 @@ Two things Prompt W should now carry that it did not:
 ## Artifacts & reproduction
 
 ```bash
-cargo run --release --example strobe_replay -- diagnostics_piano_1
-cargo run --release --example strobe_replay -- diagnostics_piano2
+cargo lab strobe replay diagnostics_piano_1
+cargo lab strobe replay diagnostics_piano2
 ```
 
 E10 is synthetic and runs whatever directory is passed; E11–E12 are real. E1–E5

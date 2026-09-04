@@ -6,9 +6,18 @@ edition = "2024"
 [features]
 telemetry = []
 
+# Hot-path cost, measured. `03` makes latency a hard rule; these are its
+# regression check. Criterion is a dev-dependency: it ships in nothing.
+[dev-dependencies]
+criterion = { version = "0.7", features = ["html_reports"] }
+
+[[bench]]
+name = "strobe_cost"
+harness = false
+
 [dependencies]
 # Use the workspace-defined versions
-anyhow = "1.0.104" # For easier error handling
+anyhow = { workspace = true }
 
 # For running audio on a separate thread and communicating
 ringbuf = { workspace = true }
@@ -22,6 +31,6 @@ once_cell = "1.21.4"
 
 # For profile saving and loading
 serde =  { workspace = true }
-crossbeam-queue = "0.3.13"
+crossbeam-queue = { workspace = true }
 crossbeam-channel = "0.5.16"
 serde_json.workspace = true

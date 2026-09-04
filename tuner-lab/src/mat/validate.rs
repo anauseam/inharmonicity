@@ -14,14 +14,13 @@
 //! per capture and read against the same set's repeat scatter (ADR 0009).
 //!
 //! Usage:
-//!   cargo run --release --example validate_mat -- [diagnostics_dir]   (default: diagnostics)
-//!   cargo run --release --example validate_mat -- diagnostics_piano2 --offset-ms 0,116,300
+//!   cargo lab mat validate [diagnostics_dir]   (default: diagnostics)
+//!   cargo lab mat offset diagnostics_piano2 --offsets 0,116,300
 
 use anyhow::{Context, Result};
 use realfft::RealFftPlanner;
 use rustfft::num_complex::Complex;
 use std::collections::BTreeMap;
-use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -43,68 +42,6 @@ const OFFSET_FFT_SIZE: usize = 32768;
 /// Where the shipped capture starts: the gatekeeper's `Stable` verdict, five
 /// hops after the NHWRSF onset. Offsets are reported against it.
 const SHIPPED_OFFSET_MS: u32 = 116;
-
-/// Register split, as `curve_compare` uses it: bass = A0–C#3, the wound-string
-/// region; treble = C6 up, where partial counts thin. Deliberately **not**
-/// `common::register`, which carries `strobe_replay`'s finer four-band split —
-/// same idea, different boundaries, and the offset sweep is read against
-/// curve-side figures.
-fn curve_register(key: u8) -> &'static str {
-    match key {
-        0..=27 => "bass",
-        28..=62 => "mid",
-        _ => "treble",
-    }
-}
-
-const REGISTERS: [&str; 3] = ["bass", "mid", "treble"];
-
-/// Capture directories under `root`, at either the top level
-/// (`diagnostics_piano2/key_*`) or one level down (`diagnostics/<instrument
-/// id>/key_*`). Key identity is read from each `analysis.json`, never from the
-/// directory name, per `examples/README.md`.
-fn find_captures(root: &Path) -> Result<Vec<PathBuf>> {
-    let is_capture = |p: &Path| {
-        p.file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with("key_"))
-    };
-    let mut out = Vec::new();
-    let rd = fs::read_dir(root).with_context(|| format!("read dir {}", root.display()))?;
-    for entry in rd.flatten() {
-        let p = entry.path();
-        if !p.is_dir() {
-            continue;
-        }
-        if is_capture(&p) {
-            out.push(p);
-        } else {
-            for sub in fs::read_dir(&p).into_iter().flatten().flatten() {
-                let p2 = sub.path();
-                if p2.is_dir() && is_capture(&p2) {
-                    out.push(p2);
-                }
-            }
-        }
-    }
-    out.sort();
-    Ok(out)
-}
-
-/// The non-causal diagnostic buffer: pre-roll, strike and decay. The offset
-/// sweep needs it because `audio.raw` begins at the very verdict under test.
-fn read_full_event(dir: &Path) -> Option<Vec<f32>> {
-    let bytes = fs::read(dir.join("audio_full_event.raw")).ok()?;
-    if bytes.is_empty() || bytes.len() % 4 != 0 {
-        return None;
-    }
-    let mut out = vec![0.0f32; bytes.len() / 4];
-    // SAFETY: f32 has no invalid bit patterns and the length is a multiple of 4.
-    unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.as_mut_ptr() as *mut u8, bytes.len());
-    }
-    Some(out)
-}
 
 /// Physical onset: the first 1 ms frame whose RMS clears both −20 dB re the
 /// event's peak and 4× the pre-roll ambient. Deliberately independent of the
@@ -170,7 +107,7 @@ fn offset_sweep(dirs: &[PathBuf], offsets: &[u32]) -> Result<()> {
     let mut skipped = 0u32;
     for dir in dirs {
         let (Some(audio), Ok(text)) = (
-            read_full_event(dir),
+            crate::raw::full_event(dir),
             fs::read_to_string(dir.join("analysis.json")),
         ) else {
             skipped += 1;
@@ -270,11 +207,14 @@ fn offset_report(rows: &[OffsetRow], offsets: &[u32], skipped: u32) {
         "\n  {:<8} {:>8} {:>9} {:>12} {:>9} {:>10} {:>10}",
         "register", "offset", "captures", "median ΔB %", "IQR %", "|ΔB|>5 %", "partials"
     );
-    for reg in REGISTERS {
+    for reg in crate::capture::CURVE_REGISTERS {
         for (oi, &off) in offsets.iter().enumerate() {
             let mut shifts = Vec::new();
             let mut partials = Vec::new();
-            for r in rows.iter().filter(|r| curve_register(r.key) == reg) {
+            for r in rows
+                .iter()
+                .filter(|r| crate::capture::curve_register(r.key) == reg)
+            {
                 let (Some((b, p)), Some((b_ref, _))) = (r.by_offset[oi], r.by_offset[ref_i]) else {
                     continue;
                 };
@@ -319,10 +259,10 @@ fn offset_report(rows: &[OffsetRow], offsets: &[u32], skipped: u32) {
     println!(
         "\n  repeat scatter of ln B at {ref_ms} ms (same key, different captures, keys with ≥3):"
     );
-    for reg in REGISTERS {
+    for reg in crate::capture::CURVE_REGISTERS {
         let mut sds: Vec<f32> = per_key
             .iter()
-            .filter(|(k, _)| curve_register(**k) == reg)
+            .filter(|(k, _)| crate::capture::curve_register(**k) == reg)
             .filter_map(|(_, v)| stdev(v))
             .collect();
         if sds.is_empty() {
@@ -493,38 +433,11 @@ fn process_capture(dir: &Path) -> Result<Option<KeyRow>> {
     }))
 }
 
-fn main() -> Result<()> {
-    let mut root = "diagnostics".to_string();
-    let mut offsets: Option<Vec<u32>> = None;
-    let mut saw_root = false;
-    let mut args = env::args().skip(1);
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--offset-ms" => {
-                let list = args
-                    .next()
-                    .context("--offset-ms needs a comma-separated list, e.g. 0,116,300")?;
-                let parsed: Vec<u32> = list
-                    .split(',')
-                    .filter_map(|s| s.trim().parse().ok())
-                    .collect();
-                if parsed.is_empty() {
-                    anyhow::bail!("--offset-ms parsed no offsets from {list:?}");
-                }
-                offsets = Some(parsed);
-            }
-            _ if !saw_root => {
-                root = arg;
-                saw_root = true;
-            }
-            other => anyhow::bail!("unexpected argument {other:?}"),
-        }
-    }
-    let root = Path::new(&root);
-    let dirs = find_captures(root)?;
+pub fn run(root: &Path, offsets: Option<&[u32]>) -> Result<()> {
+    let dirs = crate::capture::find(root)?;
 
     if let Some(offsets) = offsets {
-        return offset_sweep(&dirs, &offsets);
+        return offset_sweep(&dirs, offsets);
     }
 
     // Per-mode cell: (B, ratio-to-prior, confidence, partials).
