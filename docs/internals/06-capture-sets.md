@@ -8,7 +8,8 @@ instruments were in, and the rules for consuming them, because none of that is
 recoverable from the audio.
 
 These sets live **in the repository**, and the harnesses that read them take the
-directory as an argument (`-- diagnostics_piano2`), defaulting to `diagnostics`.
+directory as an argument (`cargo lab mat validate diagnostics_piano2`), defaulting
+to `diagnostics`.
 That is separate from where the *app* writes new dumps, which is a per-user
 directory chosen by the frontend — a released binary has no useful working
 directory — with one subdirectory per instrument, named for the opaque
@@ -194,18 +195,18 @@ the data; that one is the inference.
 cached analysis is wrong. So:
 
 ```bash
-cargo run --release --example regenerate_partials -- diagnostics_piano2 > p2.json
+cargo lab mat regen diagnostics_piano2 > p2.json
 python3 scripts/audit_captures.py p2.json      # consumes the regen, not analysis.json
 ```
 
-**Prefer independent truth to the cached fields.** `examples/pitch_ground_truth.rs`
+**Prefer independent truth to the cached fields.** `cargo lab strobe truth`
 computes a zero-padded hi-res DFT truth per capture; that is the reference for
 estimator accuracy work, not `measured_f0`.
 
 **Every capture in the three sets is 1.5 s, and a measurement may not be made
 over more than that.** The shipped path enforces it — the Worker analyses the
 first `CAPTURE_ANALYSIS_SAMPLES` however long the record is, and
-`regenerate_partials` bounds itself identically — because ADR 0009's σ model,
+`mat regen` bounds itself identically — because ADR 0009's σ model,
 ADR 0010's concordance and ADR 0011's profile were all measured at that length,
 and a longer analysis window silently makes a new number incomparable with every
 one of them. A session may still *record* longer (Settings → Advanced → Capture
@@ -234,7 +235,7 @@ repository*) therefore governs prose too:
 
 **The harnesses that read these sets**, and the on-disk format of a single
 capture, are documented in
-[`tuner-core/examples/README.md`](../../tuner-core/examples/README.md).
+[`tuner-lab/README.md`](../../tuner-lab/README.md).
 
 ## Where the numbers ended up
 

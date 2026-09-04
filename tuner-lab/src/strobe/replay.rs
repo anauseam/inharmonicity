@@ -82,19 +82,19 @@
 //! on, the law their splits follow, and whether a third line is a symmetric
 //! sideband.
 //!
-//! Run: `cargo run --release --example strobe_replay -- [diagnostics_dir]`
+//! Run: `cargo lab strobe replay [diagnostics_dir]`
 
-use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::path::Path;
 
 use realfft::RealFftPlanner;
 use rustfft::num_complex::Complex;
 
 use tuner_core::algorithms::curves::default_display_partials;
-use tuner_core::algorithms::peaks::{LineScratch, MAX_UNISON_LINES, resolve_lines};
 use tuner_core::algorithms::spectral::{self, goertzel, goertzel_bass};
 use tuner_core::audio::{BASS_WINDOW_SIZE, HOP_RATE_HZ, HOP_SIZE, SAMPLE_RATE, WINDOW_SIZE};
-use tuner_core::models::{NOTES, UnisonLine};
+use tuner_core::models::NOTES;
+
+use super::{Resolved, run_unison};
 use tuner_core::strobe::band_slope::{
     BAND_SLOPE_MIN_POINTS, BAND_SLOPE_POINTS, BAND_SLOPE_WINDOW_SECS,
 };
@@ -113,20 +113,6 @@ const BAND_WIN_HOPS: usize = (BAND_SLOPE_WINDOW_SECS * HOP_RATE_HZ) as usize;
 /// window — the coarse read's own group delay, and so the length at which the two
 /// readouts would lag the truth equally. 0.6 s is shipped.
 const WINDOW_SECS: [f32; 5] = [0.186, 0.25, 0.4, 0.6, 1.0];
-
-fn read_raw_f32(path: &Path) -> Option<Vec<f32>> {
-    let bytes = std::fs::read(path).ok()?;
-    if bytes.len() % 4 != 0 {
-        return None;
-    }
-    let n = bytes.len() / 4;
-    let mut out = vec![0.0f32; n];
-    // SAFETY: f32 has no invalid bit patterns; length is a multiple of 4.
-    unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.as_mut_ptr() as *mut u8, bytes.len());
-    }
-    Some(out)
-}
 
 /// One capture's measured facts, pulled from `analysis.json`.
 struct Capture {
@@ -160,7 +146,7 @@ fn load(dir: &Path) -> Option<Capture> {
             }
         }
     }
-    let audio = read_raw_f32(&dir.join("audio.raw"))?;
+    let audio = crate::raw::read(&dir.join("audio.raw"))?;
     if audio.len() < BASS_WINDOW_SIZE + 4 * HOP_SIZE {
         return None; // too short to fit a warmup + a few integrating hops
     }
@@ -445,67 +431,6 @@ fn synth_audio(base_hz: f32, sources: &[Source], hops: usize, snr_db: f32, seed:
             x
         })
         .collect()
-}
-
-/// What one reference published at the end of a run.
-#[derive(Clone, Copy, Default)]
-struct Resolved {
-    count: u8,
-    resolution_hz: f32,
-    lines: [UnisonLine; MAX_UNISON_LINES],
-    /// Hop the record ended on, so E8 can rebuild the exact span it covered.
-    hop: usize,
-    /// Record length in hops at that point.
-    record: usize,
-}
-
-/// Drives the shipped bank over `audio` and returns, per reference, the best
-/// record it reached — the hop with the longest unbroken record, which is what
-/// the panel would be showing when the tuner looks at it.
-fn run_unison(
-    audio: &[f32],
-    refs: &[f32; MAX_STROBE_REFS],
-    count: usize,
-    spacing_hz: f32,
-    noise_floor: f32,
-) -> (Vec<Resolved>, UnisonVerdict) {
-    let mut strobe = Strobe::new(SAMPLE_RATE);
-    strobe.retarget(StrobeRefUpdate {
-        count,
-        refs: *refs,
-        coarse_index: 0, // phase/baseband only; the coarse read is E1–E5's business
-        spacing_hz,
-    });
-
-    let hops = (audio.len().saturating_sub(BASS_WINDOW_SIZE)) / HOP_SIZE;
-    let mut best = vec![Resolved::default(); count];
-    let mut verdict = UnisonVerdict::Undetermined;
-    let mut frame = tuner_core::pipeline::ProcessingFrame::new();
-    let mut record = vec![0usize; count];
-    for h in 0..hops {
-        frame.audio_buffer[..BASS_WINDOW_SIZE]
-            .copy_from_slice(&audio[h * HOP_SIZE..h * HOP_SIZE + BASS_WINDOW_SIZE]);
-        let out = strobe.process(&frame, noise_floor, false);
-        for i in 0..count {
-            // The published resolution is 2·f_hop/L, so it *is* the record length.
-            record[i] = if out.line_resolution_hz[i] > 0.0 {
-                (2.0 * HOP_RATE_HZ / out.line_resolution_hz[i]).round() as usize
-            } else {
-                0
-            };
-            if record[i] > best[i].record {
-                best[i] = Resolved {
-                    count: out.line_count[i],
-                    resolution_hz: out.line_resolution_hz[i],
-                    lines: out.lines[i],
-                    hop: h,
-                    record: record[i],
-                };
-                verdict = out.verdict;
-            }
-        }
-    }
-    (best, verdict)
 }
 
 /// One synthetic trial: how many lines the bank resolved, and where.
@@ -1223,19 +1148,6 @@ fn measured_refs(cap: &Capture, out: &mut [f32; MAX_STROBE_REFS]) -> usize {
     count
 }
 
-/// Register label used by the unison summaries. The bass is reported separately
-/// throughout: it produces a second line on essentially every capture of both
-/// instruments, including on single-strung keys, and those lines are real
-/// spectral content that is not a second string (ADR 0012 §5, ADR 0013).
-fn register(key: u8) -> &'static str {
-    match key {
-        0..=27 => "bass",
-        28..=51 => "tenor",
-        52..=75 => "treble",
-        _ => "high 76–87",
-    }
-}
-
 /// **E7** — availability per register, and the truth-free reproducibility test.
 fn e7_real(captures: &[(Capture, Vec<Resolved>, UnisonVerdict, usize)]) {
     let table = default_display_partials();
@@ -1248,7 +1160,7 @@ fn e7_real(captures: &[(Capture, Vec<Resolved>, UnisonVerdict, usize)]) {
     for band in ["bass", "tenor", "treble", "high 76–87"] {
         let rows: Vec<&Resolved> = captures
             .iter()
-            .filter(|(c, ..)| register(c.key) == band)
+            .filter(|(c, ..)| crate::capture::strobe_register(c.key) == band)
             .filter_map(|(c, r, ..)| r.get(table[c.key as usize] as usize - 1))
             .collect();
         if rows.is_empty() {
@@ -1281,7 +1193,7 @@ fn e7_real(captures: &[(Capture, Vec<Resolved>, UnisonVerdict, usize)]) {
     for band in ["bass", "tenor", "treble", "high 76–87"] {
         let rows: Vec<&Resolved> = captures
             .iter()
-            .filter(|(c, ..)| register(c.key) == band)
+            .filter(|(c, ..)| crate::capture::strobe_register(c.key) == band)
             .flat_map(|(_, r, ..)| r.iter())
             .collect();
         if rows.is_empty() {
@@ -1316,7 +1228,10 @@ fn e7_real(captures: &[(Capture, Vec<Resolved>, UnisonVerdict, usize)]) {
     // Group by key, take each strike's split at the displayed partial.
     for band in ["bass", "tenor", "treble"] {
         let mut per_key: Vec<(u8, Vec<f32>)> = Vec::new();
-        for (cap, resolved, _, _) in captures.iter().filter(|(c, ..)| register(c.key) == band) {
+        for (cap, resolved, _, _) in captures
+            .iter()
+            .filter(|(c, ..)| crate::capture::strobe_register(c.key) == band)
+        {
             let n_star = table[cap.key as usize] as usize;
             let Some(r) = resolved.get(n_star.saturating_sub(1)) else {
                 continue;
@@ -1365,7 +1280,7 @@ fn e7_real(captures: &[(Capture, Vec<Resolved>, UnisonVerdict, usize)]) {
     for band in ["bass", "tenor", "treble", "high 76–87"] {
         let rows: Vec<UnisonVerdict> = captures
             .iter()
-            .filter(|(c, ..)| register(c.key) == band)
+            .filter(|(c, ..)| crate::capture::strobe_register(c.key) == band)
             .map(|(_, _, v, _)| *v)
             .collect();
         if rows.is_empty() {
@@ -1482,7 +1397,7 @@ fn e8_unexplained(captures: &[(Capture, Vec<Resolved>, UnisonVerdict, usize)]) {
     }
     let mut rows: Vec<Cell> = Vec::new();
     for (cap, resolved, _, window) in captures {
-        let band = register(cap.key);
+        let band = crate::capture::strobe_register(cap.key);
         for (i, r) in resolved.iter().enumerate() {
             if r.count == 0 || r.record < 2 {
                 continue;
@@ -1752,7 +1667,10 @@ fn e11_recurrence(captures: &[(Capture, Vec<Resolved>, UnisonVerdict, usize)]) {
         "register", "lines", "shared", "chance", "top bin", "null bin"
     );
     for band in ["bass", "tenor", "treble"] {
-        let rows: Vec<&Extra> = all.iter().filter(|e| register(e.key) == band).collect();
+        let rows: Vec<&Extra> = all
+            .iter()
+            .filter(|e| crate::capture::strobe_register(e.key) == band)
+            .collect();
         if rows.len() < 10 {
             continue;
         }
@@ -1887,9 +1805,9 @@ fn e12_attribution(captures: &[(Capture, Vec<Resolved>, UnisonVerdict, usize)]) 
             .iter()
             .filter(|e| {
                 if window == 0 {
-                    register(e.key) == "tenor"
+                    crate::capture::strobe_register(e.key) == "tenor"
                 } else {
-                    register(e.key).starts_with("bass") && e.window == window
+                    crate::capture::strobe_register(e.key).starts_with("bass") && e.window == window
                 }
             })
             .collect();
@@ -1964,7 +1882,10 @@ fn e12_attribution(captures: &[(Capture, Vec<Resolved>, UnisonVerdict, usize)]) 
         "register", "lines", "below", "median δ Hz", "median |δ|", "in cents", "|δ|/(2/T)"
     );
     for band in ["bass", "tenor", "treble"] {
-        let rows: Vec<&Extra> = all.iter().filter(|e| register(e.key) == band).collect();
+        let rows: Vec<&Extra> = all
+            .iter()
+            .filter(|e| crate::capture::strobe_register(e.key) == band)
+            .collect();
         if rows.len() < 10 {
             continue;
         }
@@ -2004,7 +1925,7 @@ fn e12_attribution(captures: &[(Capture, Vec<Resolved>, UnisonVerdict, usize)]) 
         for n in [2usize, 4, 6, 8] {
             let rows: Vec<&Extra> = all
                 .iter()
-                .filter(|e| register(e.key) == band && e.partial == n)
+                .filter(|e| crate::capture::strobe_register(e.key) == band && e.partial == n)
                 .collect();
             if rows.len() < 10 {
                 continue;
@@ -2054,7 +1975,10 @@ fn e12_attribution(captures: &[(Capture, Vec<Resolved>, UnisonVerdict, usize)]) 
     for band in ["bass", "tenor", "treble"] {
         let mut d1 = Vec::new();
         let mut d2 = Vec::new();
-        for (cap, resolved, ..) in captures.iter().filter(|(c, ..)| register(c.key) == band) {
+        for (cap, resolved, ..) in captures
+            .iter()
+            .filter(|(c, ..)| crate::capture::strobe_register(c.key) == band)
+        {
             for (i, r) in resolved.iter().enumerate() {
                 if r.count == 3 && cap.partial_hz[i + 1].is_some() {
                     d1.push(r.lines[1].offset_hz - r.lines[0].offset_hz);
@@ -2105,7 +2029,10 @@ fn e12_attribution(captures: &[(Capture, Vec<Resolved>, UnisonVerdict, usize)]) 
         for (label, floor) in [("all", 0.0f32), ("> 2 × 2/T", 2.0)] {
             let mut slopes = Vec::new();
             let (mut near_unison, mut near_fixed) = (0usize, 0usize);
-            for (cap, resolved, ..) in captures.iter().filter(|(c, ..)| register(c.key) == band) {
+            for (cap, resolved, ..) in captures
+                .iter()
+                .filter(|(c, ..)| crate::capture::strobe_register(c.key) == band)
+            {
                 let mut points = Vec::new();
                 for (i, r) in resolved.iter().enumerate() {
                     let Some(f_ref) = cap.partial_hz[i + 1] else {
@@ -2186,122 +2113,8 @@ fn log_slope(points: &[(f32, f32)]) -> Option<(f32, f32)> {
     (slope.is_finite() && se.is_finite() && se > 0.0).then_some((slope, se))
 }
 
-/// **E9** — per-hop cost of the whole bank in `--release`, against the 23.2 ms
-/// callback.
-fn e9_cost() {
-    // Every reference live and every ring at the cap — the worst case, which a
-    // real capture does not reach (its upper partials gate out and stop
-    // transforming).
-    let mut refs = [0.0f32; MAX_STROBE_REFS];
-    let count = MAX_STROBE_REFS;
-    for (i, r) in refs.iter_mut().enumerate() {
-        *r = 220.0 * (i + 1) as f32;
-    }
-    let hops = UNISON_RING_HOPS * 2;
-    let sources: Vec<Source> = (0..MAX_STROBE_REFS)
-        .map(|i| Source {
-            offset_hz: 220.0 * i as f32 + 0.9,
-            amplitude: 1.0,
-            tau_secs: 60.0,
-        })
-        .collect();
-    let audio = synth_audio(SYNTH_REF_HZ, &sources, hops, 40.0, 0x5bf0_3635);
-
-    let mut frame = tuner_core::pipeline::ProcessingFrame::new();
-    let mut run = |coarse: u8| -> Vec<f32> {
-        let mut strobe = Strobe::new(SAMPLE_RATE);
-        strobe.retarget(StrobeRefUpdate {
-            count,
-            refs,
-            coarse_index: coarse,
-            spacing_hz: 440.0,
-        });
-        let mut us = Vec::with_capacity(hops);
-        for h in 0..hops {
-            frame.audio_buffer[..BASS_WINDOW_SIZE]
-                .copy_from_slice(&audio[h * HOP_SIZE..h * HOP_SIZE + BASS_WINDOW_SIZE]);
-            let t0 = Instant::now();
-            std::hint::black_box(strobe.process(&frame, 1e-6, false));
-            us.push(t0.elapsed().as_secs_f32() * 1e6);
-        }
-        // Only hops with every ring at the cap, i.e. past the fill.
-        us.split_off(UNISON_RING_HOPS)
-    };
-    let full = run(0);
-
-    // The unison share alone: 12 records at the cap, transformed once each.
-    let record: Vec<Complex<f32>> = (0..UNISON_RING_HOPS)
-        .map(|h| {
-            let p = 0.31 * h as f32;
-            Complex::new(p.cos(), p.sin())
-        })
-        .collect();
-    let fft = rustfft::FftPlanner::<f32>::new().plan_fft_forward(UNISON_RING_HOPS);
-    let mut spectrum = vec![Complex { re: 0.0, im: 0.0 }; UNISON_RING_HOPS];
-    let mut magnitudes = vec![0.0f32; UNISON_RING_HOPS];
-    let mut fft_scratch = vec![Complex { re: 0.0, im: 0.0 }; fft.get_inplace_scratch_len()];
-    let mut out = [UnisonLine::default(); MAX_UNISON_LINES];
-    let reps = 2000;
-    let t0 = Instant::now();
-    for _ in 0..reps {
-        for _ in 0..MAX_STROBE_REFS {
-            std::hint::black_box(resolve_lines(
-                &record,
-                fft.as_ref(),
-                spectral::candan_c_n(UNISON_RING_HOPS),
-                HOP_RATE_HZ,
-                &mut LineScratch {
-                    spectrum: &mut spectrum,
-                    magnitudes: &mut magnitudes,
-                    fft: &mut fft_scratch,
-                },
-                &mut out,
-            ));
-        }
-    }
-    let per_hop_us = t0.elapsed().as_secs_f32() * 1e6 / reps as f32;
-
-    let mut sorted = full.clone();
-    sorted.sort_by(f32::total_cmp);
-    println!("\n=== E9: per-hop cost, --release ===");
-    println!(
-        "callback budget {:.1} ms ({} samples at {} Hz)\n\
-         whole bank, 12 references, {} hops:  median {:.1} µs, p90 {:.1} µs, max {:.1} µs\n\
-         of which resolve_lines × 12 at the cap: {:.1} µs ({:.2} % of the budget)",
-        1000.0 * HOP_SIZE as f32 / SAMPLE_RATE as f32,
-        HOP_SIZE,
-        SAMPLE_RATE,
-        hops,
-        median(full.clone()),
-        sorted[(sorted.len() as f32 * 0.9) as usize],
-        sorted.last().copied().unwrap_or(f32::NAN),
-        per_hop_us,
-        100.0 * per_hop_us / (1e6 * HOP_SIZE as f32 / SAMPLE_RATE as f32),
-    );
-    println!(
-        "ring memory: {} references × {} hops × 8 B = {:.1} KB touched per hop",
-        MAX_STROBE_REFS,
-        UNISON_RING_HOPS,
-        (MAX_STROBE_REFS * UNISON_RING_HOPS * 8) as f32 / 1024.0
-    );
-}
-
-fn main() {
-    let root = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "diagnostics".into());
-    let mut dirs: Vec<PathBuf> = std::fs::read_dir(&root)
-        .expect("read diagnostics dir")
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| {
-            p.is_dir()
-                && p.file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| n.starts_with("key_"))
-                    .unwrap_or(false)
-        })
-        .collect();
-    dirs.sort();
+pub fn run(root: &Path) -> anyhow::Result<()> {
+    let dirs = crate::capture::find(root)?;
 
     let table = default_display_partials();
     let hop_to_hz = HOP_RATE_HZ; // slope cyc/hop → Hz
@@ -2652,5 +2465,5 @@ fn main() {
         e11_recurrence(&unison);
         e12_attribution(&unison);
     }
-    e9_cost();
+    Ok(())
 }

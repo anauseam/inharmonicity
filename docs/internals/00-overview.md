@@ -76,7 +76,8 @@ run async to the hot path. They may heap-allocate freely.
 | Stateless DSP math | `algorithms/{spectral,peaks,twm,discovery,mat,metrics,curves,rigaud,giordano,whittaker}.rs` |
 | Offline curve auralization (resynthesis) | `synth.rs` |
 | Domain types, lookup tables, the persisted profile schema | `models.rs` |
-| Developer CLI tools & testing harnesses | `examples/` |
+| Synthetic checks that assert an ADR's number | `tests/` |
+| Hot-path cost against the callback budget (criterion) | `benches/` |
 
 ## File map — `tuner-gui/src/`
 
@@ -90,6 +91,23 @@ run async to the hot path. They may heap-allocate freely.
 | Profile library: per-user dirs, app settings, listing | `library.rs` |
 | Open instrument, its file, and the write policy | `session.rs` |
 | Shared view helpers | `utils/view_utils.rs` |
+
+## File map — `tuner-lab/src/`
+
+The measurement instruments ([ADR 0016](../adr/0016-measurement-harnesses-as-a-crate.md));
+every mode and what it reproduces is in
+[`tuner-lab/README.md`](../../tuner-lab/README.md).
+
+| Concern | File(s) |
+| --- | --- |
+| CLI dispatch | `main.rs` |
+| Shared plumbing: capture discovery, raw dumps, the regen schema, the DFT reference | `capture.rs`, `raw.rs`, `regen.rs`, `truth.rs` |
+| Discovery: auto lock, per-frame dump, reach, the MOBO evaluator | `engine/{lock,dump,reach,mobo}.rs` |
+| The 5-state validator | `gatekeeper/{dump,sparsity}.rs` |
+| The (f₀, B) estimator and the dumps it feeds | `mat/{validate,repeats,regenerate,recovery}.rs` |
+| The curve engines | `curve/{compare,auralize}.rs` |
+| The strobe bank and the displayed readout | `strobe/{replay,isolation,readout}.rs` |
+| The detection thresholds, which span two modules | `gates/{ambient,coarse}.rs` |
 
 ## Guidelines
 
@@ -121,7 +139,8 @@ docs/adr/
 ├── 0012-unison-line-estimator.md              Unison assist: baseband zoom DFT, OS-CFAR lines
 ├── 0013-bass-extra-lines-attribution.md       Bass second lines: attribution, the window
 ├── 0014-unison-panel-against-isolation-truth.md  Unison panel vs mute-isolation truth
-└── 0015-ambient-sigma-gates-measured.md       The ambient-σ Neyman–Pearson gates, measured
+├── 0015-ambient-sigma-gates-measured.md       The ambient-σ Neyman–Pearson gates, measured
+└── 0016-measurement-harnesses-as-a-crate.md   The harnesses: tests, benches and `tuner-lab`
 ```
 
 Each file is self-contained, and section headings are stable enough to be

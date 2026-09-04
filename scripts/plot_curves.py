@@ -3,8 +3,8 @@
 One PNG per capture set (the curve is a whole-instrument object), analogous to
 the per-sample gatekeeper/goertzel images:
 
-    cargo run --release --example regenerate_partials -- <diagnostics_dir> > partials.json
-    cargo run --release --example curve_compare -- partials.json --json curve_report.json
+    cargo lab mat regen <diagnostics_dir> > partials.json
+    cargo lab curve compare partials.json --json curve_report.json
     python scripts/plot_curves.py curve_report.json [out.png]
 
 Default output: curve_analysis.png next to the report JSON. Top panel: all

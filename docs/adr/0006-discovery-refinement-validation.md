@@ -536,7 +536,8 @@ bass-count rebate, not octave over-forgiveness.)
     synthetic-recalibration-to `calculated_b`). The standing **trusted-B-reference / second
     in-tune instrument** action is unchanged — but its *expected* result is now "confirms
     the readings", and the bass lever is confirmed to be a *discovery-application* problem,
-    not a *measurement* one. Reproduce: `cargo run --release --example mat_b_recovery`.
+    not a *measurement* one. Reproduce: `cargo lab mat recovery`; its assertions are
+    `cargo test -p tuner-core --test mat_b_recovery`.
 
   - **[NEW · 2026-06-30] Prompt 3 (asymmetric, prior-regularized, per-candidate (f₀,B)
     Stage-B refinement) BUILT as an offline diagnostic and REFUTED on real — scoring-time
@@ -593,7 +594,8 @@ bass-count rebate, not octave over-forgiveness.)
     requires the standing **trusted-B-reference / second instrument** linchpin, unchanged).
     Estimator repair (item 2) remains not-needed (`mat_b_recovery`); fix-path item (3) is
     now **tested and rejected as a scoring-time mechanism**. Reproduce:
-    `cargo run --release --example joint_b_refine_diagnostic`.
+    the harness itself was removed with the crate move (ADR 0016); git history is
+    its archive.
 - [ ] **Stage-A recall / pitch-raise** (deprioritized) — larger K in the detuned
       regime or a detuning-aware Stage A. **Loops back into the K-vs-attractor bind**:
       widening K to keep a detuned true key re-admits the dense-bass attractors the
@@ -653,7 +655,7 @@ manual-mode pivot does not lose them:
    item 5 below (070/084/085), and 005 was stable-wrong — the constants sharpen
    the attack-transient race, they don't just re-rank the steady state.
    **Pitch-raise reach does NOT degrade:** the 1¢-resolution key-40 sweep
-   (`examples/pitch_reach_sweep.rs`, harness validated — reproduces canonical
+   (`cargo lab engine reach`, harness validated — reproduces canonical
    78¢ / conservative 69¢ exactly) gives t1898 **80¢** (+reach; −82¢ down) —
    the high-q/high-ρ shoulder *recovers* the conservative config's ~9¢ reach
    loss rather than worsening it (the low-q trials drop to 59–61¢). **Still NOT
@@ -730,7 +732,7 @@ selected on the captures, so shipping it does not violate the n=1 rule.
 **[NEW · 2026-07-05] Prompt A′ re-derivation DONE — the picture materially
 changed: t1898 no longer wins; the failure-mode split survives qualitatively.**
 All four Prompt A′ tasks re-run mechanically on fixed peaks
-(`scripts/validate_config.py`, `examples/pitch_reach_sweep.rs`, the
+(`scripts/validate_config.py`, `cargo lab engine reach`, the
 peaks×gatekeeper classification method). Standing constraints held (n=1,
 validation-only, nothing adopted).
 
@@ -884,7 +886,7 @@ validation-only, nothing adopted).
   failed. Not committed by the implementing chat.
   **End-to-end engine validation (2026-07-22):** the Python replicas validate the
   *rule*, but `diagnose_engine` drives manual mode, so the *shipped auto path* was
-  separately checked by `examples/validate_engine_lock.rs` — it drives the real
+  separately checked by `cargo lab engine lock` — it drives the real
   `Engine::process` in auto mode (`target_note = None`) over the captures with the
   live gatekeeper flags and records the first `identified_key` latch. Result:
   **81/87, failures 000/003/005/010/012/086, b21/m33/t27 — identical to the replica

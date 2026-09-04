@@ -27,8 +27,8 @@
 //!
 //! ## Usage
 //!
-//!   cargo run --release --example regenerate_partials -- diagnostics > p2.json
-//!   cargo run --release --example auralize -- p2.json --out auralize_out
+//!   cargo lab mat regen diagnostics > p2.json
+//!   cargo lab curve auralize p2.json --out auralize_out
 //!
 //! Writes `auralize_out/<engine>.wav` (a, b, c×{Low,Mean,High ρ}, d, d-pure-12ths)
 //! and prints a short material-specific beat-rate screen. Consumes the piano-2
@@ -37,6 +37,10 @@
 //! [`load_profile`]). Validation-only data (n = 1); commit only when asked.
 
 use std::collections::BTreeMap;
+
+use std::path::Path;
+
+use anyhow::Result;
 
 use tuner_core::algorithms::curves::{
     self, BALANCED_INTERVALS, CurveBSource, CurveParams, PURE_TWELFTHS_INTERVALS, StretchPreset,
@@ -73,7 +77,7 @@ struct RawEntry {
 ///     that carry it;
 ///   * `measured_f0`: median (unused by the curve — `CurveInput` derives F₀
 ///     from the partials via Eq. 20 — but kept sensible).
-fn load_profile(path: &str) -> InharmonicityProfile {
+fn load_profile(path: &Path) -> InharmonicityProfile {
     let text = std::fs::read_to_string(path).expect("read partials JSON");
     let raw: Vec<serde_json::Value> = serde_json::from_str(&text).expect("parse JSON");
 
@@ -296,20 +300,11 @@ fn beat_screen(
 
 // ─── main ────────────────────────────────────────────────────────────────────
 
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let path = args
-        .get(1)
-        .cloned()
-        .unwrap_or_else(|| "partials_current.json".into());
-    let out_dir = args
-        .iter()
-        .position(|a| a == "--out")
-        .and_then(|i| args.get(i + 1).cloned())
-        .unwrap_or_else(|| "auralize_out".into());
-    std::fs::create_dir_all(&out_dir).expect("create out dir");
+pub fn run(partials: &Path, out_dir: &Path) -> Result<()> {
+    let path = partials.display();
+    std::fs::create_dir_all(out_dir).expect("create out dir");
 
-    let profile = load_profile(&path);
+    let profile = load_profile(partials);
     let input = CurveInput::from_profile_including_auto(&profile);
     let bxi = curves::instrument_b_fit(&input);
     println!(
@@ -422,7 +417,8 @@ fn main() {
         1.0
     };
     for (file, label, buf) in &buffers {
-        let path = format!("{out_dir}/{file}");
+        let path = out_dir.join(file);
+        let path = path.to_string_lossy();
         synth::write_wav(&path, buf, scale).expect("write WAV");
         println!("wrote {path}  [{label}]");
     }
@@ -456,4 +452,5 @@ fn main() {
         "\nAll numbers are a sanity screen, not selection evidence (n = 1). The\n\
          listening comparison of the WAVs picks which curve to tune the piano to."
     );
+    Ok(())
 }

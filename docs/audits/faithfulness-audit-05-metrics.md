@@ -115,7 +115,7 @@ relabeling making their units ("1 = white noise … N = pure tone") accurate.
 
 The user challenged the "deviations are right for our purpose" claim:
 *implement the faithful NINOS² and measure it.* Built
-`examples/sparsity_ab.rs`: replays all `diagnostics/key_*/` captures;
+`cargo lab gatekeeper sparsity`: replays all `diagnostics/key_*/` captures;
 **time-anchored** classes (onset = first |x| ≥ 1 % of max, Mounir Eq 19
 style; TRANSIENT = onset ± [−N/2, +90 ms]; STEADY = onset + [300, 1000] ms;
 both classes RMS-gated at 5 % of max frame RMS so decayed treble tails don't

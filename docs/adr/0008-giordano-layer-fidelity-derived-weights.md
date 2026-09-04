@@ -210,7 +210,7 @@ the octave-chain layers (engines (b)/(c)). The pure-12ths preset's old
   defining property), `test_scan_requires_coincident_pair`,
   `test_sufficiency_gate_starves_treble` (now exact pair counts),
   `test_pair_width_sensitivity_matches_finite_difference`. Suite: 60/60.
-* Harness before/after per set recorded above (`examples/curve_compare.rs`,
+* Harness before/after per set recorded above (`cargo lab curve compare`,
   which now also reports the calibration stage: accepted ρ points,
   CV-selected reg weight, calibrated φ, and both gates' pass counts).
 * Probes (`rho_probe.rs`, `d_probe.rs`) deleted after this record, per the

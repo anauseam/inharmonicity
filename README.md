@@ -114,7 +114,7 @@ directory, with an `instrument.json` naming whose captures they are (path printe
 at startup; not yet pruned). Keying on the instrument's identity rather than its
 name means renaming an instrument moves nothing. That data exists for
 development — the format and the offline harnesses that read it are documented in
-[`tuner-core/examples/README.md`](tuner-core/examples/README.md).
+[`tuner-lab/README.md`](tuner-lab/README.md).
 
 ## Interface
 

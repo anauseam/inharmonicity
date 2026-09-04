@@ -53,7 +53,7 @@ fn reach(profiles: &[KeyProfile; 88], cfg: &TwmConfig, key: usize, dir: f32) -> 
     last_ok
 }
 
-fn main() {
+pub fn run(candidates: &[String]) {
     let profiles = build_profiles();
     let key = 40_usize;
 
@@ -72,9 +72,8 @@ fn main() {
         ),
     ];
 
-    // Candidates piped in as "name q r rho" lines via argv pairs: name q r rho ...
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    for chunk in args.chunks(4) {
+    // Candidates arrive as repeated `name q r rho` quads.
+    for chunk in candidates.chunks(4) {
         if chunk.len() == 4 {
             configs.push((
                 chunk[0].clone(),

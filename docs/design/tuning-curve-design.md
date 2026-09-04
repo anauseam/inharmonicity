@@ -7,7 +7,7 @@ the `linreg` dependency deleted), the Giordano engine in
 `algorithms/dissonance.rs`, Whittaker + banded LS in
 `algorithms/smoothing.rs`, `TuningCurve`/`CurveInput` + the blocking
 `captured_in_auto` provenance flag in `models.rs`, §11 diagnostics in
-`examples/curve_compare.rs`. Validation evidence for the (c) composition is
+`cargo lab curve compare`. Validation evidence for the (c) composition is
 still pending (n = 1) — the (c) ADR remains unwritten by design (§12). This
 note remains the Prompt C deliverable
 (`next-chats-handoff.md`), expanded well beyond its original "Sethares vs
@@ -458,7 +458,7 @@ faithfulness (unit tests against paper values); Railsback-*shape* sanity per
 engine; negative-stretch detector behavior on the known treble edge-hits;
 DOF-growth behavior of the Whittaker layer (feed k = 4, 8, …, 88 keys; curve
 must interpolate Rigaud→per-key); cross-engine deltas from the comparison
-harness (`examples/curve_compare.rs`, the Rust re-implementation of the session
+harness (`cargo lab curve compare`, the Rust re-implementation of the session
 prototypes — reports stretch tables, roughness, flags per engine).
 
 **What it CANNOT show (stated honestly):** which engine *sounds better*. The

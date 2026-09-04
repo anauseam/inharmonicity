@@ -45,11 +45,10 @@ def main():
     results = []
 
     print("Compiling diagnose_engine (with telemetry) and diagnose_gatekeeper (release)...")
-    subprocess.run(["cargo", "build", "--release", "--example", "diagnose_engine", "--features", "telemetry"], check=True, stdout=subprocess.DEVNULL)
-    subprocess.run(["cargo", "build", "--release", "--example", "diagnose_gatekeeper"], check=True, stdout=subprocess.DEVNULL)
+    subprocess.run(["cargo", "build", "--release", "-p", "tuner-lab", "--features", "telemetry"], check=True, stdout=subprocess.DEVNULL)
 
-    executable_engine = "./target/release/examples/diagnose_engine"
-    executable_gate = "./target/release/examples/diagnose_gatekeeper"
+    executable_engine = ["./target/release/tuner-lab", "engine", "dump"]
+    executable_gate = ["./target/release/tuner-lab", "gatekeeper", "dump"]
 
     keys = sorted([d for d in os.listdir(base_dir) if d.startswith("key_")])
     mode_str = "REFINED" if args.refine else "DISCRETE"
@@ -67,9 +66,9 @@ def main():
             continue
 
         try:
-            subprocess.run([executable_gate, raw_file], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+            subprocess.run(executable_gate + [raw_file], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
             
-            engine_cmd = [executable_engine, raw_file]
+            engine_cmd = executable_engine + [raw_file]
             if args.refine:
                 engine_cmd.append("--refine")
             if args.config:

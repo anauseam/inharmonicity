@@ -25,13 +25,17 @@
 //! path admits manual captures exclusively.
 //!
 //! Usage:
-//!   cargo run --release --example regenerate_partials > /tmp/partials.json
-//!   cargo run --release --example curve_compare -- /tmp/partials.json
-//!   cargo run --release --example curve_compare -- /tmp/partials.json --json /tmp/curve_report.json
+//!   cargo lab mat regen > /tmp/partials.json
+//!   cargo lab curve compare /tmp/partials.json
+//!   cargo lab curve compare /tmp/partials.json --json /tmp/curve_report.json
 //!
 //! `--json <path>` additionally writes the full report as machine-readable
 //! JSON — the input of `scripts/plot_curves.py`, which renders the
 //! one-image curve comparison (`curve_analysis.png`) for a capture set.
+
+use std::path::Path;
+
+use anyhow::Result;
 
 use tuner_core::algorithms::curves::{
     self, BALANCED_INTERVALS, CurveBSource, CurveParams, IntervalSpec, PURE_TWELFTHS_INTERVALS,
@@ -65,7 +69,7 @@ fn median(mut v: Vec<f64>) -> f64 {
     }
 }
 
-fn load_profile(path: &str) -> InharmonicityProfile {
+fn load_profile(path: &Path) -> InharmonicityProfile {
     let text = std::fs::read_to_string(path).expect("read partials JSON");
     let entries: Vec<serde_json::Value> = serde_json::from_str(&text).expect("parse JSON");
     let mut profile = InharmonicityProfile::default();
@@ -167,17 +171,9 @@ fn partial_freq(f1: f64, b: f64, n: u32) -> f64 {
     n * f0 * (1.0 + b * n * n).sqrt()
 }
 
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let path = args
-        .get(1)
-        .cloned()
-        .unwrap_or_else(|| "partials_current.json".into());
-    let json_out: Option<String> = args
-        .iter()
-        .position(|a| a == "--json")
-        .and_then(|i| args.get(i + 1).cloned());
-    let profile = load_profile(&path);
+pub fn run(partials: &Path, json_out: Option<&Path>) -> Result<()> {
+    let path = partials.display();
+    let profile = load_profile(partials);
     // Validation data is auto-mode; see module doc.
     let input = CurveInput::from_profile_including_auto(&profile);
     let bxi = curves::instrument_b_fit(&input);
@@ -557,7 +553,7 @@ fn main() {
             })
             .collect();
         let report = serde_json::json!({
-            "source": path,
+            "source": path.to_string(),
             "measured_keys": input.measured_count(),
             "b_xi": { "s_b": bxi.s_b, "y_b": bxi.y_b },
             "calibration": {
@@ -573,10 +569,11 @@ fn main() {
             "engines": engines_json,
         });
         std::fs::write(
-            &out,
+            out,
             serde_json::to_string_pretty(&report).expect("serialize"),
         )
         .expect("write JSON report");
-        println!("JSON report written to {out}");
+        println!("JSON report written to {}", out.display());
     }
+    Ok(())
 }

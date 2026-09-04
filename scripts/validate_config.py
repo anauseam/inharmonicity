@@ -21,8 +21,9 @@ import os
 import subprocess
 from collections import Counter, deque
 
-ENGINE = "./target/release/examples/diagnose_engine"
-GATE = "./target/release/examples/diagnose_gatekeeper"
+LAB = "./target/release/tuner-lab"
+ENGINE = [LAB, "engine", "dump"]
+GATE = [LAB, "gatekeeper", "dump"]
 
 
 def mofn_lock(winners, m, n):
@@ -48,8 +49,8 @@ def lock_for_key(key_dir, refine, config, sum_forward, stretch, b_deadzone, nonp
     if not os.path.exists(raw):
         return None
 
-    subprocess.run([GATE, raw], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-    cmd = [ENGINE, raw]
+    subprocess.run(GATE + [raw], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    cmd = ENGINE + [raw]
     if refine:
         cmd.append("--refine")
     if config:
@@ -113,10 +114,9 @@ def main():
     if not args.lock_m > args.lock_n // 2:
         ap.error("--lock-m must exceed --lock-n/2 (majority => unique winner)")
 
-    for ex, feats in [(ENGINE, ["--features", "telemetry"]), (GATE, [])]:
-        tgt = ex.split("/")[-1]
-        subprocess.run(["cargo", "build", "--release", "--example", tgt] + feats,
-                       check=True, stdout=subprocess.DEVNULL)
+    # One binary for both modes; telemetry is what `engine dump` needs for goertzel.csv.
+    subprocess.run(["cargo", "build", "--release", "-p", "tuner-lab", "--features", "telemetry"],
+                   check=True, stdout=subprocess.DEVNULL)
 
     keys = sorted(d for d in os.listdir(args.base) if d.startswith("key_"))
     mode = "REFINED" if args.refine else "DISCRETE"

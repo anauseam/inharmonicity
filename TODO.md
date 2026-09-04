@@ -132,7 +132,7 @@ extended 2026-08-07:
   drop, which deliberately keeps the audio. It must **re-run the analysis on
   `audio.raw`**, never import the dump's cached `analysis.json`: that cache is
   exactly what was wrong about piano #2's deep bass while its audio was fine
-  (`06-capture-sets.md`). `examples/regenerate_partials` already does the
+  (`06-capture-sets.md`). `cargo lab mat regen` already does the
   re-analysis half.
 
 ## Engine and discovery

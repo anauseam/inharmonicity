@@ -2,6 +2,13 @@
 members = [
 "tuner-core",
 "tuner-gui",
+"tuner-lab",
+]
+# `cargo build` and `cargo run` mean the product. The lab is a workspace member
+# so `--workspace` lint and test runs cover it, not so it builds by default.
+default-members = [
+"tuner-core",
+"tuner-gui",
 ]
 resolver = "2" # Use the modern feature resolver
 
@@ -13,7 +20,9 @@ version = "0.1.0-alpha"
 
 # Define common dependencies for the workspace to ensure version consistency
 [workspace.dependencies]
+anyhow = "1.0.104"
 cpal = "0.18.2"
+crossbeam-queue = "0.3.13"
 ringbuf = "0.5.1"
 triple_buffer = "9.0.0"
 

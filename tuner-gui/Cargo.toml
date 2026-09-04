@@ -25,9 +25,9 @@ triple_buffer = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
-anyhow = "1.0.104" # For easier error handling
+anyhow = { workspace = true }
 rustfft.workspace = true
 realfft.workspace = true
-crossbeam-queue = "0.3.13"
+crossbeam-queue = { workspace = true }
 directories = "6"
 

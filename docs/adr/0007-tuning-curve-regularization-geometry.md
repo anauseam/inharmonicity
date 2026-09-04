@@ -215,7 +215,7 @@ the open questions on the six flags:
   `test_chain_gauge_is_mean_centered` (all 12 chains agree on the gauge to
   numerical precision). Full suite: 57/57.
 * Harness before/after on the 87 regenerated captures recorded above
-  (`examples/curve_compare.rs`).
+  (`cargo lab curve compare`).
 
 ## References
 

@@ -51,8 +51,9 @@ import subprocess
 from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
 
-ENGINE = "./target/release/examples/diagnose_engine"
-GATE = "./target/release/examples/diagnose_gatekeeper"
+LAB = "./target/release/tuner-lab"
+ENGINE = [LAB, "engine", "dump"]
+GATE = [LAB, "gatekeeper", "dump"]
 
 # Register split, identical to validate_config.py.
 def register(key):
@@ -90,9 +91,9 @@ def cache_one(base, kd, refine, tidy):
     preexisting = {p for p in tidy_targets if os.path.exists(p)}
 
     try:
-        subprocess.run([GATE, raw], stdout=subprocess.DEVNULL,
+        subprocess.run(GATE + [raw], stdout=subprocess.DEVNULL,
                        stderr=subprocess.DEVNULL, check=True)
-        cmd = [ENGINE, raw] + (["--refine"] if refine else [])
+        cmd = ENGINE + [raw] + (["--refine"] if refine else [])
         subprocess.run(cmd, stdout=subprocess.DEVNULL,
                        stderr=subprocess.DEVNULL, check=True)
     except subprocess.CalledProcessError as e:
@@ -109,10 +110,9 @@ def cache_one(base, kd, refine, tidy):
 
 
 def cmd_cache(args):
-    for ex, feats in [(ENGINE, ["--features", "telemetry"]), (GATE, [])]:
-        tgt = ex.split("/")[-1]
-        subprocess.run(["cargo", "build", "--release", "--example", tgt] + feats,
-                       check=True, stdout=subprocess.DEVNULL)
+    # One binary for both modes; telemetry is what `engine dump` needs for goertzel.csv.
+    subprocess.run(["cargo", "build", "--release", "-p", "tuner-lab", "--features", "telemetry"],
+                   check=True, stdout=subprocess.DEVNULL)
 
     keys = sorted(d for d in os.listdir(args.base) if d.startswith("key_"))
     print(f"cache | base={args.base} refine={args.refine} | {len(keys)} capture dirs")

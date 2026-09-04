@@ -26,19 +26,34 @@
 //!
 //! Run:
 //! ```bash
-//! cargo run --release --example regenerate_partials -- <dump_dir> > iso.json
-//! cargo run --release --example isolation -- iso.json <dump_dir> [--json out.json]
+//! cargo lab mat regen <dump_dir> > iso.json
+//! cargo lab strobe isolation iso.json <dump_dir> [--json out.json]
 //! ```
-
-mod common;
 
 use std::path::Path;
 
-use common::{Capture, Resolved, load_regen, median, register, run_unison};
+use crate::capture::strobe_register as register;
+use crate::regen::{self, Capture};
+use crate::strobe::{Resolved, run_unison};
+
 use tuner_core::algorithms::curves::default_display_partials;
 use tuner_core::audio::HOP_RATE_HZ;
 use tuner_core::strobe::MAX_STROBE_REFS;
 use tuner_core::strobe::unison::UnisonVerdict;
+
+/// Median of a slice, by value. Empty input yields `f32::NAN`.
+fn median(mut v: Vec<f32>) -> f32 {
+    if v.is_empty() {
+        return f32::NAN;
+    }
+    v.sort_by(f32::total_cmp);
+    let n = v.len();
+    if n % 2 == 1 {
+        v[n / 2]
+    } else {
+        0.5 * (v[n / 2 - 1] + v[n / 2])
+    }
+}
 
 /// One capture's panel reading at the partial the display shows.
 struct Reading {
@@ -79,42 +94,14 @@ fn verdict_name(v: UnisonVerdict) -> &'static str {
     }
 }
 
-fn main() {
-    let mut args = std::env::args().skip(1);
-    let regen = args
-        .next()
-        .expect("usage: isolation <regen.json> <dump_dir> [--json out]");
-    let root = args
-        .next()
-        .expect("usage: isolation <regen.json> <dump_dir> [--json out]");
-    let mut json_out = None;
-    // The isolation set is *defined* by the declaration (`06`), so that is the
-    // default population. `--all` admits undeclared captures because one
-    // question does not need a declaration: whether a note sustains long enough
-    // for the ring to publish at all is answered by any capture of it.
-    let mut include_undeclared = false;
-    let mut noise_floor = 3e-3f32;
-    while let Some(a) = args.next() {
-        match a.as_str() {
-            "--json" => json_out = args.next(),
-            "--all" => include_undeclared = true,
-            // The D3 gate is `noise_floor x K`, and `noise_floor` is the
-            // *ambient silence* RMS, not the noise present at a partial during
-            // a note. Sweeping it is how ADR 0014 §8 separates "the note ended"
-            // from "the gate closed" (ADR 0015, which measured all three
-            // gates that share this scalar).
-            "--noise-floor" => {
-                noise_floor = args
-                    .next()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(noise_floor)
-            }
-            _ => {}
-        }
-    }
-    let root = Path::new(&root);
-
-    let (caps, dropped) = load_regen(Path::new(&regen));
+pub fn run(
+    regen: &Path,
+    root: &Path,
+    json_out: Option<&Path>,
+    include_undeclared: bool,
+    noise_floor: f32,
+) {
+    let (caps, dropped) = regen::load(regen);
     let total = caps.len();
     let declared: Vec<Capture> = caps
         .into_iter()
@@ -163,7 +150,7 @@ fn main() {
     c2_false_beat_control(&readings);
     availability(&readings);
     if let Some(path) = json_out {
-        write_json(&readings, Path::new(&path));
+        write_json(&readings, path);
     }
 }
 

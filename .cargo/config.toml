@@ -1,0 +1,7 @@
+[alias]
+# `--release` is baked in: a debug build drops audio and changes every
+# availability figure. `lab-telemetry` is the same with the per-frame
+# instrumentation compiled in, which `engine dump` needs for `goertzel.csv`;
+# the two share one binary path, so re-run it after any plain `cargo lab`.
+lab = "run --release -p tuner-lab --"
+lab-telemetry = "run --release -p tuner-lab --features telemetry --"

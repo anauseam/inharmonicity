@@ -27,11 +27,14 @@
 //!   * INOS² (ℓ₁),   Eq. 14:  ‖y‖₁;
 //!   * NINOS² (ℓ₁),  Eq. 15:  ‖y‖₂/(√J−1) · (‖y‖₁/‖y‖₂ − 1).
 //!
-//! Run: cargo run --release --example sparsity_ab
+//! Run: `cargo lab gatekeeper sparsity [dir]`
 
+use std::fs;
+use std::path::Path;
+
+use anyhow::Result;
 use realfft::RealFftPlanner;
 use rustfft::num_complex::Complex;
-use std::fs;
 use tuner_core::algorithms::{metrics, spectral};
 
 const N: usize = 2048; // Gatekeeper analysis window
@@ -129,7 +132,7 @@ fn register(key_idx: usize) -> usize {
     }
 }
 
-fn main() {
+pub fn run(root: &Path) -> Result<()> {
     let mut planner = RealFftPlanner::<f32>::new();
     let r2c = planner.plan_fft_forward(N);
     let mut time_buf = vec![0.0f32; N];
@@ -153,24 +156,13 @@ fn main() {
     ];
     let mut agg = [[(0.0f64, 0usize, f32::MAX, 0usize); 3]; M];
 
-    // Capture-set root, like every other harness: `-- <dir>`, default
-    // `diagnostics` (docs/internals/06-capture-sets.md).
-    let root = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "diagnostics".to_string());
-    let mut dirs: Vec<_> = fs::read_dir(&root)
-        .expect("run from repo root")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("key_"))
-        .collect();
-    dirs.sort();
+    let dirs = crate::capture::find(root)?;
 
     let mut keys_used = 0;
     for dir in &dirs {
-        let key_idx: usize = dir.file_name().unwrap().to_string_lossy()[4..7]
-            .parse()
-            .unwrap();
+        let Some(key_idx) = crate::capture::key_of(dir).map(usize::from) else {
+            continue;
+        };
         let raw = ["audio_full_event.raw", "audio.raw"]
             .iter()
             .map(|f| dir.join(f))
@@ -287,4 +279,5 @@ fn main() {
             cell(2)
         );
     }
+    Ok(())
 }

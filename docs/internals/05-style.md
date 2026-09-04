@@ -187,7 +187,7 @@ of release builds.
 
 ## Where tests live
 
-Two locations are in use, and the choice is decided by **what the test needs
+Three locations are in use, and the choice is decided by **what the test needs
 to see**, not by file length:
 
 - **Inline `#[cfg(test)] mod tests` with `use super::*`** — the default, and
@@ -203,9 +203,15 @@ everything it touches — widening the API surface to satisfy a layout
 preference, against the visibility default above. Test volume is not a
 sizing-rule concern.
 
-A third option exists and is unused: a crate-root `tests/` directory compiles
-as a separate crate and can reach only `pub` items. That is the right home for
-a genuine end-to-end test of the public API, if one is ever written.
+- **Crate-root `tests/`** — compiles as a separate crate and reaches only
+  `pub` items, so it is the home for a synthetic check that drives the public
+  API and asserts a number an ADR states (`mat_b_recovery`, `unison_resolution`).
+  Size it to the claim: a characterisation sweep belongs in `tuner-lab`, and an
+  assertion that takes minutes stops being run.
+
+**Hot-path cost belongs in `benches/`**, not in a harness that prints
+microseconds. `03` makes latency a hard rule; a criterion bench is what notices
+the number moving.
 
 ## Feature Flags vs Debug Assertions
 
