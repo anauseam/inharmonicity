@@ -1,32 +1,22 @@
 //! # Unison — the note's individual strings, resolved as spectral lines
 //!
-//! A multi-strung note must have its strings zero-beat against each other, and
-//! the strobe's own front end already carries what that needs. Keeping the
-//! per-reference Goertzel's amplitude *with* its phase gives a complex baseband
-//! sampled once per hop; its spectrum resolves the strings as separate lines,
-//! each a signed offset from the curve target. The beat rate a tuner listens for
-//! is then the difference between any two of them.
+//! Keeping each reference's Goertzel amplitude with its phase gives a complex
+//! baseband sampled once per hop, whose spectrum resolves a note's strings as
+//! separate lines, each a signed offset from the target; a beat is the
+//! difference of two. This module holds the cross-hop half, one growing ring per
+//! reference, and the test of whether the lines are a unison at all. The
+//! estimator is [`peaks::resolve_lines`].
 //!
-//! What this file owns is the cross-hop half: one growing baseband ring per
-//! reference, held and restarted on the D3 gate exactly as
-//! [`BandSlope`](super::band_slope) is — and dropped outright when the
-//! Gatekeeper reports silence — and the goodness-of-fit test that decides
-//! whether what it resolved is a unison at all. The estimator itself is stateless
-//! and lives in [`peaks::resolve_lines`].
+//! One string can beat with itself: the bridge splits a partial's two
+//! transverse polarizations, or a defect or a soundboard mode does (Weinreich
+//! 1977), and the result looks exactly like a second string. [`UnisonVerdict`]
+//! tells them apart.
 //!
-//! **What it measures is lines; what it is for is unisons.** A *false beat* — one
-//! string beating with itself, because the bridge's mechanical impedance splits a
-//! partial's two transverse polarizations, or a defect or a soundboard mode does
-//! (Weinreich 1977; strobe design §4) — presents identically to a second string.
-//! [`Unison::verdict`] is what separates them, and it has to ship: without it the
-//! bass display would label a false beat a unison on essentially every bass key
-//! of both instruments (ADR 0012 §5).
-//!
-//! Resolution is set by observation time, so the ring **grows**: a 4 Hz split
-//! resolves in ≈0.5 s, 1 Hz needs ≈2 s. Until it is long enough, two separated
-//! strings report as *one line* — which reads as "clean" at exactly the moment a
-//! tuner decides they are finished. [`Unison::resolution_hz`] is published for
-//! that reason and is not cosmetic.
+//! Resolution grows with the record: a 4 Hz split resolves in ≈ 0.5 s, 1 Hz needs
+//! ≈ 2 s.
+// Without the verdict, a false beat reads as a unison on essentially every bass
+// capture of both measured pianos.
+// report 0013
 
 use std::sync::Arc;
 
@@ -39,58 +29,37 @@ use crate::audio::HOP_RATE_HZ;
 use crate::models::UnisonLine;
 use crate::strobe::MAX_STROBE_REFS;
 
-/// Longest baseband record a reference accumulates before the ring slides.
-///
-/// A cap exists at all because of **Weinreich coupling**: two strings on a shared
-/// bridge exchange energy rather than ringing independently, so the beat is not
-/// stationary over a long window and more observation eventually stops buying
-/// resolution. Where to put it is measured, not derived — a 0.65 s ring is worse
-/// on both availability *and* bias (short records are biased high by
-/// survivorship: close pairs merge, so only wide ones get reported), and nothing
-/// longer has real-data support, the capture sets themselves being 1.5 s
-/// (ADR 0012 §4).
+/// Longest baseband record a reference accumulates before the ring slides. Capped
+/// because coupled strings exchange energy (Weinreich 1977), so their beat is not
+/// stationary and a longer record stops buying resolution.
+// 1.3 s, measured: a 0.65 s ring is worse on availability and on bias (short
+// records report only the wide pairs), and nothing longer has real-data support,
+// the captures being 1.5 s.
+// report 0012
 pub const UNISON_RING_SECS: f32 = 1.30;
 
-/// [`UNISON_RING_SECS`] in hops — the transform length at the cap. Rounded, not
-/// truncated: the duration is the quantity that was measured, and the ±½-hop
-/// either side of it is meaningless. `ring_cap_matches_its_duration` pins both.
+/// [`UNISON_RING_SECS`] in hops: the transform length at the cap.
+// Rounded, not truncated: the duration is what was measured.
 pub const UNISON_RING_HOPS: usize = (UNISON_RING_SECS * HOP_RATE_HZ + 0.5) as usize;
 
-/// Per-line frequency scatter, as a fraction of the transform's **bin width** —
-/// the floor under the discriminator's estimated uncertainty.
-///
-/// Ours, measured (ADR 0012 §3): ≈0.05 Hz per line at the 56-point ring, whose
-/// bins are 0.769 Hz apart, and essentially independent of SNR from 40 dB down
-/// to 6 dB. Expressed as a fraction of a bin rather than in Hz because the ring
-/// grows: an interpolated-DFT estimator's scatter is a roughly fixed fraction of
-/// a bin at fixed SNR, so this form drifts with the record length while an
-/// absolute figure would under-state σ on a short ring — exactly where the test
-/// would then over-reject.
-///
-/// It is a **floor**, never the operating value: the split's scatter across
-/// partials is physical as well as instrumental, and is measured to run several
-/// times this (ADR 0012 §6).
+/// Per-line frequency scatter as a fraction of a bin: the floor under the
+/// discriminator's uncertainty, never its operating value.
+// Ours, measured: ≈ 0.05 Hz per line on the 56-point ring (bins 0.769 Hz apart),
+// flat in SNR from 40 dB to 6 dB. In bins, not Hz, because the ring grows and an
+// interpolated DFT's scatter is a fixed fraction of a bin; the physical scatter
+// across partials runs several times it.
+// report 0012
 const UNISON_LINE_SIGMA_BINS: f32 = 0.065;
 
 /// Standard errors the fitted exponent must sit within of one hypothesis, and
 /// outside of the other, before the discriminator commits to a verdict.
-///
-/// A significance level, in the same role as the `P_fa` the project's detection
-/// gates carry, and dimensionless for the same reason. Three rather than two
-/// because the two failure directions are not symmetric in cost: an
-/// [`UnisonVerdict::Undetermined`] leaves the panel showing its per-partial
-/// splits, which is what the tuner would read anyway, while a wrong verdict is
-/// an assertion about the instrument.
+// Three, not two: `Undetermined` asserts nothing, while a wrong verdict asserts
+// something false about the instrument.
 const UNISON_FIT_SIGMAS: f32 = 3.0;
 
-/// What the discriminator concluded about the lines this hop, over the whole
-/// reference bank.
-///
-/// A **unison** is two strings at different f₀, so both strings' partials scale
-/// together and the split, expressed in cents, is *constant across partials*. A
-/// **false beat** is a mode splitting of a single partial and has no reason to be.
-/// That is the whole test — see [`Unison::discriminate`] for the form it takes,
-/// which is a comparison of two models rather than a threshold on the spread.
+/// The discriminator's verdict on this hop's lines, across the bank. A unison is
+/// two strings at different f₀, whose partials scale together, so its split is
+/// constant in cents across partials; a false beat's split need not be.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum UnisonVerdict {
     /// The splits do not separate the two hypotheses — too few comparable
@@ -101,7 +70,7 @@ pub enum UnisonVerdict {
     /// The splits are consistent with one constant cents interval across the
     /// partials that resolved: strings at different pitches.
     Unison,
-    /// The splits are consistent with a separation fixed in **Hz** and not with
+    /// The splits are consistent with a separation fixed in Hz and not with
     /// one proportional to the partial frequency — which a pair of strings
     /// cannot produce.
     FalseBeat,
@@ -109,7 +78,7 @@ pub enum UnisonVerdict {
 
 /// Per-reference baseband rings, their resolved lines, and the discriminator.
 pub(super) struct Unison {
-    /// Baseband record per reference, **oldest first** in `[..len]`.
+    /// Baseband record per reference, oldest first in `[..len]`.
     ring: [[Complex<f32>; UNISON_RING_HOPS]; MAX_STROBE_REFS],
     len: [u8; MAX_STROBE_REFS],
     /// A gated hop breaks the run; the next live hop restarts the ring.
@@ -185,7 +154,7 @@ impl Unison {
     }
 
     /// Silent hop: break the run as [`Self::hold`] does, and drop what was
-    /// published with it. The hold exists for a dip below the gate *within* a
+    /// published with it. The hold exists for a dip below the gate within a
     /// note; with no note sounding there are no strings for the lines to be
     /// about.
     pub(super) fn clear(&mut self, i: usize) {
@@ -197,8 +166,8 @@ impl Unison {
     /// Live hop: append this reference's baseband sample and re-resolve.
     ///
     /// `z` is the demodulated Goertzel value `A·e^{j2πθ}`, with `θ` the bank's
-    /// accumulated beat phase. That is the demodulation of design §3 step 2 and
-    /// not an approximation of it: the accumulated angle differs from
+    /// accumulated beat phase. That is the reference demodulation itself, not an
+    /// approximation of it: the accumulated angle differs from
     /// `φ_h − 2π·f_ref·h·H/f_s` by the run's own first phase and a whole number
     /// of turns, i.e. by one constant rotation of the entire record, which
     /// changes neither `|Z|` nor the Candan ratio.
@@ -236,42 +205,26 @@ impl Unison {
             },
             &mut self.lines[i],
         ) as u8;
-        // Two lines are resolved when they are `2/T` apart — the Hann main-lobe
-        // half-width, and what the display must state alongside them.
+        // Two lines resolve when they are `2/T` apart, the Hann main-lobe half-width.
         self.resolution_hz[i] = 2.0 * HOP_RATE_HZ / n as f32;
     }
 
-    /// Runs the discriminator over everything the bank resolved this hop.
+    /// Runs the discriminator over the lines the bank resolved this hop.
     ///
-    /// Two strings at different f₀ put their partial *n* at frequencies whose
-    /// ratio is the same for every *n*, so their separation is **proportional to
-    /// the partial frequency** — constant in cents. One partial splitting against
-    /// itself has no such reason. Both hypotheses are members of one family,
+    /// Both hypotheses belong to one family, `ln Δ = ln a + p·ln f`: p = 1 is a
+    /// unison, its split constant in cents, and p = 0 a split fixed in Hz. A
+    /// verdict is returned only when `p̂` is within [`UNISON_FIT_SIGMAS`] standard
+    /// errors of one and further from the other; otherwise the answer is
+    /// [`UnisonVerdict::Undetermined`], which is common, since three neighbouring
+    /// partials give little lever arm in `ln f`.
     ///
-    /// ```text
-    ///   ln Δ = ln a + p·ln f      p = 1 unison,  p = 0 fixed in Hz
-    /// ```
-    ///
-    /// so the test is on the fitted exponent: a verdict is returned only when
-    /// `p̂` is within [`UNISON_FIT_SIGMAS`] standard errors of one hypothesis and
-    /// further than that from the other. Otherwise the data do not separate them
-    /// and the answer is [`UnisonVerdict::Undetermined`] — which is common and
-    /// correct, because a fit over three neighbouring partials has almost no
-    /// lever arm in `ln f`.
-    ///
-    /// **The standard error is estimated from the residuals**, floored at the
-    /// estimator's own precision, and that ordering is load-bearing. Do not test
-    /// against the estimator's σ alone: the *physical* scatter of the split
-    /// across partials — string-to-string differences in B, and coupling — runs
-    /// several times that, and a null built from the instrument's precision calls
-    /// 87 % of tenor unisons false beats (ADR 0012 §6). The floor stays because
-    /// no fit can know a split better than it was measured.
-    ///
-    /// Only partials that resolved the **same number** of lines are compared.
-    /// With three strings, a partial that resolved two of them is measuring a
-    /// different pair from one that resolved all three, and the two are not the
-    /// same quantity; mixing them would reject a genuine unison on nothing but
-    /// availability.
+    /// Only partials that resolved the same number of lines are compared: with
+    /// three strings, a partial that resolved two is measuring a different pair.
+    // The standard error comes from the residuals, floored at the estimator's
+    // precision. Do not test against the estimator's σ alone: the split's physical
+    // scatter across partials runs several times it, and that null calls 87 % of
+    // tenor unisons false beats.
+    // report 0012
     pub(super) fn discriminate(&mut self, refs: &[f32; MAX_STROBE_REFS], count: usize) {
         // Group by line count, then take the larger group. Ties go to the pairs:
         // a two-line split is the better-conditioned quantity of the two.
@@ -403,8 +356,8 @@ impl Unison {
 mod tests {
     use super::*;
 
-    /// The cap is a *duration* (ADR 0012 §4); the hop count must be the nearest
-    /// one to it, and must clear the estimator's own floor.
+    // The cap is a duration (report 0012); the hop count must be the nearest one
+    // to it, and must clear the estimator's own floor.
     #[test]
     fn ring_cap_matches_its_duration() {
         assert_eq!(UNISON_RING_HOPS, 56);
@@ -414,7 +367,7 @@ mod tests {
     }
 
     /// A perfect two-string unison — the split proportional to the partial
-    /// frequency — must survive, and a split that is constant in *Hz* instead
+    /// frequency — must survive, and a split that is constant in Hz instead
     /// (the signature of one partial splitting against itself) must not.
     #[test]
     fn discriminator_separates_a_unison_from_a_false_beat() {
@@ -477,8 +430,7 @@ mod tests {
     }
 
     /// A gated hop holds the published lines; the re-strike after it drops them
-    /// and starts a fresh record, so the panel never shows a split measured
-    /// across a gap.
+    /// and starts a fresh record, so no published split is measured across a gap.
     #[test]
     fn a_gate_holds_then_the_restart_drops() {
         let mut u = Unison::new();

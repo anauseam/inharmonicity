@@ -1,6 +1,6 @@
-//! Offline diagnostic: pitch-raise reach of TWM configs — the 1¢-resolution
-//! key-40 detuning sweep behind ADR 0006's "pitch-raise-reach cost" numbers
-//! (canonical 78¢ / conservative default 69¢; cf. `refined_recovers_detuned_notes`).
+//! Pitch-raise reach of TWM configs: the 1 ¢-resolution key-40 detuning sweep
+//! behind report 0006's "pitch-raise-reach cost" numbers (canonical 78 ¢,
+//! conservative default 69 ¢; cf. `refined_recovers_detuned_notes`).
 //!
 //! For each config, sweep the true detuning 0..=100¢ (and 0..=-100¢) in 1¢
 //! steps on ideal synthetic peaks (profile partials × s_true, 1/n magnitudes,
@@ -8,8 +8,7 @@
 //! discovery pipeline (Stage A K=3 → Stage B refine) first mis-identifies the
 //! key. Extra configs are passed as argv 4-tuples: `name q r rho ...`
 //! (p=0.5, λ=18 held); with no args it reports canonical M&B and the shipped
-//! default. Used 2026-07-02 to price the pinned arm-6 candidate (seed-7 trial
-//! 1898: 80¢ — no reach cost; ADR 0006 "Corrections" item 2).
+//! default. Report 0006's "Corrections" item 2 prices the arm-6 candidate with it.
 
 use tuner_core::algorithms::discovery;
 use tuner_core::algorithms::twm::TwmConfig;

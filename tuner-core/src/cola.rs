@@ -1,15 +1,10 @@
-//! # Constant Overlap-Add (COLA) Module
+//! # COLA buffer
 //!
-//! This module provides the lock-free, zero-allocation circular FIFO ring buffer
-//! necessary to implement the Constant Overlap-Add (COLA) audio processing architecture.
-//! By accumulating continuous audio and advancing by overlapping hop sizes, it guarantees
-//! temporal coverage and completely eliminates boundary blind-spots for transient events.
+//! The circular FIFO that overlapping (constant overlap-add) analysis windows
+//! are read from, so every sample is analysed and no transient falls between
+//! frames.
 
-/// Circular FIFO for overlapping audio frame analysis.
-///
-/// The buffer is heap-allocated once at construction via `Box<[f32]>`
-/// (the std-idiomatic fixed-capacity pattern for owned DSP state).
-/// All subsequent operations are allocation-free.
+/// A circular FIFO of samples, allocated once at construction.
 pub struct CircularFifo {
     buffer: Box<[f32]>,
     write_cursor: usize,
@@ -17,8 +12,10 @@ pub struct CircularFifo {
 }
 
 impl CircularFifo {
-    /// Creates a zeroed FIFO with the given capacity.
-    /// Allocates once — no further heap operations after this call.
+    /// A zeroed FIFO of `capacity` samples.
+    ///
+    /// # Panics
+    /// If `capacity` is zero.
     pub fn new(capacity: usize) -> Self {
         assert!(capacity > 0);
         Self {
@@ -51,9 +48,10 @@ impl CircularFifo {
         self.samples_since_last_hop >= hop_size
     }
 
-    /// Copies the most recent `window_size` samples into `out`,
-    /// handling wrap-around at the circular boundary.
-    /// `window_size` must be <= `self.buffer.len()`.
+    /// Copies the newest `window_size` samples into `out`, oldest first.
+    ///
+    /// # Panics
+    /// If `window_size` exceeds the capacity, or `out` is shorter than it.
     pub fn read_window(&self, window_size: usize, out: &mut [f32]) {
         assert!(
             window_size <= self.buffer.len(),
@@ -76,7 +74,7 @@ impl CircularFifo {
         }
     }
 
-    /// Resets the hop counter after a frame has been processed.
+    /// Consumes one hop of the new-sample count.
     pub fn acknowledge_hop(&mut self, hop_size: usize) {
         if self.samples_since_last_hop >= hop_size {
             self.samples_since_last_hop -= hop_size;

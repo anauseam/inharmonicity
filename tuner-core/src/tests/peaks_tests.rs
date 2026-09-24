@@ -32,7 +32,7 @@ fn single_peak_extraction() {
 }
 
 #[test]
-fn noise_floor_filtering() {
+fn min_magnitude_filtering() {
     let mut magnitudes = vec![0.0_f32; 1024];
     let sample_rate = 44100;
     let fft_size = 2048;
@@ -42,14 +42,13 @@ fn noise_floor_filtering() {
     magnitudes[10] = 1.0;
     magnitudes[11] = 0.5;
 
-    // Small peak below noise floor ratio (0.1)
+    // A peak under the 0.1 threshold.
     magnitudes[29] = 0.05;
     magnitudes[30] = 0.08;
     magnitudes[31] = 0.05;
 
     let complex: Vec<Complex<f32>> = magnitudes.iter().map(|&m| Complex::new(m, 0.0)).collect();
     let mut peaks = [SpectralPeak::default(); 64];
-    // 0.1 noise floor -> 0.08 is below it, should be ignored
     let count = extract_peaks(
         &magnitudes,
         &complex,
@@ -77,7 +76,7 @@ fn pure_silence() {
 fn edge_index_arrays() {
     let mut magnitudes = vec![0.0_f32; 10];
 
-    // Peak at index 0 (not a local maximum since there's no left neighbor to check, algorithm skips boundary)
+    // Index 0 has no left neighbour, so the scan skips it.
     magnitudes[0] = 1.0;
     magnitudes[1] = 0.5;
 

@@ -1,13 +1,13 @@
 //! A/B: our spectral-sparsity ratio vs faithful Mounir NINOS² variants.
 //!
-//! Question (faithfulness-audit-05): the Gatekeeper's tonality gate (`metrics::ninos2`)
-//! deviates from the cited Mounir 2021 NINOS² in four ways (linear magnitudes, all
-//! bins, no energy factor, reciprocal orientation). Is ours actually the better
-//! discriminator for the Gatekeeper's job — separating a note's transient from its
-//! tonal steady state — or did we just assert that?
+//! Question (audit 05): the Gatekeeper's tonality gate
+//! (`metrics::inverse_participation_ratio`) deviates from the cited Mounir 2021
+//! NINOS² in four ways (linear magnitudes, all bins, no energy factor, reciprocal
+//! orientation). Does it separate a note's transient from its tonal steady state
+//! better than the faithful variants?
 //!
 //! Method: replay every `diagnostics/key_*/` capture. Ground-truth classes are
-//! **time-anchored** (not derived from any metric, avoiding circularity):
+//! time-anchored (not derived from any metric, avoiding circularity):
 //!   * onset sample n₀ = earliest |x| ≥ 1% of max|x| (Mounir 2021 Eq. 19 style),
 //!   * TRANSIENT frames: window start ∈ [n₀ − N/2, n₀ + 90 ms] with frame RMS
 //!     ≥ 5 % of the capture's max frame RMS (the strike itself, not lead-in),
@@ -35,6 +35,8 @@ use std::path::Path;
 use anyhow::Result;
 use realfft::RealFftPlanner;
 use rustfft::num_complex::Complex;
+
+use crate::capture;
 use tuner_core::algorithms::{metrics, spectral};
 
 const N: usize = 2048; // Gatekeeper analysis window
@@ -49,7 +51,7 @@ struct Faithful {
     ninos2_l2l4: f32,
     inos2_l1: f32,
     ninos2_l1: f32,
-    /// Paper Eq. 12: normalized inverse-sparsity factor S̄ ∈ [0,1] (ℓ₂/ℓ₄),
+    /// Paper Eq. 12: normalized inverse-sparsity factor S̄ ∈ \[0,1\] (ℓ₂/ℓ₄),
     /// i.e. the ODF with its energy factor stripped — the level-independent
     /// quantity comparable to a tonality gate.
     sbar_l2l4: f32,
@@ -156,11 +158,11 @@ pub fn run(root: &Path) -> Result<()> {
     ];
     let mut agg = [[(0.0f64, 0usize, f32::MAX, 0usize); 3]; M];
 
-    let dirs = crate::capture::find(root)?;
+    let dirs = capture::find(root)?;
 
     let mut keys_used = 0;
     for dir in &dirs {
-        let Some(key_idx) = crate::capture::key_of(dir).map(usize::from) else {
+        let Some(key_idx) = capture::key_of(dir).map(usize::from) else {
             continue;
         };
         let raw = ["audio_full_event.raw", "audio.raw"]
@@ -170,8 +172,10 @@ pub fn run(root: &Path) -> Result<()> {
         let Some(raw) = raw else { continue };
         let bytes = fs::read(&raw).unwrap();
         let audio: Vec<f32> = bytes
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
             .collect();
         if audio.len() < N * 4 {
             continue;
@@ -188,8 +192,8 @@ pub fn run(root: &Path) -> Result<()> {
         let s_from = n0 + (STEADY_FROM_MS / 1000.0 * FS) as usize;
         let s_to = n0 + (STEADY_TO_MS / 1000.0 * FS) as usize;
 
-        // RMS floor: 5% of the loudest frame — keeps only frames where the note
-        // is actually sounding (drops lead-in noise and decayed-to-silence tails).
+        // RMS floor: 5 % of the loudest frame keeps only frames where the note is
+        // sounding, dropping lead-in noise and decayed tails.
         let mut max_frame_rms = 0.0f32;
         let mut cursor = 0usize;
         while cursor + N <= audio.len() {
@@ -218,7 +222,7 @@ pub fn run(root: &Path) -> Result<()> {
                     &r2c,
                     N,
                 );
-                let ours = metrics::ninos2(&spec);
+                let ours = metrics::inverse_participation_ratio(&spec);
                 let f = faithful_ninos2(&spec);
                 for (m, v) in [
                     ours,

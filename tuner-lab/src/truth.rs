@@ -14,7 +14,7 @@
 //! 3. **`yin`** — a textbook YIN / autocorrelation estimate, the family the
 //!    field's phone and web tuners use.
 //!
-//! If `app` disagrees with **both** `truth` and `yin`, the bias is ours. If
+//! If `app` disagrees with both `truth` and `yin`, the bias is ours. If
 //! `app` and `yin` agree but both differ from `truth`, the autocorrelation
 //! family is the biased reference.
 //!
@@ -38,7 +38,7 @@ pub(crate) const SAMPLE_RATE: u32 = 44_100;
 
 pub(crate) const TAU: f32 = 2.0 * std::f32::consts::PI;
 
-/// Sliding window for the band-slope readout (#4): ~0.5 s at the 43 Hz hop.
+/// Sliding window for the band-slope readout: ≈ 0.5 s at the 43 Hz hop.
 pub(crate) const BAND_WIN_HOPS: usize = 21;
 
 /// Builds the 88 prior-B templates the live pipeline seeds when nothing is
@@ -105,7 +105,7 @@ pub(crate) fn dtft_truth(
     Some((best as f32 + delta) * hz_per_bin)
 }
 
-/// **YIN** (de Cheveigné & Kawahara 2002) over the freshest `win` samples:
+/// YIN (de Cheveigné & Kawahara 2002) over the freshest `win` samples:
 /// difference function → cumulative-mean normalization → absolute threshold
 /// 0.1 → parabolic interpolation. Represents the autocorrelation family.
 pub(crate) fn yin(signal: &[f32], f_min: f32, f_max: f32) -> Option<f32> {
@@ -169,14 +169,15 @@ pub(crate) struct AppResult {
     pub(crate) f0: f32,
     pub(crate) locked_key: Option<u8>,
     pub(crate) gated_frac: f32,
-    /// Hop-to-hop std of the *instantaneous* cents readout over the settled
+    /// Hop-to-hop std of the instantaneous cents readout over the settled
     /// tail — the "strobe jitter" the user sees on the number (the band, being
     /// integrated, does not carry it).
     pub(crate) cents_jitter: f32,
 }
 
 /// **App.** Drives the real Gatekeeper + Engine at the live hop cadence
-/// (`pipeline.rs` step order) in manual mode. Returns the settled-tail mean of
+/// (`AudioPipeline::process_cola_hop`'s step order) in manual mode. Returns the
+/// settled-tail mean of
 /// the n = 1 `f_inst` and the engine's own `cents_deviation`.
 pub(crate) fn run_engine(
     signal: &[f32],
@@ -323,7 +324,7 @@ pub(crate) fn synth_tone(f0: f32, b: f32, amps: &[f32], len: usize, tau0: f32) -
 /// least-squares slope → beat Hz → cents. The post-processing half of the
 /// band-slope readout, shared by the single-reference and full-set drivers.
 ///
-/// Gate-awareness matters: a gated hop *holds* the bank's angle, so counting
+/// Gate-awareness matters: a gated hop holds the bank's angle, so counting
 /// it would contribute zero drift and drag the fit toward 0 ¢ — a decayed note
 /// would read "in tune". Gated hops therefore break the run, and the fit takes
 /// the longest contiguous ungated stretch, which for a fast-decaying treble
@@ -398,11 +399,10 @@ pub(crate) fn slope_from_angles(
 /// Drives the `Strobe` over a whole capture and returns the per-hop
 /// `(angle, gated)` series for every live reference.
 ///
-/// The reference set is installed in **one** `StrobeRefUpdate`, exactly as the
-/// live app does. This is load-bearing, not cosmetic: the bank's long-window
-/// rule keys off `refs[0]`, so retargeting with a lone higher-partial
-/// reference would select the short window and silently diverge from the
-/// shipped path.
+/// The reference set is installed in one `StrobeRefUpdate`, exactly as the
+/// live app does: the bank's long-window rule keys off `refs[0]`, so retargeting
+/// with a lone higher-partial reference would select the short window and
+/// diverge from the shipped path.
 pub(crate) fn strobe_angles(
     signal: &[f32],
     refs: &[f32; MAX_STROBE_REFS],
@@ -431,8 +431,8 @@ pub(crate) fn strobe_angles(
     out
 }
 
-/// **#4 test.** The band-slope readout at a single reference (`f_ET` — the
-/// guitar/ET case): accumulate the beat phase through the `Strobe`, then
+/// The band-slope readout at a single reference (`f_ET`, the guitar and ET
+/// case): accumulate the beat phase through the `Strobe`, then
 /// take the least-squares slope of the unwrapped angle over a sliding
 /// `win_hops` window. Returns `(mean_cents, jitter_std, run_hops)`.
 pub(crate) fn band_slope_cents_win(
@@ -456,15 +456,15 @@ pub(crate) fn band_slope_cents(signal: &[f32], f_et: f32) -> Option<(f32, f32)> 
 /// it the band-slope aliases. Not a Goertzel limit — a hop/unwrap one.
 pub(crate) const ALIAS_HZ: f32 = 0.5 * SAMPLE_RATE as f32 / HOP_SIZE as f32;
 
-/// Periodic-form Hann coefficients — the same window
-/// [`goertzel_windowed`]'s callers use, at a length chosen at runtime.
+/// Symmetric Hann coefficients, the window [`goertzel_windowed`]'s callers use,
+/// at a length chosen at runtime.
 pub(crate) fn hann_vec(n: usize) -> Vec<f32> {
     (0..n)
         .map(|i| 0.5 * (1.0 - (TAU * i as f32 / (n as f32 - 1.0)).cos()))
         .collect()
 }
 
-/// The engine's `long_window` rule (`engine.rs`): the 1024-sample Hann
+/// `Engine`'s and `Strobe`'s long-window rule: the 1024-sample Hann
 /// main-lobe half-width is `2·fs/1024`; take the long window whenever the
 /// partial spacing (≈ f₀, proxied by the f₁ seed) falls inside it.
 pub(crate) fn register_window(seed_hz: f32) -> usize {
@@ -475,13 +475,13 @@ pub(crate) fn register_window(seed_hz: f32) -> usize {
     }
 }
 
-/// **Methods 1–2 — the adaptive phase-vocoder tracker** (`engine.rs`'s tracking
+/// Methods 1–2 — the adaptive phase-vocoder tracker (`Engine`'s tracking
 /// state, n = 1 only) at an arbitrary analysis window. A faithful replica of
 /// the engine's recurrence: Goertzel at the adaptive center over the freshest
 /// `win` samples of the COLA buffer, wrapped phase difference against the
 /// expected advance at the target, NP amplitude gate at `K(win)`, then the
 /// 0.95/0.05 EMA re-centering. `--readout` prints the shipped engine's own
-/// reading alongside so the replica stays honest.
+/// reading alongside as a check on the replica.
 ///
 /// Returns one entry per hop: `None` where the method yields nothing (gated or
 /// non-physical) — that is the availability signal.
@@ -527,28 +527,13 @@ pub(crate) fn tracker_series(
     out
 }
 
-/// Search half-width for the bounded spectral read, in Hz. Three terms, in
-/// order of precedence:
-///
-/// 1. a **cents** span (register-proportional — ±100 ¢ is a fixed musical
-///    distance, unlike a fixed Hz span);
-/// 2. a **bin floor** so the band stays resolvable where that span is sub-bin
-///    (at A0, ±100 ¢ is ±1.6 Hz — under a third of one 8192 bin);
-/// 3. a **neighbour cap at half the partial spacing**, which overrides both.
-///
-/// The cap is what `mat.rs`'s constant cannot be copied without: its 4-bin
-/// floor lives in the Worker's 2¹⁶ FFT where a bin is 0.67 Hz, so the floor is
-/// 2.7 Hz. At the pipeline's 2048 a bin is 21.5 Hz, so the same 4 bins is an
-/// 86 Hz half-width — wider than a bass fundamental, and measurably fatal:
-/// uncapped, the 2048 read at E2/A2/A0 returns the **2nd partial** (+1200 ¢).
-///
-/// `spacing_hz` is the distance to the neighbouring partial (≈ f₀), and is
-/// **not** interchangeable with `center_hz`: the two coincide only for n = 1.
-/// A read centered on A0's 4th partial has `center_hz ≈ 110` but
-/// `spacing_hz ≈ 27.5`, and capping at `center_hz/2` there would admit a
-/// ±55 Hz band spanning two neighbours. A band left under one bin by the cap
-/// means that FFT size cannot serve that register at all — the selection rule,
-/// not a tuning knob.
+/// Search half-width for the bounded spectral read, in Hz, as the shipped
+/// `peaks::coarse_read` computes it: a cents span, floored at `min_bins`, then
+/// capped at half the partial spacing. The cap is what MAT's 4-bin floor cannot
+/// be copied without: in the Worker's 2¹⁶ FFT that floor is 2.7 Hz, but at 2048
+/// it is an 86 Hz half-width, and uncapped the read at E2/A2/A0 returns the 2nd
+/// partial (+1200 ¢). `spacing_hz` (≈ f₀) is not `center_hz`: they coincide only
+/// for n = 1.
 pub(crate) fn search_halfwidth_hz(
     center_hz: f32,
     spacing_hz: f32,
@@ -570,23 +555,16 @@ pub(crate) const P_FA: f32 = 0.001;
 pub(crate) struct CfarCfg {
     /// Order statistic as a fraction of the reference count (0.5 = median).
     pub(crate) quantile: f32,
-    /// Cells excluded either side of the peak — its own main lobe. **The shipped
-    /// read uses 0** (Rohling §V: unnecessary for an OS detector, and measured
+    /// Cells excluded either side of the peak — its own main lobe. The shipped
+    /// read uses 0 (Rohling §V: unnecessary for an OS detector, and measured
     /// inert — audit 13). Retained here to sweep it and for the in-band control.
     pub(crate) guard_bins: usize,
     /// Take reference cells from outside the search band rather than inside.
     pub(crate) flanking: bool,
-    /// Floor on the reference half-width, **in Hz**. In the deep bass partials
-    /// are ≈ 5 bins apart at 8192, so 75 % of cells lie inside some partial's
-    /// main lobe: a flank of `1.5 × spacing` samples only the strong low
-    /// partials and the order statistic reads *signal* as noise. Widening spans
-    /// partials ≈ 1–11 at A0 and imports the **weak upper** ones, 19–36 dB below
-    /// the band peak, which is what the low quantile lands on (`--refset`).
-    ///
-    /// **Hz, not bins** — a bin is a different physical width at each FFT size
-    /// (5.4 Hz at 8192, 21.5 Hz at 2048), so a bin-specified floor silently
-    /// quadruples when the coarse read switches size. 172 Hz is the 8192-tuned
-    /// value the deep-bass profile was measured at (32 bins there).
+    /// Floor on the reference half-width, in Hz, since a floor in bins changes
+    /// physical width with the FFT size. In the deep bass a `1.5 × spacing` flank
+    /// samples only the strong low partials; 172 Hz (32 bins at 8192) reaches the
+    /// weak upper ones the low quantile lands on (`--refset`, audit 13).
     pub(crate) flank_min_hz: f32,
     /// Use Rohling's exact finite-N scaling factor instead of the asymptotic
     /// quantile one.
@@ -596,13 +574,11 @@ pub(crate) struct CfarCfg {
 /// Which detection threshold the bounded spectral read applies.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) enum Gate {
-    /// **The shipped gate.** Kay 1998 Neyman–Pearson against the *ambient*
-    /// silence RMS (`engine.rs`, `strobe.rs`, discovery's peak threshold).
-    /// Its H₀ is a quiet room, which is the wrong null during a sustain —
-    /// see [ADR 0015](../../docs/adr/0015-ambient-sigma-gates-measured.md).
-    /// Present here as the control.
+    /// The ambient gate, Kay 1998 Neyman–Pearson against the silence threshold
+    /// (`Engine::process`'s peak and tracker gates, `Strobe::process`). Its H₀ is
+    /// a quiet room, the wrong null during a sustain (report 0015). The control.
     Ambient,
-    /// **Ordered-statistic CFAR** against a *local* noise estimate taken from
+    /// Ordered-statistic CFAR against a local noise estimate taken from
     /// reference cells around the peak (Rohling 1983).
     Cfar(CfarCfg),
 }
@@ -623,7 +599,7 @@ impl Gate {
     }
 }
 
-/// **Asymptotic** threshold multiplier on an ordered-statistic noise estimate,
+/// Asymptotic threshold multiplier on an ordered-statistic noise estimate,
 /// for Rayleigh magnitude bins — ours, derived.
 ///
 /// Magnitude bins of locally-flat complex Gaussian noise are Rayleigh, so
@@ -632,15 +608,15 @@ impl Gate {
 /// `T = x_q · √( ln(P_fa) / ln(1−q) )` — 3.157 at the median, 4.900 at the
 /// 25th percentile, both for P_fa = 0.001. Exact only as the reference count
 /// → ∞; [`cfar_multiplier_finite`] is the finite-N form, and the two agree in
-/// the limit (pinned by `test_cfar_multiplier_limit`).
+/// the limit (core's `coarse_cfar_multiplier_pinned` pins it).
 pub(crate) fn cfar_multiplier(quantile: f32) -> f32 {
     (P_FA.ln() / (1.0 - quantile).ln()).sqrt()
 }
 
-/// **Exact finite-N** scaling factor — a faithful port of Rohling (1983).
+/// Exact finite-N scaling factor — a faithful port of Rohling (1983).
 ///
 /// His Eq. 14 gives the false-alarm probability of an OS-CFAR detector with
-/// `N` reference cells selecting rank `k`, for an **exponentially** distributed
+/// `N` reference cells selecting rank `k`, for an exponentially distributed
 /// (square-law detector) parent population:
 ///
 /// ```text
@@ -657,12 +633,10 @@ pub(crate) fn cfar_multiplier(quantile: f32) -> f32 {
 ///
 /// which is exact, monotone in `T`, and needs no gamma function.
 ///
-/// Our cells are Rayleigh **magnitudes**, not exponential powers, so his
-/// Table II does not apply directly — but the paper anticipates exactly this:
-/// its closing section derives the linear-detector conversion **`T_lin = √T_sq`**
-/// for the case where the receiver uses the absolute value and the cells "obey
-/// a Rayleigh distribution". That conversion is applied here, making this a
-/// port of Eqs 14 + 17 rather than a bespoke calibration.
+/// Our cells are Rayleigh magnitudes, not exponential powers, so his Table II
+/// does not apply directly; Eq. 17 converts it for a receiver taking the
+/// absolute value, whose cells "obey a Rayleigh distribution", as
+/// `T_lin = √T_q`.
 ///
 /// # Reference
 /// Rohling, H. (1983). "Radar CFAR Thresholding in Clutter and Multiple Target
@@ -705,7 +679,7 @@ pub(crate) fn ambient_threshold(noise_floor: f32, fft_size: usize) -> f32 {
     (-p_bin * P_FA.ln()).sqrt()
 }
 
-/// Outcome of one bounded spectral read, distinguishing *why* a hop produced
+/// Outcome of one bounded spectral read, distinguishing why a hop produced
 /// nothing — a gate that rejects and a gate that cannot be calibrated are very
 /// different failures, and in the deep bass both occur.
 pub(crate) enum Read {
@@ -732,10 +706,9 @@ pub(crate) struct ReadOut {
 
 /// Outer bounds of the two flanking reference bands, before guard exclusion.
 ///
-/// Shared by [`spectral_read`] and [`ref_anatomy`] so the anatomy report cannot
-/// drift from the gate it describes. Both terms are in Hz and converted once:
-/// the floor and the spacing rule must be compared in physical units, not bins,
-/// because a bin is 5.4 Hz at 8192 and 21.5 Hz at 2048.
+/// Shared by `spectral_read` and `ref_anatomy` so the anatomy report cannot
+/// drift from the gate it describes. Both terms are compared in Hz and converted
+/// to bins once.
 pub(crate) fn ref_window(
     lo: usize,
     hi: usize,
@@ -752,7 +725,7 @@ pub(crate) fn ref_window(
     )
 }
 
-/// **Method 3 — bounded spectral peak + `jacobsen`.** The candidate coarse
+/// Method 3 — bounded spectral peak + `jacobsen`. The candidate coarse
 /// read: argmax of the already-computed magnitude spectrum within
 /// [`search_halfwidth_hz`] of `center_hz`, refined sub-bin by the audited
 /// Candan estimator, admitted by `gate`.
@@ -822,13 +795,13 @@ pub(crate) fn spectral_read(
             let k = (((refs.len() as f32 - 1.0) * c.quantile).round() as usize).max(1);
             let mult = if c.finite_n {
                 // ── Search loss (measured, then derived) ──────────────────
-                // Rohling's P_fa is for ONE cell under test, but this detector
+                // Rohling's P_fa is for one cell under test, but this detector
                 // takes the argmax over the whole search band, so it gets M
                 // independent chances to false-alarm and the realized rate is
                 // ≈ M·P_fa. Measured directly: collapsing the band to a single
                 // bin brought the realized AWGN rate to 0.0012 against a
                 // nominal 0.001 (exactly right), while the full band gave
-                // 0.0386 — a 32× search loss. The correction is the standard
+                // 0.0386, a 32× search loss (39× nominal). The correction is the standard
                 // multiple-comparisons one: budget P_fa/M per cell. Hann
                 // correlation makes adjacent bins non-independent, so M is the
                 // band width halved.
@@ -970,20 +943,20 @@ pub(crate) fn score(series: &[Option<f32>], f_ref: f32) -> Score {
     }
 }
 
-/// Highest partial index examined by [`bass_partials`]. The strobe bank holds
+/// Highest partial index examined by `bass_partials`. The strobe bank holds
 /// 12 references; the interesting bass energy is well inside the first six.
 pub(crate) const MAX_BASS_PARTIAL: usize = 6;
 
-/// Strobe reference frequencies for a key, in the **shipped** convention
+/// Strobe reference frequencies for a key, in the shipped convention
 /// ([`tuner_core::models::TuningCurve::strobe_partials`]):
 /// `f₀* = f₁*/√(1+B)`, then `fₙ* = n·f₀*·√(1+B n²)`.
 ///
-/// Getting this exactly right matters twice over. The obvious form
-/// `n·f_ET·√(1+B n²)` treats f_ET as the *flexible-string* f₀, but the curve —
-/// and every target in this app — is defined on the **audible first partial**
-/// f₁. The two differ by √(1+B): 0.09 ¢ at A0, but **17 ¢ at A7**, which would
+/// The obvious form `n·f_ET·√(1+B n²)` treats f_ET as the flexible-string f₀,
+/// but the curve —
+/// and every target in this app — is defined on the audible first partial
+/// f₁. The two differ by √(1+B): 0.09 ¢ at A0, but 17 ¢ at A7, which would
 /// silently poison any treble column. And under the correct form the n = 1
-/// reference is identically `f₁*` with B cancelling — the R4 B-immunity the
+/// reference is identically `f₁*` with B cancelling — the B-immunity the
 /// register table's treble entry relies on.
 ///
 /// Offline there is no curve, so `f1` is the key's ET frequency: the ET-mode
@@ -1019,15 +992,12 @@ pub(crate) fn strobe_refs(
 /// Here the partials come from the hi-res DFT truths, so this is a measurement
 /// of B from the capture itself.
 ///
-/// **n = 1 is excluded**, on two independent grounds that both point the same
-/// way. Statistically it sits at `x = n² = 1`, the extreme of the regressor's
-/// range, so it carries maximal leverage on the *intercept* — and B is
-/// `slope/intercept`, so a bad fundamental corrupts B directly. Physically it
-/// is the least informative point about B at all, since its `B·n²` term is the
-/// smallest in the series (`f₁ ≈ f₀` for any plausible B). In the deep bass the
-/// n = 1 "truth" is exactly the junk this whole investigation established it to
-/// be, which is why the first version of this fit returned **negative B** on A0
-/// and C#1.
+/// n = 1 is excluded on two grounds. Statistically it sits at `x = n² = 1`, the
+/// extreme of the regressor's range, so it carries maximal leverage on the
+/// intercept, and B is `slope/intercept`, so a bad fundamental corrupts B
+/// directly. Physically it is the least informative point about B, its `B·n²`
+/// term the smallest in the series. In the deep bass the n = 1 "truth" is junk,
+/// and including it returns negative B on A0 and C#1.
 pub(crate) fn fit_f0_b(freqs: &[(usize, f32)]) -> Option<(f32, f32)> {
     let freqs: Vec<(usize, f32)> = freqs.iter().copied().filter(|&(n, _)| n >= 2).collect();
     if freqs.len() < 2 {
@@ -1057,19 +1027,11 @@ pub(crate) fn fit_f0_b(freqs: &[(usize, f32)]) -> Option<(f32, f32)> {
     Some((f0 as f32, b as f32))
 }
 
-/// **The candidate shipping gate**, settled by the round-2 flank sweep and
-/// used by every measurement below so their results are mutually comparable.
-///
-/// 25th percentile, ±2 guard bins, flanking references with a **32-bin floor**,
-/// exact finite-N multiplier. The floor is the load-bearing part: deep-bass
-/// partials are ≈ 5 bins apart at 8192, so the natural `1.5 × spacing` flank
-/// (≈ 8 bins) reaches only the strong low partials and the order statistic reads
-/// signal as if it were noise — the threshold then rejects the true peak.
-/// Widening to 32 bins spans partials ≈ 1–11 and brings in the weak upper ones,
-/// which is what the low order statistic actually selects (`--refset`).
-///
-/// This is exactly the configuration Measurement A was mistakenly run without,
-/// which is why its bass rows measured a broken gate rather than a policy.
+/// The shipped coarse-read gate, used by every measurement below so their
+/// results are mutually comparable: 25th percentile, no guard cells, flanking
+/// references floored at `flank_min_hz`, exact finite-N multiplier. Without the
+/// floor the deep-bass flank reaches only the strong low partials and the gate
+/// rejects the true peak, so a bass row measured without it measures a broken gate.
 pub(crate) fn shipping_gate_hz(flank_min_hz: f32) -> Gate {
     Gate::Cfar(CfarCfg {
         quantile: 0.25,
@@ -1091,6 +1053,9 @@ pub(crate) const FLANK_MIN_HZ: f32 = 172.0;
 /// Per-hop reading and CFAR margin for one reference partial.
 pub(crate) type HopRead = (Option<f32>, f32);
 
+/// Per-hop reads of every reference partial from a single FFT, the structure
+/// the pipeline would use (one spectrum, several bounded searches). Returns
+/// `[hop][partial] = (reading, CFAR margin)`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn multi_partial_series(
     signal: &[f32],
@@ -1150,9 +1115,9 @@ pub(crate) fn multi_partial_series(
     out
 }
 
-/// The gate variants compared by [`gate_ab`]: the shipped ambient-σ control
-/// plus the four OS-CFAR corners (median vs 25th percentile × in-band vs
-/// flanking reference cells), all at ±2 guard bins.
+/// The gate variants compared by `gate_ab`: the ambient-σ control, the in-band
+/// median control with ±2 guard bins, and the guard-free flank-floor sweep at
+/// the median and the 25th percentile.
 pub(crate) fn gate_variants() -> Vec<Gate> {
     let mut v = vec![Gate::Ambient];
     // In-band control (known degenerate in the deep bass), then the flank-floor

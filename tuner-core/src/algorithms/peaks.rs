@@ -1,25 +1,10 @@
-//! # Spectral Peak Extraction
+//! # Spectral peaks
 //!
-//! Stateless DSP module for extracting sub-bin accurate spectral peaks
-//! from magnitude spectra. Two consumers, both scan-then-refine:
-//!
-//! - [`extract_peaks`] — Discovery's *global* peak list (every local maximum
-//!   above an absolute threshold), fed to TWM after [`mask_peaks`].
-//! - [`coarse_read`] — the tuning readout's *bounded* single-partial search
-//!   around a known reference, admitted by an ordered-statistic CFAR gate.
-//! - [`resolve_lines`] — the unison estimator's search over one reference
-//!   partial's *baseband*, admitted by the same gate against a sliding local
-//!   reference window.
-//!
-//! Do not fold the second onto the first: the global list is built only in the
-//! discovery branch (`identified_key.is_none()`), so it is unavailable exactly
-//! while a locked note is being tuned, and its Neyman–Pearson gate and masking
-//! can drop a weak target partial the readout still needs.
-//!
-//! The third shares [`cfar_multiplier`] with the second and nothing else: it
-//! reads a decimated baseband rather than a magnitude spectrum, and its
-//! reference geometry is deliberately the opposite one
-//! ([`UNISON_CFAR_GUARD_BINS`]).
+//! Local maxima of a spectrum, refined sub-bin: a frame's global peak list
+//! ([`extract_peaks`], thinned by [`mask_peaks`]), one partial read in a band
+//! around a known reference ([`coarse_read`]), and the lines within one partial's
+//! baseband ([`resolve_lines`]). The last two admit a peak by an ordered-statistic
+//! CFAR gate.
 
 use rustfft::Fft;
 use rustfft::num_complex::Complex;
@@ -27,28 +12,10 @@ use rustfft::num_complex::Complex;
 use crate::algorithms::spectral;
 use crate::models::{SpectralPeak, UnisonLine};
 
-/// Extracts all significant spectral peaks from a magnitude spectrum with sub-bin
-/// interpolated frequencies using the complex-domain Jacobsen estimator.
-///
-/// # Algorithm
-/// 1. Walk magnitudes to find local maxima (`mag[i] > mag[i-1]` AND `mag[i] > mag[i+1]`).
-/// 2. Filter out peaks below `min_magnitude` (absolute threshold).
-/// 3. For each surviving peak, apply the Jacobsen estimator on the `complex_spectrum`
-///    for Hann-optimal sub-bin frequency interpolation.
-/// 4. Sort peaks by magnitude descending. Store in `peaks_out`.
-///
-/// # Arguments
-/// * `magnitudes` — Linear magnitude spectrum (output of `magnitude_spectrum`).
-/// * `complex_spectrum` — Complex frequency spectrum from the RFFT.
-/// * `sample_rate` — Audio sample rate in Hz.
-/// * `fft_size` — FFT window size (e.g. 8192).
-/// * `min_magnitude` — Absolute minimum linear magnitude threshold for a peak to be
-///   considered. (Discovery passes a Neyman–Pearson AWGN false-alarm threshold
-///   computed per frame — see the Kay 1998 derivation in `engine.rs`.)
-/// * `peaks_out` — Mutable slice to write peaks into.
-///
-/// # Returns
-/// The number of peaks extracted (up to `peaks_out.len()`).
+/// Every local maximum of `magnitudes` above `min_magnitude`, refined sub-bin by
+/// [`spectral::jacobsen`] on `complex_spectrum` and written to `peaks_out` strongest
+/// first. Returns how many were written. A non-positive `min_magnitude` writes
+/// nothing, and only the first 128 maxima in bin order are kept.
 pub fn extract_peaks(
     magnitudes: &[f32],
     complex_spectrum: &[Complex<f32>],
@@ -61,20 +28,17 @@ pub fn extract_peaks(
         return 0;
     }
 
-    let noise_floor = min_magnitude;
-    if noise_floor <= 0.0 {
-        return 0; // Empty spectrum or invalid threshold
+    if min_magnitude <= 0.0 {
+        return 0;
     }
 
     let mut temp_peaks = [SpectralPeak::default(); 128];
     let mut num_found = 0;
 
-    // Walk magnitudes to find local maxima (avoid boundaries)
     for i in 1..(magnitudes.len() - 1) {
         let mag = magnitudes[i];
 
-        if mag > noise_floor && mag > magnitudes[i - 1] && mag > magnitudes[i + 1] {
-            // Sub-bin refinement via the complex-domain Jacobsen estimator (Candan 2015).
+        if mag > min_magnitude && mag > magnitudes[i - 1] && mag > magnitudes[i + 1] {
             let frequency = spectral::jacobsen(complex_spectrum, i, fft_size, sample_rate);
 
             if frequency > 0.0 && num_found < temp_peaks.len() {
@@ -88,53 +52,37 @@ pub fn extract_peaks(
     }
 
     let valid_peaks = &mut temp_peaks[..num_found];
-    // Sort temp_peaks by magnitude descending
     valid_peaks.sort_unstable_by(|a, b| {
         b.magnitude
             .partial_cmp(&a.magnitude)
             .unwrap_or(core::cmp::Ordering::Equal)
     });
 
-    // Copy to peaks_out up to its capacity
     let count = num_found.min(peaks_out.len());
     peaks_out[..count].copy_from_slice(&valid_peaks[..count]);
 
     count
 }
 
-/// ── Peak Masking & Dynamic-Range Gate (OURS — empirically validated) ─────
-/// Filters out acoustic side-lobes, sympathetic resonance, and intermodulation
-/// distortion that cause TWM to sub-harmonically false-lock.
+/// Removes side lobes, sympathetic resonance and intermodulation products from a
+/// peak list: every peak more than 30 dB below the strongest, and every peak within
+/// ±20 % of a stronger one's frequency and more than 30 dB below it. Only the first
+/// 64 entries are considered. Returns how many survive, written to `peaks[..count]`
+/// by ascending frequency.
 ///
-/// # Provenance (faithfulness-audit-04)
-/// This is the codebase's own heuristic, NOT a paper port — validated on real
-/// captures in ADR 0002 (2026-05-28: replaced the failed geometric gate; 8/8
-/// keys, zero false locks; known limitation: environments with SNR ≲ 30 dB).
-/// * The **global dynamic-range gate** adapts Cano (1998) §4.3, which accepts
-///   only peaks "less than 40 dB below the highest peak"; we ship the stricter
-///   −30 dB that ADR 0002 validated.
-/// * The **dominance masking** (a louder peak suppresses smaller peaks within
-///   a proportional band) is ours; the 20 % bandwidth matches the textbook
-///   critical-band approximation (CB ≈ 0.2·f above ~500 Hz) — inspiration,
-///   not a port. No masking procedure exists in Gómez (2006) or Cano (1998);
-///   do not re-cite them for it (see faithfulness-audit-04).
+/// # Panics
+/// On a NaN magnitude or frequency.
 ///
-/// # Preconditions
-/// The `peaks` slice must contain no more than 64 elements. If it is larger,
-/// it will be artificially truncated to 64 to fit the internal tracking array.
-///
-/// # Reference
-/// 1. ADR 0002 (`docs/adr/0002-twm-peak-masking-validation.md`) — the
-///    empirical basis for the mechanism and the −30 dB values.
-/// 2. Cano, P. (1998). "Fundamental Frequency Estimation in the SMS Analysis."
-///    DAFx-98, §4.3 — the dynamic-range rule the global gate adapts.
-///
-/// # Algorithm
-/// Peaks are evaluated in descending amplitude order. First, any peak more
-/// than 30 dB below the global maximum is discarded (Cano's 40 dB rule,
-/// tightened per ADR 0002). Then, a dominant peak masks any smaller peak that
-/// falls within its proportional critical band if the smaller peak is below a
-/// relative masking threshold.
+/// # References
+/// Cano, P. (1998). "Fundamental Frequency Estimation in the SMS Analysis."
+/// DAFx-98, §4.3, which accepts a peak "less than 40 dB below the highest peak";
+/// the global gate is that rule at 30 dB.
+// Ours: the masking, and 30 dB where Cano has 40, validated at 8/8 keys with zero
+// false locks. Neither Cano nor Gómez (2006) has a masking procedure, so neither is
+// its citation; the 20 % band borrows the critical-band approximation CB ≈ 0.2·f
+// above ≈ 500 Hz. Below ≈ 30 dB SNR, sympathetic noise survives the mask.
+// report 0002
+// audit 04
 pub fn mask_peaks(peaks: &mut [SpectralPeak]) -> usize {
     if peaks.is_empty() {
         return 0;
@@ -143,36 +91,32 @@ pub fn mask_peaks(peaks: &mut [SpectralPeak]) -> usize {
     let k = peaks.len().min(64);
     let active_peaks = &mut peaks[..k];
 
-    // 1. Sort by magnitude descending
     active_peaks.sort_unstable_by(|a, b| b.magnitude.partial_cmp(&a.magnitude).unwrap());
 
     let mut valid_count = 0;
     let mut masked = [false; 64];
     let global_max = active_peaks[0].magnitude;
 
-    // OUR constants, ADR 0002-validated (not from Gómez/Cano — see doc-comment).
-    const GLOBAL_THRESHOLD_DB: f32 = 0.0316; // −30 dB from global max (Cano §4.3 proposes 40 dB; ADR 0002 validated 30)
-    const MASK_THRESHOLD_DB: f32 = 0.0316; // −30 dB relative to masker
-    const MASK_BANDWIDTH_PROPORTION: f32 = 0.20; // ≈ textbook critical band (CB ≈ 0.2·f above ~500 Hz)
+    // Amplitude ratios: 0.0316 is −30 dB.
+    const GLOBAL_THRESHOLD_RATIO: f32 = 0.0316;
+    const MASK_THRESHOLD_RATIO: f32 = 0.0316;
+    const MASK_BANDWIDTH_PROPORTION: f32 = 0.20;
 
     for i in 0..k {
         if masked[i] {
             continue;
         }
 
-        // Global dynamic-range gate: −30 dB from the frame's maximum (ADR 0002).
-        // Prevents the engine from analyzing isolated microscopic acoustic room noise.
-        if active_peaks[i].magnitude < global_max * GLOBAL_THRESHOLD_DB {
+        if active_peaks[i].magnitude < global_max * GLOBAL_THRESHOLD_RATIO {
             continue;
         }
 
         let masker_freq = active_peaks[i].frequency;
         let masker_mag = active_peaks[i].magnitude;
 
-        let mask_threshold = masker_mag * MASK_THRESHOLD_DB;
+        let mask_threshold = masker_mag * MASK_THRESHOLD_RATIO;
         let mask_bw = masker_freq * MASK_BANDWIDTH_PROPORTION;
 
-        // Mask neighboring weaker peaks
         for j in (i + 1)..k {
             if !masked[j] {
                 let target_freq = active_peaks[j].frequency;
@@ -184,12 +128,10 @@ pub fn mask_peaks(peaks: &mut [SpectralPeak]) -> usize {
             }
         }
 
-        // Retain valid peak
         active_peaks[valid_count] = active_peaks[i];
         valid_count += 1;
     }
 
-    // Sort by frequency ascending for O(N+K) two-pointer sweep in TWM
     active_peaks[..valid_count]
         .sort_unstable_by(|a, b| a.frequency.partial_cmp(&b.frequency).unwrap());
 
@@ -198,203 +140,131 @@ pub fn mask_peaks(peaks: &mut [SpectralPeak]) -> usize {
 
 // ─── Coarse Readout: bounded search + OS-CFAR ────────────────────────────────
 
-/// Search half-width in **cents** — scale-invariant, so one value serves A0 and
-/// C8. Ours (ADR 0011).
-///
-/// This *is* the readout's reach: a peak outside the band cannot be the argmax,
-/// so the measured cliff — 100 % availability at 0.1–3.1 ¢ of error out to 75 ¢
-/// of detuning, nothing past 100 ¢ — is the band edge, not a phenomenon. Widening
-/// buys reach during a pitch raise; narrowing buys nothing, because it is **not**
-/// what prevents mis-selection. That is the neighbour cap in
-/// [`search_halfwidth_hz`]: within one sounding note there is no competitor at
-/// the neighbouring key's pitch, and the cap keeps the band inside `spacing/2`
-/// regardless of this value. The residual risk is a *second sounding key* —
-/// sympathetic ring or an adjacent strike — which is a measurable failure mode,
-/// not something a narrower span fixes.
+/// Search half-width in cents, so one value serves every register. A partial
+/// detuned further cannot be read.
+// Ours, measured: availability holds at 100 % out to 75 ¢ of detuning, then ends
+// at this edge. Widening buys reach in a pitch raise; narrowing buys nothing, since
+// the neighbour cap in `search_halfwidth_hz` prevents mis-selection and a second
+// sounding key is not narrowed away.
+// report 0011
 const COARSE_SPAN_CENTS: f32 = 100.0;
 
-/// Floor on the search half-width in **bins**, for registers where
-/// [`COARSE_SPAN_CENTS`] is sub-bin (±100 ¢ at A0 is ±1.6 Hz — under a third of
-/// one 8192 bin). Ours (ADR 0011).
-///
-/// What it prevents is a **degenerate band**, not a precision loss: below one bin
-/// the search collapses to `lo >= hi` and [`coarse_read`] returns `None`, so
-/// wherever the cents span is sub-bin the read would simply vanish. The derived
-/// lower bound is therefore ~1 bin, and the exact value above that is not
-/// load-bearing — 3 vs 4 bins is inert on real captures (availability 92.1 % both,
-/// |e| 23.67 vs 23.68 ¢, jitter 3.32 vs 3.28 ¢ over keys 8–26).
-///
-/// Do not adopt this floor without the neighbour cap in [`search_halfwidth_hz`]:
-/// uncapped at 2048 it is an 86 Hz half-width and the read returns the 2nd
-/// partial (+1200 ¢). The cap is also what makes it inert in the deep bass, where
-/// `spacing/2` is under 3 bins; between there and ≈ key 44 (the point where the
-/// cents span overtakes it) the floor is the term that sets the band.
+/// Floor on the search half-width in bins, for registers where
+/// [`COARSE_SPAN_CENTS`] is sub-bin (±1.6 Hz at A0).
+// Ours, measured; 3 vs 4 bins is inert on keys 8–26 (availability 92.1 % both,
+// |e| 23.67 vs 23.68 ¢, jitter 3.32 vs 3.28 ¢). At 8192 it sets the band from the
+// deep bass, where the neighbour cap binds, to ≈ key 44, where the cents span
+// overtakes it. Never without the cap: at 2048 it is an 86 Hz half-width, and the
+// read returns the 2nd partial (+1200 ¢).
+// report 0011
 const COARSE_SPAN_MIN_BINS: f32 = 4.0;
 
-/// Order statistic taken as the local noise estimate, as a fraction of the
-/// reference count — Rohling's rank parameter `k/N`.
-///
-/// Fixed by the paper's own interference criterion (§V): an inhomogeneity in the
-/// reference window is tolerable only while it "affects less than (N − k)
-/// resolution cells". Here the interferer is the harmonic comb itself, so with
-/// partial spacing `s` bins and a Hann main lobe `W_lobe = 4` bins wide
-/// null-to-null,
+/// Rank of the order statistic taken as the local noise, as a fraction of the
+/// reference count: Rohling's `k/N`. His §V criterion sets it: an inhomogeneity in
+/// the reference window is tolerable only while it "affects less than (N − k)
+/// resolution cells". Here the harmonic comb is that inhomogeneity, so with partial
+/// spacing `s` bins and a Hann main lobe `W_lobe = 4` bins wide null-to-null,
 ///
 /// ```text
 ///   (W_lobe / s)·N  ≤  N − k      ⇒      k/N  ≤  1 − W_lobe / s
 /// ```
 ///
-/// A0 is the binding case and this value meets its bound with no margin:
-/// `s = 27.5/5.383 = 5.11` bins, measured lobe occupancy 75 % of reference cells
-/// ⇒ `k/N ≤ 0.25`. The bound relaxes monotonically upward (0.53 at F1), so the
-/// deep bass sets it for the whole keyboard.
-///
-/// The departure from the paper's own `k > N/2` recommendation is forced by that
-/// same criterion, not taken against it: a radar reference window is mostly
-/// clutter with a few interfering targets, ours is mostly partials with few
-/// background cells, so the inequality binds from the other side. Its cost is the
-/// one Rohling names for `k < N/2` — "erosion", under-estimation at an edge —
-/// bounded by the realized-P_fa measurement in ADR 0011 §5.
-///
-/// Do not raise it: at the median the bound is violated for every key up to F1,
-/// and the deep bass admits ±400 ¢ junk.
+/// That binds below the paper's own `k > N/2`: a radar reference window is mostly
+/// clutter, this one mostly partials. The cost is the one Rohling names for
+/// `k < N/2`, erosion: under-estimation at an edge.
+// A0 binds, with no margin: s = 5.11 bins and 75 % of reference cells in a lobe
+// give k/N ≤ 0.25, and the bound relaxes upward (0.53 at F1). Do not raise it: at
+// the median the bound fails for every key up to F1, and the deep bass admits
+// ±400 ¢ junk.
+// report 0011
+// audit 13
 const COARSE_CFAR_QUANTILE: f32 = 0.25;
 
-/// No guard cells: this detector has none, by Rohling §V — "in OS CFAR
-/// processing these guard cells become unnecessary since a small number of target
-/// amplitudes occurring within the reference area have almost no influence on the
-/// clutter level estimation by quantiles" (his Fig. 9 window, as against Fig. 3's
-/// guarded CA/CAGO one). Structurally so here: references come from *outside* the
-/// search band, so the only cells of the peak's own lobe that can enter are the
-/// ones just past a band edge, and those are high magnitudes that sort above a
-/// low quantile. Measured: a ±0…4-bin guard moves availability, error and jitter
-/// by nothing on any of the three capture sets (audit 13).
-/// Reference half-width as a multiple of the partial spacing. Ours, measured
-/// (ADR 0011).
+/// Reference flank width either side of the search band, in partial spacings.
+// Ours, measured.
+// report 0011
 const COARSE_CFAR_FLANK_SPACINGS: f32 = 1.5;
 
-/// Floor on the reference half-width, in **Hz, not bins** — a bin is 5.4 Hz at
-/// 8192 and 21.5 Hz at 2048, so a bin-specified floor would silently quadruple
-/// when the read switches size. Ours, measured (ADR 0011).
-///
-/// It exists because deep-bass partials are ≈ 5 bins apart at 8192, so 75 % of
-/// cells lie inside some partial's main lobe and there is no inter-partial valley
-/// to reach: [`COARSE_CFAR_FLANK_SPACINGS`] × spacing would sample only the
-/// *strong* low partials and the order statistic would read signal as noise.
-/// Widening to 172 Hz spans partials ≈ 1–11 at A0 and so imports the **weak
-/// upper** ones, whose skirts sit 19–36 dB below the band peak; that is what the
-/// low quantile lands on. Measured: the selected cell is a partial's lobe in
-/// ≈ 56–68 % of deep-bass hops, and a valley cell in ≥ 95 % of hops from F1 up.
-///
-/// **Hz is the correct unit here, not a fallback.** The floor's job is to widen
-/// the flank in the register where the comb is dense and to *disappear* where it
-/// is not, and only an absolute frequency does both: a floor in **bins** is a
-/// different physical width at each FFT size (5.4 Hz at 8192, 21.5 at 2048), and
-/// a floor in **partial spacings** never turns off — 6.3 spacings is 172 Hz at A0
-/// but 2.8 kHz at A4, a reference window spanning DC to 3 kHz around a 440 Hz
-/// partial. Expressing it as "reach partial *m*" is also refuted by measurement:
-/// the cell the order statistic selects is whichever partial is weakest at that
-/// hop, and its index ranges over n1–n11 with no stable median across keys, so
-/// there is no *m* to reach.
-///
-/// What remains is an amplitude-envelope property rather than window geometry,
-/// so it is not reducible to a scale-free formula on one instrument. It is
-/// active only where `1.5 × spacing < 172 Hz`, i.e. spacing below 115 Hz
-/// (≈ key ≤ 25), and inert above — an absolute frequency, but a bounded one.
+/// Floor on the flank width, in Hz: in bins it would change width with the FFT
+/// size.
+// Ours, measured. Where partials sit ≈ 5 bins apart, 75 % of cells lie in a lobe,
+// so 1.5 spacings would sample only the strong low partials and read signal as
+// noise; 172 Hz reaches the weak upper ones (≈ 1–11 at A0), whose skirts the low
+// quantile lands on. Inert where the spacing passes 115 Hz (≈ key 25). Not in
+// spacings either: that floor never turns off (2.8 kHz at A4).
+// report 0011
+// audit 13
 const COARSE_CFAR_FLANK_MIN_HZ: f32 = 172.0;
 
-/// False-alarm probability both CFAR gates in this file are calibrated to — the
-/// same 0.001 [`spectral::neyman_pearson_k`] commits to, so the gates differ only
-/// in *which* noise they measure, never in how permissive they are.
+/// False-alarm probability both CFAR gates are calibrated to: the 0.001
+/// [`spectral::neyman_pearson_k`] uses, so the gates differ only in the noise they
+/// measure.
 const CFAR_P_FA: f32 = 0.001;
 
-/// Minimum reference cells for a usable noise estimate: below this the local
-/// null is unidentifiable and the read is withheld rather than guessed. Reached
-/// when the flanks are clipped by the spectrum's own edges — a reference close
-/// to DC or to Nyquist.
-///
-/// A refusal floor, not an operating point. The structural minimum is **2** (the
-/// rank clamp below needs `n_ref ≥ 2` for an order statistic to exist at all);
-/// the margin above it is free because the gate is already effectively closed
-/// there — at four references the multiplier is `cfar_multiplier(2, 1, ·)`, i.e.
-/// `T_q = 2/p − 2` ⇒ `T_lin ≈ 45`, some 6× the working threshold. For scale, the
-/// shipped read normally has 53–57 references, and Rohling's own OS-CFAR window
-/// sizes are `N = 24 … 32 and more`.
+/// Fewest reference cells for a noise estimate. With fewer, as where the flanks
+/// meet DC or Nyquist, the read is withheld.
+// A refusal floor, not an operating point: the order statistic needs 2, and at 4
+// the multiplier is already ≈ 45, some 6× the working threshold. A read normally
+// has 53–57.
+// audit 13
 const COARSE_CFAR_MIN_REFS: usize = 4;
 
-/// Search half-width in Hz. Three terms, in order of precedence:
+/// Search half-width in Hz: [`COARSE_SPAN_CENTS`], floored at
+/// [`COARSE_SPAN_MIN_BINS`], then capped at half the partial spacing, even below
+/// one bin.
 ///
-/// 1. [`COARSE_SPAN_CENTS`] — register-proportional;
-/// 2. [`COARSE_SPAN_MIN_BINS`] — a floor where that span is sub-bin;
-/// 3. a **neighbour cap at half the partial spacing**, which overrides both.
-///
-/// `spacing_hz` is the distance to the neighbouring partial (≈ f₀) and is
-/// **not** interchangeable with `center_hz`: they coincide only at n = 1. A read
-/// centred on A0's 4th partial has `center_hz ≈ 110` but `spacing_hz ≈ 27.5`,
-/// and a cap at `center_hz / 2` would admit a ±55 Hz band spanning two
-/// neighbours.
-///
-/// A band the cap leaves under one bin means that FFT size cannot serve that
-/// register — the size-selection rule doing its job, not a knob to widen.
+/// `spacing_hz` (≈ f₀) is not `center_hz`; they coincide only at n = 1. A0's 4th
+/// partial has `center_hz ≈ 110` but `spacing_hz ≈ 27.5`, and a cap at
+/// `center_hz / 2` would admit a ±55 Hz band spanning two neighbours.
 fn search_halfwidth_hz(center_hz: f32, spacing_hz: f32, hz_per_bin: f32) -> f32 {
     let span = center_hz * (2f32.powf(COARSE_SPAN_CENTS / 1200.0) - 1.0);
     span.max(COARSE_SPAN_MIN_BINS * hz_per_bin)
         .min(spacing_hz / 2.0)
 }
 
-/// **Exact finite-`N` OS-CFAR threshold multiplier** — a port of Rohling
-/// (1983) Eqs. 14 + 17.
+/// Exact finite-`N` OS-CFAR threshold multiplier, a port of Rohling (1983)
+/// Eqs. 14 + 17.
 ///
-/// His Eq. 14 gives the false-alarm probability of an ordered-statistic CFAR
-/// detector with `n_ref` reference cells selecting rank `k`, for an
-/// **exponentially** distributed (square-law detector) parent population:
+/// Eq. 14 gives the false-alarm probability of an ordered-statistic CFAR detector
+/// with `N = n_ref` reference cells selecting rank `k`, for exponentially
+/// distributed (square-law) cells:
 ///
 /// ```text
 ///   P_fa = k·C(N,k)·Γ(k)·Γ(T+N−k+1) / Γ(T+N+1)
 /// ```
 ///
-/// The gamma ratio telescopes for integer `k` — `Γ(T+N−k+1)/Γ(T+N+1)` is
-/// `1/∏_{j=0}^{k−1}(T+N−j)` — and the combinatorial prefactor reduces to
-/// `N!/(N−k)!`, leaving the product form evaluated here:
+/// For integer `k` the gamma ratio telescopes to `1/∏_{j=0}^{k−1}(T+N−j)` and the
+/// prefactor reduces to `N!/(N−k)!`, leaving
 ///
 /// ```text
 ///   P_fa = ∏_{j=0}^{k−1} (N−j)/(T+N−j)
 /// ```
 ///
-/// which is exact, strictly decreasing in `T`, and needs no gamma function —
-/// so `T` follows by bisection.
+/// which is exact and strictly decreasing in `T`, so `T` follows by bisection.
 ///
-/// Our cells are Rayleigh **magnitudes**, not exponential powers. The paper's
-/// closing section derives the linear-detector conversion **`T_lin = √T_q`** (its
-/// `T_q` is the square-law factor of Table II — not a quantile) for exactly the
-/// case where the receiver takes the absolute value and the cells "obey a
-/// Rayleigh distribution", and scopes it explicitly to this detector: "this
-/// simple conversion, however, does not apply for CA or CAGO CFAR". That
-/// conversion is the `sqrt` below, making this a port of Eqs. 14 + 17 rather than
-/// a bespoke calibration.
+/// Our cells are Rayleigh magnitudes, not exponential powers. For a receiver taking
+/// the absolute value, Eq. 17 converts the square-law factor to `T_lin = √T_q`
+/// (`T_q` is Table II's factor, not a quantile), and Rohling scopes the conversion
+/// to this detector: "this simple conversion, however, does not apply for CA or
+/// CAGO CFAR".
 ///
-/// Table II itself is tabulated at `P_fa = 10⁻⁶`, so it is not the operating
-/// point here, but it is a direct check on this implementation:
-/// `coarse_cfar_multiplier_table_ii` reproduces all 32 of its `N = 32` entries.
+/// As `N → ∞` with `k = q·N` the result tends to `√(ln P_fa / ln(1−q))`, 3.157 at
+/// the median for P_fa = 0.001.
 ///
-/// As `N → ∞` with `k = q·N` the product tends to
-/// `T_lin → √(ln P_fa / ln(1−q))` (3.157 at the median for P_fa = 0.001) — the
-/// asymptotic quantile form, pinned against this exact one by
-/// `coarse_cfar_multiplier_pinned`.
+/// Returns infinity for an unusable rank, so a gate that cannot form an order
+/// statistic admits nothing.
 ///
-/// Returns infinity for an unusable rank, so a caller that cannot form a
-/// legitimate order statistic admits nothing.
-///
-/// # Reference
+/// # References
 /// Rohling, H. (1983). "Radar CFAR Thresholding in Clutter and Multiple Target
 /// Situations." IEEE Trans. Aerospace and Electronic Systems, AES-19(4),
 /// pp. 608–621. DOI: 10.1109/TAES.1983.309350. (Eqs. 9–10, 12, 14, 17.)
 /// Lineage: Finn, H. M. & Johnson, R. S. (1968). "Adaptive Detection Mode with
 /// Threshold Control as a Function of Spatially Sampled Clutter-Level
 /// Estimates." RCA Review 29(3), pp. 414–464 — the cell-averaging predecessor.
+// asserted: coarse_cfar_multiplier_table_ii, coarse_cfar_multiplier_pinned
 fn cfar_multiplier(n_ref: usize, k: usize, p_fa: f32) -> f32 {
     if n_ref == 0 || k == 0 || k > n_ref {
-        return f32::INFINITY; // Unusable rank ⇒ admit nothing.
+        return f32::INFINITY;
     }
     let n = n_ref as f64;
     let pfa = |t: f64| -> f64 {
@@ -405,8 +275,8 @@ fn cfar_multiplier(n_ref: usize, k: usize, p_fa: f32) -> f32 {
         }
         p
     };
-    // P_fa is strictly decreasing in T. 60 halvings of [0, 1e6] resolve T_sq
-    // far below f32 precision, so the cast below is exact for any wider search.
+    // The bracket caps T_q at 1e6 (T_lin at 1000); 60 halvings resolve it far below
+    // f32 precision.
     let (mut lo, mut hi) = (0.0f64, 1.0e6f64);
     for _ in 0..60 {
         let mid = 0.5 * (lo + hi);
@@ -420,50 +290,31 @@ fn cfar_multiplier(n_ref: usize, k: usize, p_fa: f32) -> f32 {
     (0.5 * (lo + hi)).sqrt() as f32
 }
 
-/// **The coarse readout** — bounded argmax around one reference partial,
-/// admitted by an ordered-statistic CFAR gate, refined sub-bin by
-/// [`spectral::jacobsen`]. Returns the partial's frequency in Hz, or `None`
-/// when nothing at the reference clears the local noise.
+/// The coarse readout: the strongest bin in a bounded band around one reference
+/// partial, admitted by an ordered-statistic CFAR gate and refined sub-bin by
+/// [`spectral::jacobsen`]. Returns the partial's frequency in Hz, or `None` when
+/// nothing in the band clears the local noise.
 ///
-/// The wide-range companion to the strobe band, whose phase read is the more
-/// accurate one but aliases past ±0.5·fs/HOP ≈ 21.5 Hz — in cents ≈ 37200/f, so
-/// only ±9 ¢ at C8. A magnitude read costs jitter and buys range, so it stays
-/// correct through a pitch raise.
+/// The gate (Rohling 1983; Finn & Johnson 1968 lineage) sets its threshold from
+/// reference cells in flanks either side of the band, so the null is the spectrum
+/// around the sounding note rather than a quiet room. The argmax gives every cell
+/// in the band a chance to false-alarm, so each gets `P_fa / M`, `M` the band's
+/// bins halved for Hann correlation.
 ///
-/// # Gate
-/// Ordered-statistic CFAR (Rohling 1983; Finn & Johnson 1968 lineage) sets the
-/// threshold from the *neighbourhood* of the cell under test rather than from a
-/// calibrated absolute floor, so the null tracks the note that is sounding
-/// instead of the quiet room. Reference cells come from **flanks outside** the
-/// search band, never from inside it — in the deep bass the capped band is
-/// ≈ 5 bins and the guard cells consume all of it.
-///
-/// The low [`COARSE_CFAR_QUANTILE`] follows the paper's own §V interference
-/// criterion applied to a harmonic comb; the one adaptation that is ours is the
-/// **search-loss correction**, measured (ADR 0011 §5). Rohling's
-/// P_fa governs *one* cell under test, but this detector takes the argmax over
-/// the whole band and so gets one chance to false-alarm per cell; the
-/// multiple-comparisons budget is therefore `P_fa / M`, with `M` the band width
-/// halved because Hann correlation makes adjacent bins non-independent. Without
-/// it the realized rate runs ~32× nominal.
-///
-/// # Arguments
-/// * `magnitudes` — linear magnitude spectrum (`fft_size / 2` bins).
-/// * `complex_spectrum` — the same frame's complex spectrum, for the refiner.
-/// * `fft_size` — FFT length behind those spectra (2048 or 8192).
-/// * `sample_rate` — audio sample rate in Hz.
-/// * `center_hz` — the reference frequency of the partial being read.
-/// * `spacing_hz` — the key's partial spacing (≈ f₀), which sets both the
-///   neighbour cap and the reference flank width. **Not** `center_hz` — see
-///   [`search_halfwidth_hz`].
-/// * `scratch` — reference-cell workspace, reused across hops so the hot path
-///   allocates nothing. Must hold at least `magnitudes.len()` elements, the
-///   most cells the flanks can ever yield.
+/// `magnitudes` (`fft_size / 2` bins) and `complex_spectrum` are one frame, and the
+/// band centres on `center_hz`. `spacing_hz`, the key's partial spacing (≈ f₀), sets
+/// the neighbour cap and the flank width. `scratch` holds the reference cells and
+/// needs at least `magnitudes.len()` elements.
 ///
 /// # Panics
-/// In debug builds, if `scratch` is shorter than `magnitudes`. In release it
-/// truncates the reference set, which biases the order statistic — a caller
-/// bug, not a runtime condition.
+/// In debug builds, if `scratch` is shorter than `magnitudes`. In release the
+/// reference set is truncated, which biases the order statistic.
+// Not a lookup in `extract_peaks`' list: `Engine` builds that list only while
+// discovering, and its absolute threshold and `mask_peaks` can drop the weak
+// partial being tuned.
+// Ours: the flanks and the `P_fa / M` budget. Without the budget the realized
+// false-alarm rate was 39× nominal.
+// report 0011
 pub fn coarse_read(
     magnitudes: &[f32],
     complex_spectrum: &[Complex<f32>],
@@ -510,15 +361,17 @@ pub fn coarse_read(
     }
 
     // ── Local noise estimate from the flanking reference cells ──
-    // Both terms in Hz, converted once: the floor and the spacing rule must be
-    // compared in physical units, not bins.
     let flank_hz = (COARSE_CFAR_FLANK_SPACINGS * spacing_hz).max(COARSE_CFAR_FLANK_MIN_HZ);
-    // Saturating: a large `spacing_hz` saturates the float→int cast to
-    // `usize::MAX`, and a plain `+` would then overflow.
+    // A huge `spacing_hz` saturates this cast to `usize::MAX`, so the bounds
+    // saturate too.
     let flank = (flank_hz / hz_per_bin).ceil() as usize;
     let outer_lo = lo.saturating_sub(flank).max(1);
     let outer_hi = hi.saturating_add(flank).min(n_bins - 2);
 
+    // No guard cells: "in OS CFAR processing these guard cells become unnecessary"
+    // (Rohling §V). The only lobe cells that can enter lie just past a band edge,
+    // and they sort above a low quantile; a 0–4-bin guard measured inert.
+    // audit 13
     let mut n_ref = 0usize;
     for bin in (outer_lo..lo).chain((hi + 1)..=outer_hi) {
         if n_ref < scratch.len() {
@@ -536,12 +389,11 @@ pub fn coarse_read(
     let noise = *noise;
 
     // Three factors of two, calibrated as one: Hann correlation is taken to halve
-    // both the effective reference count and the band's independent cells, and
-    // the argmax costs a per-cell P_fa budget over the latter. The textbook
-    // figure is Hann's ENBW of 1.5 bins, not 2, so each is individually
-    // conservative — but the composite lands on nominal (realized 0.00097 vs
-    // 0.001, ADR 0011 §5). Do not "fix" one of them alone; they are only
-    // validated together.
+    // both the effective reference count and the band's independent cells, and the
+    // argmax divides the P_fa budget over the latter. Hann's ENBW is 1.5 bins, not
+    // 2, so each alone is conservative, but together they land on nominal (realized
+    // 0.00097 against 0.001). Do not change one alone.
+    // report 0011
     let m_eff = (hi - lo).div_ceil(2).max(1) as f32;
     let threshold =
         noise * cfar_multiplier((n_ref / 2).max(2), (rank / 2).max(1), CFAR_P_FA / m_eff);
@@ -555,144 +407,92 @@ pub fn coarse_read(
 
 // ─── Unison lines: baseband zoom-DFT + sliding local OS-CFAR ─────────────────
 
-/// Lines one reference can report — a three-string unison, the widest the piano
-/// builds. The cap means "the three strongest *admitted* lines", since candidates
-/// are magnitude-sorted and the CFAR loop stops at the first rejection.
+/// Most lines one reference reports, the strongest admitted: a piano unison has at
+/// most three strings.
 pub const MAX_UNISON_LINES: usize = 3;
 
-/// Guard cells either side of the cell under test, in bins — the Hann main lobe
-/// of the cell itself, whose skirt is not noise.
-///
-/// Do not give this detector [`coarse_read`]'s reference geometry: references
-/// drawn from flanks *outside* the search band exclude the dominant line's own
-/// skirt, so a secondary maximum riding that skirt is compared against distant
-/// background and admitted. Measured on a *single* synthetic string, up to
-/// **26.7 % false second lines** (ADR 0012 §2).
+/// Guard cells either side of the cell under test, in bins: the cell's own Hann
+/// main lobe, whose skirt is not noise.
+// Not `coarse_read`'s flanks outside the band: they exclude the dominant line's
+// skirt, so a secondary maximum riding it is admitted, up to 26.7 % false second
+// lines on one synthetic string.
+// report 0012
 const UNISON_CFAR_GUARD_BINS: usize = 2;
 
-/// Reference cells per side, at circular distance
-/// `(GUARD, GUARD + UNISON_CFAR_WINDOW_BINS]` from the cell under test — 32
-/// total, the same order as Rohling's own `N = 24 … 32 and more`.
-///
-/// The window slides with the cell under test rather than flanking a fixed band,
-/// so the reference is always the local background. Where the record is too short
-/// to reach this far the set degrades to *every* bin outside the guard, which is
-/// the same thing said with fewer cells; [`UNISON_MIN_BINS`] is the length below
-/// which that stops being enough.
+/// Reference cells either side, beyond the guard: 32 in all, within Rohling's
+/// `N = 24 … 32 and more`. The window slides with the cell under test, and a record
+/// too short to fill it uses every bin outside the guard.
 const UNISON_CFAR_WINDOW_BINS: usize = 16;
 
-/// Order statistic taken as the local noise estimate, as a fraction of the
-/// reference count — Rohling's rank parameter `k/N`, here the paper's own median.
-///
-/// Unlike [`COARSE_CFAR_QUANTILE`], which the harmonic comb drives *below* the
-/// paper's `k > N/2` recommendation, this window sees at most the note's other
-/// strings. Rohling §V binds from the usual side and is satisfied with margin:
-/// two interfering lines occupy `2 × (2·GUARD + 1) = 10` cells of the reference
-/// window against the `N_ref − k = 16` the criterion allows.
-///
-/// Do not raise it to the paper's own worked `q = 0.75`: with three lines
-/// present the reference window is signal-dominated at the upper quantile, and a
-/// three-string unison is lost outright (detection 100 % → 0 %, ADR 0012 §2).
+/// Rank of the order statistic taken as the local noise, as a fraction of the
+/// reference count: Rohling's `k/N`, at the median. His §V criterion holds with
+/// margin, the note's other two strings occupying `2 × (2·GUARD + 1) = 10` cells
+/// against the `N_ref − k = 16` it allows.
+// Do not raise it to Rohling's worked q = 0.75: with three lines present the upper
+// quantile is signal, and a three-string unison is lost (detection 100 % → 0 %).
+// report 0012
 const UNISON_CFAR_QUANTILE: f32 = 0.50;
 
-/// Rayleigh criterion, in bins: two lines closer than the Hann main-lobe
-/// half-width (`2/T` Hz) are one line, and reporting them as two is a measured
-/// failure mode. Applied to the *refined* positions — at the integer grid the
-/// test is inert, because two distinct local maxima are already two bins apart.
+/// Rayleigh criterion in bins: two lines closer than the Hann main-lobe half-width
+/// (`2/T` Hz) are one line.
 const UNISON_MERGE_BINS: f32 = 2.0;
 
-/// Reference cells Rohling's §V interference criterion demands of this geometry:
-/// an inhomogeneity is tolerable only while it "affects less than `(N − k)`
-/// resolution cells", and here the inhomogeneity is the note's *other* strings —
-/// [`MAX_UNISON_LINES`] − 1 of them, each occupying its own main lobe
-/// (`2·GUARD + 1` cells).
+/// Reference cells Rohling's §V criterion demands: the note's other strings,
+/// [`MAX_UNISON_LINES`] − 1 main lobes of `2·GUARD + 1` cells, must affect fewer
+/// than `N − k` of them.
 const UNISON_MIN_REFS: usize = (((MAX_UNISON_LINES - 1) * (2 * UNISON_CFAR_GUARD_BINS + 1)) as f32
     / (1.0 - UNISON_CFAR_QUANTILE)) as usize;
 
-/// Shortest transform [`resolve_lines`] will run — the length at which the
-/// reference window still holds [`UNISON_MIN_REFS`] cells once the cell under
-/// test and its guard are excluded.
-///
-/// This is the estimator's own floor, not a display policy: below it the
-/// reference window is signal-dominated whenever a second string is present, so
-/// "one line" stops meaning "no second line" and starts meaning "the detector is
-/// blind". [`strobe::unison`](crate::strobe::unison) honours it as the ring's
-/// publish floor.
+/// Shortest record [`resolve_lines`] resolves: [`UNISON_MIN_REFS`] reference cells
+/// besides the cell under test and its guard. Below it a second string makes the
+/// window signal-dominated, so one line would mean a blind detector, not one string.
 pub(crate) const UNISON_MIN_BINS: usize = UNISON_MIN_REFS + 2 * UNISON_CFAR_GUARD_BINS + 1;
 
-/// Caller-owned working buffers for [`resolve_lines`], reused across hops so the
-/// hot path allocates nothing. [`Self::spectrum`] and [`Self::magnitudes`] must
-/// hold at least the transform length, [`Self::fft`] at least the plan's
-/// `get_inplace_scratch_len()`.
+/// Working buffers for [`resolve_lines`], so a hop allocates nothing.
+/// [`Self::spectrum`] and [`Self::magnitudes`] hold at least the transform length,
+/// [`Self::fft`] at least the plan's `get_inplace_scratch_len()`.
 pub struct LineScratch<'a> {
     /// Windowed baseband, transformed in place.
     pub spectrum: &'a mut [Complex<f32>],
-    /// `|Z[m]|`, read by the candidate scan and the reference cells.
+    /// `|Z[m]|`, the magnitudes of `spectrum`.
     pub magnitudes: &'a mut [f32],
-    /// `rustfft`'s own in-place scratch.
+    /// `rustfft`'s in-place scratch.
     pub fft: &'a mut [Complex<f32>],
 }
 
-/// **The unison line estimator** — resolves the individual strings of one
-/// reference partial as separate spectral lines, each a signed Hz offset from
-/// that reference. Returns how many were written to `out`.
+/// Resolves the strings of one reference partial as separate spectral lines, each
+/// a signed Hz offset from the reference. Returns how many were written to `out`,
+/// strongest first and at most [`MAX_UNISON_LINES`], with `relative_amplitude`
+/// normalised to the strongest.
 ///
-/// # What it is
-/// A **zoom FFT** (Lyons, *Understanding DSP*, ch. 13) whose front end is already
-/// running: the strobe's Hann-windowed Goertzel at `f_ref` is the mixer and
-/// anti-alias filter, and taking one output per hop is the decimator, so
-/// `baseband[h]` is a sum of damped complex exponentials turning at each string's
-/// **offset** from the target. Sampled at `hop_rate_hz`, it is unambiguous over
-/// ±`hop_rate_hz/2` ≈ ±21.5 Hz. Resolution is set by observation time, not bin
-/// count — 50 % of pairs resolve at `2/T`, 100 % at ≈1.35·`2/T` — which is why
-/// the caller must publish `2/T` alongside the lines.
+/// A zoom FFT (Lyons 2010, ch. 13) whose mixing, anti-alias filtering and
+/// decimation are done: `baseband` holds one Hann-windowed Goertzel output per hop
+/// at the reference, oldest first, sampled at `hop_rate_hz` and so unambiguous over
+/// ±`hop_rate_hz / 2`. Resolution is set by the record's duration `T`, not its bin
+/// count: a pair resolves once its separation clears `2/T`.
 ///
-/// # Steps
-/// 1. Hann-window the record and take an `N`-point complex DFT, `N` =
-///    `baseband.len()`. **Natural Fourier bins, no zero-padding**: padded bins are
-///    interpolated rather than independent, and the CFAR null below assumes
-///    independence.
-/// 2. Take circular local maxima of `|Z|` in descending magnitude — the baseband
-///    spectrum wraps, so bin 0 and bin `N−1` are neighbours and there is no edge
-///    case.
-/// 3. Refine each sub-bin by the three-bin Candan estimator on the complex bins
-///    (the same Eq. 1 [`spectral::jacobsen`] ports, evaluated circularly), then
-///    reject any candidate within [`UNISON_MERGE_BINS`] of an accepted stronger
-///    one.
-/// 4. Admit by an ordered-statistic CFAR gate against a **sliding local**
-///    reference window ([`UNISON_CFAR_WINDOW_BINS`], [`UNISON_CFAR_GUARD_BINS`],
-///    [`UNISON_CFAR_QUANTILE`]), reusing [`cfar_multiplier`]. Candidates are
-///    magnitude-sorted, so the first rejection ends the list.
+/// The record is Hann-windowed and transformed at its own length `N`, unpadded:
+/// padded bins are interpolated, and the CFAR null assumes independent bins. Local
+/// maxima of the circular spectrum are taken strongest first, refined by Candan's
+/// Eq. 1 evaluated circularly, dropped within `UNISON_MERGE_BINS` of a stronger
+/// line, and admitted by an ordered-statistic CFAR gate against a window sliding
+/// with each; the first rejection ends the list.
 ///
-/// The Hann halvings and the `m_eff` search-loss divisor follow [`coarse_read`]'s
-/// calibrated pattern: this detector also takes an argmax, so ADR 0011 §5's
-/// correction applies, over the whole record rather than a bounded band.
-///
-/// # Arguments
-/// * `baseband` — the per-reference complex baseband, **oldest first**. Its
-///   length is the transform length; below [`UNISON_MIN_BINS`] nothing is
-///   reported. There is no upper bound — how long a record is worth keeping is
-///   the caller's policy, not this function's.
-/// * `fft` — a complex forward transform planned for exactly `baseband.len()`,
-///   built once at startup and held by the caller.
-/// * `c_n` — [`spectral::candan_c_n`] at that length. Passed in rather than
-///   evaluated here because it is `O(N)` in trigonometry and constant per length;
-///   the 2.0 asymptote is a 2.4 % scale error on every offset at these sizes.
-/// * `hop_rate_hz` — the baseband's sample rate, i.e. the DSP hop rate.
-/// * `scratch` — see [`LineScratch`].
-/// * `out` — receives up to `min(out.len(), MAX_UNISON_LINES)` lines, strongest
-///   first, with `relative_amplitude` normalised to that strongest line.
+/// `fft` is a forward plan for exactly `N`, and `c_n` is [`spectral::candan_c_n`]
+/// at `N`, passed in because it costs `O(N)` in trigonometry; the 2.0 asymptote
+/// would scale every offset by 2.4 % at `N = 56`. A record shorter than
+/// `UNISON_MIN_BINS` reports nothing, and there is no upper bound.
 ///
 /// # Panics
 /// In debug builds, if `fft`'s length disagrees with `baseband`'s or a scratch
-/// buffer is too short. In release those are runtime `0`-returns rather than
-/// wrong answers.
+/// buffer is too short. In release those return `0`.
 ///
-/// # Reference
+/// # References
 /// Rohling, H. (1983). "Radar CFAR Thresholding in Clutter and Multiple Target
 /// Situations." IEEE Trans. AES-19(4) — the admission gate; §V sets the rank.
 /// Candan, Ç. (2015). Signal Processing 114, Eq. 1 — the sub-bin refinement.
 /// Lyons, R. (2010). *Understanding DSP*, ch. 13 — the zoom-FFT structure.
+// asserted: tests/unison_resolution.rs
 pub fn resolve_lines(
     baseband: &[Complex<f32>],
     fft: &dyn Fft<f32>,
@@ -727,8 +527,7 @@ pub fn resolve_lines(
     }
 
     // ── Window and transform ──
-    // Hann over [0, N−1] — the window `c_n` is derived for and the one the rest
-    // of the pipeline applies.
+    // Symmetric Hann, over [0, N−1]: the window `c_n` is derived for.
     let n_minus_1 = (n - 1) as f32;
     for (i, (dst, &src)) in scratch.spectrum[..n].iter_mut().zip(baseband).enumerate() {
         let w = 0.5 * (1.0 - (2.0 * core::f32::consts::PI * i as f32 / n_minus_1).cos());
@@ -749,9 +548,8 @@ pub fn resolve_lines(
     let mut positions = [0.0f32; MAX_UNISON_LINES];
     let mut found = 0usize;
     let mut strongest = 0.0f32;
-    // The last candidate examined. Advancing a cursor through a strict total
-    // order is what lets the scan skip what it has already taken without a
-    // visited set — and so without any bound on the record length.
+    // The last candidate examined. A cursor through a strict total order skips what
+    // was already examined without a visited set, so nothing bounds the record.
     let mut cursor: Option<(f32, usize)> = None;
 
     while found < max_lines {
@@ -812,10 +610,9 @@ pub fn resolve_lines(
     found
 }
 
-/// Strict total order on candidates: descending magnitude, ties broken by
-/// ascending bin. Total rather than merely descending because two bins of equal
-/// magnitude must still order, or a scan that advances by "strictly after the
-/// last one taken" would never leave them.
+/// Strict total order on candidates: descending magnitude, then ascending bin.
+/// Ties must order too, or the cursor scan would skip a candidate as strong as the
+/// last one examined.
 fn precedes(a: (f32, usize), b: (f32, usize)) -> bool {
     match a.0.total_cmp(&b.0) {
         core::cmp::Ordering::Greater => true,
@@ -883,10 +680,9 @@ fn admits(magnitudes: &[f32], bin: usize, n: usize, mag: f32) -> bool {
     let (_, noise, _) = refs.select_nth_unstable_by(rank, f32::total_cmp);
     let noise = *noise;
 
-    // The same three calibrated factors of two as `coarse_read`: Hann
-    // correlation halves the effective reference count and the record's
-    // independent cells, and the argmax costs a per-cell budget over the latter.
-    // The search here spans the whole record, there being no bounded band.
+    // `coarse_read`'s three calibrated factors of two, with the whole record as the
+    // searched band.
+    // report 0012
     let m_eff = (n / 2).max(1) as f32;
     let threshold =
         noise * cfar_multiplier((n_ref / 2).max(2), (rank / 2).max(1), CFAR_P_FA / m_eff);
@@ -896,13 +692,11 @@ fn admits(magnitudes: &[f32], bin: usize, n: usize, mag: f32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audio::{BASS_WINDOW_SIZE, SAMPLE_RATE, WINDOW_SIZE};
+    use crate::audio::{BASS_WINDOW_SIZE, HOP_RATE_HZ, SAMPLE_RATE, WINDOW_SIZE};
 
-    /// Rohling Eq. 14 + 17 at the ranks the gate actually uses, against values
-    /// computed independently from the closed form, plus the asymptotic limit
+    /// Pins the calibration: Rohling Eqs. 14 + 17 at the median rank against values
+    /// computed independently from the closed form, and the asymptotic limit
     /// `T_lin → √(ln P_fa / ln(1−q))` = 3.157 at the median for P_fa = 0.001.
-    /// These pin the *calibration*: a drift here silently changes how permissive
-    /// every coarse read is.
     #[test]
     fn coarse_cfar_multiplier_pinned() {
         for &(n, k, want) in &[
@@ -917,30 +711,26 @@ mod tests {
                 "N={n} k={k}: expected {want}, got {got}"
             );
         }
-        // Asymptotic agreement (the two forms are mutually validating).
+        // The finite-N form converges on the quantile form.
         let limit = cfar_multiplier(100_000, 50_000, 0.001);
         assert!(
             (limit - 3.1569).abs() < 5e-3,
             "finite-N must converge to the quantile form, got {limit}"
         );
-        // Monotone in P_fa: a tighter budget demands a higher threshold — the
-        // property the search-loss correction relies on.
+        // A tighter budget demands a higher threshold, which the search-loss
+        // correction relies on.
         assert!(cfar_multiplier(64, 16, 1e-5) > cfar_multiplier(64, 16, 1e-3));
         // Unusable rank admits nothing rather than defaulting to something.
         assert!(cfar_multiplier(0, 1, 0.001).is_infinite());
         assert!(cfar_multiplier(8, 9, 0.001).is_infinite());
     }
 
-    /// **Rohling Table II reproduced.** The paper tabulates the square-law
-    /// scaling factor `T_q` at `P_fa = 10⁻⁶` for `N ∈ {8, 16, 24, 32}`; squaring
-    /// this function's output (Eq. 17 inverted) must return it. That checks Eq. 14
-    /// against the source's own numbers rather than against our re-derivation of
-    /// it — the strongest available guard on the port.
+    /// Reproduces Rohling Table II: the square-law factor `T_q` at `P_fa = 10⁻⁶` for
+    /// `N ∈ {8, 16, 24, 32}` is this function's output squared (Eq. 17 inverted).
+    /// That checks Eq. 14 against the paper's numbers, not our derivation of it.
     ///
-    /// `k = 1` is excluded: `T_q = N/P_fa − N` reaches 3.2 × 10⁷ there, above the
-    /// bisection's `1e6` interval. Unreachable in use — the widest shipped band
-    /// puts `T_q` under 2.5 × 10⁴ — but it is a real bound on the search, not a
-    /// property of the formula.
+    /// `k = 1` is excluded: its `T_q = N/P_fa − N` reaches 3.2 × 10⁷, past the
+    /// bisection's `1e6` bracket. The widest band in use keeps `T_q` under 2.5 × 10⁴.
     #[test]
     fn coarse_cfar_multiplier_table_ii() {
         // (N, k, T_q) transcribed from Table II, journal p. 616.
@@ -985,7 +775,7 @@ mod tests {
         let a0 = search_halfwidth_hz(27.5, 27.5, bin_8192);
         assert!((a0 - 13.75).abs() < 1e-4, "cap must win at A0, got {a0}");
 
-        // A0 n = 4: the cap follows the *spacing*, not the centre. Capping at
+        // A0 n = 4: the cap follows the spacing, not the centre. Capping at
         // centre/2 would give ±55 Hz and span two neighbouring partials.
         let a0_n4 = search_halfwidth_hz(110.0, 27.5, bin_8192);
         assert!((a0_n4 - 13.75).abs() < 1e-4);
@@ -996,9 +786,8 @@ mod tests {
         assert!((search_halfwidth_hz(82.4, 82.4, bin_2048) - 41.2).abs() < 1e-3);
     }
 
-    /// One Hann-windowed sine in AWGN, read at 8192. The gate must admit it and
-    /// `jacobsen` must land within a small fraction of a bin — the end-to-end
-    /// contract the readout depends on.
+    /// A clean sine ≈ 29 ¢ off the reference, read at 8192, is admitted and lands
+    /// within 0.6 Hz.
     #[test]
     fn coarse_read_finds_a_tone_off_reference() {
         let fs = SAMPLE_RATE;
@@ -1023,9 +812,7 @@ mod tests {
         );
     }
 
-    /// Noise alone must be rejected. The gate's whole purpose: the ambient
-    /// Neyman–Pearson threshold admits 100 % of this during a sustain, because
-    /// its null is a quiet room rather than the local spectrum.
+    /// Broadband noise alone yields no reading.
     #[test]
     fn coarse_read_rejects_noise() {
         let mut noise = Vec::with_capacity(BASS_WINDOW_SIZE);
@@ -1054,9 +841,8 @@ mod tests {
         );
     }
 
-    /// The neighbour cap in force: a strong 2nd partial one spacing above the
-    /// reference must not be returned in place of the (present, weaker)
-    /// fundamental. Uncapped at 2048 this is the measured +1200 ¢ failure.
+    /// A strong 2nd partial is not returned in place of the weaker fundamental:
+    /// without the neighbour cap, the read at 2048 returns it (+1200 ¢).
     #[test]
     fn coarse_read_never_returns_the_neighbour() {
         let f0 = 82.4; // guitar E2 — spacing < the 2048 four-bin floor
@@ -1075,9 +861,7 @@ mod tests {
         }
     }
 
-    /// A band the spectrum cannot hold withholds rather than guesses — the
-    /// tier-1 size selection reads `None` as "this size cannot serve this
-    /// register", so a fabricated number here would defeat it.
+    /// A band the spectrum cannot hold, or a non-physical input, withholds the read.
     #[test]
     fn coarse_read_withholds_without_a_band() {
         let (mag, spec) = spectrum_of(&sine(440.0, 0.2, WINDOW_SIZE), WINDOW_SIZE);
@@ -1100,10 +884,8 @@ mod tests {
         // Non-physical inputs are runtime conditions, not panics.
         assert!(read(0.0, 27.5).is_none());
         assert!(read(440.0, f32::NAN).is_none());
-        // A finite but absurd spacing saturates the flank's float→int cast to
-        // `usize::MAX`. The flank arithmetic must clamp to the spectrum rather
-        // than overflow; the read then degrades to a whole-spectrum noise
-        // reference, which is sane, so the contract here is "does not panic".
+        // An absurd spacing saturates the flank's cast to `usize::MAX`; the flank
+        // must clamp rather than overflow. Only not panicking is asserted.
         let _ = read(440.0, 1.0e30);
         let _ = read(440.0, f32::MAX);
     }
@@ -1114,8 +896,8 @@ mod tests {
             .collect()
     }
 
-    /// Hann-windowed magnitude + complex spectra, the same path the pipeline
-    /// hands to [`coarse_read`].
+    /// Hann-windowed magnitude and complex spectra of the freshest `fft_size`
+    /// samples.
     fn spectrum_of(signal: &[f32], fft_size: usize) -> (Vec<f32>, Vec<Complex<f32>>) {
         let fft = realfft::RealFftPlanner::<f32>::new().plan_fft_forward(fft_size);
         let mut time = vec![0.0f32; fft_size];
@@ -1134,9 +916,6 @@ mod tests {
 
     // ── resolve_lines ────────────────────────────────────────────────────────
 
-    /// The hop rate the strobe's baseband is sampled at.
-    const HOP_HZ: f32 = 44_100.0 / 1024.0;
-
     /// One string: a damped complex exponential at `offset_hz` from the
     /// reference, which is what the strobe's demodulated Goertzel produces.
     struct Source {
@@ -1145,8 +924,8 @@ mod tests {
         tau_secs: f32,
     }
 
-    /// Builds a baseband record of `n` hops from the given strings plus
-    /// deterministic circular noise at `noise` RMS per component.
+    /// Builds a baseband record of `n` hops from the given strings, plus
+    /// deterministic uniform noise spanning `noise` in each component.
     fn baseband(strings: &[Source], n: usize, noise: f32, seed: u32) -> Vec<Complex<f32>> {
         let mut x = seed | 1;
         let mut rand = move || {
@@ -1157,7 +936,7 @@ mod tests {
         };
         (0..n)
             .map(|h| {
-                let t = h as f32 / HOP_HZ;
+                let t = h as f32 / HOP_RATE_HZ;
                 let mut z = Complex::new(noise * rand(), noise * rand());
                 for (k, s) in strings.iter().enumerate() {
                     // Distinct start phases: two strings struck by one hammer do
@@ -1171,8 +950,7 @@ mod tests {
             .collect()
     }
 
-    /// Runs the shipped estimator over a record, planning its transform the way
-    /// the component does at startup.
+    /// Runs [`resolve_lines`] over a record, with a transform planned for its length.
     fn resolve(record: &[Complex<f32>]) -> Vec<UnisonLine> {
         let n = record.len();
         let fft = rustfft::FftPlanner::<f32>::new().plan_fft_forward(n);
@@ -1184,7 +962,7 @@ mod tests {
             record,
             fft.as_ref(),
             spectral::candan_c_n(n),
-            HOP_HZ,
+            HOP_RATE_HZ,
             &mut LineScratch {
                 spectrum: &mut spectrum,
                 magnitudes: &mut magnitudes,
@@ -1215,9 +993,8 @@ mod tests {
         assert!(!ok(UNISON_MIN_BINS - 1));
     }
 
-    /// Two strings 2.0 Hz apart over the 56-hop record must resolve as two lines
-    /// at the right places. This is the feature: a tuner watching two markers
-    /// converge.
+    /// Two strings 2.0 Hz apart over a 56-hop record resolve as two lines, each in
+    /// place.
     #[test]
     fn resolve_lines_finds_two_strings() {
         let lines = resolve(&baseband(
@@ -1251,10 +1028,9 @@ mod tests {
         assert!(lines[1].relative_amplitude > 0.5);
     }
 
-    /// **The null.** One string must report one line — no matter how clean, how
-    /// fast it decays, or how long the record. A false second line here is a
-    /// tuner chasing a beat that does not exist, and the flanking reference
-    /// geometry `coarse_read` uses produced them at up to 26.7 % (ADR 0012 §2).
+    /// The null: one string reports one line, whatever its noise, decay or record
+    /// length.
+    // report 0012
     #[test]
     fn resolve_lines_reports_one_line_for_one_string() {
         for (n, tau, noise, seed) in [
@@ -1282,9 +1058,7 @@ mod tests {
         }
     }
 
-    /// Below the Rayleigh criterion two components *are* one line, and saying so
-    /// is the honest answer — the caller publishes `2/T` beside it so the display
-    /// can say how much "one line" is worth.
+    /// Two components inside the Rayleigh criterion report one line.
     #[test]
     fn resolve_lines_merges_inside_the_rayleigh_criterion() {
         let lines = resolve(&baseband(
@@ -1307,14 +1081,12 @@ mod tests {
         assert_eq!(lines.len(), 1, "0.4 Hz is under 2/T = 1.54 Hz");
     }
 
-    /// A record too short for the gate to stand behind reports nothing rather
-    /// than something. There is no ceiling to match it: a record longer than
-    /// anything the ring currently keeps must still resolve, because how long to
-    /// keep is the caller's policy and not this function's.
+    /// A record shorter than [`UNISON_MIN_BINS`] reports nothing, and there is no
+    /// matching ceiling: how long a record to keep is the caller's policy.
     #[test]
     fn resolve_lines_has_a_floor_and_no_ceiling() {
-        // 5 Hz apart, so the pair clears 2/T at the floor (3.45 Hz) as well as
-        // at the long record — the test is about length limits, not resolution.
+        // 5 Hz apart, clearing 2/T at the floor (3.45 Hz) too: this tests length
+        // limits, not resolution.
         let two = [
             Source {
                 offset_hz: -2.5,
@@ -1329,7 +1101,7 @@ mod tests {
         ];
         assert!(resolve(&baseband(&two, UNISON_MIN_BINS - 1, 0.01, 7)).is_empty());
         assert_eq!(resolve(&baseband(&two, UNISON_MIN_BINS, 0.01, 7)).len(), 2);
-        // Well past the shipped ring cap, and past the 64 a bitmask scan allowed.
+        // Past the ring's cap, and past 64 bins, which a bitmask scan cannot reach.
         assert_eq!(resolve(&baseband(&two, 100, 0.01, 7)).len(), 2);
 
         // No room to write an answer into ⇒ no work.
@@ -1343,7 +1115,7 @@ mod tests {
                 &record,
                 fft.as_ref(),
                 spectral::candan_c_n(record.len()),
-                HOP_HZ,
+                HOP_RATE_HZ,
                 &mut LineScratch {
                     spectrum: &mut spectrum,
                     magnitudes: &mut magnitudes,
@@ -1355,8 +1127,9 @@ mod tests {
         );
     }
 
-    /// A silent baseband has no lines, and a lopsided pair still finds the
-    /// quiet string: sensitivity reaches ≈26 dB below the strongest (ADR 0012 §3).
+    /// A silent baseband has no lines, and a second string 20 dB down is still
+    /// found.
+    // report 0012
     #[test]
     fn resolve_lines_handles_the_extremes() {
         let silence = vec![Complex::new(0.0f32, 0.0); 56];

@@ -4,15 +4,6 @@
 //! the small state machine around writing it: whether this session has taken
 //! its rollback copy, and whether an interaction-rate edit is still waiting to
 //! be flushed.
-//!
-//! Kept out of `app.rs` because it is the one part of the frontend with
-//! invariants of its own rather than message routing, and it can be exercised
-//! without a GUI. `app.rs` holds a [`ProfileSession`] and its handlers become
-//! calls into it.
-//!
-//! The persistence rules — save on every measurement and every undo, atomic
-//! write, a `.bak` per session, coalesced typing — are argued in
-//! `docs/design/session-persistence-and-profile-library.md` §4.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -22,50 +13,36 @@ use tuner_core::models::{InharmonicityProfile, KeyMeasurement};
 use crate::library::{self, AppSettings};
 
 /// How long an interaction-rate edit waits for the interaction to stop before
-/// it is written.
-///
-/// Text inputs emit per character and sliders per step, while the profile is a
-/// single ~140 KB document — writing on each event would rewrite the whole file
-/// eight times to type a name, and hundreds of times to drag a threshold. The
-/// worst case this costs is the tail of a name typed in the last moment before
-/// a crash; measurements and undo never take this path.
+/// it is written. Writing per event would rewrite the whole profile for every
+/// character typed or slider step; the cost is an edit made just before a crash.
 const EDIT_FLUSH_QUIET: Duration = Duration::from_millis(700);
 
-/// Captures whose most recent measurement can still be undone in one session.
-///
-/// Bounded because undo is the short-timescale remedy only — "the mistake you
-/// just made". A key that looks wrong later is the inspector's job; total loss
-/// is the `.bak`'s.
+/// Captures that can still be undone in one session. Undo is for the mistake
+/// just made; the inspector and the `.bak` cover the rest.
 const UNDO_HISTORY_DEPTH: usize = 100;
 
-/// One capture the session can still undo, by **identity, never position**:
+/// One capture the session can still undo, by identity, never position:
 /// retention evicts from the middle of a key's list, and undo deletes the
 /// capture's dump, which nothing restores.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UndoneCapture {
-    /// The key the capture measured.
     pub key: u8,
-    /// The capture's `last_captured` stamp — also its dump directory's name
-    /// (`worker::dump_dir_name`).
+    /// The capture's `last_captured` stamp, which also names its dump.
     pub epoch: Box<str>,
 }
 
 /// The instrument currently open, its file, and the write policy around it.
 #[derive(Default)]
 pub struct ProfileSession {
-    /// The authoritative in-memory profile.
     profile: InharmonicityProfile,
     /// Where it is persisted. `None` only before the first profile exists.
     path: Option<PathBuf>,
-    /// Whether this session has written its `.bak` for [`Self::path`]. Reset
-    /// whenever a different profile is opened.
+    /// This session has written its `.bak` for [`Self::path`].
     backed_up: bool,
-    /// An interaction-rate edit is pending a write; the clock restarts on each
-    /// keystroke so the write lands once the user stops.
+    /// When the pending interaction-rate edit was last touched.
     dirty_since: Option<Instant>,
-    /// Captures that can still be undone, oldest first. Session-scoped and
-    /// never persisted — an undo deletes the capture's dump, so a restored
-    /// cross-session entry would be a promise the files can no longer keep.
+    /// Captures that can still be undone, oldest first. Never persisted: an
+    /// undo deletes a dump, which a later session cannot vouch for.
     undo_history: std::collections::VecDeque<UndoneCapture>,
 }
 
@@ -86,22 +63,16 @@ impl ProfileSession {
         self.path.as_deref()
     }
 
-    /// The key whose capture the next undo would revert, with the timestamp of
-    /// the entry that would be discarded — repeat captures share a key, so the
-    /// epoch is the only thing distinguishing which one. Matches the on-disk
-    /// `key_<idx>_<note>_<epoch>` dump name.
+    /// The key and timestamp of the capture the next undo would revert.
     pub fn undo_target(&self) -> Option<(u8, Option<&str>)> {
         let undone = self.undo_history.back()?;
         Some((undone.key, Some(&*undone.epoch).filter(|s| !s.is_empty())))
     }
 
-    /// Resolves which instrument the session starts on, recording the choice in
-    /// `settings`.
-    ///
-    /// In order: the profile open when the app last closed; else a one-time
-    /// import of a pre-library `tuning_profile.json` from the working
-    /// directory; else a fresh empty instrument, so autosave always has
-    /// somewhere to write.
+    /// Opens the instrument the session starts on, recording it in `settings`:
+    /// the profile open when the app last closed, else a one-time import of a
+    /// pre-library `tuning_profile.json`, else a fresh instrument, so autosave
+    /// always has somewhere to write.
     pub fn open_at_startup(&mut self, settings: &mut AppSettings) {
         if let Some(path) = settings.last_profile.clone()
             && let Ok(profile) = InharmonicityProfile::from_file(&path)
@@ -121,11 +92,8 @@ impl ProfileSession {
     }
 
     /// Makes `profile` at `path` the open instrument, stamping `last_opened`
-    /// and recording it as the one to resume next launch.
-    ///
-    /// Undo history is dropped: it names captures of the instrument being
-    /// closed, and replaying it against a different one would discard a
-    /// stranger's measurement from this profile.
+    /// and recording it as the one to resume next launch. Undo history is
+    /// dropped: it names captures of the instrument being closed.
     pub fn adopt(
         &mut self,
         mut profile: InharmonicityProfile,
@@ -133,10 +101,9 @@ impl ProfileSession {
         settings: &mut AppSettings,
     ) {
         profile.last_opened = unix_now();
-        // Mint the identity on first open, so a profile written before the
-        // field existed gets one and the `persist` below makes it durable.
-        // Everything that must survive a rename — the dump directory above all
-        // — keys off this, so it is minted exactly once and never rewritten.
+        // A profile written before the field existed, or a duplicate, gets its
+        // id here, and the `persist` below makes it durable. Never rewritten:
+        // the dump directory keys off it.
         if profile.identity.id.is_empty() {
             profile.identity.id = uuid::Uuid::now_v7().to_string();
             eprintln!(
@@ -163,11 +130,6 @@ impl ProfileSession {
     }
 
     /// Appends a capture and persists immediately.
-    ///
-    /// Appending rather than replacing is what keeps an unattended auto-mode
-    /// capture from destroying a manual one: `InharmonicityProfile::active`
-    /// resolves to the newest *trusted* entry, and retention budgets the two
-    /// classes apart.
     pub fn record(&mut self, measurement: KeyMeasurement) {
         self.undo_history.push_back(UndoneCapture {
             key: measurement.key_index,
@@ -180,13 +142,9 @@ impl ProfileSession {
         self.persist();
     }
 
-    /// Reverts the most recent capture, returning **which** one so the caller
-    /// can delete its dump. Persists immediately, or an undo would leave the
-    /// bad measurement on disk.
-    ///
-    /// The dump goes whether or not the entry was still retained. A *dropped*
-    /// capture never reaches here — [`Self::remove`] takes its slot out, which
-    /// is what keeps the drop's promise that the audio is kept.
+    /// Reverts the most recent capture and persists, returning it so its dump
+    /// can be deleted, whether or not the entry was still retained. A dropped
+    /// capture never comes back here: [`Self::remove`] takes its slot.
     pub fn undo(&mut self) -> Option<UndoneCapture> {
         let undone = self.undo_history.pop_back()?;
         self.profile.remove_capture(undone.key, &undone.epoch);
@@ -194,11 +152,9 @@ impl ProfileSession {
         Some(undone)
     }
 
-    /// Discards one retained measurement of `key` — the inspector's drop —
-    /// returning it. Persists immediately, for the same reason undo does.
-    ///
-    /// Takes that capture's undo slot with it, matched by epoch: a drop keeps
-    /// the audio deliberately, so no later undo may reach the dump it spared.
+    /// Discards one retained measurement of `key` (a drop) and persists,
+    /// returning it. It takes the capture's undo slot too, so no later undo
+    /// deletes the audio the drop kept.
     pub fn remove(&mut self, key: u8, index: usize) -> Option<KeyMeasurement> {
         let removed = self.profile.remove(key, index)?;
         self.undo_history
@@ -207,9 +163,8 @@ impl ProfileSession {
         Some(removed)
     }
 
-    /// Marks an interaction-rate edit for a coalesced write. The clock restarts
-    /// on every call, so the write lands once the user stops typing or dragging
-    /// rather than once per character or slider step.
+    /// Marks an interaction-rate edit for a write once the interaction stops;
+    /// each call restarts the clock.
     pub fn touch(&mut self) {
         self.dirty_since = Some(Instant::now());
     }
@@ -219,8 +174,7 @@ impl ProfileSession {
         self.dirty_since.is_some()
     }
 
-    /// Writes a pending edit once the interaction has stopped. Called from the
-    /// frontend's tick loop.
+    /// Writes a pending edit once the interaction has stopped.
     pub fn flush_if_quiet(&mut self) {
         if self
             .dirty_since
@@ -230,19 +184,15 @@ impl ProfileSession {
         }
     }
 
-    /// Writes the profile, taking this session's `.bak` first if it has not
-    /// been taken yet.
-    ///
-    /// The write itself is atomic (`InharmonicityProfile::to_file`); the `.bak`
-    /// is a rollback point that does not depend on the in-memory undo stack.
+    /// Writes the profile atomically, first taking this session's `.bak`: a
+    /// rollback point that does not depend on the undo history.
     pub fn persist(&mut self) {
         let Some(path) = self.path.clone() else {
             eprintln!("[SESSION] No profile open; nothing to save.");
             return;
         };
         if !self.backed_up {
-            // Only meaningful once the file exists — a brand-new profile has
-            // nothing to roll back to, and its first write is not a risk.
+            // A brand-new profile has nothing to roll back to.
             if path.is_file() {
                 let mut bak = path.as_os_str().to_owned();
                 bak.push(".bak");
@@ -304,15 +254,11 @@ mod tests {
         }
     }
 
-    /// Nothing in this module may write the real `settings.json`: these tests
-    /// run on a developer's machine, and clobbering the resume pointer there
-    /// once already sent the app to a fresh profile on next launch. `adopt`
-    /// therefore takes the settings to update, and the caller decides when —
-    /// and whether — they reach disk.
-    ///
-    /// A session resuming an instrument that already exists on disk — the case
-    /// the rollback point is for. (A brand-new profile deliberately gets none:
-    /// there is nothing to roll back to.)
+    // No test may write the real `settings.json`, which holds the resume
+    // pointer; `adopt` takes the settings to update so that none does.
+
+    /// A session resuming an instrument that already exists on disk, the case
+    /// the rollback point is for.
     fn session(tag: &str) -> (ProfileSession, PathBuf) {
         let dir = std::env::temp_dir().join(format!("inh-sess-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -375,8 +321,8 @@ mod tests {
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
-    /// An inspector drop reaches any entry, writes through, and takes **that
-    /// capture's** undo slot with it. A drop keeps the audio deliberately, so a
+    /// An inspector drop reaches any entry, writes through, and takes that
+    /// capture's undo slot with it. A drop keeps the audio deliberately, so a
     /// later undo must not be able to reach the dump it decided to spare.
     #[test]
     fn a_drop_writes_through_and_consumes_its_own_undo() {
@@ -405,7 +351,7 @@ mod tests {
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
-    /// The reason undo carries identity: retention evicts from the **middle** of
+    /// The reason undo carries identity: retention evicts from the middle of
     /// a key's list, so a positional handle would come to name a different
     /// capture — and undoing deletes audio that cannot be recaptured.
     #[test]

@@ -1,28 +1,13 @@
-//! # Tuning-curve comparison harness (design note §11)
+//! # Tuning-curve comparison harness
 //!
-//! Runs all four curve engines on a regenerated-partials JSON dump (the
-//! output of `examples/regenerate_partials`) and reports the §11
-//! no-ground-truth diagnostics side by side:
+//! Runs all four curve engines on a `cargo lab mat regen` dump and prints the
+//! no-ground-truth diagnostics side by side, numbered as the report sections
+//! below: the B_ξ fit, stretch tables, roughness, flags, implied beat rates,
+//! Giordano cross-scores, leave-one-key-out error, and engine (b)'s DOF growth.
 //!
-//! 1. the per-instrument $B_\xi$ fit and curve-B fallback counts;
-//! 2. stretch tables (curve values at the A keys, per-register median
-//!    octave stretch);
-//! 3. roughness (curvature $|\Delta^2 d|$ statistics);
-//! 4. §2 detector / exclusion flag counts;
-//! 5. implied beat-rate profiles per coincident-pair type (magnitude and
-//!    jaggedness — aural practice expects slow, smoothly progressing
-//!    beats: the Verituner patent's own criterion);
-//! 6. Giordano cross-scoring of every engine's curve (descriptive ONLY —
-//!    selecting on it would bias toward engine (c) by construction);
-//! 7. leave-one-key-out prediction error in cents (the cleanest genuine
-//!    error number available), which also exercises the DOF-growth claim;
-//! 8. a DOF-growth sweep for engine (b): k = 4, 8, 16, 32, 88 measured keys.
-//!
-//! **These numbers are diagnostics, not selection evidence** (n = 1, no
-//! aurally-tuned reference — §11's honesty clause). The captures are
-//! auto-mode provenance, admitted via
-//! `CurveInput::from_profile_including_auto` — validation only; the user
-//! path admits manual captures exclusively.
+//! These are diagnostics, not selection evidence: n = 1, with no aurally tuned
+//! reference. The captures are auto-mode, admitted through
+//! `CurveInput::from_profile_including_auto` for validation only.
 //!
 //! Usage:
 //!   cargo lab mat regen > /tmp/partials.json
@@ -30,13 +15,14 @@
 //!   cargo lab curve compare /tmp/partials.json --json /tmp/curve_report.json
 //!
 //! `--json <path>` additionally writes the full report as machine-readable
-//! JSON — the input of `scripts/plot_curves.py`, which renders the
+//! JSON, the input of `plot_curves.py`, which renders the
 //! one-image curve comparison (`curve_analysis.png`) for a capture set.
 
 use std::path::Path;
 
 use anyhow::Result;
 
+use crate::capture;
 use tuner_core::algorithms::curves::{
     self, BALANCED_INTERVALS, CurveBSource, CurveParams, IntervalSpec, PURE_TWELFTHS_INTERVALS,
 };
@@ -45,16 +31,6 @@ use tuner_core::models::{
     CurveInput, InharmonicityProfile, KeyMeasurement, MAX_STRINGS_PER_KEY, Partial,
     SoundingStrings, TuningCurve,
 };
-
-/// Register split used throughout the report (stated per §11: bass =
-/// A0–C#3 wound strings region, treble = C6 up where partial counts thin).
-fn register(key: usize) -> &'static str {
-    match key {
-        0..=27 => "bass",
-        28..=62 => "mid",
-        _ => "treble",
-    }
-}
 
 fn median(mut v: Vec<f64>) -> f64 {
     if v.is_empty() {
@@ -93,7 +69,7 @@ fn load_profile(path: &Path) -> InharmonicityProfile {
             partials,
             calculated_b: e["calculated_b"].as_f64().map(|b| b as f32),
             last_captured: String::new(),
-            // Honest provenance: these are auto-mode captures.
+            // Auto-mode captures.
             captured_in_auto: true,
             // Carried through so a string-isolated capture cannot stand for
             // the note — `newest_whole_note` refuses a partial unison.
@@ -174,7 +150,6 @@ fn partial_freq(f1: f64, b: f64, n: u32) -> f64 {
 pub fn run(partials: &Path, json_out: Option<&Path>) -> Result<()> {
     let path = partials.display();
     let profile = load_profile(partials);
-    // Validation data is auto-mode; see module doc.
     let input = CurveInput::from_profile_including_auto(&profile);
     let bxi = curves::instrument_b_fit(&input);
 
@@ -229,7 +204,7 @@ pub fn run(partials: &Path, json_out: Option<&Path>) -> Result<()> {
         print!("{name:<24}");
         for reg in ["bass", "mid", "treble"] {
             let vals: Vec<f64> = (0..76)
-                .filter(|&m| register(m) == reg)
+                .filter(|&m| capture::curve_register(m as u8) == reg)
                 .map(|m| (curve.cents[m + 12] - curve.cents[m]) as f64)
                 .collect();
             print!("{:>8.2}", median(vals));
@@ -291,8 +266,8 @@ pub fn run(partials: &Path, json_out: Option<&Path>) -> Result<()> {
             phi.rho_at_midi(69.0)
         );
     }
-    // Demoted diagnostic: what the old above-median-amplitude gate would
-    // have passed, vs the §VI.C coincident-pair gate.
+    // Report 0008's gate comparison: the above-median-amplitude gate against the
+    // §VI.C coincident-pair gate.
     let (mut old_gate, mut new_gate, mut both_measured) = (0usize, 0usize, 0usize);
     for m in 0..76usize {
         let (Some(lo), Some(up)) = (&input.keys[m], &input.keys[m + 12]) else {
@@ -314,6 +289,8 @@ pub fn run(partials: &Path, json_out: Option<&Path>) -> Result<()> {
     );
 
     // ── 5. Implied beat rates ──
+    // Aural practice expects slow, smoothly progressing beats, the Verituner
+    // patent's own criterion, so both magnitude and jaggedness are reported.
     println!("\n── implied beat rates at coincident pairs (Hz; median / max / median jag) ──");
     let pair_types: [(&str, usize, u32, u32); 4] = [
         ("2:1 oct", 12, 2, 1),
@@ -346,7 +323,7 @@ pub fn run(partials: &Path, json_out: Option<&Path>) -> Result<()> {
     }
 
     // ── 5b. Engine (d): model-B widths vs blend widths ──
-    // The 0.02 ¢ per-key listing threshold is ADR 0009 analysis 4's
+    // The 0.02 ¢ per-key listing threshold is report 0009 analysis 4's
     // (d)-Balanced curve-noise SD: below it, a difference is draw noise.
     if let (Some((_, blend)), Some((_, model))) = (
         runs.iter().find(|(n, _)| *n == "d: multi-interval"),
@@ -355,7 +332,7 @@ pub fn run(partials: &Path, json_out: Option<&Path>) -> Result<()> {
         println!("\n── engine (d): |model-B − blend-B| curves (¢; median / max / argmax key) ──");
         for reg in ["bass", "mid", "treble"] {
             let diffs: Vec<(usize, f64)> = (0..88)
-                .filter(|&k| register(k) == reg)
+                .filter(|&k| capture::curve_register(k as u8) == reg)
                 .map(|k| (k, (model.cents[k] as f64 - blend.cents[k] as f64).abs()))
                 .collect();
             let (kmax, max) = diffs
@@ -381,6 +358,7 @@ pub fn run(partials: &Path, json_out: Option<&Path>) -> Result<()> {
     }
 
     // ── 6. Giordano cross-scoring ──
+    // Descriptive only: selecting on it would favour engine (c) by construction.
     println!("\n── Giordano cross-score (Σ octave-pair dissonance at prescribed widths) ──");
     println!("   (descriptive only — this objective favors engine (c) by construction)");
     let mut cross_scores: Vec<(String, f64)> = Vec::new();
@@ -435,7 +413,7 @@ pub fn run(partials: &Path, json_out: Option<&Path>) -> Result<()> {
         for (i, reg) in ["bass", "mid", "treble"].iter().enumerate() {
             let vals: Vec<f64> = errs
                 .iter()
-                .filter(|&&(k, _)| register(k) == *reg)
+                .filter(|&&(k, _)| capture::curve_register(k as u8) == *reg)
                 .map(|&(_, e)| e)
                 .collect();
             meds[i] = median(vals);
@@ -513,7 +491,7 @@ pub fn run(partials: &Path, json_out: Option<&Path>) -> Result<()> {
                 let stretch = |reg: &str| {
                     median(
                         (0..76)
-                            .filter(|&m| register(m) == reg)
+                            .filter(|&m| capture::curve_register(m as u8) == reg)
                             .map(|m| (curve.cents[m + 12] - curve.cents[m]) as f64)
                             .collect(),
                     )

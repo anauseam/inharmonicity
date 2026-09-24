@@ -1,26 +1,23 @@
 //! # Isolation — what the shipped unison panel sees, against isolation truth
 //!
-//! The mute-isolation set is the only data in the project with **ground truth
-//! for a unison split**: the same note recorded once per string with the others
+//! The mute-isolation set is the only data in the project with ground truth
+//! for a unison split: the same note recorded once per string with the others
 //! damped, and once open. A difference of two independently measured solo f₀ is
 //! not `2/T`-bound, so for the first time a reported split has an answer to
-//! check against (`docs/internals/06-capture-sets.md`).
+//! check against (`capture-sets.md`).
 //!
-//! This harness supplies the half of Prompt AD that only the shipped code can
-//! answer — **what the panel reports** — and emits it as JSON for the scoring
-//! step. The truth side (per-string (f₀, B), true splits, the B spread, the
-//! coupling comparison) is post-processing of `regenerate_partials` output and
-//! lives in `scripts/isolation_truth.py`, the same split as
-//! `scripts/audit_captures.py`.
+//! This supplies the half of report 0014's analysis only the shipped code can
+//! answer, what the panel reports, as JSON for the scoring step. The truth side
+//! (per-string (f₀, B), true splits, the B spread, the coupling comparison) is
+//! post-processing of `cargo lab mat regen` output in `isolation_truth.py`, the
+//! same split as `audit_captures.py`.
 //!
-//! Two pre-registered criteria are evaluated here (ADR 0014; the rule is
-//! `docs/internals/07-evidence-and-methodology.md`):
+//! Two of report 0014's pre-registered criteria are evaluated here:
 //!
-//! - **C2 — the false-beat positive control.** A capture with **one string
-//!   sounding** that still resolves two lines is a false beat by construction,
-//!   and the project had none of these before this set. Extra lines are
-//!   *expected* in the bass (ADR 0013); the test is whether the discriminator
-//!   ever asserts them as a second string.
+//! - **C2 — the false-beat positive control.** A capture with one string
+//!   sounding that still resolves two lines is a false beat by construction.
+//!   Extra lines are expected in the bass (report 0013); the test is whether the
+//!   discriminator ever asserts them as a second string.
 //! - **C1's panel half** — the split the panel reports per open capture, written
 //!   to JSON for comparison against solo truth.
 //!
@@ -154,9 +151,9 @@ pub fn run(
     }
 }
 
-/// **C2** — the false-beat positive control. Pre-registered pass: an
+/// C2 — the false-beat positive control. Pre-registered pass: an
 /// `Unison` verdict on ≤ 5 % of solo captures, anchored to the 4 % bass rate
-/// ADR 0012 §5 measured on this instrument.
+/// report 0012 §5 measured on this instrument.
 fn c2_false_beat_control(readings: &[Reading]) {
     println!("=== C2: the false-beat positive control (solo captures) ===");
     println!("A solo that resolves two lines is a false beat by construction.");
@@ -175,9 +172,9 @@ fn c2_false_beat_control(readings: &[Reading]) {
         if rows.is_empty() {
             return;
         }
-        // Only captures whose ring actually published can testify: below the
+        // Only captures whose ring published can testify: below the
         // record floor "one line" means the detector is blind, not that the
-        // note is clean (ADR 0012 §3).
+        // note is clean (report 0012 §3).
         let pub_rows: Vec<&&Reading> = rows.iter().filter(|r| r.at_n_star.record > 0).collect();
         let n = pub_rows.len().max(1) as f32;
         let pct = |k: usize| {

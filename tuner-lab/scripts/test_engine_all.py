@@ -1,0 +1,176 @@
+import os
+import subprocess
+import pandas as pd
+import argparse
+from collections import Counter, deque
+
+
+def mofn_lock(winners, m, n):
+    """First key to win >= m of the last n winners (deque(maxlen=n)); identical
+    to validate_config.py / replay_lock_rules.py and the engine's
+    record_stable_winner. m = n = 3 reproduces the old 3-consecutive rule."""
+    win = deque(maxlen=n)
+    counts = Counter()
+    for w in winners:
+        if len(win) == n:
+            counts[win[0]] -= 1
+        win.append(w)
+        counts[w] += 1
+        if counts[w] >= m:
+            return w
+    return None
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--refine", action="store_true", help="Enable Stage B refinement")
+    parser.add_argument("--config", default=None,
+                        help='Override TWM constants: "p q r rho lambda" (lambda may be inf)')
+    parser.add_argument("--profile", default=None,
+                        help="Path to a persisted InharmonicityProfile JSON; seeds each "
+                             "measured key's template with its measured B (ET-centered, "
+                             "validation only).")
+    parser.add_argument("--no-plot", action="store_true",
+                        help="Skip per-key plotting (faster; not needed for pass/fail)")
+    parser.add_argument("--base", default="./diagnostics",
+                        help="capture dir holding key_* subdirs (default ./diagnostics)")
+    parser.add_argument("--lock-m", type=int, default=7,
+                        help="M-of-N lock: votes required (default 7; report 0010 refined)")
+    parser.add_argument("--lock-n", type=int, default=8,
+                        help="M-of-N lock: window length (default 8; 3/3 = old rule)")
+    args = parser.parse_args()
+    if not args.lock_m > args.lock_n // 2:
+        parser.error("--lock-m must exceed --lock-n/2 (majority => unique winner)")
+    base_dir = args.base
+    results = []
+
+    print("Compiling tuner-lab (with telemetry)...")
+    subprocess.run(["cargo", "build", "--release", "-p", "tuner-lab", "--features", "telemetry"], check=True, stdout=subprocess.DEVNULL)
+
+    executable_engine = ["./target/release/tuner-lab", "engine", "dump"]
+    executable_gate = ["./target/release/tuner-lab", "gatekeeper", "dump"]
+
+    keys = sorted([d for d in os.listdir(base_dir) if d.startswith("key_")])
+    mode_str = "REFINED" if args.refine else "DISCRETE"
+    print(f"Found {len(keys)} keys. Running Engine diagnostics ({mode_str} mode, "
+          f"lock={args.lock_m}-of-{args.lock_n}, base={base_dir})...")
+
+    for key_dir_name in keys:
+        expected_key = int(key_dir_name.split("_")[1])
+        key_dir = os.path.join(base_dir, key_dir_name)
+        raw_file = os.path.join(key_dir, "audio_full_event.raw")
+        if not os.path.exists(raw_file):
+            raw_file = os.path.join(key_dir, "audio.raw")
+        
+        if not os.path.exists(raw_file):
+            continue
+
+        try:
+            subprocess.run(executable_gate + [raw_file], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+            
+            engine_cmd = executable_engine + [raw_file]
+            if args.refine:
+                engine_cmd.append("--refine")
+            if args.config:
+                engine_cmd += ["--config", args.config]
+            if args.profile:
+                engine_cmd += ["--profile", args.profile]
+            subprocess.run(engine_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+
+            if not args.no_plot:
+                subprocess.run(["python", "./tuner-lab/scripts/plot_engine.py", key_dir], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        except subprocess.CalledProcessError:
+            print(f"Error running diagnostic for {key_dir_name}")
+            continue
+
+        csv_gate = os.path.join(key_dir, "gatekeeper.csv")
+        csv_engine = os.path.join(key_dir, "peaks.csv")
+        csv_goertzel = os.path.join(key_dir, "goertzel.csv")
+        
+        if not os.path.exists(csv_gate) or not os.path.exists(csv_engine) or not os.path.exists(csv_goertzel):
+            continue
+
+        try:
+            df_gate = pd.read_csv(csv_gate)
+            df_engine = pd.read_csv(csv_engine)
+            df_goertzel = pd.read_csv(csv_goertzel)
+        except Exception as e:
+            print(f"Error reading CSVs for {key_dir_name}: {e}")
+            continue
+
+        # Merge TWM/Consistency checks on frame
+        df = pd.merge(df_gate, df_engine, left_on='frame_idx', right_on='frame')
+        stable_df = df[df['state_name'] == 'Stable'].copy()
+        
+        p1_alive_frames = 0
+        p1_dead_frames = 0
+        if len(df_goertzel) > 0:
+            p1_data = df_goertzel[df_goertzel['partial_n'] == 1]
+            p1_alive_frames = len(p1_data[p1_data['is_alive'] == True])
+            p1_dead_frames = len(p1_data[p1_data['is_alive'] == False])
+
+        median_s_win = 0.0
+        if 's_win_cents' in stable_df.columns and len(stable_df) > 0:
+            median_s_win = stable_df['s_win_cents'].median()
+
+        if len(stable_df) == 0:
+            results.append({"key": key_dir_name, "locked_key": -1, "status": "FAIL_NEVER_STABLE", "p1_alive": p1_alive_frames, "p1_dead": p1_dead_frames, "median_s_win": 0.0})
+            continue
+            
+        # M-of-N binary-integration lock (report 0010) over the stable-frame
+        # winner sequence — same rule as validate_config.py and the engine.
+        stable_winners = [int(row['key_idx']) for _, row in stable_df.iterrows()]
+        locked = mofn_lock(stable_winners, args.lock_m, args.lock_n)
+        locked_key = -1 if locked is None else locked
+
+        if locked_key == -1:
+            results.append({"key": key_dir_name, "locked_key": -1, "status": "FAIL_NO_LOCK", "p1_alive": p1_alive_frames, "p1_dead": p1_dead_frames, "median_s_win": median_s_win})
+        elif locked_key != expected_key:
+            results.append({"key": key_dir_name, "locked_key": locked_key, "status": f"FAIL_WRONG_KEY (Expected {expected_key})", "p1_alive": p1_alive_frames, "p1_dead": p1_dead_frames, "median_s_win": median_s_win})
+        else:
+            results.append({"key": key_dir_name, "locked_key": locked_key, "status": "PASS", "p1_alive": p1_alive_frames, "p1_dead": p1_dead_frames, "median_s_win": median_s_win})
+
+    df_results = pd.DataFrame(results)
+    
+    print("\n" + "="*80)
+    print("ENGINE TWM & GOERTZEL DIAGNOSTIC (88 KEYS)")
+    print("="*80)
+    
+    passes = df_results[df_results['status'] == 'PASS']
+    failures = df_results[df_results['status'] != 'PASS']
+    
+    print(f"Total keys processed: {len(df_results)}")
+    print(f"TWM Lock PASS: {len(passes)}")
+    print(f"TWM Lock FAIL: {len(failures)}")
+    
+    if len(failures) > 0:
+        print("\n--- TWM LOCK FAILURES ---")
+        for _, row in failures.iterrows():
+            print(f"  {row['key']}: {row['status']} (Locked on: {row['locked_key']}) s_win: {row['median_s_win']:+.1f}c")
+    else:
+        print(f"\nSUCCESS! All 88 keys achieved a {args.lock_m}-of-{args.lock_n} stability lock on the correct fundamental!")
+
+    print("\n--- REFINED SCALE SUMMARY ---")
+    if args.refine:
+        s_wins = df_results['median_s_win']
+        print(f"s_win_cents distribution: min={s_wins.min():+.1f}c, median={s_wins.median():+.1f}c, max={s_wins.max():+.1f}c")
+        for _, row in df_results.iterrows():
+            if abs(row['median_s_win']) >= 79.0:
+                print(f"  WARNING: {row['key']} s_win pinned at {row['median_s_win']:+.1f}c (possible edge clip)")
+    else:
+        print("Discrete mode (s_win_cents = 0.0)")
+
+    print("\n--- GOERTZEL PARTIAL 1 TRACKING SUMMARY ---")
+    dead_keys = df_results[(df_results['p1_alive'] == 0) & (df_results['p1_dead'] > 0)]
+    print(f"Keys where Partial 1 was completely DEAD: {len(dead_keys)}")
+    for _, row in dead_keys.iterrows():
+        print(f"  {row['key']}: DEAD ({row['p1_dead']} frames)")
+        
+    struggling_keys = df_results[(df_results['p1_alive'] > 0) & (df_results['p1_dead'] > 0)]
+    if len(struggling_keys) > 0:
+        print(f"\nKeys where Partial 1 struggled (flickered ALIVE/DEAD): {len(struggling_keys)}")
+        for _, row in struggling_keys.iterrows():
+            print(f"  {row['key']}: {row['p1_alive']} ALIVE / {row['p1_dead']} DEAD")
+
+if __name__ == "__main__":
+    main()

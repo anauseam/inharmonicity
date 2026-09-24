@@ -1,4 +1,3 @@
-// tuner-core/src/tests/audio_tests.rs
 use crate::algorithms::spectral;
 use realfft::RealFftPlanner;
 use rustfft::num_complex::Complex;
@@ -113,10 +112,10 @@ fn test_cspe_super_resolution() {
 
 #[test]
 fn test_jacobsen_bias() {
-    // Candan 2015 Eq. 1 + Eq. 12 regression: the corrected estimator must be
-    // essentially exact across the fractional-offset range, at both pipeline FFT
-    // sizes. The pre-audit implementation erred by ≈ −2.5·δ bins — worse than the
-    // bin centre (faithfulness-audit-03); this pins the faithful behavior.
+    // Candan 2015 Eqs. 1 and 12 are essentially exact across the fractional-offset
+    // range at both pipeline FFT sizes; a wrong correction errs by ≈ −2.5·δ bins,
+    // worse than the bin centre.
+    // audit 03
     let sample_rate = 44100u32;
     for &n in &[2048usize, 8192] {
         let bin_hz = sample_rate as f32 / n as f32;
@@ -141,10 +140,10 @@ fn test_jacobsen_bias() {
     }
 }
 
-/// The tabulated `c_N` values `jacobsen` uses on the hot path must be what
-/// Candan Eq. 12 actually evaluates to, and the short lengths the unison ring
-/// transforms at must be nowhere near the 2.0 asymptote the table falls back to
-/// — 2.4 % of scale at 56 points, applied to every reported line offset.
+/// The tabulated `c_N` values `jacobsen` uses are what Candan Eq. 12 evaluates to,
+/// and the short lengths the unison ring transforms at are far from the 2.0
+/// asymptote the table falls back to: 2.4 % of scale at 56 points, on every
+/// reported line offset.
 #[test]
 fn candan_c_n_reproduces_the_jacobsen_table() {
     assert!((spectral::candan_c_n(2048) - 2.001_329).abs() < 1e-6);
@@ -169,7 +168,7 @@ fn candan_c_n_reproduces_the_jacobsen_table() {
     assert!(spectral::candan_c_n(128) > spectral::candan_c_n(8192));
 }
 
-/// `find_supported_config` must only ever return a range that **contains** the
+/// `find_supported_config` must only ever return a range that contains the
 /// target rate. The pipeline's buffer sizes and timing constants are
 /// dimensioned for `SAMPLE_RATE`, so a merely-nearby range is not usable — and
 /// cpal's `with_sample_rate` panics when handed one.
@@ -220,7 +219,7 @@ mod find_supported_config {
     #[test]
     fn rejects_stereo_and_non_f32() {
         let configs = vec![
-            range(2, 8_000, 96_000, SampleFormat::F32), // stereo: one DcBlocker state
+            range(2, 8_000, 96_000, SampleFormat::F32), // stereo: the DC blocker keeps one channel's state
             range(1, 8_000, 96_000, SampleFormat::I16), // wrong sample format
         ];
         assert!(find_supported_config(configs, TARGET).is_none());

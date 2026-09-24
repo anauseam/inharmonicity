@@ -1,37 +1,16 @@
-//! # Additive resynthesis of a tuning curve to audio (headless, cold-path)
+//! # Curve auralization
 //!
-//! Renders short piano-like audio from a [`TuningCurve`] plus the per-key
-//! measured timbre in a [`CurveInput`], by **additive sine summation**. Its
-//! purpose is auralization: hearing how a candidate curve sounds *before*
-//! tuning a piano to it — the perceptual A/B that no statistic can decide
-//! (there is no ground-truth-free "best" stretch; ADR 0009).
+//! Renders a [`TuningCurve`] to audio by additive resynthesis, with the measured
+//! timbre in a [`CurveInput`], so a candidate curve can be heard before a piano is
+//! tuned to it. Cold path: it allocates, and playing the buffer is the caller's
+//! job.
 //!
-//! This module is **pure, thread-free, and NOT on the real-time hot path**: it
-//! runs on no pipeline thread, holds no shared state, allocates freely, and
-//! produces a buffer of `f32` samples (or writes a WAV). It owns **no audio
-//! stream** — playing the samples through a speaker is the caller's job.
-//!
-//! ## Method (design note §1/§5/§7 conventions)
-//!
-//! For a note on key `m`, partial `n` is placed at
-//! `f_n = n·f₀·√(1 + B·n²)`, with `f₀` chosen so the audible first partial
-//! `f₁ = f₀·√(1+B)` equals the curve's target for that key
-//! ([`TuningCurve::target_f1`]), using the key's **raw measured B**. So the
-//! partials sit where the physical string's would when tuned to the curve —
-//! the same placement [`TuningCurve::strobe_partials`] uses. Amplitudes are
-//! the measured partial amplitudes (the timbre). A per-partial exponential
-//! decay ([`EnvelopeParams`]) plus a short onset ramp shape each note.
-//!
-//! The envelope is a **plausible heuristic**, not a measured model: it exists
-//! only to sustain notes long enough that coincident-partial beats are
-//! audible. The beat *rates* come entirely from the curve, never the envelope.
-//!
-//! Oscillators are rotating phasors (two multiplies per sample, no `sin`/`exp`
-//! in the inner loop; periodically renormalized), and note amplitudes are
-//! equal-power-normalized so level does not depend on the measurement's
-//! absolute magnitude scale. The returned buffer is **un-normalized** — the
-//! caller sets the level (loudness-match a set with one shared scale via
-//! [`peak`], or peak-normalize a single buffer).
+//! Partial n sits at `f_n = n·f₀·√(1 + B·n²)`, with f₀ chosen so the audible first
+//! partial is the curve's target and B the key's measured value, where
+//! [`TuningCurve::strobe_partials`] places it. The decay envelope is a heuristic
+//! that only sustains a note long enough for its beats to be heard; the beat
+//! rates come from the curve alone. Notes are equal-power normalized, the buffer
+//! is not: the caller sets the level, with [`peak`].
 
 use std::f64::consts::TAU;
 
@@ -60,9 +39,7 @@ pub struct Note {
     pub dur_s: f64,
 }
 
-/// Per-partial decay + onset envelope (a heuristic auralization envelope, not
-/// a measured model — see the module doc). [`Default`] reproduces the shipped
-/// values; expose it to a UI later if a brightness/sustain knob is wanted.
+/// The per-partial decay and onset envelope: a heuristic, not a measured model.
 #[derive(Debug, Clone, Copy)]
 pub struct EnvelopeParams {
     /// Fundamental decay time constant τ₀ (s) at the bottom of the compass
@@ -99,10 +76,9 @@ impl EnvelopeParams {
 /// Frequency of stiff-string partial `n` for a string whose audible first
 /// partial is `f1` with inharmonicity `b`:
 ///
-///   `f_n = n·f₀·√(1 + B·n²)`,  `f₀ = f₁/√(1+B)`  (design note §7).
+///   `f_n = n·f₀·√(1 + B·n²)`,  `f₀ = f₁/√(1+B)`.
 ///
-/// The same placement [`TuningCurve::strobe_partials`] uses; exposed so
-/// callers (e.g. beat-rate screens) can reproduce the synth's partial layout.
+/// The placement [`TuningCurve::strobe_partials`] uses.
 pub fn partial_freq(f1: f64, b: f64, n: u32) -> f64 {
     let f0 = f1 / (1.0 + b).sqrt();
     let n = n as f64;
@@ -116,11 +92,9 @@ pub fn peak(samples: &[f32]) -> f32 {
     samples.iter().fold(0.0f32, |m, &s| m.max(s.abs()))
 }
 
-/// Render `notes` into a mono `f32` buffer at [`SAMPLE_RATE`] by additive
-/// resynthesis (see the module doc). The buffer spans the full timeline
-/// (`max(start_s + dur_s)`). Notes whose key carries no trusted measurement
-/// in `input` are silently skipped (they render silence). The output is
-/// un-normalized — apply the caller's level policy before quantizing/playing.
+/// Renders `notes` into a mono `f32` buffer at [`SAMPLE_RATE`] spanning the
+/// whole timeline. A note whose key has no trusted measurement renders silence.
+/// The output is not normalized.
 pub fn render(
     curve: &TuningCurve,
     input: &CurveInput,

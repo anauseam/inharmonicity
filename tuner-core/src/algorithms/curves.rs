@@ -1,47 +1,18 @@
-//! # Curves — the manual-mode tuning-curve engines
+//! # Tuning-curve engines
 //!
-//! The **orchestrator** of the cold-path curve layer: it composes the pure
-//! cited leaves [`super::rigaud`], [`super::giordano`] and [`super::whittaker`]
-//! into finished curves — exactly the shape [`super::discovery`] has over
-//! [`super::twm`], and for the same reason (each cited method stays pure and
-//! auditable in its own file).
+//! Four engines turn a profile's measurements into a tuning curve by composing the
+//! cited leaves [`super::rigaud`], [`super::giordano`] and [`super::whittaker`]:
+//! [`rigaud_pure`] (a), [`per_key_smoothed`] (b), [`giordano_calibrated`] (c) and
+//! [`multi_interval`] (d). Engines (b) and (c) each add one stage to the one before.
 //!
-//! The four cold-path engines of the tuning-curve design note
-//! (`docs/design/tuning-curve-design.md` — the governing spec; §6):
-//!
-//! * **(a)** [`rigaud_pure`] — faithful end-to-end port of Rigaud, David &
-//!   Daudet 2013 §II.B: per-instrument B_ξ fit (Eq. 29) → octave-type
-//!   curve ρ̄_φ(m) (Eq. 9, ±1 stretch presets per §IV.C.2) →
-//!   Eq.-6 A-chain from A4 → Lagrange interpolation (§II.B.4) → global
-//!   deviation d_g (Eq. 32's role).
-//! * **(b)** [`per_key_smoothed`] — (a) plus measured per-key B in the
-//!   Eq.-6 stretches and a Whittaker smoother on the cents-space residual
-//!   from (a)'s prior curve (design D3: d-space residual-from-prior;
-//!   λ by LOO-CV). Componentwise faithful (Rigaud + Whittaker/Eilers).
-//! * **(c)** [`giordano_calibrated`] — (b) plus the instrument-measured
-//!   octave type: per-octave Giordano dissonance scans → Eq.-30 inversion →
-//!   Eq.-9 refit (regularization weight by LOO-CV over the ρ points). The
-//!   composition is **ours**
-//!   (a pipeline of faithful uses; ADR pending validation evidence — §12).
-//! * **(d)** [`multi_interval`] — weighted multi-interval least squares,
-//!   linear in cents-space (§6(d)); components faithful, assembly = industry
-//!   practice (Verituner patent US 6,529,843 as the citable document).
-//!
-//! The engines are *progressive compositions*, not implementations of one
-//! trait (user direction, §6): (b) calls (a)'s functions plus the smoother,
-//! (c) calls (b)'s plus the dissonance/inversion stage.
-//!
-//! **Conventions (design note §1 — these bite):** d(m) is defined on the
-//! **audible first partial** f_1 = F_0√(1+B); MAT and Eq. 6 work on
-//! the flexible-string F_0. Every width in this module converts
-//! explicitly (see [`octave_stretch_cents`], [`interval_width_cents`]).
-//! Strobe targets always use the key's **raw measured** B (§5, D3) —
-//! that split lives in `models::TuningCurve::strobe_partials`. The curve is
-//! derived data: recomputed on load, never persisted (§9). Negative octave
-//! stretch is a **validity detector, never a clamp** (§2).
+//! Conventions: d(m) is defined on the audible first partial f₁ = F₀√(1+B), while
+//! MAT and Eq. 6 work on the flexible-string F₀, so every width here converts
+//! explicitly ([`octave_stretch_cents`], [`interval_width_cents`]). Strobe targets
+//! use the key's raw measured B instead ([`TuningCurve::strobe_partials`]). A
+//! negative octave stretch is flagged by a detector, never clamped.
 //!
 //! # References
-//! * Rigaud, David & Daudet 2013, JASA 133(5), DOI: 10.1121/1.4802644 —
+//! * Rigaud, David & Daudet 2013, JASA 133(5), DOI: 10.1121/1.4799806 —
 //!   Eqs. 4, 6, 9, 29–32, §II.B procedure.
 //! * Giordano 2015, JASA 138(4), DOI: 10.1121/1.4931439 — via
 //!   [`super::giordano`].
@@ -59,16 +30,15 @@ use crate::models::{
 // ─── CurveInput construction ─────────────────────────────────────────────────
 
 impl CurveInput {
-    /// Builds the engine input from a profile, admitting **trusted captures
-    /// only** (`KeyMeasurement::is_trusted` — the shipping rule).
+    /// Builds the engine input from a profile's trusted captures
+    /// ([`is_trusted`](crate::models::KeyMeasurement::is_trusted)).
     pub fn from_profile(profile: &InharmonicityProfile) -> Self {
         Self::build(profile, false)
     }
 
-    /// Builds the engine input with **only the auto-mode disqualification
-    /// waived** — a string-isolated capture is still refused, since a curve is
-    /// per note. **Diagnostics only**: the offline harnesses run on regenerated
-    /// auto-mode captures. Never call this on the user path.
+    /// Builds the engine input with only the auto-mode disqualification waived; a
+    /// string-isolated capture is still refused, since a curve is per note. For
+    /// diagnostics on auto-mode captures, never for a curve a tuner follows.
     pub fn from_profile_including_auto(profile: &InharmonicityProfile) -> Self {
         Self::build(profile, true)
     }
@@ -117,13 +87,13 @@ impl CurveInput {
 
 // ─── Shared curve primitives ─────────────────────────────────────────────────
 
-/// Beat-minimized octave stretch in cents **on the audible first partial**,
+/// Beat-minimized octave stretch in cents on the audible first partial,
 /// from Rigaud Eq. 6 with explicit F_0 → f_1 conversion:
 ///
 /// s = 1200·log₂[ 2·√((1+4ρ²·B_L)/(1+ρ²·B_U)) · √((1+B_U)/(1+B_L)) ] − 1200
 ///
 /// (the first factor is the Eq.-6 F₀ ratio; the second converts to
-/// f₁ = F₀·√(1+B), the coordinate d(m) is defined on — note §1).
+/// f₁ = F₀·√(1+B), the coordinate d(m) is defined on).
 pub fn octave_stretch_cents(b_l: f64, b_u: f64, rho: f64) -> f64 {
     let r0 = 2.0 * ((1.0 + 4.0 * rho * rho * b_l) / (1.0 + rho * rho * b_u)).sqrt();
     let r1 = r0 * ((1.0 + b_u) / (1.0 + b_l)).sqrt();
@@ -131,13 +101,13 @@ pub fn octave_stretch_cents(b_l: f64, b_u: f64, rho: f64) -> f64 {
 }
 
 /// Beatless width of the coincident pair p:q over `k` semitones, as a
-/// deviation from the ET width in cents, **on the audible first partial**
-/// (design note §6(d)'s c_{m,k}, converted from its F_0-space form):
+/// deviation from the ET width in cents, on the audible first partial
+/// (c_{m,k}, converted from its F_0-space form):
 ///
 /// c = 1200·log₂[ (p/q)·√((1+B_L·p²)/(1+B_U·q²)) · √((1+B_U)/(1+B_L)) ] − 100k
 ///
-/// The p:q=2:1, k=12 case coincides with
-/// [`octave_stretch_cents`] at ρ = 1 (tested).
+/// The p:q = 2:1, k = 12 case coincides with [`octave_stretch_cents`] at ρ = 1.
+// asserted: test_interval_width_octave_consistency
 pub fn interval_width_cents(b_l: f64, b_u: f64, p: u32, q: u32, k: usize) -> f64 {
     let (p, q) = (p as f64, q as f64);
     let r0 = (p / q) * ((1.0 + b_l * p * p) / (1.0 + b_u * q * q)).sqrt();
@@ -145,10 +115,9 @@ pub fn interval_width_cents(b_l: f64, b_u: f64, p: u32, q: u32, k: usize) -> f64
     1200.0 * r1.log2() - 100.0 * k as f64
 }
 
-/// User-facing stretch preset: the paper's mean octave-type model and its
-/// ±1 high/low variants (Rigaud §IV.C.2; the low variant floors at the 2:1
-/// asymptote ρ = 1 — the paper prints `min`, an evident typo for the
-/// physical floor).
+/// Stretch preset: the mean octave-type model and its ±1 high and low variants
+/// (Rigaud §IV.C.2). The low variant floors at the 2:1 asymptote ρ = 1, where the
+/// paper prints `min`, a typo for the physical floor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StretchPreset {
     /// ρ̄_φ(m) - 1, floored at 1 (gentler stretch).
@@ -174,7 +143,7 @@ impl StretchPreset {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CurveBSource {
     /// The precision-weighted blend of the key's measured B and the B_ξ
-    /// fit (ADR 0009).
+    /// fit, weighted by each one's variance.
     #[default]
     Blend,
     /// The Eq.-29 fit B_ξ alone (Rigaud's model; per-key deviations from
@@ -218,35 +187,27 @@ impl CurveParams {
 // ─── Curve-B precision-weighted shrinkage ────────────────────────────────────
 //
 // Curve-side B is the precision-weighted (inverse-variance) combination of the
-// key's measurement and the B_ξ fit:
+// key's measurement and the B_ξ fit, the posterior mean of a normal mean under a
+// normal prior:
 //
 //   ln B_curve = ( ln B_meas/σ_m² + ln B_ξ/σ_p² ) / ( 1/σ_m² + 1/σ_p² )
-//              = w·ln B_meas + (1−w)·ln B_ξ,   w = σ_p²/(σ_p² + σ_m²),
+//              = w·ln B_meas + (1−w)·ln B_ξ,   w = σ_p²/(σ_p² + σ_m²).
 //
-// the posterior mean of a normal mean under a normal prior. Both terms are in
-// ln B because the repeat noise is multiplicative. w → 1 where the measurement
-// is precise (bass/mid, σ_m ≪ 1 %), w → 0 in the information-limited treble
-// (σ_m up to ~100 %), and B_curve is continuous in the partial count — there is
-// no trust boundary to land badly.
-//
-// Strobe targets never use this value: they take the raw measured B (§5).
-//
-// The σ constants below are OURS, measured — derivation and data: ADR 0009.
+// Both terms are in ln B because the repeat noise is multiplicative. w → 1 where
+// the measurement is precise (bass/mid, σ_m ≪ 1 %) and w → 0 in the treble (σ_m up
+// to ≈ 100 %), continuously in the partial count.
 
-/// Coefficient of the repeat-measured capture-to-capture SD of ln B as a
-/// function of the persisted partial count n:
+/// Coefficient of the capture-to-capture SD of ln B as a function of the persisted
+/// partial count n:
 ///
 ///   σ_m(n) = max( SIGMA_LNB_COEFF · n⁻³ , SIGMA_LNB_FLOOR ).
-///
-/// **Ours (measured)**: least-squares fit of ln σ on ln n over the
-/// instrument-#2 repeat set (595 captures, 88 keys, n ≥ 5 each; ADR 0009
-/// analysis 1) — the fitted exponent is −3.00, the floor is the bass/mid
-/// plateau (σ_lnB ≈ 0.35 % where 20–32 partials pin B). The n⁻³ decade
-/// span is what matters downstream, not the constants' third digit: the
-/// blend weight w is insensitive to 2× errors in σ_m except within ~1
-/// partial of the σ_m = σ_p crossover.
+// Ours, measured: a least-squares fit of ln σ on ln n over repeat captures, at
+// least 5 per key, with exponent −3.00. The blend weight is insensitive to 2× errors
+// in σ_m except within ≈ 1 partial of the σ_m = σ_p crossover, so the third digit
+// does not matter.
+// report 0009
 pub const SIGMA_LNB_COEFF: f64 = 19.3;
-/// Bass/mid repeat-noise plateau of σ_lnB (see [`SIGMA_LNB_COEFF`]).
+/// Bass/mid plateau of σ_m (≈ 0.35 %), where 20–32 partials pin B.
 pub const SIGMA_LNB_FLOOR: f64 = 3.5e-3;
 
 /// Repeat-capture SD of ln B for a key persisting `partial_count` partials
@@ -256,28 +217,31 @@ pub fn sigma_ln_b(partial_count: usize) -> f64 {
     (SIGMA_LNB_COEFF / (n * n * n)).max(SIGMA_LNB_FLOOR)
 }
 
-/// Keys whose σ_m is at most this calibrate σ_p (⇔ n ≥ 10 partials under
-/// [`sigma_ln_b`]): their residual scatter about the B_ξ fit is dominated
-/// by real per-key structure, not capture noise (measured: bass/mid
-/// repeat σ ≈ 0.4 % vs fit-residual scatter 6–19 %; ADR 0009).
+/// Keys whose σ_m is at most this calibrate σ_p (n ≥ 10 partials under
+/// [`sigma_ln_b`]): their scatter about the B_ξ fit is per-key structure, not
+/// capture noise.
+// Measured: bass/mid repeat σ ≈ 0.4 % against fit-residual scatter of 6–19 %.
+// report 0009
 pub const SIGMA_PRIOR_NOISE_CAP: f64 = 0.02;
 /// Fewer calibrating keys than this and [`sigma_prior`] returns
 /// [`SIGMA_PRIOR_DEFAULT`] — a 2-parameter L1 fit near-interpolates very
 /// small key sets, deflating the residual scatter.
 pub const SIGMA_PRIOR_MIN_KEYS: usize = 4;
-/// Fallback σ_p, between the two measured instruments (0.062 upright #2,
-/// 0.186 upright #1; ADR 0009 analysis 1).
+/// Fallback σ_p.
+// Between the two measured instruments' 0.062 and 0.186.
+// report 0009
 pub const SIGMA_PRIOR_DEFAULT: f64 = 0.12;
 /// Floor on σ_p — guards the degenerate near-interpolating fit; at the
 /// floor a 32-partial measurement still carries w ≈ 0.89.
 pub const SIGMA_PRIOR_FLOOR: f64 = 0.01;
 
-/// Per-instrument prior scatter σ_p: the robust SD (1.4826 × MAD — the
-/// normal-consistent scale estimate) of ln(B_meas/B_ξ) over the keys whose
-/// measurement noise is negligible ([`SIGMA_PRIOR_NOISE_CAP`]). This is
-/// the spread of *real* per-key B structure the 2-parameter B_ξ family
-/// cannot express — measured at 0.062 (piano #2) vs 0.186 (piano #1), so
-/// it must be self-calibrated per instrument, not a constant.
+/// Per-instrument prior scatter σ_p: the robust SD (1.4826 × MAD, the
+/// normal-consistent scale) of ln(B_meas/B_ξ) over the keys whose measurement noise
+/// is negligible ([`SIGMA_PRIOR_NOISE_CAP`]), the per-key B structure the
+/// 2-parameter B_ξ family cannot express.
+// Calibrated per instrument, not a constant: it measures 0.062 on one piano and
+// 0.186 on the other.
+// report 0009
 pub fn sigma_prior(input: &CurveInput, bxi: &BXi) -> f64 {
     let mut residuals: Vec<f64> = input
         .keys
@@ -302,39 +266,25 @@ pub fn sigma_prior(input: &CurveInput, bxi: &BXi) -> f64 {
 }
 
 /// Tolerance below which a computed octave stretch counts as negative
-/// (cents). Guards the §2 detector against floating-point noise, nothing
-/// more — real violations are on the order of whole cents.
+/// (cents). Guards the negative-stretch detector against floating-point
+/// noise, nothing more — real violations are on the order of whole cents.
 pub const NEGATIVE_STRETCH_TOL_CENTS: f64 = 0.01;
 
-/// Reversion length ℓ of the prior-mean reversion term, in keys (ADR 0007).
+/// Reversion length ℓ of the prior-mean reversion term, in keys.
 ///
-/// **The problem it solves:** the second-difference penalty's null space is
-/// the affine functions, so in any data-free region (the treble tail above
-/// the last trusted key) the penalized-LS minimizer continues the residual's
-/// end slope as an exact straight line — consistent with Eilers 2003
-/// (extrapolation is a polynomial of order d = degree d−1, linear for
-/// d = 2), and observed on the real captures as an arithmetic progression
-/// of the (b)−(a) gap (−3.8/−8.1/−12.4 ¢ at A5/A6/A7 pre-fix). That
-/// contradicts §8 of the design note: away from data the curve must ride
-/// the prior, i.e. the residual's prior mean is zero.
-///
-/// **The fix:** observe the prior mean (residual 0) at every key carrying no
-/// data, with weight w_0 — a proper Gaussian prior stated *in the
-/// objective* (not an output clamp). The tail Euler–Lagrange equation
-/// w_0 z + λ z'''' = 0 has decaying solutions with rate
-/// (w₀/λ)^(1/4)/√2, so the reversion length is
-/// ℓ = √2·(λ/w₀)^(1/4), i.e. w₀ = 4λ/ℓ⁴
-/// ([`reversion_weight`]). Tying w_0 to λ keeps ℓ invariant across the
-/// CV grid, and makes the design note's own "λ→∞ reproduces the prior"
-/// statement literally true (with pure D² it was not).
-///
-/// **Why 12:** the residual field is generated by deviations of B(m)
-/// around the B_ξ model, whose own characteristic lengths are the
-/// asymptote e-foldings 1/s_T ≈ 10.8 and 1/|s_B| ≈ 12–15
-/// keys — a trend cannot justifiably be carried past the generating model's
-/// correlation length. 12 keys = one octave sits inside that bracket and is
-/// the natural musical unit. Scale-invariant (key-space); **ours**,
-/// documented in ADR 0007.
+/// The second-difference penalty's null space is the affine functions, so in a
+/// data-free region, such as the treble past the last trusted key, the penalized
+/// least-squares minimizer continues the residual's end slope as a straight line
+/// (Eilers 2003: extrapolation is a polynomial of degree d − 1). The term observes
+/// the prior mean, residual 0, at every key carrying no data, with weight w₀: a
+/// Gaussian prior in the objective, not an output clamp. The tail Euler–Lagrange
+/// equation w₀z + λz'''' = 0 decays at rate (w₀/λ)^(1/4)/√2, so
+/// ℓ = √2·(λ/w₀)^(1/4), i.e. w₀ = 4λ/ℓ⁴. Tying w₀ to λ keeps ℓ fixed across the
+/// CV grid, and λ → ∞ reproduces the prior.
+// Ours: one octave, inside the B_ξ model's own correlation lengths, its asymptote
+// e-foldings 1/s_T ≈ 10.8 and 1/|s_B| ≈ 12–15 keys, since a trend is not carried
+// past the model generating it.
+// report 0007
 pub const REVERSION_LENGTH_KEYS: f64 = 12.0;
 
 /// Prior-reversion pseudo-observation weight w_0 = 4λ/ℓ⁴
@@ -343,50 +293,36 @@ fn reversion_weight(lambda: f64) -> f64 {
     4.0 * lambda / REVERSION_LENGTH_KEYS.powi(4)
 }
 
-/// Minimum coincident 2j:j pairs for a Giordano scan to enter the ρ fit
-/// (design note defaults #13.2) — **derived from Giordano §VI.C**, verified
-/// against the PDF: the A0–A1 / A1–A2 dissonance reaches its asymptotic
-/// stretch only with ≥ 16 lower / 8 upper partials, i.e. min(⌊16/2⌋, 8) = 8
-/// coincident pairs; fewer under-predicts the stretch (a biased ρ point).
-/// See `giordano::coincident_pairs` for the full derivation and the
-/// conservative-floor note.
+/// Fewest coincident 2j:j pairs for a Giordano scan to enter the ρ fit. Giordano
+/// §VI.C's A0–A1 and A1–A2 stretch converges only with 16 lower and 8 upper
+/// partials, min(⌊16/2⌋, 8) = 8 pairs, and fewer under-predict the stretch
+/// ([`giordano::coincident_pairs`]).
+// Measured: 42 of 74 octave pairs pass it.
+// report 0008
 pub const GIORDANO_MIN_COINCIDENT_PAIRS: usize = 8;
 
-/// Minimum accepted ρ points before engine (c) trusts an Eq.-9 refit;
-/// below it (c) degrades to (b). **Ours**: 6 points = twice the parameter
-/// count of φ, the floor for a meaningful regularized fit.
+/// Fewest accepted ρ points for engine (c)'s Eq.-9 refit; below it (c) degrades
+/// to (b).
+// Ours: twice φ's three parameters.
 pub const RHO_FIT_MIN_POINTS: usize = 6;
 
-/// Decade grid for the Eq.-9 regularization weight (see
-/// [`select_rho_reg_weight`]): (lo, hi, steps) in log₁₀, spanning
-/// 10⁻² (fit follows the ρ points) to 10² (fit pinned to the prior) —
-/// deliberately beyond both useful extremes so the CV minimum is interior
-/// in practice, like `whittaker::LAMBDA_GRID_DECADES`.
+/// Decade grid for the Eq.-9 regularization weight, (lo, hi, steps) in log₁₀: from
+/// 10⁻², where the fit follows the ρ points, to 10², where it is pinned to the
+/// prior. Both ends lie past the useful range, so the CV minimum is interior.
 pub const RHO_REG_GRID_DECADES: (f64, f64, usize) = (-2.0, 2.0, 5);
 
-/// Selects the Eq.-9 regularization weight by leave-one-out
-/// cross-validation over the ρ points: for each candidate weight on
-/// [`RHO_REG_GRID_DECADES`], drop one octave pair, refit, and score the
-/// absolute prediction error at the held-out pair — then apply the
-/// **one-standard-error rule** (Hastie, Tibshirani & Friedman, *The
-/// Elements of Statistical Learning* 2nd ed. §7.10: choose the most
-/// parsimonious model within one standard error of the CV minimum;
-/// SE = std of the per-point LOO errors / √n): the *largest* weight whose
-/// mean error is ≤ min + SE wins. Model selection per the design note's
-/// own doctrine (defaults #13.4 — categorically distinct from benchmark
-/// tuning).
-///
-/// Why the 1-SE rule and not the bare argmin: single-capture ρ points are
-/// noise-dominated (measured: mean LOO error ≈ 1.2 ρ-units on the real
-/// captures, flat within ~20 % across four decades of weight), and they
-/// end where the sufficiency gate ends (key ~44) — everything above is
-/// extrapolation the CV never scores. A bare argmin then lets a
-/// noise-level preference at the weak edge of the grid set the fit's
-/// *treble* tail (±13 ¢ at A7 observed), exactly the un-scored region.
-/// Breaking ties toward the prior realizes §6(c)'s "strong
-/// regularization" intent precisely when — and only when — the data
-/// cannot distinguish. Falls back to the grid's strongest weight when no
-/// candidate yields a finite score.
+/// Selects the Eq.-9 regularization weight by leave-one-out cross-validation over
+/// the ρ points: for each weight on [`RHO_REG_GRID_DECADES`], drop one octave pair,
+/// refit, and score the absolute error at the held-out pair. The one-standard-error
+/// rule then takes the largest weight whose mean error is within one SE of the
+/// minimum (SE = std of the per-point errors / √n): the most parsimonious model the
+/// data cannot tell from the best (Hastie, Tibshirani & Friedman, *The Elements of
+/// Statistical Learning*, 2nd ed., §7.10). Falls back to the grid's strongest
+/// weight when no candidate scores.
+// Do not replace the 1-SE rule with the bare CV argmin: the LOO curve is flat at
+// noise level across four decades, and the ρ points end near key 44, so the argmin
+// lands on a grid edge and drives engine (c) to A7 +47.2 ¢ / C8 +60.5 ¢.
+// report 0008
 pub fn select_rho_reg_weight(points: &[(f64, f64)], prior: &RhoPhi) -> f64 {
     let (lo, hi, steps) = RHO_REG_GRID_DECADES;
     let strongest = 10f64.powf(hi);
@@ -454,10 +390,8 @@ fn lagrange_eval(xs: &[f64], ys: &[f64], x: f64) -> f64 {
     sum
 }
 
-/// The per-instrument B_ξ fit (Eq. 29) over a profile's trusted keys,
-/// degrading to the medium-piano default when fewer than 2 keys are
-/// measured. Exposed for the comparison harness; the engines call it
-/// through their shared context.
+/// The per-instrument B_ξ fit (Eq. 29) over the input's keys, degrading to the
+/// medium-piano default when fewer than 2 keys are measured.
 pub fn instrument_b_fit(input: &CurveInput) -> BXi {
     let points: Vec<(f64, f64)> = input
         .keys
@@ -468,13 +402,12 @@ pub fn instrument_b_fit(input: &CurveInput) -> BXi {
     rigaud::fit_b_xi(&points).unwrap_or(BXi::DEFAULT_MEDIUM)
 }
 
-/// What every engine starts from: the instrument's curve-side B (with the §2
-/// pre-exclusion applied) and engine (a)'s prior curve. Engines (a)–(d) differ
-/// only in what they do with this.
+/// What every engine starts from: the instrument's curve-side B, after the
+/// negative-stretch pre-exclusion, and engine (a)'s curve as the prior.
 struct CurveBasis {
     /// Curve-side B per key: the precision-weighted blend of the key's
     /// measured B and the B_ξ fit, the fit alone where nothing is measured.
-    /// Never used for strobe targets (§5 takes raw measured B).
+    /// Never used for strobe targets, which take raw measured B.
     curve_b: [f64; 88],
     /// True where `curve_b` is measurement-dominated (blend weight ≥ 1/2).
     b_is_measured: [bool; 88],
@@ -491,12 +424,8 @@ fn curve_basis(input: &CurveInput, params: &CurveParams) -> CurveBasis {
     // Eq. 29 fit over all trusted measured keys (L1 is the outlier guard).
     let bxi = instrument_b_fit(input);
 
-    // Curve-side B: precision-weighted shrinkage of the measurement toward
-    // the B_ξ fit (defaults #13.3, ADR 0009 — see the SIGMA_LNB_* block).
-    // `b_is_measured` keeps its downstream meaning (chain gauge, smoother
-    // data weights, LKO reference) via the point of equal information,
-    // w ≥ 1/2 ⇔ σ_m ≤ σ_p — a derived boundary, and one that only grades
-    // keys as data/prior; the B *value* itself is continuous across it.
+    // `b_is_measured` grades a key as data at the point of equal information,
+    // w ≥ 1/2 ⇔ σ_m ≤ σ_p; the blended B itself is continuous across it.
     let sigma_p = sigma_prior(input, &bxi);
     let mut curve_b = [0.0f64; 88];
     let mut b_is_measured = [false; 88];
@@ -520,10 +449,10 @@ fn curve_basis(input: &CurveInput, params: &CurveParams) -> CurveBasis {
         }
     }
 
-    // §2 pre-exclusion: a negative Eq.-6 octave stretch is definitionally an
-    // estimator artifact. Exclude the pair's larger prior-deviator (by
-    // |log(B/B_ξ)| among measured keys), fall back to B_ξ, and re-check —
-    // flag-and-exclude, never clamp.
+    // Negative-stretch pre-exclusion: a negative Eq.-6 octave stretch is an
+    // estimator artifact. Exclude the pair's measured key deviating most from B_ξ
+    // (by |ln(B/B_ξ)|), fall back to B_ξ, and re-check: flag and exclude, never
+    // clamp.
     loop {
         let mut worst: Option<(usize, f64)> = None; // (key to exclude, deviation)
         for m in 0..76 {
@@ -548,7 +477,7 @@ fn curve_basis(input: &CurveInput, params: &CurveParams) -> CurveBasis {
         flags[k].curve_b_fallback = true;
     }
 
-    // Engine (a)'s curve doubles as every engine's prior (D3).
+    // Engine (a)'s curve doubles as every engine's prior.
     let prior = a_chain_prior(&bxi, params);
 
     CurveBasis {
@@ -566,7 +495,7 @@ fn curve_basis(input: &CurveInput, params: &CurveParams) -> CurveBasis {
 fn a_chain_prior(bxi: &BXi, params: &CurveParams) -> [f64; 88] {
     let b = |k: usize| bxi.b_at_key(k);
     let mut f0 = [0.0f64; 88];
-    // f1(A4) = 440 ⇒ F0 = 440/√(1+B) (flexible-string convention, §1).
+    // f1(A4) = 440 ⇒ F0 = 440/√(1+B) (flexible-string convention).
     f0[48] = 440.0 / (1.0 + b(48)).sqrt();
     for a in [60usize, 72, 84] {
         // ρ is indexed by the reference (lower) note m (Eq. 9 note).
@@ -594,7 +523,7 @@ fn a_chain_prior(bxi: &BXi, params: &CurveParams) -> [f64; 88] {
 
 /// Finalizes an engine's cents vector into a [`TuningCurve`]: re-anchors
 /// A4 to exactly 0 (a vertical gauge shift — the reference pitch lives in
-/// `d_g`), then runs the §2 detector over the **final** curve, flagging
+/// `d_g`), then runs the negative-stretch detector over the final curve, flagging
 /// (never fixing) any remaining d(m+12) < d(m) pair.
 fn finish(mut cents: [f64; 88], mut flags: [CurveKeyFlags; 88], d_g: f64) -> TuningCurve {
     let a4 = cents[48];
@@ -616,10 +545,13 @@ fn finish(mut cents: [f64; 88], mut flags: [CurveKeyFlags; 88], d_g: f64) -> Tun
 
 // ─── Engine (a): Rigaud-pure ─────────────────────────────────────────────────
 
-/// Engine (a) — the faithful end-to-end Rigaud §II.B curve (module doc).
-/// ~3 effective DOF; bias-heavy/variance-light. With no trusted
-/// measurements the B_ξ fit degrades to the medium-piano default — the
-/// "generic start" curve.
+/// Engine (a): Rigaud, David & Daudet's §II.B procedure end to end. The
+/// per-instrument B_ξ fit (Eq. 29) and the octave-type curve ρ̄_φ(m) (Eq. 9, with
+/// the §IV.C.2 presets) drive an Eq.-6 chain of A notes from A4, Lagrange
+/// interpolation (§II.B.4) spreads it over the compass, and d_g carries the global
+/// deviation (Eq. 32's role). About 3 effective degrees of freedom: heavy on bias,
+/// light on variance. With no trusted measurements the fit degrades to the
+/// medium-piano default, a generic starting curve.
 pub fn rigaud_pure(input: &CurveInput, params: &CurveParams) -> TuningCurve {
     let basis = curve_basis(input, params);
     finish(basis.prior, basis.flags, params.d_g)
@@ -627,18 +559,15 @@ pub fn rigaud_pure(input: &CurveInput, params: &CurveParams) -> TuningCurve {
 
 // ─── Engine (b): per-key coincidence + Whittaker ─────────────────────────────
 
-/// Raw per-key octave-chain deviations (engine (b)'s pre-smoothing stage),
-/// exposed for the comparison harness's leave-keys-out error. Returns the
-/// raw d(m) and, per key, whether its chain step used measured curve-B.
+/// Engine (b)'s raw per-key octave-chain deviations, before smoothing. Returns the
+/// raw d(m) and, per key, whether its curve-B is measurement-dominated.
 ///
-/// **Gauge (ADR 0007):** Eq. 6 fixes only octave *differences* — each of
-/// the 12 semitone chains carries a one-dimensional offset the data cannot
-/// identify, so its estimate must come from the prior alone. The
-/// minimum-norm (Moore–Penrose) choice is used: per chain, the offset that
-/// zeroes the mean of (raw − prior) over the chain's measured keys. No key
-/// is pinned, so no fabricated zero-residual data point enters the
-/// smoother; A4 = 0 remains the single *physical* anchor, applied globally
-/// in `finish()`.
+/// **Gauge.** Eq. 6 fixes only octave differences, so each of the 12 semitone
+/// chains carries an offset the data cannot identify. It takes the minimum-norm
+/// (Moore–Penrose) choice: the offset that zeroes the mean of (raw − prior) over
+/// the chain's measured keys. No key is pinned, so no fabricated zero-residual
+/// point reaches the smoother; A4 = 0 is the one physical anchor, applied to the
+/// finished curve.
 pub fn raw_octave_chain(input: &CurveInput, params: &CurveParams) -> ([f64; 88], [bool; 88]) {
     let basis = curve_basis(input, params);
     (raw_chain(&basis, params), basis.b_is_measured)
@@ -682,21 +611,18 @@ fn raw_chain(basis: &CurveBasis, params: &CurveParams) -> [f64; 88] {
     raw
 }
 
-/// Engine (b) — per-key coincidence + Whittaker (module doc): Eq.-6
-/// stretches from measured per-key B (ρ still the configured model) →
-/// raw d(m) → subtract (a)'s prior → Whittaker(λ by LOO-CV) on the
-/// residual → add back (design D3). Effective DOF grows with trusted
-/// captures; with fewer than 3 measured keys the smoother is skipped and
-/// the curve *is* the prior. Honest note (§6(b)): inherits (a)'s
-/// octave-type taste — measured B improves local fidelity, not the global
-/// stretch choice.
+/// Engine (b): engine (a) with measured per-key B in the Eq.-6 stretches, and a
+/// Whittaker smoother (Eilers 2003) on the cents residual from (a)'s curve, λ by
+/// leave-one-out CV. Effective degrees of freedom grow with trusted captures; with
+/// fewer than 3 measured keys the smoother is skipped and the curve is the prior.
+/// ρ stays the configured model, so measured B improves local fidelity, not the
+/// global stretch.
 ///
-/// Boundary treatment (ADR 0007): keys without measured curve-B enter the
-/// smoother as pseudo-observations of the prior mean (residual 0) at weight
-/// w₀ = 4λ/ℓ⁴ ([`REVERSION_LENGTH_KEYS`]), so the curve decays to the prior
-/// within ~ℓ keys of the last data instead of extrapolating the residual's
-/// end slope linearly. λ is still selected by LOO-CV, scored over the
-/// measured keys only — pseudo-points are prior, not data.
+/// Keys without measured curve-B enter the smoother as observations of the prior
+/// mean (residual 0) at weight w₀ = 4λ/ℓ⁴ ([`REVERSION_LENGTH_KEYS`]), so the curve
+/// decays to the prior within ≈ ℓ keys of the last data. The CV scores measured
+/// keys only.
+// report 0007
 pub fn per_key_smoothed(input: &CurveInput, params: &CurveParams) -> TuningCurve {
     let basis = curve_basis(input, params);
     let raw = raw_chain(&basis, params);
@@ -749,18 +675,7 @@ pub fn per_key_smoothed(input: &CurveInput, params: &CurveParams) -> TuningCurve
 
 // ─── Engine (c): (b) + Giordano-calibrated octave type ───────────────────────
 
-/// Engine (c) — the primary study subject (module doc): where partials
-/// suffice (bass/mid; defaults #13.2 gate), per-octave Giordano dissonance
-/// scans give optimal widths → Eq.-30 inversion → implied ρ points →
-/// Eq.-9 refit ([`select_rho_reg_weight`] picks the regularization by
-/// LOO-CV) → an instrument-specific octave-type
-/// curve; the information-starved treble rides the fitted curve's
-/// ρ → 1 asymptote. Then proceeds exactly as engine (b) under the
-/// calibrated ρ. Perceptual taste enters once, offline, as the octave-type
-/// selection — never the live loop.
-///
-/// The Giordano calibration stage of engine (c), exposed for the
-/// comparison harness: per-octave coincidence-bracket scans, the §VI.C
+/// Engine (c)'s calibration stage: per-octave coincidence-bracket scans, the §VI.C
 /// sufficiency gate, and the Eq.-30 inversion. Returns the accepted
 /// `(m_midi, rho)` points and the per-key exclusion flags.
 pub fn giordano_rho_points(input: &CurveInput) -> (Vec<(f64, f64)>, [bool; 88]) {
@@ -771,9 +686,9 @@ pub fn giordano_rho_points(input: &CurveInput) -> (Vec<(f64, f64)>, [bool; 88]) 
         let (Some(lo), Some(up)) = (&input.keys[m], &input.keys[m + 12]) else {
             continue;
         };
-        // Sufficiency gate (defaults #13.2, Giordano §VI.C): ≥ 8 coincident
-        // 2j:j pairs and an interior dissonance minimum; else the pair is
-        // excluded from the ρ fit (edge-hit = detector artifact, §2).
+        // Sufficiency gate (Giordano §VI.C): ≥ 8 coincident 2j:j pairs and an
+        // interior dissonance minimum; else the pair is excluded from the ρ fit
+        // (an edge hit is a detector artifact).
         if giordano::coincident_pairs(&lo.partials, &up.partials) < GIORDANO_MIN_COINCIDENT_PAIRS {
             *excl = true;
             continue;
@@ -789,7 +704,7 @@ pub fn giordano_rho_points(input: &CurveInput) -> (Vec<(f64, f64)>, [bool; 88]) 
             continue;
         }
         // The scan's optimal offset retunes the upper note multiplicatively,
-        // so its flexible-string F0 scales by the same factor (§1: both
+        // so its flexible-string F0 scales by the same factor (both
         // conventions scale together).
         let f0_u_star = up.f0 * (scan.offset_cents / 1200.0).exp2();
         match rigaud::invert_rho(lo.f0, lo.b, f0_u_star, up.b) {
@@ -802,8 +717,14 @@ pub fn giordano_rho_points(input: &CurveInput) -> (Vec<(f64, f64)>, [bool; 88]) 
     (points, excluded)
 }
 
-/// Degrades to engine (b) (flags telling) when fewer than
-/// [`RHO_FIT_MIN_POINTS`] octave pairs pass the gate.
+/// Engine (c): engine (b) under an instrument-measured octave type. Where partials
+/// suffice, per-octave Giordano dissonance scans give optimal widths, Eq. 30 inverts
+/// them to ρ points, and an Eq.-9 refit ([`select_rho_reg_weight`]) gives the
+/// instrument's octave-type curve; the treble rides its ρ → 1 asymptote. Perceptual
+/// taste enters once, as the octave-type selection. When fewer than
+/// [`RHO_FIT_MIN_POINTS`] octave pairs pass the gate it is engine (b), with the
+/// excluded pairs flagged.
+// Ours: the composition. Each method in it is used as published.
 pub fn giordano_calibrated(input: &CurveInput, params: &CurveParams) -> TuningCurve {
     let (points, giordano_excluded) = giordano_rho_points(input);
 
@@ -846,7 +767,7 @@ pub struct IntervalSpec {
 }
 
 impl IntervalSpec {
-    /// The tempering offset τ_k in cents (design note §6(d)).
+    /// The tempering offset τ_k in cents.
     pub fn tau(&self) -> f64 {
         if self.tempered {
             100.0 * self.k as f64 - 1200.0 * (self.p as f64 / self.q as f64).log2()
@@ -856,16 +777,12 @@ impl IntervalSpec {
     }
 }
 
-/// Default interval set + weights for engine (d) (design note defaults
-/// #13.6): octaves as the 2:1/4:2/6:3 pair compromise, the 3:1 twelfth and
-/// 4:1 double octave for long-range coherence, tempered fifths and fourths.
-/// The *set* is the note's; the `weight` values are **taste multipliers**
-/// on the derived Form-2 sensitivities (see [`multi_interval`]) — since
-/// the Set-3 review the register balance comes from the measured
-/// amplitudes, and the preset only expresses interval-family preference
-/// (octave-family prioritization following the Verituner patent's
-/// interval-prioritization concept) — style presets, never silent magic
-/// numbers.
+/// Default interval set and weights for engine (d): octaves as the 2:1/4:2/6:3
+/// compromise, the 3:1 twelfth and 4:1 double octave for long-range coherence, and
+/// tempered fifths and fourths. The `weight`s are taste multipliers on the derived
+/// sensitivities (see [`multi_interval`]): the measured amplitudes set the register
+/// balance, and the preset only prefers interval families, octaves first, after the
+/// Verituner patent's interval prioritization.
 pub const BALANCED_INTERVALS: &[IntervalSpec] = &[
     IntervalSpec {
         k: 12,
@@ -918,7 +835,7 @@ pub const BALANCED_INTERVALS: &[IntervalSpec] = &[
     },
 ];
 
-/// Pure-twelfths style preset (OnlyPure/Stopper precedent, §3.1): the 3:1
+/// Pure-twelfths style preset (OnlyPure/Stopper precedent): the 3:1
 /// twelfth dominates; octaves ride along lightly.
 pub const PURE_TWELFTHS_INTERVALS: &[IntervalSpec] = &[
     IntervalSpec {
@@ -962,37 +879,31 @@ pub const PURE_TWELFTHS_INTERVALS: &[IntervalSpec] = &[
 /// the per-data-row weighted fast-LOO scores (empty when not requested).
 type IntervalSolve = (Vec<f64>, Vec<f64>);
 
-/// Engine (d) — weighted multi-interval least squares in cents-space
-/// (module doc). Solving for x = d - d_{prior} with A4 eliminated
-/// (hard anchor d(A4) = 0):
+/// Engine (d): weighted multi-interval least squares in cents space, its components
+/// published and its assembly industry practice (Verituner, US 6,529,843). Solving
+/// for x = d − d_prior with A4 eliminated (the hard anchor d(A4) = 0):
 ///
 /// J(x) = ∑_{(m,k)} W_{m,k} (x_{m+k} - x_m - t_{m,k})²
 ///   + λ ∑_m (Δ² x_m)²,
 ///
-/// a banded SPD system (half-bandwidth ≤ 24) solved by the shared Cholesky.
-/// The beatless widths t_{m,k} read the B named by `params.b_source`.
-/// Data rows exist only where **both** endpoints carry measured curve-B and
-/// **both** coincident partials are measured; W_{m,k} is **derived** —
-/// the preset's taste multiplier × the Form-2 Giordano sensitivity
-/// ∂D/∂ε at the pair (`giordano::pair_width_sensitivity`), normalized
-/// to unit mean (a gauge, absorbed by λ). Register awareness follows from
-/// the data: in the bass the fundamental is weak and the 6:3/4:2 pairs
-/// carry the amplitude product, so the wide-stretch rows dominate; in the
-/// treble only the 2:1 pair exists at all.
+/// a banded SPD system, its half-bandwidth the widest interval, solved by Cholesky.
+/// The beatless widths t_{m,k} read the B named by `params.b_source`. A data row
+/// exists only where both endpoints carry measured curve-B and both coincident
+/// partials are measured, and its weight W_{m,k} is derived: the preset's taste
+/// multiplier times Giordano's width sensitivity ∂D/∂ε at the pair
+/// ([`giordano::pair_width_sensitivity`]), normalized to unit mean. Register
+/// follows from the data: in the bass the fundamental is weak and the 6:3 and 4:2
+/// pairs carry the amplitude product, so the wide-stretch rows dominate; in the
+/// treble only the 2:1 pair exists.
 ///
-/// Boundary treatment (ADR 0007): keys touched by no data row get a
-/// prior-reversion pseudo-row (x_m = 0 at weight w₀ = 4λ/ℓ⁴,
-/// [`REVERSION_LENGTH_KEYS`]) so the curve decays to the prior there
-/// instead of extrapolating x linearly through the penalty's affine null
-/// space. Pseudo-rows shape the system but are excluded from the CV
-/// scores — they are prior, not data.
+/// A key touched by no data row gets a pseudo-row x_m = 0 at weight w₀ = 4λ/ℓ⁴
+/// ([`REVERSION_LENGTH_KEYS`]), so the curve decays to the prior there.
+/// Pseudo-rows shape the system but are not scored.
 ///
-/// `lambda`: `Some` to fix the smoothness weight; `None` selects it by
-/// leave-one-row-out CV (the penalized-WLS fast-LOO identity, the same
-/// Eilers Eqs.-10/11 form `whittaker::cv` uses) with the
-/// one-standard-error rule (ESL §7.10) over the smoothing module's λ
-/// grid — model selection, not benchmark tuning; see the selection block
-/// for why GCV was retired with the derived weights.
+/// `Some(lambda)` fixes the smoothness weight. `None` selects it by
+/// leave-one-row-out CV (the penalized-WLS fast-LOO identity, Eilers 2003
+/// Eqs. 10–11) with the one-standard-error rule (ESL §7.10) over
+/// [`whittaker::LAMBDA_GRID_DECADES`].
 pub fn multi_interval(
     input: &CurveInput,
     params: &CurveParams,
@@ -1011,8 +922,8 @@ pub fn multi_interval(
         }
     };
 
-    // Equal-total-power amplitude normalization per note (Giordano's,
-    // design note defaults #13.1) — the Form-2 weights' a_p/a_q scale.
+    // Equal-total-power amplitude normalization per note (Giordano's), the scale of
+    // the sensitivity's a_p and a_q.
     let power_norm: [f64; 88] = core::array::from_fn(|k| {
         input.keys[k]
             .as_ref()
@@ -1023,13 +934,9 @@ pub fn multi_interval(
             .unwrap_or(0.0)
     });
 
-    // Data rows: (cols, coefs, target, weight); one or two columns each.
-    // W_{m,k} = preset multiplier × Form-2 sensitivity
-    // (`giordano::pair_width_sensitivity` — derived, no free
-    // parameters): a row exists only where both endpoints carry measured
-    // curve-B **and** both coincident partials are physically measured (which
-    // implies both are below Nyquist). Where the pair is absent the interval
-    // carries no Giordano evidence and the row is absent, not down-weighted.
+    // Data rows: (cols, coefs, target, weight), one or two columns each. An interval
+    // missing a coincident partial carries no Giordano evidence, so its row is
+    // absent, not down-weighted.
     let mut rows: Vec<(Vec<usize>, Vec<f64>, f64, f64)> = Vec::new();
     for spec in intervals {
         for m in 0..(88 - spec.k) {
@@ -1070,11 +977,9 @@ pub fn multi_interval(
             rows.push((cols, coefs, t, spec.weight * sens));
         }
     }
-    // Unit-mean weight gauge: the derived weights are defined up to a
-    // common scale (a global factor is absorbed into λ, which the CV
-    // re-selects), so normalize to mean 1 — keeps the shared λ grid
-    // interior and the reversion pseudo-rows' w₀ = 4λ/ℓ⁴ commensurate
-    // with the data rows. A gauge convention, not a free parameter.
+    // Unit-mean weights: the derived weights are defined up to a common scale, which
+    // λ absorbs. Mean 1 keeps the λ grid's minimum interior and w₀ = 4λ/ℓ⁴
+    // commensurate with the data rows.
     if !rows.is_empty() {
         let mean_w: f64 = rows.iter().map(|&(_, _, _, w)| w).sum::<f64>() / rows.len() as f64;
         if mean_w.is_finite() && mean_w > 0.0 {
@@ -1084,8 +989,8 @@ pub fn multi_interval(
         }
     }
 
-    // Keys carrying no data row: recipients of the prior-reversion
-    // pseudo-rows (ADR 0007). A4 (eliminated) is excluded.
+    // Keys carrying no data row receive the reversion pseudo-rows; A4, eliminated,
+    // never does.
     let mut has_data = [false; 88];
     for (cols, _, _, _) in &rows {
         for &c in cols {
@@ -1113,8 +1018,7 @@ pub fn multi_interval(
             }
             sys.add_row(&cols, &coefs, 0.0, lambda);
         }
-        // Prior-reversion pseudo-rows: x_k = 0 at w₀ = 4λ/ℓ⁴ where no data
-        // speaks (excluded from the CV scores below — prior, not data).
+        // Reversion pseudo-rows, x_k = 0 at w₀ = 4λ/ℓ⁴, never scored by the CV.
         let w0 = reversion_weight(lambda);
         for (k, &spoken_for) in has_data.iter().enumerate() {
             if !spoken_for && let Some(ck) = col(k) {
@@ -1162,18 +1066,12 @@ pub fn multi_interval(
     } else if let Some(l) = lambda {
         solve_for(l, false)
     } else {
-        // λ by leave-one-row-out CV with the **one-standard-error rule**
-        // (ESL §7.10, as in `select_rho_reg_weight`): among the λ grid,
-        // take the largest λ whose mean CV score is within one SE of the
-        // minimum. GCV (Golub–Heath–Wahba 1979) was the original selector
-        // and is sound under the uniform preset weights, but the Form-2
-        // importance weights span ~2 orders of magnitude and break its
-        // equal-variance premise — near-weightless rows still count fully
-        // in N, deflating RSS/N; observed on the real captures as a
-        // λ ≈ 10⁻² pick leaving the mutually-conflicting deep-bass rows
-        // unsmoothed (26 ¢ |Δ²d| kink). Per-row LOO scores each row on
-        // its own weighted scale, and the 1-SE rule breaks the shallow
-        // valley toward the prior — model selection, not benchmark tuning.
+        // λ by leave-one-row-out CV with the one-standard-error rule (ESL §7.10):
+        // the largest λ whose mean score is within one SE of the minimum. Not GCV:
+        // the derived weights span ≈ 2 orders of magnitude, breaking its
+        // equal-variance premise. Per-row LOO scores each row on its own weighted
+        // scale, and the 1-SE rule breaks the shallow valley toward the prior.
+        // report 0008
         let (lo, hi, steps) = whittaker::LAMBDA_GRID_DECADES;
         let mut stats: Vec<(f64, f64, f64, Vec<f64>)> = Vec::new(); // (λ, mean, se, x)
         for s in 0..steps {
@@ -1212,21 +1110,18 @@ pub fn multi_interval(
     finish(cents, basis.flags, params.d_g)
 }
 
-/// The **fallback** displayed strobe partial `n*` per key: the D5 register
-/// rule instantiated as the default of TuneLab's editable "Table of Partials"
-/// — 6th partial in the low bass, then 4th, then 2nd, then the fundamental
-/// from A4 up (its documented last switch). The interior boundaries follow
-/// the aural octave-type registers the same tools encode (6:3 bass / 4:2
-/// tenor / 2:1 toward the treble).
+/// The fallback displayed strobe partial `n*` per key, where amplitude-informed
+/// selection ([`select_display_partials`]) has nothing to go on: the default of
+/// TuneLab's editable "Table of Partials", the 6th partial in the low bass, then
+/// the 4th, then the 2nd, then the fundamental from A4 up. The boundaries follow
+/// the aural octave-type registers (6:3 bass, 4:2 tenor, 2:1 toward the treble).
 ///
-/// Used where amplitude-informed selection ([`select_display_partials`])
-/// can't run: a key with no measurement, and every key when no profile-based
-/// curve exists (prior-only curve, or a non-piano in ET mode).
-///
-/// The treble entry is derived, not just precedented: the n = 1 target is
-/// identically B-immune (R4 — f₁ anchors the target chain), so ADR 0009's ×8
-/// treble σ_lnB cannot move it. Conversely selection cannot fix deep-bass
-/// window leakage (R3) — that is the long-window strobe Goertzel's job.
+/// The treble entry is derived as well as precedented: the n = 1 target is immune
+/// to B (f₁ anchors the target chain), so the treble's ×8 repeat σ_lnB cannot move
+/// it.
+// No choice of partial fixes deep-bass window leakage; the strobe's long window
+// does.
+// report 0009
 pub fn default_display_partials() -> [u8; 88] {
     let mut table = [1u8; 88];
     for (key, n) in table.iter_mut().enumerate() {
@@ -1234,19 +1129,17 @@ pub fn default_display_partials() -> [u8; 88] {
             0..=26 => 6,  // A0–B2: bass — weak fundamental, 6:3 register
             27..=38 => 4, // C3–B3: tenor — 4:2 register
             39..=47 => 2, // C4–G#4: low treble — 2:1 register
-            _ => 1,       // A4–C8: fundamental — B-immune target (R4)
+            _ => 1,       // A4–C8: fundamental — immune to B
         };
     }
     table
 }
 
-/// The window of partials the amplitude search may pick from, per key — the
-/// D5 octave-type range, the same register provenance as
-/// [`default_display_partials`] widened from a single value to a band. Its
-/// shape is what R4's δcents(n) ≈ 866·B·(n²−1)·σ_lnB justifies: the treble is
-/// pinned to the fundamental (any n > 1 target jumps with ADR 0009's ×8 treble
-/// σ_lnB), while the bass opens up because bass B is tiny (δcents < 0.1 ¢ even
-/// at n = 8), so sustained amplitude can safely choose within it.
+/// The partials the amplitude search may pick from per key: the registers of
+/// [`default_display_partials`], widened to bands. δcents(n) ≈ 866·B·(n²−1)·σ_lnB
+/// shapes them: any n > 1 target in the treble moves with its ×8 σ_lnB, so the
+/// treble is pinned to the fundamental, while bass B is small enough
+/// (δcents < 0.1 ¢ even at n = 8) for amplitude to choose.
 fn register_window(key: usize) -> (u32, u32) {
     match key {
         0..=26 => (4, 8),  // bass — 6:3 register
@@ -1256,29 +1149,18 @@ fn register_window(key: usize) -> (u32, u32) {
     }
 }
 
-/// Per-key displayed strobe partial `n*`, **amplitude-informed** where the key
-/// carries a measurement — CyberTuner's "Smart Partials" (strobe design §6.3,
-/// R5): within the key's D5 [`register_window`], the loudest **sustained**
-/// partial. Our capture is the post-attack Golden Window (design §6.2), so the
-/// measured amplitudes *are* the sustained ones — the correct "which partial
-/// is strong while you tune" basis. A key with no measurement (and every key
-/// when no profile-based curve exists) keeps its [`default_display_partials`]
-/// value.
-///
-/// Computed at curve time and carried in the [`crate::worker::CurveBundle`] so
-/// it locks with the curve (D6/R8) — never recomputed per key at read time, or
-/// a capture landing mid-pass would shift the band's partial under the lock.
+/// Per-key displayed strobe partial `n*`, after CyberTuner's "Smart Partials": the
+/// loudest measured partial within the key's register window. Captures are taken
+/// after the attack, so these are the partials strong while a note sustains. A key
+/// with no measurement keeps its [`default_display_partials`] value.
 pub fn select_display_partials(input: &CurveInput) -> [u8; 88] {
     let mut out = default_display_partials();
     for (key, slot) in out.iter_mut().enumerate() {
         let Some(data) = input.keys[key].as_ref() else {
-            continue; // unmeasured → keep the register default
+            continue;
         };
         let (lo, hi) = register_window(key);
-        // Loudest measured partial inside the register window. total_cmp
-        // orders the f64 amplitudes total-ly (no NaN branch needed — measured
-        // amplitudes are finite). Window with no measured partial (sparse
-        // capture) leaves the register default in place.
+        // A window with no measured partial keeps the register default.
         if let Some((n, _, _)) = data
             .partials
             .iter()
@@ -1291,32 +1173,24 @@ pub fn select_display_partials(input: &CurveInput) -> [u8; 88] {
     out
 }
 
-/// First key at which the coarse read moves to the fundamental. Below it the
-/// n = 1 partial is too weak to admit: measured availability collapses to 32 %
-/// at F1 and 0 % at G1, and B1 reads 10.7 ¢ off at 81 %. It is clean from C#2
-/// up, and the n = 4 side is clean across keys 8–20, so the two overlap — a
-/// handover zone, not a knife edge (ADR 0011).
+/// First key whose coarse read centres on the fundamental; below it the
+/// fundamental is too weak to admit.
+// Measured: n = 1 availability is 0 % at G1 and 32 % at F1, B1 reads 10.7 ¢ off at
+// 81 %, and it is clean from C#2 up. n = 4 is clean across keys 8–20, so the
+// handover sits inside an overlap.
+// report 0011
 const COARSE_READ_FUNDAMENTAL_KEY: usize = 16;
 
-/// Per-key **coarse-read partial** `n*` — which partial the wide-range
-/// magnitude read centres on. Deliberately *not*
-/// [`default_display_partials`]: the strobe band and the coarse number answer
-/// different questions, so the same key can use different partials for each.
-///
-/// **Ours, measured** (ADR 0011). Two instruments agree on a fixed n\* = 4 in
-/// the bass: on the piano n\* = 5 is the only strict all-pass, but a guitar's
-/// E2 fails hard on 5 (jitter 13.8 ¢) and passes on 4. Two tiebreaks point the
-/// same way — cold-start bias grows as (n²−1) with an unmeasured `B` (5 ¢ at
-/// n = 4 vs 8 ¢ at n = 5), and picking the per-key margin argmax instead rides
-/// systematically high (B0 +7.5 ¢ vs +0.7 ¢ fixed).
-///
-/// Per-*hop* selection is refuted, not merely unbuilt: switching partials steps
-/// the displayed number by 866·ΔB·n², measured at 20 ¢+, so it would need
-/// hysteresis constants and partial-identity plumbing to the GUI to buy nothing.
-///
-/// Above [`COARSE_READ_FUNDAMENTAL_KEY`] this returns 1, so every guitar string
-/// (key ≥ 19) reads on the fundamental — coherent with ET mode, which publishes
-/// only the fundamental reference.
+/// Per-key coarse-read partial `n*`, the partial the wide-range magnitude read
+/// centres on: the 4th below `COARSE_READ_FUNDAMENTAL_KEY`, the fundamental from
+/// there up. Not [`default_display_partials`]: the strobe band and the coarse
+/// number answer different questions.
+// Ours, measured: a fixed n* = 4 is the cross-instrument answer (n = 5 is the
+// piano's only strict all-pass, but a guitar's E2 fails on it, jitter 13.8 ¢), and
+// both tiebreaks agree: cold-start bias grows as n² − 1 (5 ¢ at n = 4, 8 ¢ at
+// n = 5), and a per-key margin argmax rides high (B0 +7.5 ¢ against +0.7 ¢). Do
+// not select per hop: switching partials steps the number by 866·ΔB·n², 20 ¢+.
+// report 0011
 pub fn coarse_read_partial(key_index: u8) -> u8 {
     if (key_index as usize) < COARSE_READ_FUNDAMENTAL_KEY {
         4
@@ -1330,7 +1204,7 @@ mod tests {
     use super::*;
     use crate::models::{InharmonicityProfile, KeyMeasurement, Partial};
 
-    /// §6.4/R5 fallback display-partial table: values from the TuneLab default
+    /// Fallback display-partial table: values from the TuneLab default
     /// set, monotone non-increasing across the compass, fundamental from A4
     /// (key 48) up.
     #[test]
@@ -1348,17 +1222,17 @@ mod tests {
         );
     }
 
-    /// Smart-Partials (§6.3, R5): a measured key picks the loudest partial
+    /// Smart Partials: a measured key picks the loudest partial
     /// inside its register window; partials outside the window are ignored
     /// however loud; an unmeasured key keeps the default; treble is pinned to
     /// the fundamental (window [1, 1]).
     #[test]
     fn test_select_display_partials() {
         let mut input = CurveInput::default();
-        // A0 (key 0), window [4, 8]: n = 7 is the loudest *in-window* partial.
+        // A0 (key 0), window [4, 8]: n = 7 is the loudest in-window partial.
         // n = 1 (amp 100) is below the window and n = 9 (amp 50) above it, so
         // both are ignored despite being louder — the window is the stability
-        // guard (R4).
+        // guard.
         input.keys[0] = Some(CurveKeyData {
             b: 4e-4,
             f0: 27.5,
@@ -1388,9 +1262,9 @@ mod tests {
         );
     }
 
-    /// ADR-0010 coarse-read partial: fixed n\* = 4 through the handover key,
-    /// fundamental above it — and independent of the *display* table, whose
-    /// bass entry is 6.
+    /// Fixed n* = 4 below the handover key, the fundamental from it up, and
+    /// independent of the display table, whose bass entry is 6.
+    // report 0011
     #[test]
     fn test_coarse_read_partial() {
         assert_eq!(coarse_read_partial(0), 4, "A0 reads on the 4th partial");
@@ -1439,8 +1313,8 @@ mod tests {
         profile
     }
 
-    /// §11 test: Eq.-6 closed-form sanity — zero at B = 0, strictly positive
-    /// stretch for B > 0 (the §2 theorem at moderate ρ), monotone in B_L.
+    /// Eq.-6 closed-form sanity — zero at B = 0, strictly positive stretch for
+    /// B > 0 (the stretched-octave theorem at moderate ρ), monotone in B_L.
     #[test]
     fn test_octave_stretch_closed_form() {
         assert!(octave_stretch_cents(0.0, 0.0, 2.0).abs() < 1e-12);
@@ -1453,8 +1327,8 @@ mod tests {
         assert!((octave_stretch_cents(1e-3, 0.0, 1.0) - hand).abs() < 1e-9);
     }
 
-    /// §11 test: at ρ = 1 the upper note's B cancels exactly (design §2/§8)
-    /// — the treble fallback's insensitivity result.
+    /// At ρ = 1 the upper note's B cancels exactly — the treble fallback's
+    /// insensitivity result.
     #[test]
     fn test_rho1_upper_b_cancellation() {
         let s1 = octave_stretch_cents(8e-4, 1e-5, 1.0);
@@ -1465,7 +1339,7 @@ mod tests {
         );
     }
 
-    /// Negative stretch requires B_U/B_L beyond (4ρ²−1)/(ρ²−1) (§2) — the
+    /// Negative stretch requires B_U/B_L beyond (4ρ²−1)/(ρ²−1) — the
     /// detector's trigger condition, checked on both sides.
     #[test]
     fn test_negative_stretch_threshold() {
@@ -1523,13 +1397,13 @@ mod tests {
         }
     }
 
-    /// §11 property test: on a valid synthetic profile every engine yields a
+    /// Property test: on a valid synthetic profile every engine yields a
     /// finite curve, anchored at A4 = 0, with monotone octaves (no detector
     /// flags).
     #[test]
     fn test_engines_on_valid_synthetic_profile() {
         let profile = synth_profile(0..88);
-        let input = crate::models::CurveInput::from_profile(&profile);
+        let input = CurveInput::from_profile(&profile);
         assert_eq!(input.measured_count(), 88);
         let params = CurveParams::default();
 
@@ -1572,22 +1446,22 @@ mod tests {
                 m.captured_in_auto = true;
             }
         }
-        let input = crate::models::CurveInput::from_profile(&profile);
+        let input = CurveInput::from_profile(&profile);
         assert_eq!(input.measured_count(), 0);
         // Engines still produce the generic prior curve.
         let curve = rigaud_pure(&input, &CurveParams::default());
         assert!(curve.cents.iter().all(|c| c.is_finite()));
         assert!(curve.flags.iter().all(|f| !f.measured));
 
-        // The diagnostics builder waives *this* disqualification and only this
-        // one: the offline harnesses run on regenerated auto-mode captures.
-        let diagnostic = crate::models::CurveInput::from_profile_including_auto(&profile);
+        // The diagnostics builder waives this disqualification, and only this one.
+        let diagnostic = CurveInput::from_profile_including_auto(&profile);
         assert_eq!(diagnostic.measured_count(), 88);
     }
 
-    /// A string-isolated capture measured one string, not the note, so it feeds
-    /// no curve on **either** path — the diagnostics builder waives auto-mode
-    /// provenance alone (ADR 0012; `docs/internals/06-capture-sets.md`).
+    /// A string-isolated capture measured one string, not the note, so it feeds no
+    /// curve on either path: the diagnostics builder waives only auto-mode
+    /// provenance.
+    // report 0014
     #[test]
     fn test_solo_captures_never_feed_a_curve() {
         let mut profile = synth_profile(0..88);
@@ -1596,18 +1470,15 @@ mod tests {
                 m.sounding_strings = Some(crate::models::SoundingStrings::UNDECLARED.toggled(1));
             }
         }
+        assert_eq!(CurveInput::from_profile(&profile).measured_count(), 0);
         assert_eq!(
-            crate::models::CurveInput::from_profile(&profile).measured_count(),
-            0
-        );
-        assert_eq!(
-            crate::models::CurveInput::from_profile_including_auto(&profile).measured_count(),
+            CurveInput::from_profile_including_auto(&profile).measured_count(),
             0,
             "a solo is not a stand-in for the note on any path"
         );
     }
 
-    /// §2 detector: a wildly broken measured B (upper of a bass octave far
+    /// Negative-stretch detector: a wildly broken measured B (upper of a bass octave far
     /// above its lower) is excluded — flagged, replaced by the fit, never
     /// clamped into the output.
     #[test]
@@ -1619,7 +1490,7 @@ mod tests {
         let m = profile.active_mut(poisoned).unwrap();
         let b_bad = m.calculated_b.unwrap() * 40.0;
         m.calculated_b = Some(b_bad);
-        let input = crate::models::CurveInput::from_profile(&profile);
+        let input = CurveInput::from_profile(&profile);
         let params = CurveParams::default();
         let curve = per_key_smoothed(&input, &params);
         assert!(
@@ -1636,12 +1507,11 @@ mod tests {
         }
     }
 
-    /// ADR 0009 shrinkage: σ_m(n) is monotone with the measured floor;
-    /// σ_p self-calibrates (small on an on-model profile, ≈ the deviation
-    /// scale on a deviating one); the blend keeps a precise measurement and
-    /// flags a starved one prior-dominated — with the B value continuous
-    /// (no hard switch), which the §2 detector never mistakes for an
+    /// σ_m(n) falls to its floor; σ_p self-calibrates, small on an on-model profile
+    /// and near the deviation scale on a deviating one; the blend keeps a precise
+    /// measurement and marks a starved one prior-dominated, which is not an
     /// exclusion.
+    // report 0009
     #[test]
     fn test_curve_b_shrinkage() {
         // σ model shape.
@@ -1652,26 +1522,23 @@ mod tests {
 
         // Self-calibrated σ_p: an exactly on-model profile deflates to the
         // floor; the ±30 % deviating profile measures its own scatter.
-        let on_model = crate::models::CurveInput::from_profile(&synth_profile(0..88));
+        let on_model = CurveInput::from_profile(&synth_profile(0..88));
         let bxi = instrument_b_fit(&on_model);
         assert!(sigma_prior(&on_model, &bxi) <= 0.02);
-        let deviating = crate::models::CurveInput::from_profile(&synth_profile_deviating(0..88));
+        let deviating = CurveInput::from_profile(&synth_profile_deviating(0..88));
         let bxi_dev = instrument_b_fit(&deviating);
         let sp = sigma_prior(&deviating, &bxi_dev);
         assert!((0.1..0.5).contains(&sp), "sigma_prior {sp} not near 0.3/√2");
 
-        // Blend semantics on the deviating profile: a 24-partial bass key is
-        // measurement-dominated; the same key starved to 4 partials becomes
-        // prior-dominated (flagged, not excluded) and its octave partner's
-        // raw chain value moves smoothly toward the prior, not to a
-        // different-key value (continuity: the starved-B blend stays between
-        // the measurement and the fit).
+        // On the deviating profile a 24-partial bass key is measurement-dominated,
+        // and the same key starved to 4 partials is prior-dominated: flagged, not
+        // excluded.
         let params = CurveParams::default();
         let full = per_key_smoothed(&deviating, &params);
         assert!(!full.flags[14].curve_b_fallback);
         let mut starved_profile = synth_profile_deviating(0..88);
         starved_profile.active_mut(14).unwrap().partials.truncate(4);
-        let starved = crate::models::CurveInput::from_profile(&starved_profile);
+        let starved = CurveInput::from_profile(&starved_profile);
         let curve = per_key_smoothed(&starved, &params);
         assert!(
             curve.flags[14].curve_b_fallback,
@@ -1685,7 +1552,7 @@ mod tests {
     /// a ±30 % multiplicative sine on the model B — so the residual from
     /// the fitted prior is genuine and cannot be absorbed by the Eq.-29 fit
     /// (the deviation is orthogonal to the family; L1 keeps the majority
-    /// level). Amplitude 0.3 stays below the §2 detector threshold
+    /// level). Amplitude 0.3 stays below the negative-stretch detector's threshold
     /// (max pair ratio ≈ 2.8 < 4.16 at deep-bass ρ). Only `calculated_b`
     /// is perturbed: engines (a)/(b)/(d) consume B and the partial count,
     /// not the partial frequencies.
@@ -1700,14 +1567,13 @@ mod tests {
         profile
     }
 
-    /// ADR 0007 reversion test: with data ending at key 40, the curve's
-    /// deviation from the prior must *decay* toward the treble (reversion
-    /// length ℓ = 12 keys), not extrapolate linearly. Pre-fix behavior was
-    /// an arithmetic progression growing all the way to C8.
+    /// With data ending at key 40, the curve's deviation from the prior decays
+    /// toward the treble instead of extrapolating linearly.
+    // report 0007
     #[test]
     fn test_reversion_decays_extrapolation() {
         let profile = synth_profile_deviating(0..=40);
-        let input = crate::models::CurveInput::from_profile(&profile);
+        let input = CurveInput::from_profile(&profile);
         let params = CurveParams::default();
         let a = rigaud_pure(&input, &params);
 
@@ -1726,12 +1592,9 @@ mod tests {
                 peak > 0.3,
                 "engine {name}: no boundary residual to test decay against (peak {peak})"
             );
-            // …whose *shape* has decayed by ≥ 3ℓ past the boundary. A
-            // constant tail offset is allowed: `finish()` re-anchors A4,
-            // and with A4 unmeasured here its reversion-predicted residual
-            // becomes a uniform vertical shift of the whole curve — pure
-            // gauge. Pre-fix (linear extrapolation) the tail is *sloped*
-            // (−4.3 ¢/oct on the real captures), which this rejects.
+            // …whose shape has decayed by 3ℓ past it. A constant tail offset is
+            // allowed: with A4 unmeasured, re-anchoring A4 shifts the whole curve. A
+            // sloped tail is the failure: linear extrapolation gives ≈ −4.3 ¢/octave.
             let tail_ref = resid(87);
             for k in 80..88 {
                 assert!(
@@ -1750,21 +1613,18 @@ mod tests {
         }
     }
 
-    /// ADR 0007 gauge test: the chain offset is the minimum-norm choice —
-    /// the residual from the prior averages to zero over each chain's
-    /// measured keys (no key is pinned).
+    /// The chain offset is the minimum-norm choice: the residual from the prior
+    /// averages to the same value over each chain's measured keys.
+    // report 0007
     #[test]
     fn test_chain_gauge_is_mean_centered() {
         let profile = synth_profile_deviating(0..88);
-        let input = crate::models::CurveInput::from_profile(&profile);
+        let input = CurveInput::from_profile(&profile);
         let params = CurveParams::default();
         let (raw, measured) = raw_octave_chain(&input, &params);
         let prior = rigaud_pure(&input, &params);
-        // Recover the un-normalized prior scale: finish() re-anchors A4, so
-        // compare chain residuals against the basis prior via raw − (a) up to
-        // the A4 shift — the per-chain mean must be constant across chains
-        // and equal to that shift; testing mean-of-residual differences
-        // avoids depending on it.
+        // Engine (a)'s finished curve is re-anchored at A4, so raw − (a) carries one
+        // global shift, and every chain's mean residual must equal it.
         for c in 0..12usize {
             let keys: Vec<usize> = (c..88).step_by(12).filter(|&k| measured[k]).collect();
             assert!(!keys.is_empty());
@@ -1773,8 +1633,6 @@ mod tests {
                 .map(|&k| raw[k] - prior.cents[k] as f64)
                 .sum::<f64>()
                 / keys.len() as f64;
-            // All chains share the same global A4 shift; their means must
-            // agree with each other to numerical precision.
             let ref_mean: f64 = (0..88)
                 .step_by(12)
                 .filter(|&k| measured[k])
@@ -1788,12 +1646,11 @@ mod tests {
         }
     }
 
-    /// DOF growth (§11): with few keys, engine (b) hugs the prior; the
-    /// smoothed curve never strays past the raw data spread.
+    /// With few keys, engine (b) stays near the prior.
     #[test]
     fn test_few_keys_stay_near_prior() {
         let profile = synth_profile([0usize, 24, 48, 72].into_iter());
-        let input = crate::models::CurveInput::from_profile(&profile);
+        let input = CurveInput::from_profile(&profile);
         let params = CurveParams::default();
         let a = rigaud_pure(&input, &params);
         let b = per_key_smoothed(&input, &params);

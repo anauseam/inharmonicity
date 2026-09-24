@@ -1,13 +1,10 @@
-//! MAT's (f₀, B) recovery against **known** synthetic inharmonicity.
+//! MAT's (f₀, B) recovery against known synthetic inharmonicity.
 //!
-//! [ADR 0006](../../docs/adr/0006-discovery-refinement-validation.md) states the
-//! numbers this asserts: MAT recovers known B to **< 1 %** across the doubted
-//! regime — B to 25× the prior, missing fundamentals, parallel strings —
-//! **provided the f₀ seed is within ~±10 % of true**, and the *only* way to
-//! manufacture a large self-consistent error is an **octave** seed error, which
-//! yields exactly 4× B at a *low* self-fit residual. `MAT_SEED_TOLERANCE`'s
-//! ±10 % is that cliff edge, with no margin either side, so both edges are
-//! asserted.
+//! Report 0006 states the numbers this asserts: MAT recovers known B to < 1 %
+//! across the doubted regime (B to 25× the prior, missing fundamentals, parallel
+//! strings) provided the f₀ seed is within ≈ ±10 % of true, and the only large
+//! self-consistent error is an octave seed error, which yields exactly 4× B at a
+//! low self-fit residual.
 //!
 //! MAT consumes a magnitude spectrum plus a CSPE per-bin frequency map, not a
 //! peak list, so the fixture synthesizes time-domain sinusoids and runs the
@@ -41,7 +38,7 @@ const F_MAX: f32 = 9000.0;
 /// significance floor realistic without letting noise drive the result.
 const SNR_DB: f32 = 40.0;
 
-/// Realizations per cell. The medians the ADR quotes are stable well below the
+/// Realizations per cell. The medians report 0006 quotes are stable well below the
 /// characterisation's 24; this is what keeps the test inside a plain
 /// `cargo test`.
 const SEEDS: usize = 5;
@@ -75,7 +72,7 @@ impl Rng {
     }
 }
 
-/// One synthesis condition: the physical knobs the ADR's rows vary.
+/// One synthesis condition: the physical knobs report 0006's rows vary.
 #[derive(Clone, Copy)]
 struct Cond {
     f0: f32,
@@ -163,7 +160,7 @@ fn synth_spectrum(
 }
 
 /// RMS relative residual of a fitted `(f0, B)` against its own located partials,
-/// in ppm — self-consistency, not accuracy. Low here *and* wrong against truth
+/// in ppm — self-consistency, not accuracy. Low here and wrong against truth
 /// is the mis-association signature.
 fn self_residual_ppm(est: &MatEstimate, freqs: &[f32], ns: &[u32]) -> f32 {
     let mut sumsq = 0.0_f32;
@@ -237,7 +234,7 @@ fn deep_bass(ratio: f32, missing_fundamental: bool) -> Cond {
     }
 }
 
-/// ADR 0006: baseline at prior B, bass/mid/treble — 1.00×. If this fails the
+/// report 0006: baseline at prior B, bass/mid/treble — 1.00×. If this fails the
 /// fixture is wrong, not MAT.
 #[test]
 fn recovers_prior_b_across_the_compass() {
@@ -259,7 +256,7 @@ fn recovers_prior_b_across_the_compass() {
     }
 }
 
-/// ADR 0006: B swept to 25× the prior, with and without the fundamental —
+/// report 0006: B swept to 25× the prior, with and without the fundamental —
 /// 1.00× at every step. This is the row the deep-bass measurement rests on.
 #[test]
 fn recovers_high_bass_b_with_and_without_a_fundamental() {
@@ -276,9 +273,9 @@ fn recovers_high_bass_b_with_and_without_a_fundamental() {
     }
 }
 
-/// ADR 0006: the `MAT_SEED_TOLERANCE` cliff. Inside ±10 % the recovery is
-/// unaffected; the path review called this "the cliff edge with zero margin",
-/// and nothing downstream catches a wrong B, so both edges are asserted.
+/// report 0006: the `MAT_SEED_TOLERANCE` cliff. Inside ±10 % the recovery is
+/// unaffected. The tolerance has no margin either side and nothing downstream
+/// catches a wrong B, so both edges are asserted.
 #[test]
 fn seed_error_within_ten_percent_does_not_move_b() {
     let cond = deep_bass(7.0, true);
@@ -291,7 +288,7 @@ fn seed_error_within_ten_percent_does_not_move_b() {
     }
 }
 
-/// ADR 0006: an **octave** seed error is the one self-consistent failure. Every
+/// report 0006: an octave seed error is the one self-consistent failure. Every
 /// other partial of a stiff string is itself a stiff series with f₀′ = 2f₀ and
 /// B′ = 4B, so the fit is exact and the self-residual stays low — confidence
 /// cannot catch it, which is why the seed tolerance is the guard.
@@ -312,6 +309,6 @@ fn octave_seed_error_yields_four_times_b_at_a_low_residual() {
         resid < 10.0 * on_seed_resid.max(1.0),
         "octave seed self-residual {resid:.1} ppm is not low against the \
          on-seed {on_seed_resid:.1} ppm — the failure would be detectable, \
-         which contradicts ADR 0006"
+         which contradicts report 0006"
     );
 }

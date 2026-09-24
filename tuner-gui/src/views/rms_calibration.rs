@@ -1,14 +1,20 @@
+//! # Silence-threshold panel
+//!
+//! The room's level against the threshold that gates it, with a slider and a
+//! recalibrate button.
+
 use iced::widget::{Space, button, column, container, row, slider, text};
 use iced::{Alignment, Element, Fill, Length};
 
+use crate::Message;
 use crate::app::AppDisplayData;
 use crate::widgets::envelope;
 
-pub fn create_rms_calibration_panel(data: &AppDisplayData) -> Element<'static, crate::Message> {
+pub fn panel(data: &AppDisplayData) -> Element<'static, Message> {
     let rms_data: Vec<f32> = data.settings_data.rms.history.iter().copied().collect();
     let threshold = data.settings_data.rms.current_threshold;
 
-    let envelope_content: Element<'static, crate::Message> =
+    let envelope_content: Element<'static, Message> =
         container(envelope::EnvelopeViewer::new(rms_data, threshold).view())
             .width(Fill)
             .height(Fill)
@@ -17,16 +23,16 @@ pub fn create_rms_calibration_panel(data: &AppDisplayData) -> Element<'static, c
     let slider_min = 0.001_f32;
     let slider_max = 0.5_f32;
     let slider_step = 0.0001_f32;
-    let calibration_complete = data.settings_data.rms.calibration_complete;
+    let calibration_complete = !data.settings_data.rms.is_calibrating();
 
-    let controls: Element<'static, crate::Message> = if calibration_complete {
+    let controls: Element<'static, Message> = if calibration_complete {
         column![
             row![
                 text("Silence Threshold: ").size(14),
                 slider(
                     slider_min..=slider_max,
                     threshold,
-                    crate::Message::SilenceThresholdChanged
+                    Message::SilenceThresholdChanged
                 )
                 .step(slider_step)
                 .width(Fill),
@@ -35,8 +41,8 @@ pub fn create_rms_calibration_panel(data: &AppDisplayData) -> Element<'static, c
             .spacing(10)
             .align_y(Alignment::Center),
             Space::new().height(5),
-            button(text("Recalibrate Noise Floor").size(14))
-                .on_press(crate::Message::RecalibrateNoiseFloor)
+            button(text("Recalibrate").size(14))
+                .on_press(Message::RecalibrateNoiseFloor)
                 .padding([8, 16]),
         ]
         .spacing(5)
@@ -47,7 +53,7 @@ pub fn create_rms_calibration_panel(data: &AppDisplayData) -> Element<'static, c
 
     container(
         column![
-            text("Noise Floor Adjustment").size(18),
+            text("Silence Threshold Calibration").size(18),
             Space::new().height(10),
             envelope_content,
             Space::new().height(10),

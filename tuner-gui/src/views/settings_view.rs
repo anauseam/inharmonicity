@@ -1,14 +1,18 @@
+//! # Settings screen
+//!
+//! The settings sidebar and the panel each of its entries opens: the three
+//! calibrations, the instrument library, the curve gallery and the inspector,
+//! and the switches for the measurement-session surfaces.
+
 use iced::widget::{Space, button, column, container, row, text};
 use iced::{Alignment, Element, Fill, Length};
 use tuner_core::worker::CurveBundle;
 
 use crate::Message;
 use crate::app::{AppDisplayData, Instrument};
-use crate::utils::view_utils::{
-    ButtonConfig, ButtonType, make_capture_button, make_sidebar_section, make_undo_button,
-};
+use crate::views::sidebar::{self, ButtonConfig, ButtonType};
 use crate::views::{
-    curve_select, inspector_view, library_view, ninos2_calibration, rms_calibration,
+    curve_select, inspector_view, library_view, rms_calibration, sustain_calibration,
     transient_calibration,
 };
 
@@ -18,8 +22,6 @@ const TONAL_CONFIG: [ButtonConfig; 4] = [
         message: None,
         button_type: ButtonType::Disabled,
     },
-    // Reference-pitch / A440 view entry. Locked to A440 for now (curve d_g = 0);
-    // the view that lets the user set a non-440 reference is deferred UX.
     ButtonConfig {
         label: "Tuning Standard",
         message: None,
@@ -30,8 +32,6 @@ const TONAL_CONFIG: [ButtonConfig; 4] = [
         message: None,
         button_type: ButtonType::Disabled,
     },
-    // The curve comparison/selection gallery (strobe design §9): every
-    // engine is in the bundle already, this view renders and picks from it.
     ButtonConfig {
         label: "Curve Select",
         message: Some(Message::ToggleCurveSelect),
@@ -46,12 +46,12 @@ const PROGRAM_CONFIG: [ButtonConfig; 4] = [
         button_type: ButtonType::Standard,
     },
     ButtonConfig {
-        label: "NINOS2 Stability Calibration",
-        message: Some(Message::ToggleNinosCalibration),
+        label: "Sustain Stability Calibration",
+        message: Some(Message::ToggleSustainCalibration),
         button_type: ButtonType::Standard,
     },
     ButtonConfig {
-        label: "Noise Floor Adjustment",
+        label: "Silence Threshold Calibration",
         message: Some(Message::ToggleNoiseFloorAdjustment),
         button_type: ButtonType::Standard,
     },
@@ -62,12 +62,8 @@ const PROGRAM_CONFIG: [ButtonConfig; 4] = [
     },
 ];
 
-// Surfaces an ordinary tuning session never touches. All persist with the
-// app rather than the open profile.
+// Surfaces an ordinary tuning session never touches.
 const ADVANCED_CONFIG: [ButtonConfig; 4] = [
-    // Swaps the main-view note picker between the piano keyboard and a
-    // six-button guitar-string picker. Not a full instrument mode — no
-    // inharmonicity is measured for guitar (see `Instrument`).
     ButtonConfig {
         label: "Instrument Select",
         message: Some(Message::ToggleInstrumentSelect),
@@ -90,8 +86,6 @@ const ADVANCED_CONFIG: [ButtonConfig; 4] = [
     },
 ];
 
-// Which instrument is open, and every instrument previously measured; plus the
-// per-key review surface autosave assumes (design note §4).
 const LIBRARY_CONFIG: [ButtonConfig; 2] = [
     ButtonConfig {
         label: "Instrument Library",
@@ -105,7 +99,6 @@ const LIBRARY_CONFIG: [ButtonConfig; 2] = [
     },
 ];
 
-/// Static settings sidebar configuration
 const SETTINGS_SIDEBAR_CONFIG: [(&str, &[ButtonConfig]); 4] = [
     ("Instrument", LIBRARY_CONFIG.as_slice()),
     ("Tonal adjustments", TONAL_CONFIG.as_slice()),
@@ -113,39 +106,24 @@ const SETTINGS_SIDEBAR_CONFIG: [(&str, &[ButtonConfig]); 4] = [
     ("Advanced", ADVANCED_CONFIG.as_slice()),
 ];
 
-pub fn create_settings_view(
+pub fn view(
     data: &AppDisplayData,
     curve_bundle: Option<&CurveBundle>,
 ) -> Element<'static, Message> {
-    // Show calibrating/shutdown message if audio worker is not active AND not in settings recalibration
-    if !data.audio_worker_active && !data.is_calibrating {
-        return container(text("Shutting down...").size(40))
-            .width(Fill)
-            .height(Fill)
-            .center_x(Fill)
-            .center_y(Fill)
-            .into();
-    }
-
     let title = text("Settings").size(28);
 
-    // Build main panel content based on which sub-view is active
     let main_panel_content: Element<'static, Message> = if data.library_visible {
-        library_view::create_library_panel(data)
+        library_view::panel(data)
     } else if data.inspector_visible {
-        inspector_view::create_inspector_panel(data, curve_bundle)
+        inspector_view::panel(data, curve_bundle)
     } else if data.curve_select_visible {
-        curve_select::create_curve_select_panel(
-            curve_bundle,
-            data.selected_engine,
-            data.curve_detail,
-        )
+        curve_select::panel(curve_bundle, data.selected_engine, data.curve_detail)
     } else if data.settings_data.rms.visible {
-        rms_calibration::create_rms_calibration_panel(data)
+        rms_calibration::panel(data)
     } else if data.settings_data.transient.visible {
-        transient_calibration::create_transient_calibration_panel(data)
-    } else if data.settings_data.ninos.visible {
-        ninos2_calibration::create_ninos2_calibration_panel(data)
+        transient_calibration::panel(data)
+    } else if data.settings_data.sustain.visible {
+        sustain_calibration::panel(data)
     } else if data.instrument_select_visible {
         create_instrument_select_panel(data.instrument)
     } else if data.string_isolation_visible {
@@ -175,13 +153,7 @@ pub fn create_settings_view(
     container(main_content).width(Fill).height(Fill).into()
 }
 
-/// The Unison Assist switch: whether the note's individual strings are
-/// resolved on screen at all.
-///
-/// Off by default: the panels answer one narrow question, and cannot answer it
-/// below their own `2/T` floor — which covered most of the compass on the
-/// instrument ADR 0014 measured. Turning it on adds both panels to the live
-/// loop and their entries to Tools.
+/// The Unison Assist panel: what the unison panels are, and their switch.
 fn create_unison_assist_panel(enabled: bool) -> Element<'static, Message> {
     column![
         text("Unison Assist").size(20),
@@ -219,9 +191,20 @@ fn enable_segment(
     target: bool,
     active: bool,
 ) -> iced::widget::Button<'static, Message> {
-    let btn = button(text(label).size(16))
-        .padding([8, 24])
-        .on_press(Message::SetUnisonAssist(target));
+    highlight(
+        button(text(label).size(16))
+            .padding([8, 24])
+            .on_press(Message::SetUnisonAssist(target)),
+        active,
+    )
+}
+
+/// Lights a segment button when it is the current setting, in the purple of
+/// the active Settings button.
+fn highlight(
+    btn: iced::widget::Button<'static, Message>,
+    active: bool,
+) -> iced::widget::Button<'static, Message> {
     if active {
         btn.style(|_theme, _status| button::Style {
             background: Some(iced::Background::Color(iced::Color::from_rgb(
@@ -235,33 +218,20 @@ fn enable_segment(
     }
 }
 
-/// The string-isolation panel: what the per-capture string declaration is,
-/// and the switch that offers it.
-///
-/// It is off by default and hidden while off, because a declaration is only
-/// meaningful when strings are actually being damped one at a time — and a
-/// stale one left standing would label ordinary captures with a mute pattern
-/// that was not there.
+/// The string-isolation panel: what the per-capture string declaration is, and
+/// its switch.
 fn create_string_isolation_panel(enabled: bool) -> Element<'static, Message> {
     fn segment(
         label: &'static str,
         target: bool,
         active: bool,
     ) -> iced::widget::Button<'static, Message> {
-        let btn = button(text(label).size(16))
-            .padding([8, 24])
-            .on_press(Message::SetStringIsolation(target));
-        if active {
-            btn.style(|_theme, _status| button::Style {
-                background: Some(iced::Background::Color(iced::Color::from_rgb(
-                    0.325, 0.278, 0.388,
-                ))), // purple — matches the active Settings button
-                text_color: iced::Color::WHITE,
-                ..button::Style::default()
-            })
-        } else {
-            btn
-        }
+        highlight(
+            button(text(label).size(16))
+                .padding([8, 24])
+                .on_press(Message::SetStringIsolation(target)),
+            active,
+        )
     }
 
     column![
@@ -295,29 +265,7 @@ fn create_string_isolation_panel(enabled: bool) -> Element<'static, Message> {
 
 /// The capture-duration panel: whether a capture records past the shipped
 /// 1.5 s, and for how long.
-///
-/// The lengths offered are stored-audio lengths only. What the Worker *measures*
-/// is fixed at [`CAPTURE_ANALYSIS_SAMPLES`](tuner_core::pipeline::CAPTURE_ANALYSIS_SAMPLES)
-/// whatever is chosen here, so a session can take long records without making
-/// its own measurements incomparable with the capture sets.
 fn create_capture_duration_panel(enabled: bool, secs: f32) -> Element<'static, Message> {
-    fn highlight(
-        btn: iced::widget::Button<'static, Message>,
-        active: bool,
-    ) -> iced::widget::Button<'static, Message> {
-        if active {
-            btn.style(|_theme, _status| button::Style {
-                background: Some(iced::Background::Color(iced::Color::from_rgb(
-                    0.325, 0.278, 0.388,
-                ))), // purple — matches the active Settings button
-                text_color: iced::Color::WHITE,
-                ..button::Style::default()
-            })
-        } else {
-            btn
-        }
-    }
-
     let mode = |label: &'static str, target: bool| {
         highlight(
             button(text(label).size(16))
@@ -367,30 +315,19 @@ fn create_capture_duration_panel(enabled: bool, secs: f32) -> Element<'static, M
     .into()
 }
 
-/// The instrument-select debug panel: a two-button segmented toggle between the
-/// piano keyboard and the guitar-string picker, with the active surface
-/// highlighted. Switching is otherwise handled in `App::set_instrument` (strobe
-/// reference + manual-target coupling live there, not here).
+/// The note-picker panel: the piano keyboard or the guitar strings.
 fn create_instrument_select_panel(instrument: Instrument) -> Element<'static, Message> {
     fn segment(
         label: &'static str,
         target: Instrument,
         active: bool,
     ) -> iced::widget::Button<'static, Message> {
-        let btn = button(text(label).size(16))
-            .padding([8, 24])
-            .on_press(Message::SetInstrument(target));
-        if active {
-            btn.style(|_theme, _status| button::Style {
-                background: Some(iced::Background::Color(iced::Color::from_rgb(
-                    0.325, 0.278, 0.388,
-                ))), // purple — matches the active Settings button
-                text_color: iced::Color::WHITE,
-                ..button::Style::default()
-            })
-        } else {
-            btn
-        }
+        highlight(
+            button(text(label).size(16))
+                .padding([8, 24])
+                .on_press(Message::SetInstrument(target)),
+            active,
+        )
     }
 
     let toggle = row![
@@ -408,9 +345,9 @@ fn create_instrument_select_panel(instrument: Instrument) -> Element<'static, Me
         Space::new().height(8),
         text(
             "Debug convenience — swaps the main-view note picker only. Guitar shows \
-             six standard-tuning string buttons (EADGBE) and sets the strobe reference \
-             to equal temperament; Piano restores the 88-key keyboard and the tuning \
-             curve. No inharmonicity is measured for guitar."
+             six standard-tuning string buttons (EADGBE); Piano shows the 88-key \
+             keyboard. The strobe reference does not change with it: set it from the \
+             Reference control. No inharmonicity is measured for guitar."
         )
         .size(13),
         Space::new().height(16),
@@ -423,50 +360,43 @@ fn create_instrument_select_panel(instrument: Instrument) -> Element<'static, Me
 fn create_settings_sidebar(data: &AppDisplayData) -> Element<'static, Message> {
     let mut sections = column![].spacing(10);
 
-    // The same control as the main view's "Settings", so it names where it
-    // goes rather than where it is — otherwise it reads as the label of the
-    // view you are already in.
+    // The main view's Settings button, named for where it goes rather than
+    // where it is, or it would read as this view's label.
     let settings_button = button(text("← Back to Tuner").size(16).width(Fill))
         .padding([10, 15])
-        .style(|_theme, _status| {
-            use iced::widget::button;
-            button::Style {
-                background: Some(iced::Background::Color(iced::Color::from_rgb(
-                    0.325, 0.278, 0.388,
-                ))), // purple
-                text_color: iced::Color::WHITE,
-                ..button::Style::default()
-            }
+        .style(|_theme, _status| button::Style {
+            background: Some(iced::Background::Color(iced::Color::from_rgb(
+                0.325, 0.278, 0.388,
+            ))),
+            text_color: iced::Color::WHITE,
+            ..button::Style::default()
         })
         .on_press(Message::ToggleSettingsView);
 
     sections = sections.push(settings_button);
     sections = sections.push(Space::new().height(10));
 
-    // Add all settings sections
     for (title, buttons) in SETTINGS_SIDEBAR_CONFIG {
-        sections = sections.push(make_sidebar_section(
+        sections = sections.push(sidebar::section(
             title,
             buttons,
             data.measurement_mode_active,
         ));
     }
 
-    // Add capture button if in measurement mode
     if data.measurement_mode_active {
         // Never abortable: this copy is a shortcut back to capturing, not the
-        // live control the take is watched on.
-        sections = sections.push(make_capture_button(
+        // control a take is watched on.
+        sections = sections.push(sidebar::capture_button(
             data.capture_state,
             Message::CaptureButtonClicked,
             false,
         ));
     }
 
-    // Show undo button if undo history exists
     if let Some(note_name) = data.undo_target_note.clone() {
-        sections = sections.push(iced::widget::Space::new().height(20));
-        sections = sections.push(make_undo_button(note_name));
+        sections = sections.push(Space::new().height(20));
+        sections = sections.push(sidebar::undo_button(note_name));
     }
 
     container(sections.padding(15))

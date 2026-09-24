@@ -1,19 +1,19 @@
 //! # MAT (f₀, B) ground-truth recovery stress test
 //!
-//! Characterises the Worker's Median-Adjustive Trajectories estimator against **known**
-//! synthetic inharmonicity, in the regime the real captures cast doubt on: **high bass B
-//! with missing fundamentals** (ADR 0006 fix-path step 1; "Validation strategy" bullet).
+//! Characterises the Worker's Median-Adjustive Trajectories estimator against known
+//! synthetic inharmonicity, in the regime the real captures cast doubt on: high bass B
+//! with missing fundamentals (report 0006 fix-path step 1; "Validation strategy" bullet).
 //! The real deep-bass keys read 7–25× the Rigaud prior; this harness asks whether that is a
-//! trustworthy measurement or a partial-**mis-association** artifact — by sweeping a *known*
+//! trustworthy measurement or a partial-mis-association artifact — by sweeping a known
 //! B from 1× to 25× the prior and scoring MAT's recovery against truth.
 //!
-//! ## Why this is honest (the gotcha)
+//! ## Why the signal is synthesized in the time domain
 //!
-//! MAT does not consume a peak list — it consumes a **magnitude spectrum + a CSPE per-bin
-//! frequency map** (`detect_pitch_mat`). So we cannot reuse `mobo_evaluator`'s peak-domain
-//! frames. Instead we **synthesize a time-domain signal** (sum of sinusoids at
+//! MAT does not consume a peak list — it consumes a magnitude spectrum + a CSPE per-bin
+//! frequency map (`detect_pitch_mat`). So we cannot reuse `engine::nsga2`'s peak-domain
+//! frames. Instead we synthesize a time-domain signal (sum of sinusoids at
 //! `f_n = n·f0·√(1+B·n²)`, with the `gen_frame` amplitude / missing-fundamental / unison /
-//! noise model), Hann-window it, and run the **exact** Worker path: two real FFTs (the frame
+//! noise model), Hann-window it, and run the exact Worker path: two real FFTs (the frame
 //! and the same frame advanced one sample) → `spectral::cspe` → `detect_pitch_mat`. Rendering
 //! through real FFT leakage + CSPE (rather than placing ideal peaks) is what makes the
 //! recovery test faithful — every hazard MAT meets in production (leakage skirts, sub-bin
@@ -25,7 +25,7 @@
 //!    nail these (sanity; if it fails here the harness, not MAT, is wrong).
 //! 2. **B sweep** — a deep-bass f₀, known B swept 1×→25× the prior, full partials. Does
 //!    recovered B track the diagonal up to high B, or saturate / diverge?
-//! 3. **Missing-fundamental stress** (the key one) — the sweep with partials 1–3 attenuated
+//! 3. **Missing-fundamental stress** — the sweep with partials 1–3 attenuated
 //!    (the real bass condition: soundboard impedance kills the lows). Does MAT still recover
 //!    the true high B, or lock onto a wrong-but-self-consistent series (over / under-read)?
 //! 4. **Parallel-string stress** — 2–3 detuned unison strings; at high n their partials
@@ -33,9 +33,9 @@
 //!    tracking bias B (the DAFx-09 Conclusion/§4 concern)?
 //!
 //! Both `MatOrder::Serial` (the shipped default) and `MatOrder::Simultaneous` are run
-//! side-by-side, as `validate_mat` does. The ground-truth-free **self-fit residual** (does
-//! the model explain its *own* located partials) is reported alongside the truth error so the
-//! mis-association signature — *low self-residual yet wrong B* (the A#0→279× band-tightening
+//! side-by-side, as `cargo lab mat validate` does. The ground-truth-free self-fit residual (does
+//! the model explain its own located partials) is reported alongside the truth error so the
+//! mis-association signature — low self-residual yet wrong B (the A#0→279× band-tightening
 //! failure) — is visible as a number.
 //!
 //! Usage:  `cargo lab mat recovery`
@@ -64,7 +64,7 @@ const F_MAX: f32 = 9000.0;
 const SNR_DB: f32 = 40.0;
 
 // ─────────────────────────── Deterministic RNG ───────────────────────────
-// SplitMix64 — same generator `mobo_evaluator` uses, so the synthetic physics is byte-for-byte
+// SplitMix64 — same generator `engine::nsga2` uses, so the synthetic physics is byte-for-byte
 // the same family of draws (envelope jitter, unison spread, missing-fundamental attenuation).
 
 struct Rng(u64);
@@ -99,7 +99,7 @@ impl Rng {
 // ─────────────────────────── Synthetic tone model ───────────────────────────
 
 /// One synthesis condition: the physical knobs the experiments vary. The partial / envelope /
-/// missing-fundamental / unison model mirrors `mobo_evaluator::gen_frame`; only the rendering
+/// missing-fundamental / unison model mirrors `engine::nsga2::gen_frame`; only the rendering
 /// differs (time-domain sinusoids here, ideal peaks there).
 #[derive(Clone, Copy)]
 struct Cond {
@@ -127,7 +127,7 @@ struct Cond {
 
 /// Renders `cond` to a time-domain signal, then runs the exact Worker spectral front-end
 /// (two Hann FFTs + CSPE) and returns the `(magnitude spectrum, CSPE frequency map)` that
-/// `detect_pitch_mat` consumes — identical to `worker::process_payload` / `validate_mat`.
+/// `detect_pitch_mat` consumes — identical to `worker::process_payload` / `mat::validate`.
 fn synth_spectrum(
     cond: &Cond,
     rng: &mut Rng,
@@ -235,8 +235,8 @@ fn rms(signal: &[f32]) -> f32 {
 
 // ─────────────────────────── Scoring ───────────────────────────
 
-/// RMS relative residual of a fitted `(f0, B)` against its located partials (validate_mat's
-/// goodness-of-fit, in ppm). The *self-consistency* metric: low here + wrong B vs truth = the
+/// RMS relative residual of a fitted `(f0, B)` against its located partials (`mat::validate`'s
+/// goodness-of-fit, in ppm). The self-consistency metric: low here + wrong B vs truth = the
 /// mis-association signature.
 fn self_residual_ppm(est: &MatEstimate, freqs: &[f32], ns: &[u32]) -> f32 {
     let mut sumsq = 0.0_f32;
@@ -547,7 +547,7 @@ pub fn run() {
         }
     }
 
-    // ── Experiment 3: B sweep, missing fundamental (THE key one) ──
+    // ── Experiment 3: B sweep, missing fundamental ──
     println!(
         "\n========== EXPERIMENT 3 — B sweep, MISSING FUNDAMENTAL (partials 1–3 attenuated) =========="
     );
@@ -660,7 +660,7 @@ pub fn run() {
     // ── Seed-sensitivity probe: does a wrong f₀ seed trigger mis-association? ──
     // A0, high B (18×) — the worst real cell — seeded off true f₀ across a wide range, to map
     // the cliff between "robust" and "locks onto a wrong-but-self-consistent series". Run both
-    // WITH the missing fundamental and WITHOUT it, to isolate whether the hazard is the missing
+    // with the missing fundamental and without it, to isolate whether the hazard is the missing
     // fundamental or purely the seed. (A wrong-octave seed is what the Goertzel tracker can
     // report when the true fundamental is absent.)
     println!(

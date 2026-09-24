@@ -1,10 +1,10 @@
-//! # Strobe replay — offline metrics for the Path-A strobe bank
+//! # Strobe replay — offline metrics for the strobe bank
 //!
-//! Runs the **shipped** [`Strobe`] over captured real audio
+//! Runs the shipped [`Strobe`] over captured real audio
 //! (`diagnostics/key_*/audio.raw`) and measures rotation fidelity with hard
-//! numbers, so the strobe design note §15 "unlocked-regime" and R3 bass
+//! numbers, so the unlocked-regime and deep-bass-window
 //! questions can be answered without eyeballing a spinning disc. Every capture
-//! we have is of a **detuned** piano, which is exactly the regime the strobe
+//! we have is of a detuned piano, which is exactly the regime the strobe
 //! is claimed to help in.
 //!
 //! It replays the pipeline cadence faithfully: an 8192-sample window advanced
@@ -14,69 +14,69 @@
 //!
 //! ## The experiments (they answer different questions)
 //!
-//! **E1 — detuning coherence (ET fundamental).** Reference = the pure ET
-//! harmonic series `n·f_ET` (B = 0); we read the **fundamental** band (n = 1),
-//! which is B-immune (R4), so its rotation is *pure pitch detuning*. This is
+//! E1 — detuning coherence (ET fundamental). Reference = the pure ET
+//! harmonic series `n·f_ET` (B = 0); we read the fundamental band (n = 1),
+//! which is B-immune, so its rotation is pure pitch detuning. This is
 //! the "string is off, engine can't lock, does the band still show the offset
 //! coherently" test — and the preview of a guitar/ET strobe mode. Only
 //! meaningful where the fundamental is alive and the detuning is inside the
 //! ±(fs/2·hop) ≈ 21.5 Hz phase-unwrap range (beyond that the rotation aliases;
-//! D4's coarse cents indicator is what gets the user back into range).
+//! the coarse readout is what gets the user back into range).
 //!
-//! **E2 — steadiness + bass window (measured reference).** Reference = the
+//! E2 — steadiness + bass window (measured reference). Reference = the
 //! string's own measured stiff-string series `n·f0·√(1+Bn²)`, so a stable
-//! string *should* hold each band ≈ stationary; residual rotation is then a
-//! steadiness/noise metric. We read the **displayed** partial (the coarse
+//! string should hold each band ≈ stationary; residual rotation is then a
+//! steadiness/noise metric. We read the displayed partial (the coarse
 //! register table) and, for bass keys, A/B the 4096-sample window (auto) vs a
-//! forced 1024 window to quantify the R3 payoff on real bass audio.
+//! forced 1024 window to quantify the long window's payoff on real bass audio.
 //!
-//! **E3 — per-hop delta noise.** The quantity `BAND_READABLE_HZ`'s margin below
-//! the alias boundary is made of (ADR 0011 §10).
+//! E3 — per-hop delta noise. The quantity `BAND_READABLE_HZ`'s margin below
+//! the alias boundary is made of (report 0011 §10).
 //!
-//! **E4 — fit-window length.** Slope jitter against window length, measured, vs
-//! the exact `T/2` motion lag (ADR 0011 §11).
+//! E4 — fit-window length. Slope jitter against window length, measured, vs
+//! the exact `T/2` motion lag (report 0011 §11).
 //!
-//! **E5 — shipped rate vs an independent fit.** `StrobeResult::beat_hz` is the
+//! E5 — shipped rate vs an independent fit. `StrobeResult::beat_hz` is the
 //! bank's own least-squares slope; E5 refits the same retained points here and
 //! reports the disagreement, so the DSP-side estimator is checked against real
 //! audio rather than only against synthetic hops.
 //!
-//! ### Unison assist (ADR 0012)
+//! ### Unison assist (report 0012)
 //!
-//! **E6 — the estimator against synthetic truth.** Resolution law, accuracy, and
-//! the false-split null, on signals with known lines. The port must reproduce the
-//! design note's own tables: 50 % of pairs resolved at `2/T` and 100 % at
-//! ≈1.35·`2/T`; bias ≤ 0.02 Hz and σ ≤ 0.06 Hz where it resolves; **zero** false
-//! second lines on a single string across SNR, decay and record length.
+//! E6 — the estimator against synthetic truth. Resolution law, accuracy, and
+//! the false-split null, on signals with known lines. Report 0012 §4 records what
+//! the port measured, overturning the appendix's smooth law: a pair resolves once
+//! its separation clears `2/T` and not before, with no false second line on a
+//! single string across SNR, decay and record length.
 //!
-//! **E7 — availability and repeat reproducibility (real).** How often the ring
+//! E7 — availability and repeat reproducibility (real). How often the ring
 //! reaches a usable record per register, and — the truth-free test — whether
 //! independent strikes of the same key agree on the split they report.
 //!
-//! **E8 — unexplained lines.** Every reported line matched against a full-rate
-//! DFT of the *identical* span with an **uncapped** peak picker, and the residue
+//! E8 — unexplained lines. Every reported line matched against a full-rate
+//! DFT of the identical span with an uncapped peak picker, and the residue
 //! classified: is the energy there at all, and does the residue concentrate in
-//! the weakest line? This is the open item ADR 0012 §8 carries.
+//! the weakest line? This is the open item report 0012 §8 carries.
 //!
-//! **E9 — cost.** µs per hop in `--release` for the whole bank, against the
+//! E9 — cost. µs per hop in `--release` for the whole bank, against the
 //! 23.2 ms callback the pipeline has to fit inside.
 //!
-//! ### The bass extra lines (ADR 0013)
+//! ### The bass extra lines (report 0013)
 //!
-//! **E10 — the bass configuration, which every trial above skips.** The deep
-//! bass runs a 4096-sample Goertzel against the same 1024-sample hop (R3), so
+//! E10 — the bass configuration, which every trial above skips. The deep
+//! bass runs a 4096-sample Goertzel against the same 1024-sample hop, so
 //! its baseband is 4× oversampled and its noise correlated — the independence
 //! the CFAR null assumes. The null, the resolution law and the noise
 //! correlation are measured there against the same audio through the 1024
-//! window; then the folded interferer's *strength* (the open E-Q question) and
+//! window; then the folded interferer's strength (the open E-Q question) and
 //! a sweep of how far up the compass a string's own neighbouring partials fold
 //! into its baseband.
 //!
-//! **E11 — do the extra lines sit at fixed absolute frequencies?** Recurrence
-//! across *different keys* is the signature of an instrument or room resonance
+//! E11 — do the extra lines sit at fixed absolute frequencies? Recurrence
+//! across different keys is the signature of an instrument or room resonance
 //! rather than a property of the struck string.
 //!
-//! **E12 — attribution.** Every extra line against the families that could have
+//! E12 — attribution. Every extra line against the families that could have
 //! produced it, each predicted from the instrument's own measured (f₀, B) and
 //! scored against a permutation null; then which side of the partial they sit
 //! on, the law their splits follow, and whether a third line is a symmetric
@@ -89,12 +89,12 @@ use std::path::Path;
 use realfft::RealFftPlanner;
 use rustfft::num_complex::Complex;
 
+use super::{Resolved, run_unison};
+use crate::{capture, raw};
 use tuner_core::algorithms::curves::default_display_partials;
 use tuner_core::algorithms::spectral::{self, goertzel, goertzel_bass};
 use tuner_core::audio::{BASS_WINDOW_SIZE, HOP_RATE_HZ, HOP_SIZE, SAMPLE_RATE, WINDOW_SIZE};
 use tuner_core::models::NOTES;
-
-use super::{Resolved, run_unison};
 use tuner_core::strobe::band_slope::{
     BAND_SLOPE_MIN_POINTS, BAND_SLOPE_POINTS, BAND_SLOPE_WINDOW_SECS,
 };
@@ -146,7 +146,7 @@ fn load(dir: &Path) -> Option<Capture> {
             }
         }
     }
-    let audio = crate::raw::read(&dir.join("audio.raw"))?;
+    let audio = raw::read(&dir.join("audio.raw"))?;
     if audio.len() < BASS_WINDOW_SIZE + 4 * HOP_SIZE {
         return None; // too short to fit a warmup + a few integrating hops
     }
@@ -180,20 +180,20 @@ fn fit(series: &[f32]) -> (f32, f32) {
     (slope, (ss / n).sqrt())
 }
 
-/// **Per-hop phase-delta noise σ_d, in cycles** — the quantity the readable-range
+/// Per-hop phase-delta noise σ_d, in cycles — the quantity the readable-range
 /// margin is made of.
 ///
 /// The GUI unwraps one delta per DSP frame, so the branch folds as soon as a
-/// *single* hop's delta leaves ±0.5 cycle. With true rate `Δf/f_hop` and delta
+/// single hop's delta leaves ±0.5 cycle. With true rate `Δf/f_hop` and delta
 /// noise σ_d, staying inside the branch needs
 /// `|Δf|/f_hop + z·σ_d < 0.5`, i.e. a readable limit of `f_hop·(0.5 − z·σ_d)`
-/// and a margin below the alias boundary of **`f_hop·z·σ_d`**.
+/// and a margin below the alias boundary of `f_hop·z·σ_d`.
 ///
 /// Deltas are detrended over the GUI's own fit window (`win_hops`), so a
 /// constant rotation — the detuning itself — contributes nothing; only
 /// hop-to-hop noise does. Windows whose mean delta is already near the branch
 /// edge are dropped, since a folded delta would be measured as noise. Returns
-/// `(σ_d, p99.9 |Δ|, max |Δ|)`: folding is a *tail* event, so the tail is what
+/// `(σ_d, p99.9 |Δ|, max |Δ|)`: folding is a tail event, so the tail is what
 /// must size the margin.
 fn delta_noise(unwrapped: &[f32], usable: &[bool], win_hops: usize) -> Option<(f32, f32, f32)> {
     let d: Vec<(f32, bool)> = unwrapped
@@ -229,22 +229,22 @@ fn delta_noise(unwrapped: &[f32], usable: &[bool], win_hops: usize) -> Option<(f
     Some((var.sqrt(), p999, *mag.last().unwrap()))
 }
 
-/// **Slope jitter vs fit-window length** — the lower bound on the band-slope
+/// Slope jitter vs fit-window length — the lower bound on the band-slope
 /// window, measured rather than assumed.
 ///
 /// The unwrapped series telescopes (`y_h = Σd_i = φ_h − φ_0`), so its samples
-/// carry the *phase* noise σ_η with `Var(d) = 2σ_η²`, and textbook OLS would give
+/// carry the phase noise σ_η with `Var(d) = 2σ_η²`, and textbook OLS would give
 /// `Var(slope) = σ_η² / Σ(x−x̄)²` with `Σ(x−x̄)² = n(n²−1)/12`. That assumes
 /// independent samples, and the bank's windows overlap 75–87 %, so the prediction
 /// is optimistic by an unknown factor. This measures the real thing: fit over
-/// **non-overlapping** windows of `n` hops, then take successive differences of
+/// non-overlapping windows of `n` hops, then take successive differences of
 /// the fitted rates (÷√2) so a slowly drifting true rate is not counted as noise.
 ///
-/// Returns the successive rate *differences* (cycles/hop) for the caller to pool:
+/// Returns the successive rate differences (cycles/hop) for the caller to pool:
 /// a 1.3 s capture yields only two non-overlapping 0.6 s windows, so a per-capture
 /// variance would be meaningless at the lengths that matter.
 ///
-/// The figure this produces is an **upper bound** on estimator noise, since a
+/// The figure this produces is an upper bound on estimator noise, since a
 /// genuine drift in the string's rate between windows also lands in the
 /// difference.
 fn slope_diffs(unwrapped: &[f32], usable: &[bool], n: usize) -> Vec<f32> {
@@ -259,7 +259,7 @@ fn slope_diffs(unwrapped: &[f32], usable: &[bool], n: usize) -> Vec<f32> {
     rates.windows(2).map(|w| w[1] - w[0]).collect()
 }
 
-/// **Shipped rate vs an independent fit (E5).** For every hop the bank published
+/// Shipped rate vs an independent fit (E5). For every hop the bank published
 /// a rate on, refits the points it held — the current unbroken ungated run,
 /// capped at the window — and returns the absolute disagreements in Hz.
 ///
@@ -292,7 +292,7 @@ fn rate_disagreement(
 }
 
 /// Drives the shipped [`Strobe`] over the capture with a given reference
-/// set; returns the per-hop unwrapped angle (cycles), the per-hop **ungated**
+/// set; returns the per-hop unwrapped angle (cycles), the per-hop ungated
 /// mask, and the per-hop published beat rate (Hz) for the band at `read_idx`
 /// (0-based partial index), aligned index-wise.
 fn run_strobe(
@@ -401,11 +401,11 @@ impl Noise {
     }
 }
 
-/// Renders `sources` as **audio**, so the trials go through the shipped Goertzel
+/// Renders `sources` as audio, so the trials go through the shipped Goertzel
 /// front end rather than a model of it: the analysis window, the decay and the
 /// noise are all in the loop. Offsets are measured from `base_hz`.
 ///
-/// `snr_db` is against the **total** source power, which is the probed line's own
+/// `snr_db` is against the total source power, which is the probed line's own
 /// SNR only when it is the only source; a multi-source trial that wants a stated
 /// SNR at one line pre-compensates (see [`e10_bass_null`]).
 fn synth_audio(base_hz: f32, sources: &[Source], hops: usize, snr_db: f32, seed: u32) -> Vec<f32> {
@@ -442,7 +442,7 @@ fn synth_trial(sources: &[Source], hops: usize, snr_db: f32, seed: u32) -> Resol
     best[0]
 }
 
-/// **E6** — the estimator against synthetic truth: resolution law, accuracy, null.
+/// E6 — the estimator against synthetic truth: resolution law, accuracy, null.
 fn e6_synthetic() {
     const TRIALS: usize = 40;
     let equal = |offset: f32, tau: f32| Source {
@@ -683,9 +683,9 @@ fn e6_synthetic() {
 // ─── The bass configuration (E10) ───────────────────────────────────────────
 
 /// Where content `delta_hz` from a reference lands in the baseband. One Goertzel
-/// output per hop *is* a decimation to `HOP_RATE_HZ`, so anything the analysis
+/// output per hop is a decimation to `HOP_RATE_HZ`, so anything the analysis
 /// window admits folds into ±f_hop/2 — it never leaves the band, it only moves
-/// inside it (design note E-Q).
+/// inside it (report 0012, E-Q).
 fn fold_hz(delta_hz: f32) -> f32 {
     let wrapped = delta_hz.rem_euclid(HOP_RATE_HZ);
     if wrapped > 0.5 * HOP_RATE_HZ {
@@ -695,16 +695,16 @@ fn fold_hz(delta_hz: f32) -> f32 {
     }
 }
 
-/// A first reference low enough that the bank's R3 rule selects the 4096-sample
+/// A first reference low enough that the bank's long-window rule selects the 4096-sample
 /// window (the boundary is `2·f_s/1024` ≈ 86 Hz), carrying no synthetic content
 /// of its own. It makes the window an A/B at any probed frequency: the bank
 /// keys the choice on `refs[0]`, and every reference is evaluated independently.
-const R3_FORCING_HZ: f32 = 50.0;
+const LONG_WINDOW_FORCING_HZ: f32 = 50.0;
 
 /// One key's stiff-string series `f_n = n·f₀·√(1+Bn²)`, and the partial the
 /// panel displays for it.
 ///
-/// `B` is the Rigaud medium **prior** at the key, never a capture's own
+/// `B` is the Rigaud medium prior at the key, never a capture's own
 /// `calculated_b`: the standing rule is that the synthetic generator is not
 /// recalibrated to the engine's measurements.
 struct KeyRefs {
@@ -749,9 +749,9 @@ impl KeyRefs {
 
     /// One string's whole partial series as sources, offsets measured from the
     /// probed partial. Equal amplitudes: the deep bass radiates its fundamental
-    /// *worse* than its upper partials (ADR 0011 §"mechanism" — the n = 1
+    /// worse than its upper partials (report 0011 §"mechanism" — the n = 1
     /// competitor runs 1.3–1.8 × the target at B0–C#1), so a flat series is not
-    /// a pessimistic choice there, and it is the leakage case the R3 window
+    /// a pessimistic choice there, and it is the leakage case the long window
     /// exists for.
     fn series(&self, tau: f32) -> Vec<Source> {
         self.partials
@@ -767,11 +767,11 @@ impl KeyRefs {
 
 /// What the probed frequency resolves under one window, with the reference set
 /// shaped to select it: the probe alone (1024), or the probe behind
-/// [`R3_FORCING_HZ`] (4096, the shipped deep-bass path).
+/// [`LONG_WINDOW_FORCING_HZ`] (4096, the shipped deep-bass path).
 fn probe_lines(audio: &[f32], probe_hz: f32, long: bool) -> Resolved {
     let mut refs = [0.0f32; MAX_STROBE_REFS];
     if long {
-        refs[0] = R3_FORCING_HZ;
+        refs[0] = LONG_WINDOW_FORCING_HZ;
         refs[1] = probe_hz;
         run_unison(audio, &refs, 2, refs[0], 1e-6).0[1]
     } else {
@@ -780,14 +780,14 @@ fn probe_lines(audio: &[f32], probe_hz: f32, long: bool) -> Resolved {
     }
 }
 
-/// SNR against the *total* source power that puts the probed line — source 0 —
+/// SNR against the total source power that puts the probed line — source 0 —
 /// at `want_db`. [`synth_audio`] scales its noise to every source together.
 fn total_snr_for(sources: &[Source], want_db: f32) -> f32 {
     let total: f32 = sources.iter().map(|s| s.amplitude * s.amplitude).sum();
     want_db + 10.0 * (total / sources[0].amplitude.powi(2)).log10()
 }
 
-/// The demodulated baseband of a **noise-only** input at `f_ref`, formed exactly
+/// The demodulated baseband of a noise-only input at `f_ref`, formed exactly
 /// as the bank forms it: one Goertzel per hop over the newest window, its
 /// reference rotation removed.
 fn baseband_noise(f_ref: f32, long: bool, hops: usize, seed: u32) -> Vec<Complex<f32>> {
@@ -810,19 +810,19 @@ fn baseband_noise(f_ref: f32, long: bool, hops: usize, seed: u32) -> Vec<Complex
         .collect()
 }
 
-/// **E10** — the null, the resolution law and the noise correlation in the
-/// **bass** configuration, which every synthetic trial before this one skipped.
+/// E10 — the null, the resolution law and the noise correlation in the
+/// bass configuration, which every synthetic trial before this one skipped.
 ///
-/// The deep bass runs `goertzel_bass` (R3) against the same 1024-sample hop, so
+/// The deep bass runs `goertzel_bass` against the same 1024-sample hop, so
 /// its baseband is 4× oversampled and consecutive samples share three quarters
 /// of their input. Correlated reference cells are exactly what an OS-CFAR
 /// threshold assumes away, so the shipped null — measured only at the treble's
 /// critically-sampled 1024 window — may not hold there at all. That is the first
-/// candidate explanation for the bass second lines (ADR 0012 §5, Prompt T).
+/// candidate explanation for the bass second lines (report 0012 §5; report 0013).
 fn e10_bass_null() {
     const TRIALS: usize = 40;
     /// E1 — inside the 0–27 band whose second lines this is about, and well
-    /// under the R3 boundary, so its shipped path is the 4096-sample window.
+    /// under the long-window boundary, so its shipped path is the 4096-sample window.
     const BASS_KEY: usize = 7;
     let cfg = KeyRefs::for_key(BASS_KEY);
     let probe = cfg.probe_hz();
@@ -831,7 +831,7 @@ fn e10_bass_null() {
         "reference set: key {BASS_KEY} ({}), f₁ = {:.2} Hz, B = {:.2e} (Rigaud medium prior),\n\
          probed at the displayed partial n = {} → {:.2} Hz, spacing there {:.1} Hz.  The A/B is\n\
          the *same audio* through two reference sets differing only in what selects the\n\
-         window: the probe alone (1024) and the probe behind a {R3_FORCING_HZ:.0} Hz first reference (4096).",
+         window: the probe alone (1024) and the probe behind a {LONG_WINDOW_FORCING_HZ:.0} Hz first reference (4096).",
         NOTES[BASS_KEY].name,
         cfg.f1,
         cfg.b,
@@ -1148,7 +1148,7 @@ fn measured_refs(cap: &Capture, out: &mut [f32; MAX_STROBE_REFS]) -> usize {
     count
 }
 
-/// **E7** — availability per register, and the truth-free reproducibility test.
+/// E7 — availability per register, and the truth-free reproducibility test.
 fn e7_real(captures: &[(Capture, Vec<Resolved>, UnisonVerdict, usize)]) {
     let table = default_display_partials();
 
@@ -1160,7 +1160,7 @@ fn e7_real(captures: &[(Capture, Vec<Resolved>, UnisonVerdict, usize)]) {
     for band in ["bass", "tenor", "treble", "high 76–87"] {
         let rows: Vec<&Resolved> = captures
             .iter()
-            .filter(|(c, ..)| crate::capture::strobe_register(c.key) == band)
+            .filter(|(c, ..)| capture::strobe_register(c.key) == band)
             .filter_map(|(c, r, ..)| r.get(table[c.key as usize] as usize - 1))
             .collect();
         if rows.is_empty() {
@@ -1193,7 +1193,7 @@ fn e7_real(captures: &[(Capture, Vec<Resolved>, UnisonVerdict, usize)]) {
     for band in ["bass", "tenor", "treble", "high 76–87"] {
         let rows: Vec<&Resolved> = captures
             .iter()
-            .filter(|(c, ..)| crate::capture::strobe_register(c.key) == band)
+            .filter(|(c, ..)| capture::strobe_register(c.key) == band)
             .flat_map(|(_, r, ..)| r.iter())
             .collect();
         if rows.is_empty() {
@@ -1230,7 +1230,7 @@ fn e7_real(captures: &[(Capture, Vec<Resolved>, UnisonVerdict, usize)]) {
         let mut per_key: Vec<(u8, Vec<f32>)> = Vec::new();
         for (cap, resolved, _, _) in captures
             .iter()
-            .filter(|(c, ..)| crate::capture::strobe_register(c.key) == band)
+            .filter(|(c, ..)| capture::strobe_register(c.key) == band)
         {
             let n_star = table[cap.key as usize] as usize;
             let Some(r) = resolved.get(n_star.saturating_sub(1)) else {
@@ -1280,7 +1280,7 @@ fn e7_real(captures: &[(Capture, Vec<Resolved>, UnisonVerdict, usize)]) {
     for band in ["bass", "tenor", "treble", "high 76–87"] {
         let rows: Vec<UnisonVerdict> = captures
             .iter()
-            .filter(|(c, ..)| crate::capture::strobe_register(c.key) == band)
+            .filter(|(c, ..)| capture::strobe_register(c.key) == band)
             .map(|(_, _, v, _)| *v)
             .collect();
         if rows.is_empty() {
@@ -1302,7 +1302,7 @@ fn e7_real(captures: &[(Capture, Vec<Resolved>, UnisonVerdict, usize)]) {
 /// The full-rate view of one baseband's span: every local maximum inside the
 /// band, refined sub-bin, and the magnitude spectrum behind them.
 ///
-/// The peak list is **uncapped** — the design note's own reference picker was
+/// The peak list is uncapped — the original reference picker (report 0012, E-R) was
 /// capped at three peaks, and lifting it to five alone halved its unmatched rate,
 /// so a cap here would beg the question E8 asks.
 struct Reference {
@@ -1373,7 +1373,7 @@ impl Reference {
     }
 }
 
-/// **E8** — the unexplained-line investigation.
+/// E8 — the unexplained-line investigation.
 fn e8_unexplained(captures: &[(Capture, Vec<Resolved>, UnisonVerdict, usize)]) {
     println!("\n=== E8: reported lines vs a full-rate DFT of the identical span ===");
     println!(
@@ -1397,7 +1397,7 @@ fn e8_unexplained(captures: &[(Capture, Vec<Resolved>, UnisonVerdict, usize)]) {
     }
     let mut rows: Vec<Cell> = Vec::new();
     for (cap, resolved, _, window) in captures {
-        let band = crate::capture::strobe_register(cap.key);
+        let band = capture::strobe_register(cap.key);
         for (i, r) in resolved.iter().enumerate() {
             if r.count == 0 || r.record < 2 {
                 continue;
@@ -1505,10 +1505,10 @@ fn e8_unexplained(captures: &[(Capture, Vec<Resolved>, UnisonVerdict, usize)]) {
 
 // ─── Bass attribution (E11–E12) ─────────────────────────────────────────────
 
-/// A reported line that is not the strongest at its reference — what Prompt T is
-/// about. The bass produces one on essentially every capture of both
+/// A reported line that is not the strongest at its reference — what report 0013
+/// is about. The bass produces one on essentially every capture of both
 /// instruments, including on single-strung keys, and what they are is
-/// unestablished (ADR 0012 §5).
+/// unestablished (report 0012 §5).
 struct Extra {
     key: u8,
     /// Partial number of the reference it sits on.
@@ -1519,7 +1519,7 @@ struct Extra {
     /// its main lobe being ±2·f_s/N.
     window: usize,
     /// `2/T` of the record it came from — the floor its offset must clear
-    /// before the *position* means anything (ADR 0012 §4).
+    /// before the position means anything (report 0012 §4).
     resolution_hz: f32,
 }
 
@@ -1558,7 +1558,7 @@ fn extras(captures: &[(Capture, Vec<Resolved>, UnisonVerdict, usize)]) -> Vec<Ex
     out
 }
 
-/// The instrument's own partial layout, one row per key — where a *neighbouring*
+/// The instrument's own partial layout, one row per key — where a neighbouring
 /// key's partials sit, which is what the sympathetic-resonance candidate
 /// predicts. Built from the set's own captures and extended past the twelve
 /// measured partials by the stiff-string law.
@@ -1586,13 +1586,13 @@ impl KeyTable {
         Self { f0, b }
     }
 
-    /// The **phantom partials** that land near this key's partial `n`: Conklin's
+    /// The phantom partials that land near this key's partial `n`: Conklin's
     /// nonlinear mixing products `fᵢ + fⱼ` with `i + j = n` and `2fᵢ − fⱼ` with
-    /// `2i − j = n`. They sit *below* the transverse partial, because the
+    /// `2i − j = n`. They sit below the transverse partial, because the
     /// transverse series is stretched by inharmonicity while a mixing product
     /// adds linearly — `f_n − (fᵢ + fⱼ) = (3/2)·B·f₀·i·j·n` to first order in B.
     ///
-    /// The *free* longitudinal series is not predictable from `(f₀, B)` — it
+    /// The free longitudinal series is not predictable from `(f₀, B)` — it
     /// needs the string's length and `√(E/ρ)` — so this is the testable half of
     /// the longitudinal candidate.
     fn phantoms(&self, key: usize, n: usize, out: &mut Vec<f32>) {
@@ -1645,10 +1645,10 @@ fn folds_onto(set: &[f32], e: &Extra, offset_hz: f32, tol: f32) -> bool {
     })
 }
 
-/// **E11** — do the extra lines sit at *fixed absolute frequencies*?
+/// E11 — do the extra lines sit at fixed absolute frequencies?
 ///
-/// Prompt T's second discriminating experiment, and Prompt E's test: recurrence
-/// of the same absolute frequency across *different keys* is the signature of an
+/// Report 0013's second discriminating experiment: recurrence
+/// of the same absolute frequency across different keys is the signature of an
 /// instrument or room resonance rather than a property of the struck string.
 fn e11_recurrence(captures: &[(Capture, Vec<Resolved>, UnisonVerdict, usize)]) {
     const TOL_HZ: f32 = 0.5;
@@ -1669,7 +1669,7 @@ fn e11_recurrence(captures: &[(Capture, Vec<Resolved>, UnisonVerdict, usize)]) {
     for band in ["bass", "tenor", "treble"] {
         let rows: Vec<&Extra> = all
             .iter()
-            .filter(|e| crate::capture::strobe_register(e.key) == band)
+            .filter(|e| capture::strobe_register(e.key) == band)
             .collect();
         if rows.len() < 10 {
             continue;
@@ -1751,12 +1751,12 @@ fn e11_recurrence(captures: &[(Capture, Vec<Resolved>, UnisonVerdict, usize)]) {
     }
 }
 
-/// **E12** — the attribution itself: every extra line against the families that
+/// E12 — the attribution itself: every extra line against the families that
 /// could have produced it.
 ///
 /// Every transverse partial of every key is predictable from the measured
 /// (f₀, B), so the struck key's own series, the neighbouring keys' series and
-/// Conklin's nonlinear-mixing family can each be *predicted* and the leftovers
+/// Conklin's nonlinear-mixing family can each be predicted and the leftovers
 /// classified. Each family is scored against the same test run on redrawn
 /// positions, because the piano's spectrum is dense enough that a family with
 /// enough members explains everything by coincidence.
@@ -1790,7 +1790,7 @@ fn e12_attribution(captures: &[(Capture, Vec<Resolved>, UnisonVerdict, usize)]) 
 
     let mut candidates: Vec<f32> = Vec::new();
     let mut scratch: Vec<f32> = Vec::new();
-    // The bass is split by *window*, because that is what decides which
+    // The bass is split by window, because that is what decides which
     // candidates the front end can admit at all: keys whose f₁ clears 86 Hz —
     // roughly 20 upwards — ship the 1024-sample window with the panel still
     // displaying partial 6, so their neighbouring partials are inside its main
@@ -1805,16 +1805,16 @@ fn e12_attribution(captures: &[(Capture, Vec<Resolved>, UnisonVerdict, usize)]) 
             .iter()
             .filter(|e| {
                 if window == 0 {
-                    crate::capture::strobe_register(e.key) == "tenor"
+                    capture::strobe_register(e.key) == "tenor"
                 } else {
-                    crate::capture::strobe_register(e.key).starts_with("bass") && e.window == window
+                    capture::strobe_register(e.key).starts_with("bass") && e.window == window
                 }
             })
             .collect();
         if rows.len() < 10 {
             continue;
         }
-        // The null shuffles the *observed* offsets between lines of the same
+        // The null shuffles the observed offsets between lines of the same
         // register rather than drawing uniformly: real offsets concentrate near
         // the reference, and a uniform draw would credit every family with the
         // difference between those two distributions.
@@ -1884,7 +1884,7 @@ fn e12_attribution(captures: &[(Capture, Vec<Resolved>, UnisonVerdict, usize)]) 
     for band in ["bass", "tenor", "treble"] {
         let rows: Vec<&Extra> = all
             .iter()
-            .filter(|e| crate::capture::strobe_register(e.key) == band)
+            .filter(|e| capture::strobe_register(e.key) == band)
             .collect();
         if rows.len() < 10 {
             continue;
@@ -1925,7 +1925,7 @@ fn e12_attribution(captures: &[(Capture, Vec<Resolved>, UnisonVerdict, usize)]) 
         for n in [2usize, 4, 6, 8] {
             let rows: Vec<&Extra> = all
                 .iter()
-                .filter(|e| crate::capture::strobe_register(e.key) == band && e.partial == n)
+                .filter(|e| capture::strobe_register(e.key) == band && e.partial == n)
                 .collect();
             if rows.len() < 10 {
                 continue;
@@ -1977,7 +1977,7 @@ fn e12_attribution(captures: &[(Capture, Vec<Resolved>, UnisonVerdict, usize)]) 
         let mut d2 = Vec::new();
         for (cap, resolved, ..) in captures
             .iter()
-            .filter(|(c, ..)| crate::capture::strobe_register(c.key) == band)
+            .filter(|(c, ..)| capture::strobe_register(c.key) == band)
         {
             for (i, r) in resolved.iter().enumerate() {
                 if r.count == 3 && cap.partial_hz[i + 1].is_some() {
@@ -2017,7 +2017,7 @@ fn e12_attribution(captures: &[(Capture, Vec<Resolved>, UnisonVerdict, usize)]) 
     );
     println!(
         "A split at the record's own limit is reported *at* the limit whatever the truth was\n\
-         (ADR 0012 §4), and the limit is the same for every partial — which would itself\n\
+         (report 0012 §4), and the limit is the same for every partial — which would itself\n\
          manufacture p̂ = 0. The second row per register admits only splits wider than\n\
          2 × 2/T, where §4 measures the reported separation to be exact.\n"
     );
@@ -2031,7 +2031,7 @@ fn e12_attribution(captures: &[(Capture, Vec<Resolved>, UnisonVerdict, usize)]) 
             let (mut near_unison, mut near_fixed) = (0usize, 0usize);
             for (cap, resolved, ..) in captures
                 .iter()
-                .filter(|(c, ..)| crate::capture::strobe_register(c.key) == band)
+                .filter(|(c, ..)| capture::strobe_register(c.key) == band)
             {
                 let mut points = Vec::new();
                 for (i, r) in resolved.iter().enumerate() {
@@ -2114,7 +2114,7 @@ fn log_slope(points: &[(f32, f32)]) -> Option<(f32, f32)> {
 }
 
 pub fn run(root: &Path) -> anyhow::Result<()> {
-    let dirs = crate::capture::find(root)?;
+    let dirs = capture::find(root)?;
 
     let table = default_display_partials();
     let hop_to_hz = HOP_RATE_HZ; // slope cyc/hop → Hz
@@ -2145,20 +2145,20 @@ pub fn run(root: &Path) -> anyhow::Result<()> {
         let n_star = table[key] as usize;
 
         // ── E7/E8: the unison rings, on the key's own measured partials ──
-        // The measured series centres each baseband, which is what the design
-        // note's real-capture runs did; the app's reference is the curve target
-        // and an out-of-tune string sits off-centre (ADR 0012, Limitations).
+        // The measured series centres each baseband, as report 0012's appendix
+        // runs did; the app's reference is the curve target, and an out-of-tune
+        // string sits off-centre (report 0012, Limitations).
         //
         // Piano #2's cached deep-bass partials predate the MAT seed fix, so any
         // capture whose fundamental is absurd against ET is dropped rather than
-        // consumed (`06-capture-sets.md`). v1 is tenor and treble regardless.
+        // consumed (`capture-sets.md`).
         let mut measured = [0.0f32; MAX_STROBE_REFS];
         let n_measured = measured_refs(&cap, &mut measured);
         let sane = cap.partial_hz[1]
             .is_some_and(|f1| f1 > 0.0 && (1200.0 * (f1 / f_et).log2()).abs() < 200.0);
         if n_measured > 0 && sane {
             let window = if measured[0] * 1024.0 < 2.0 * SAMPLE_RATE as f32 {
-                BASS_WINDOW_SIZE / 2 // the R3 long-window path
+                BASS_WINDOW_SIZE / 2 // the long-window path
             } else {
                 WINDOW_SIZE / 2
             };
@@ -2191,7 +2191,7 @@ pub fn run(root: &Path) -> anyhow::Result<()> {
             *r = f;
             count += 1;
         }
-        // ── E3: per-hop delta noise at the *displayed* partial ──
+        // ── E3: per-hop delta noise at the displayed partial ──
         // The band the user watches, on the shipped ET reference set, so the
         // margin below the alias boundary can be derived instead of chosen.
         if n_star >= 1 && n_star <= count {

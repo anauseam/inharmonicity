@@ -1,12 +1,7 @@
 //! # Profile library — where instruments live on disk
 //!
-//! The frontend's file-location policy: the directories profiles, app settings
-//! and capture dumps live in, the listing the browser renders, and the one-time
-//! import of a pre-library profile.
-//!
-//! Why these locations, and why identity is part of the answer rather than
-//! decoration, is argued in
-//! `docs/design/session-persistence-and-profile-library.md` §3.
+//! The frontend's file-location policy: where profiles, app settings and capture
+//! dumps live, and the listing the browser shows.
 
 use crate::app::Instrument;
 use serde::{Deserialize, Serialize};
@@ -26,19 +21,14 @@ const SETTINGS_FILE: &str = "settings.json";
 const MAX_RECENTS: usize = 12;
 
 /// Per-user directories for this app.
-///
-/// `directories` rather than a hand-rolled XDG lookup because the XDG variables
-/// are unset on macOS and absent on Windows, where a hand-rolled fallback would
-/// pick a non-native path or none at all; pre-built binaries are a planned
-/// deliverable (TODO.md). On Linux this resolves to the XDG values as expected.
+// `directories`, not a hand-rolled XDG lookup: macOS and Windows have no XDG
+// variables.
 fn project_dirs() -> Option<directories::ProjectDirs> {
     directories::ProjectDirs::from("org", "anauseam", "inharmonicity")
 }
 
-/// Directory holding profile documents, created if absent.
-///
-/// Falls back to `./profiles` when no home directory can be resolved — a
-/// headless or sandboxed environment should still be able to save.
+/// Directory holding profile documents, created if absent. Falls back to
+/// `./profiles` without a home directory, so a sandboxed run can still save.
 pub(crate) fn profiles_dir() -> PathBuf {
     let dir = project_dirs()
         .map(|d| d.data_dir().join(PROFILES_SUBDIR))
@@ -48,17 +38,9 @@ pub(crate) fn profiles_dir() -> PathBuf {
 }
 
 /// Directory capture dumps are written under, created if absent.
-///
-/// `data_local_dir` rather than `data_dir` because dumps are large — raw audio
-/// per capture — and on Windows `data_dir` is the *roaming* profile, which a
-/// domain login would sync across the network. On Linux and macOS the two
-/// resolve to the same path, so the choice costs nothing there.
-///
-/// Not the working directory: a released binary has no useful CWD (a macOS
-/// `.app` launched from Finder gets `/`, a Windows exe gets its install
-/// directory), so dumps would land somewhere unwritable or unfindable.
-/// The repo's capture sets are a separate thing and stay where they are —
-/// `docs/internals/06-capture-sets.md`.
+// The local data dir, not the roaming one: dumps are raw audio, and Windows
+// syncs the roaming profile across a domain. Not the working directory, which a
+// released binary does not choose.
 pub(crate) fn diagnostics_dir() -> PathBuf {
     let dir = project_dirs()
         .map(|d| d.data_local_dir().join("diagnostics"))
@@ -68,15 +50,9 @@ pub(crate) fn diagnostics_dir() -> PathBuf {
 }
 
 /// Where one instrument's capture dumps live: a subdirectory of
-/// [`diagnostics_dir`] named for its [`InstrumentIdentity::id`].
-///
-/// The id rather than the display name or the filename because both of those
-/// are renameable, and a directory that moves strands every dump written under
-/// the old name (dumps are matched to captures by directory name —
-/// `worker::dump_dir_name`). The name a human needs is in the directory's own
-/// [`write_manifest`] instead. An id-less profile falls back to the root, which
-/// only happens before [`ProfileSession::adopt`](crate::session::ProfileSession)
-/// has minted one.
+/// [`diagnostics_dir`] named for its [`models::InstrumentIdentity::id`], which,
+/// unlike the name and the file, never changes. A profile not yet given an id
+/// uses the root.
 pub(crate) fn diagnostics_dir_for(id: &str) -> PathBuf {
     let root = diagnostics_dir();
     let dir = if id.is_empty() { root } else { root.join(id) };
@@ -84,13 +60,10 @@ pub(crate) fn diagnostics_dir_for(id: &str) -> PathBuf {
     dir
 }
 
-/// Writes `instrument.json` into a dump directory: which instrument these
-/// captures came from, in a form a tool can read without opening the profile.
-///
-/// Refreshed whenever the instrument is opened, so a rename reaches it; the
-/// `id` never changes, which is what the directory name depends on. The
-/// offline harnesses discover dumps by the `key_` prefix, so this file sits
-/// beside them without disturbing anything.
+/// Writes `instrument.json` into a dump directory: which instrument the captures
+/// came from, readable without the profile.
+// The harnesses find dumps by their `key_` prefix, so this file does not
+// disturb them.
 pub(crate) fn write_manifest(dir: &Path, identity: &models::InstrumentIdentity) {
     let manifest = serde_json::json!({
         "id": identity.id,
@@ -123,12 +96,12 @@ fn settings_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(SETTINGS_FILE))
 }
 
-/// App-level state that is **not** a property of any instrument.
+/// App-level state that is not a property of any instrument: which profile to
+/// reopen, the recents list, and the operator's session preferences.
 ///
-/// Deliberately small. Everything describing an instrument — its thresholds,
-/// its engine, its reference mode — lives in the profile so it travels with the
-/// instrument between machines; what is left here is the pointer to which
-/// profile to reopen, which is by definition not a property of any one of them.
+/// Anything describing an instrument — its thresholds, its engine, its
+/// reference mode — belongs in the profile instead, so it travels with the
+/// instrument between machines.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     /// The profile to reopen at launch. `None` on a first run.
@@ -137,21 +110,18 @@ pub struct AppSettings {
     /// Recently opened profiles, most recent first.
     #[serde(default)]
     pub recents: Vec<PathBuf>,
-    /// Show the per-capture string declaration (the mute-isolation metadata,
-    /// `docs/internals/06-capture-sets.md`). Off for ordinary tuning: it is a
-    /// measurement-session control, and while it is off no capture carries a
-    /// declaration at all.
+    /// Offer the per-capture string declaration, a measurement-session control;
+    /// while off, no capture carries one.
     #[serde(default)]
     pub string_isolation: bool,
-    /// Show the unison panels, and the Tools entries that hide and show them.
-    /// Off for ordinary tuning: the panels read a note's individual strings,
-    /// which is a measurement surface rather than a tuning one, and their
-    /// resolution floor sits above most set unisons (ADR 0014).
+    /// Show the unison panels, a measurement surface rather than a tuning one.
+    // Off by default: the panels' resolution floor sits above most set unisons.
+    // report 0014
     #[serde(default)]
     pub unison_assist: bool,
-    /// Record past the shipped 1.5 s, for the offline deliverables a capture
-    /// cannot otherwise serve (per-string decay τ, deep-bass resolution). Off
-    /// for ordinary tuning; the measured span is unchanged either way.
+    /// Record past the shipped 1.5 s, for what a capture cannot otherwise serve
+    /// (per-string decay τ, deep-bass resolution). What is measured is unchanged;
+    /// only the stored audio grows.
     #[serde(default)]
     pub extended_capture: bool,
     /// Seconds an extended capture records for. Ignored while
@@ -165,12 +135,8 @@ pub struct AppSettings {
     pub instrument: Instrument,
 }
 
-/// Seconds an extended capture defaults to.
-///
-/// Also the ceiling ([`CAPTURE_MAX_SAMPLES`](tuner_core::pipeline::CAPTURE_MAX_SAMPLES)):
-/// measured on A0 and C1, the longest-decaying keys, the note is 20 dB down by
-/// 4–5 s and flat into the floor after it, so a longer record only adds
-/// noise-only samples.
+/// Seconds an extended capture defaults to: the ceiling,
+/// [`CAPTURE_MAX_SAMPLES`](tuner_core::pipeline::CAPTURE_MAX_SAMPLES).
 fn default_extended_capture_secs() -> f32 {
     5.0
 }
@@ -190,9 +156,8 @@ impl Default for AppSettings {
 }
 
 impl AppSettings {
-    /// Loads the settings document, or defaults if it is absent or unreadable.
-    /// A corrupt settings file must never block startup — the worst it can cost
-    /// is the resume-last pointer, which the browser can restore in one click.
+    /// Loads the settings document, or defaults if it is absent or unreadable: a
+    /// corrupt file must not block startup, and costs only the resume pointer.
     pub fn load() -> Self {
         std::fs::read_to_string(settings_path())
             .ok()
@@ -237,17 +202,12 @@ impl AppSettings {
 /// without opening it in full.
 #[derive(Debug, Clone)]
 pub struct ProfileEntry {
-    /// Path of the document.
     pub path: PathBuf,
-    /// Display name from the profile's identity.
+    /// The identity's name, or the file stem when it has none.
     pub name: String,
-    /// Manufacturer, if recorded — one of the three sort orders.
     pub make: Option<String>,
-    /// Model, if recorded.
     pub model: Option<String>,
-    /// Serial number, if recorded.
     pub serial: Option<String>,
-    /// Instrument family, for the unit vocabulary.
     pub kind: models::InstrumentKind,
     /// Keys/strings carrying at least one measurement.
     pub measured_count: usize,
@@ -332,11 +292,8 @@ impl std::fmt::Display for ProfileSort {
     }
 }
 
-/// Every profile document in the library, ordered by `sort`.
-///
-/// Unreadable files are skipped rather than reported: the directory is the
-/// user's own and may hold anything, and a browser that refuses to open
-/// because of one stray file is worse than one that lists the rest.
+/// Every profile document in the library, ordered by `sort`. Unreadable files
+/// are skipped, not reported: one stray file must not break the browser.
 pub(crate) fn list_profiles(sort: ProfileSort) -> Vec<ProfileEntry> {
     let dir = profiles_dir();
     let mut entries: Vec<ProfileEntry> = std::fs::read_dir(&dir)
@@ -375,8 +332,7 @@ fn slugify(name: &str) -> String {
         if c.is_ascii_alphanumeric() || c == '_' {
             slug.push(c.to_ascii_lowercase());
         } else if !slug.ends_with('-') {
-            // Collapse runs: "Steinway B — #1234" has four separators in a row
-            // between "b" and "1234", and one hyphen reads as one word break.
+            // A run of separators becomes one hyphen.
             slug.push('-');
         }
     }
@@ -414,11 +370,9 @@ pub(crate) fn default_profile_name() -> String {
     format!("Untitled instrument ({})", secs / 86_400)
 }
 
-/// Imports a pre-move `tuning_profile.json` from the working directory, once.
-///
-/// Runs only when the library is empty, and **copies** rather than moves: the
-/// original stays where the offline harnesses and `diagnose_engine --profile`
-/// expect it. Returns the imported path, or `None` if there was nothing to do.
+/// Imports a pre-library `tuning_profile.json` from the working directory, once:
+/// only into an empty library, and as a copy, since `cargo lab engine dump
+/// --profile` reads the original. Returns the imported path, if any.
 pub(crate) fn import_legacy_profile() -> Option<PathBuf> {
     let legacy = Path::new(models::PROFILE_PATH);
     if !legacy.is_file() || !list_profiles(ProfileSort::default()).is_empty() {

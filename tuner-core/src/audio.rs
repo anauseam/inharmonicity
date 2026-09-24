@@ -1,26 +1,9 @@
-//! # Audio Capture Module
+//! # Audio capture and the analysis host
 //!
-//! This module handles real-time audio capture using CPAL (Cross-Platform Audio Library).
-//! It provides functions for setting up audio streams, selecting appropriate devices,
-//! and streaming clean, DC-free audio data to the analysis pipeline.
-//!
-//! ## Features
-//! - Automatic audio device selection
-//! - Configurable sample rates and formats
-//! - Real-time audio streaming with buffering
-//! - Always-on DC offset removal
-//! - Error handling and device fallback
-//!
-//! ## Standalone Host Extension
-//!
-//! The [`spawn_analysis_thread()`] function provides a turnkey solution for standalone
-//! applications. It creates an [`AudioPipeline`], opens a CPAL stream (or accepts an
-//! external audio consumer via [`AudioSource`]), spawns a dedicated analysis thread,
-//! and returns a [`HostHandle`] with everything the frontend needs.
-//!
-//! This is **optional to use** — VST/plugin hosts that drive their own audio thread
-//! can call [`AudioPipeline::push_audio()`] directly and ignore this module's
-//! thread-spawning facilities entirely.
+//! The CPAL input stream, whose callback DC-blocks each sample into a lock-free
+//! ring buffer, and [`spawn_analysis_thread`], which runs an [`AudioPipeline`] on
+//! its own thread. A host with its own audio thread calls
+//! [`AudioPipeline::push_audio`] instead.
 
 use anyhow::{Result, anyhow};
 use cpal::SupportedStreamConfigRange;
@@ -38,84 +21,50 @@ use crate::pipeline::{
 };
 use crate::worker::{CurveJob, WorkerJob, WorkerOutput};
 
-/// The standard analysis window size (samples).
-/// Used by the Gatekeeper, Scout, and all Engine paths.
+/// The standard analysis window size, in samples.
 pub const WINDOW_SIZE: usize = 2048;
 
 /// The expanded analysis window size for extracting exact bass fundamental frequencies.
 pub const BASS_WINDOW_SIZE: usize = WINDOW_SIZE * 4; // 8192 samples
 
-/// Hop size for overlapping frame analysis (50% overlap of WINDOW_SIZE).
-/// Each hop triggers a new FFT + pipeline frame.
+/// Hop size between overlapping frames: half a window.
 pub const HOP_SIZE: usize = WINDOW_SIZE / 2; // 1024 samples
 
-/// Frames the DSP produces per second — one per hop, ≈ 43.07 Hz.
-///
-/// Anything whose intent is a *duration* but whose unit is frames should be
-/// expressed against this rather than written as a count: a bare count silently
-/// changes meaning if [`HOP_SIZE`] or [`SAMPLE_RATE`] moves.
+/// Frames the DSP produces per second, one per hop: ≈ 43.07 Hz.
 pub const HOP_RATE_HZ: f32 = SAMPLE_RATE as f32 / HOP_SIZE as f32;
 
-/// Capacity of the lock-free ring buffer between the CPAL capture thread and
-/// the analysis thread, in samples.
-///
-/// 8 × WINDOW_SIZE = 16,384 samples (~371 ms at 44.1 kHz).
-/// This headroom ensures the real-time callback never drops samples even if
-/// the analysis thread hits a scheduling spike.
+/// Capacity of the ring buffer between the capture callback and the analysis
+/// thread, in samples: ≈ 371 ms, headroom for a scheduling spike.
 pub const RING_BUFFER_CAPACITY: usize = WINDOW_SIZE * 8;
 
-/// The target sample rate for the application in Hz.
-///
-/// TODO: replace with the CPAL-negotiated rate once it is plumbed through
-/// (README → Pipeline Hardening → Dynamic Sample Rate Plumbing).
+/// The sample rate the pipeline is dimensioned for, in Hz. Buffer sizes, windows
+/// and every gate's timing derive from it, so it is a constant of the design.
+// Plumbing the negotiated rate through is planned; see TODO.md.
 pub const SAMPLE_RATE: u32 = 44_100;
 
-/// Consumer half of the audio ring buffer.
-///
-/// Returned by [`open_input_stream`] and [`start_audio_capture`]. The analysis thread
-/// holds this end and pops samples whenever it is ready to process a new frame.
-/// Callers do not need to import `ringbuf` directly.
+/// The consumer half of the audio ring buffer, so callers need not import
+/// `ringbuf`.
 pub type AudioConsumer = ringbuf::HeapCons<f32>;
 
-/// DC blocking filter coefficient.
-///
-/// For `y[n] = x[n] − x[n−1] + α·y[n−1]` the −3 dB corner is `(1−α)·fs/2π`, so
-/// **α = 0.995 is a 35 Hz corner at 44.1 kHz** — *above* A0, not below it. It
-/// costs −4.2 dB at A0's 27.5 Hz fundamental, −3.9 at A#0, −3.3 at C1, −2.4 at
-/// E1, and is inaudible from A2 up (−0.4 dB).
-///
-/// **Do not raise α to move the corner below A0.** It gains 2–4 dB on a bass
-/// fundamental that stays under `mask_peaks`' −30 dB gate regardless (the deficit
-/// is acoustic, 24–45 dB), while the CFAR reference cells that set the coarse
-/// read's local noise estimate sit in this band — its deep-bass lower flank clamps
-/// at bin 1 — so the threshold rises 1–3 dB and the readout measurably worsens:
-/// availability 93.3 → 87.4 %, |e| 0.70 → 1.85 ¢. If the bottom octave is ever
-/// worth recovering, the lever is the filter's **order**, not α; the measured
-/// trade and the conditions that would justify it are in `ARCHITECTURE.md`,
-/// "Why the DC blocker corner sits above A0".
+/// DC-blocking filter coefficient. For `y[n] = x[n] − x[n−1] + α·y[n−1]` the
+/// −3 dB corner is `(1−α)·fs/2π`: 35 Hz, above A0. It costs −4.2 dB at A0's
+/// fundamental, −2.4 dB at E1, and −0.4 dB from A2 up.
+// Do not raise α to put the corner below A0: the CFAR reference cells sit in this
+// band, so the coarse readout worsens (availability 93.3 → 87.4 %, |e| 0.70 →
+// 1.85 ¢), and the bass fundamental recovered stays under mask_peaks' −30 dB gate.
+// The lever is the filter's order.
+// report 0019
 const DC_BLOCK_ALPHA: f32 = 0.995;
 
 // ─── Shared CPAL Stream Setup ────────────────────────────────────────────────
 
-/// Opens a CPAL input stream with DC blocking and a ring buffer of `capacity` samples.
+/// Opens the default input device at [`SAMPLE_RATE`], DC-blocking every sample
+/// into a ring buffer of `capacity` samples. The callback neither allocates nor
+/// blocks: a full buffer drops samples. Returns the running stream, the consumer
+/// and the negotiated rate in Hz.
 ///
-/// This is the single source of truth for CPAL device negotiation, DC-filtered
-/// ring buffer construction, and stream activation. Both [`start_audio_capture()`]
-/// and the calibration module call this helper instead of duplicating the logic.
-///
-/// The CPAL callback is allocation-free: it only applies the DC blocking filter
-/// and pushes filtered samples into the ring buffer via `try_push`. If the buffer
-/// is full, samples are silently dropped to avoid blocking the real-time thread.
-///
-/// # Arguments
-/// * `capacity` — Ring buffer capacity in samples. Use [`RING_BUFFER_CAPACITY`]
-///   for analysis streams, or a smaller value (e.g., `WINDOW_SIZE * 4`) for
-///   short-lived calibration streams.
-///
-/// # Returns
-/// * `Ok((stream, consumer, sample_rate))` — Active CPAL stream, ring buffer
-///   consumer, and the negotiated sample rate in Hz.
-/// * `Err(e)` — If no input device is available or config negotiation fails.
+/// # Errors
+/// If there is no input device, or no mono `f32` configuration at [`SAMPLE_RATE`].
 pub fn open_input_stream(capacity: usize) -> Result<(cpal::Stream, AudioConsumer, u32)> {
     let host = cpal::default_host();
     let device = host
@@ -129,9 +78,8 @@ pub fn open_input_stream(capacity: usize) -> Result<(cpal::Stream, AudioConsumer
         anyhow!("No mono f32 input configuration supporting {SAMPLE_RATE} Hz was found")
     })?;
 
-    // `try_` rather than `with_sample_rate`: the latter panics on a range that
-    // does not cover the rate. `find_supported_config` already guarantees it
-    // does, so this is a second line of defence against that filter loosening.
+    // `try_with_sample_rate`, not `with_sample_rate`, which panics on a range
+    // that misses the rate: a guard in case `find_supported_config` loosens.
     let config = supported_config
         .try_with_sample_rate(SAMPLE_RATE)
         .ok_or_else(|| anyhow!("Input configuration does not support {SAMPLE_RATE} Hz"))?;
@@ -143,12 +91,9 @@ pub fn open_input_stream(capacity: usize) -> Result<(cpal::Stream, AudioConsumer
 
     let err_fn = |err| eprintln!("An error occurred on the audio stream: {}", err);
 
-    // Create the lock-free ring buffer. The producer moves into the CPAL callback
-    // (real-time thread); the consumer is returned to the caller.
     let rb = HeapRb::<f32>::new(capacity);
     let (mut producer, consumer) = rb.split();
 
-    // DC blocking filter state — captured by the closure below.
     let mut dc_prev_x: f32 = 0.0;
     let mut dc_prev_y: f32 = 0.0;
 
@@ -158,9 +103,7 @@ pub fn open_input_stream(capacity: usize) -> Result<(cpal::Stream, AudioConsumer
             for &sample in data {
                 let filtered = dc_block(sample, &mut dc_prev_x, &mut dc_prev_y);
 
-                // Push filtered sample lock-free into the ring buffer.
-                // If the buffer is full, drop the sample — we cannot block
-                // in a real-time audio callback.
+                // Dropping beats blocking: this is the real-time callback.
                 let _ = producer.try_push(filtered);
             }
         },
@@ -175,15 +118,11 @@ pub fn open_input_stream(capacity: usize) -> Result<(cpal::Stream, AudioConsumer
 
 // ─── Standalone Host Extension ───────────────────────────────────────────────
 
-/// Determines where audio samples come from.
-///
-/// Use `Default` for standalone apps (opens CPAL internally via [`open_input_stream()`]).
-/// Use `External` when the caller provides their own audio consumer
-/// (e.g., a VST host feeding samples, or a test harness with pre-recorded audio).
+/// Where audio samples come from.
 pub enum AudioSource {
-    /// Opens a CPAL stream internally with the standard ring buffer capacity.
+    /// The default input device.
     Default,
-    /// Caller provides a pre-existing ring buffer consumer and the sample rate.
+    /// A ring buffer the caller feeds, such as a plugin host or a test.
     External {
         /// The consumer end of a ring buffer already being fed by an external source.
         consumer: AudioConsumer,
@@ -192,87 +131,49 @@ pub enum AudioSource {
     },
 }
 
-/// Control handle returned by [`spawn_analysis_thread()`].
-///
-/// The frontend holds this handle to receive analysis results, access pipeline
-/// shared state, and shut down the audio system cleanly.
-///
-/// When this handle is dropped, the CPAL stream (if any) is dropped with it,
-/// which stops the hardware capture. Call [`stop()`](HostHandle::stop) first
-/// to cleanly signal the analysis thread to exit.
+/// A frontend's handle on a running analysis host: its frames, the shared
+/// state and every channel. Dropping it stops the analysis thread before the
+/// stream.
 pub struct HostHandle {
-    /// Read the freshest per-hop visualization frame from the DSP thread (lossy).
-    ///
-    /// Uses `triple_buffer::Output` — the GUI always reads the most recent frame,
-    /// intermediate frames are silently discarded.
-    /// Wrapped in `Option` so it can be `.take()`'d by the GUI.
+    /// The freshest per-hop frame (lossy). An `Option`, so a frontend can take it.
     pub frame_rx: Option<triple_buffer::Output<FrameOutput>>,
-
-    /// Frontend-side handle to the pipeline's shared atomic state.
-    ///
-    /// Use this to read runtime observations (RMS, NHWRSF) and write
-    /// configuration parameters (silence threshold, key hint, etc.).
+    /// The pipeline's shared atomic state.
     pub pipeline_handle: PipelineHandle,
-
-    /// Worker → UI receiver for `WorkerOutput` results (crossing #5): a
-    /// `KeyMeasurement` per capture, a `CurveBundle` per curve recompute. Drain
-    /// it with `try_recv` in the frontend's tick loop.
+    /// Worker → UI results (crossing #5): a `KeyMeasurement` per capture, a
+    /// `CurveBundle` per recompute.
     pub worker_rx: crossbeam_channel::Receiver<WorkerOutput>,
-
-    /// UI → Worker sender for background jobs (crossing #6). Use the typed
-    /// `send_*_job` methods rather than touching this directly — they keep the
-    /// crossbeam types out of the frontend crate.
+    /// UI → Worker jobs (crossing #6), sent through the typed methods.
     worker_job_tx: crossbeam_channel::Sender<WorkerJob>,
-
-    /// UI → DSP producer for template updates (crossing #4). After handling a
-    /// `KeyMeasurement` (or editing the profile), call `update_key_profile` to push
-    /// the recompiled template to the live engine.
+    /// UI → DSP template updates (crossing #4).
     pub profiles: ProfileSender,
-
-    /// UI → DSP producer for strobe reference updates (crossing #4's second
-    /// instance). Push on key change / re-lock; `count: 0` clears the bank.
+    /// UI → DSP strobe reference updates (crossing #4).
     pub strobe_refs: StrobeSender,
-
-    /// UI → DSP producer for capture-lifecycle commands (crossing #4's third
-    /// instance): arm, re-state what the pending record is, cancel.
+    /// UI → DSP capture-lifecycle commands (crossing #4).
     pub capture_commands: CaptureSender,
-
-    /// Keep the CPAL stream alive for the lifetime of the host.
-    /// `None` when using `AudioSource::External`.
+    /// Keeps the CPAL stream alive; `None` for an external source.
     _stream: Option<cpal::Stream>,
-
-    /// Join handle for the analysis thread, used for clean shutdown.
     thread_handle: Option<JoinHandle<()>>,
 }
 
 impl HostHandle {
-    /// Enqueues a curve-compute job for the Worker (crossing #6). Non-blocking,
-    /// latest-wins: returns `true` if the job was
-    /// accepted, `false` if the single job slot was full (the worker is still
-    /// computing the previous bundle) — the caller keeps its `curve_dirty`
-    /// flag set and retries on the next tick. A disconnected worker also
-    /// returns `false` (the job is silently dropped).
+    /// Enqueues a curve job for the Worker (crossing #6) without blocking.
+    /// Returns `false` if the slot is full or the Worker has gone.
     pub fn send_curve_job(&self, job: CurveJob) -> bool {
         self.worker_job_tx.try_send(WorkerJob::Curve(job)).is_ok()
     }
 
-    /// Points capture dumps at `dir` (crossing #6), or at nothing when `None`.
-    ///
-    /// Where files land is host policy, so the frontend owns this; the worker
-    /// applies it to every capture it takes off the queue *after* the one it is
-    /// working on. Unlike a curve job this is never coalesced away — a dropped
-    /// directory change files captures under the wrong instrument — so a full
-    /// slot is worth retrying, which is what `false` reports.
+    /// Points capture dumps at `dir`, or nowhere when `None` (crossing #6), from
+    /// the Worker's next capture. Returns `false` if the slot is full; unlike a
+    /// curve job, a dropped change must be retried, or captures land under the
+    /// wrong instrument.
     pub fn send_dump_dir(&self, dir: Option<std::path::PathBuf>) -> bool {
         self.worker_job_tx
             .try_send(WorkerJob::SetDumpDir(dir))
             .is_ok()
     }
 
-    /// Signals the analysis thread to stop and waits for it to finish.
-    ///
-    /// This must be called before dropping the handle to ensure the audio
-    /// thread exits cleanly (preventing CPAL/ALSA segfaults on shutdown).
+    /// Signals the analysis thread to stop and joins it; dropping the handle
+    /// does the same.
     pub fn stop(&mut self) {
         self.pipeline_handle
             .atomics
@@ -288,7 +189,6 @@ impl HostHandle {
 
 impl Drop for HostHandle {
     fn drop(&mut self) {
-        // Ensure the analysis thread is stopped if the user forgot to call stop().
         if self.thread_handle.is_some() {
             self.stop();
         }
@@ -311,40 +211,14 @@ impl std::fmt::Debug for HostHandle {
     }
 }
 
-/// Spawns a dedicated analysis thread that polls audio and feeds the pipeline.
+/// Creates an [`AudioPipeline`] and runs it on a new analysis thread fed from
+/// `source`, returning the frontend's [`HostHandle`]. `dump_dir` is where capture
+/// dumps are written; `None` writes none.
 ///
-/// This is the turnkey entry point for standalone applications. It:
+/// # Errors
+/// If opening the input device fails, which only [`AudioSource::Default`] can.
 ///
-/// 1. Creates a fresh [`AudioPipeline`] and its [`PipelineHandle`].
-/// 2. Opens a CPAL stream (for [`AudioSource::Default`]) or accepts an external
-///    audio consumer (for [`AudioSource::External`]).
-/// 3. Spawns a dedicated analysis thread that polls the ring buffer consumer
-///    and calls [`AudioPipeline::push_audio()`].
-/// 4. Returns a [`HostHandle`] with the continuous frame output reader,
-///    pipeline handle, and shutdown control.
-///
-/// The CPAL callback thread remains **allocation-free** — it only pushes raw
-/// samples into the ring buffer. All DSP work (FFT, Gatekeeper, Engine) runs
-/// on the spawned analysis thread, which is a normal OS thread.
-///
-/// ## Cross-Thread Channels
-///
-/// | Channel | Type | Direction | Semantics |
-/// |---|---|---|---|
-/// | `frame_rx` | `triple_buffer` | DSP → UI | Lossy freshest-frame-only |
-/// | `atomics.config.*` | `AtomicU32` | UI → DSP | Wait-free parameters |
-/// | `atomics.runtime.*` | `AtomicU32` | DSP → UI | Wait-free observations |
-/// | `atomics.shutdown` | `AtomicBool` | UI → DSP | Wait-free shutdown flag |
-///
-/// # Arguments
-/// * `source` — Where to get audio samples from. Use [`AudioSource::Default`]
-///   for standalone apps, or [`AudioSource::External`] for VST/plugin hosts.
-///
-/// # Returns
-/// * `Ok(HostHandle)` — The control handle for the frontend.
-/// * `Err(e)` — If audio device setup fails (only for `AudioSource::Default`).
-///
-/// # Example
+/// # Examples
 /// ```no_run
 /// use tuner_core::audio::{AudioSource, spawn_analysis_thread};
 ///
@@ -371,7 +245,6 @@ pub fn spawn_analysis_thread(
         capture_commands,
     } = ports;
 
-    // Resolve the audio source — either open CPAL or use the provided consumer.
     let (stream, consumer, sample_rate) = match source {
         AudioSource::Default => {
             let (stream, consumer, sr) = open_input_stream(RING_BUFFER_CAPACITY)?;
@@ -383,10 +256,9 @@ pub fn spawn_analysis_thread(
         } => (None, consumer, sample_rate),
     };
 
-    // Triple buffer for continuous per-hop FrameOutput (DSP → UI).
+    // The per-hop frame, DSP → UI.
     let (tri_input, tri_output) = triple_buffer::TripleBuffer::new(&FrameOutput::default()).split();
 
-    // Clone the shared atomics for the analysis thread.
     let thread_atomics = pipeline_handle.atomics.clone();
 
     let thread_handle = thread::spawn(move || {
@@ -398,24 +270,21 @@ pub fn spawn_analysis_thread(
         let mut consumer = consumer;
         let mut tri_input = tri_input;
 
-        // Fixed-size stack array — no heap allocation.
-        // 512 × f32 = 2 KB, well within stack budget.
+        // On the stack, so the loop never allocates.
         let mut pop_buf = [0.0_f32; 512];
 
-        // Track state for debug logging
+        #[cfg(debug_assertions)]
         let mut last_was_silence = true;
 
-        // Add a small delay to let GUI initialize
+        // A start-up delay whose need is untested; TODO.md tracks it.
         std::thread::sleep(std::time::Duration::from_millis(100));
 
         loop {
-            // 1. Check for shutdown signal (wait-free atomic read)
             if thread_atomics.shutdown.load(Ordering::Relaxed) {
                 eprintln!("[HOST] Received shutdown signal.");
                 break;
             }
 
-            // 2. Lock-free ring buffer polling
             let available = consumer.occupied_len().min(pop_buf.len());
             if available > 0 {
                 consumer.pop_slice(&mut pop_buf[..available]);
@@ -426,19 +295,17 @@ pub fn spawn_analysis_thread(
                     continue; // Hop boundary not reached yet
                 };
 
-                // Write the freshest FrameOutput into the triple buffer (lossy).
-                // The GUI will read only the most recent frame.
+                // Lossy by contract: a reader sees only the freshest frame.
                 tri_input.write(frame_output.clone());
 
-                // Log silence transitions
-                let current_silence = frame_output.is_silence;
-                if current_silence != last_was_silence {
-                    if current_silence {
+                #[cfg(debug_assertions)]
+                if frame_output.is_silence != last_was_silence {
+                    last_was_silence = frame_output.is_silence;
+                    if last_was_silence {
                         eprintln!("[GATEKEEPER] → Silence");
                     } else {
                         eprintln!("[GATEKEEPER] → Active");
                     }
-                    last_was_silence = current_silence;
                 }
             } else {
                 std::thread::sleep(std::time::Duration::from_millis(2));
@@ -463,13 +330,8 @@ pub fn spawn_analysis_thread(
 
 // ─── DSP Utilities ───────────────────────────────────────────────────────────
 
-/// Applies one step of the DC blocking high-pass IIR filter.
-///
-/// Removes hardware-dependent DC offset from a single sample.
-/// `prev_x` and `prev_y` are the filter's persistent state and must be
-/// initialized to `0.0` before the first call.
-///
-/// Transfer function: `y[n] = x[n] - x[n-1] + α·y[n-1]`
+/// One step of the DC-blocking filter ([`DC_BLOCK_ALPHA`]). `prev_x` and `prev_y`
+/// carry its state and start at `0.0`.
 pub(crate) fn dc_block(sample: f32, prev_x: &mut f32, prev_y: &mut f32) -> f32 {
     let y = sample - *prev_x + DC_BLOCK_ALPHA * *prev_y;
     *prev_x = sample;
@@ -477,22 +339,10 @@ pub(crate) fn dc_block(sample: f32, prev_x: &mut f32, prev_y: &mut f32) -> f32 {
     y
 }
 
-/// Finds a supported audio configuration that can run at `target_rate`.
-///
-/// The pipeline requires all three: mono (the [`DcBlocker`] carries one filter
-/// state, so interleaved channels would corrupt it), `f32` samples, and a range
-/// that **contains** `target_rate` — the buffer sizes, COLA window and
-/// Gatekeeper timings are dimensioned for it, so a nearby rate is not a
-/// substitute. Among qualifying ranges the one whose bounds sit closest to the
-/// target wins, which prefers a device's dedicated range over a catch-all one.
-///
-/// # Arguments
-/// * `configs` - List of supported audio configurations from the device
-/// * `target_rate` - Required sample rate in Hz
-///
-/// # Returns
-/// * `Some(config)` - A configuration whose range covers `target_rate`
-/// * `None` - The device offers no mono `f32` range covering it
+/// The mono `f32` configuration range covering `target_rate` whose bounds sit
+/// closest to it, which prefers a dedicated range over a catch-all. Mono because
+/// one filter state is carried per stream; the exact rate because every buffer
+/// and timing is dimensioned for it. `None` if no range qualifies.
 pub(crate) fn find_supported_config(
     configs: Vec<SupportedStreamConfigRange>,
     target_rate: u32,

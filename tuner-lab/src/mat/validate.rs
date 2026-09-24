@@ -7,23 +7,28 @@
 //!
 //! `--offset-ms <list>` runs a second experiment instead: the same estimator over
 //! same-length windows cut from `audio_full_event.raw` at several offsets from the
-//! *physical* onset. The shipped capture begins at the gatekeeper's `Stable` verdict
+//! physical onset. The shipped capture begins at the gatekeeper's `Stable` verdict
 //! (~116 ms), so the loudest part of the note is never measured; the literature's
 //! reason for skipping it is that the attack's frequencies are unsettled and its
 //! energy would drag the peak positions the B fit reads. This prices that, paired
-//! per capture and read against the same set's repeat scatter (ADR 0009).
+//! per capture and read against the same set's repeat scatter (report 0009).
 //!
 //! Usage:
-//!   cargo lab mat validate [diagnostics_dir]   (default: diagnostics)
-//!   cargo lab mat offset diagnostics_piano2 --offsets 0,116,300
+//!
+//! ```text
+//! cargo lab mat validate [diagnostics_dir]   (default: diagnostics)
+//! cargo lab mat offset diagnostics_piano2 --offsets 0,116,300
+//! ```
 
-use anyhow::{Context, Result};
-use realfft::RealFftPlanner;
-use rustfft::num_complex::Complex;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use anyhow::{Context, Result};
+use realfft::RealFftPlanner;
+use rustfft::num_complex::Complex;
+
+use crate::{capture, raw};
 use tuner_core::algorithms::mat::{MAX_PARTIALS, MatOrder, detect_pitch_mat};
 use tuner_core::algorithms::spectral::{cspe, fft, magnitude_spectrum};
 use tuner_core::models::{NOTES, get_expected_beta};
@@ -107,7 +112,7 @@ fn offset_sweep(dirs: &[PathBuf], offsets: &[u32]) -> Result<()> {
     let mut skipped = 0u32;
     for dir in dirs {
         let (Some(audio), Ok(text)) = (
-            crate::raw::full_event(dir),
+            raw::full_event(dir),
             fs::read_to_string(dir.join("analysis.json")),
         ) else {
             skipped += 1;
@@ -207,13 +212,13 @@ fn offset_report(rows: &[OffsetRow], offsets: &[u32], skipped: u32) {
         "\n  {:<8} {:>8} {:>9} {:>12} {:>9} {:>10} {:>10}",
         "register", "offset", "captures", "median ΔB %", "IQR %", "|ΔB|>5 %", "partials"
     );
-    for reg in crate::capture::CURVE_REGISTERS {
+    for reg in capture::CURVE_REGISTERS {
         for (oi, &off) in offsets.iter().enumerate() {
             let mut shifts = Vec::new();
             let mut partials = Vec::new();
             for r in rows
                 .iter()
-                .filter(|r| crate::capture::curve_register(r.key) == reg)
+                .filter(|r| capture::curve_register(r.key) == reg)
             {
                 let (Some((b, p)), Some((b_ref, _))) = (r.by_offset[oi], r.by_offset[ref_i]) else {
                     continue;
@@ -248,7 +253,7 @@ fn offset_report(rows: &[OffsetRow], offsets: &[u32], skipped: u32) {
     }
     println!("  * the reference offset: its own row is ΔB against itself, and prices nothing.");
 
-    // Repeat scatter at the reference offset — ADR 0009's yardstick, recomputed
+    // Repeat scatter at the reference offset — report 0009's yardstick, recomputed
     // here so the comparison is against this set rather than a quoted figure.
     let mut per_key: BTreeMap<u8, Vec<f32>> = BTreeMap::new();
     for r in rows {
@@ -259,10 +264,10 @@ fn offset_report(rows: &[OffsetRow], offsets: &[u32], skipped: u32) {
     println!(
         "\n  repeat scatter of ln B at {ref_ms} ms (same key, different captures, keys with ≥3):"
     );
-    for reg in crate::capture::CURVE_REGISTERS {
+    for reg in capture::CURVE_REGISTERS {
         let mut sds: Vec<f32> = per_key
             .iter()
-            .filter(|(k, _)| crate::capture::curve_register(**k) == reg)
+            .filter(|(k, _)| capture::curve_register(**k) == reg)
             .filter_map(|(_, v)| stdev(v))
             .collect();
         if sds.is_empty() {
@@ -434,7 +439,7 @@ fn process_capture(dir: &Path) -> Result<Option<KeyRow>> {
 }
 
 pub fn run(root: &Path, offsets: Option<&[u32]>) -> Result<()> {
-    let dirs = crate::capture::find(root)?;
+    let dirs = capture::find(root)?;
 
     if let Some(offsets) = offsets {
         return offset_sweep(&dirs, offsets);
@@ -466,7 +471,7 @@ pub fn run(root: &Path, offsets: Option<&[u32]>) -> Result<()> {
     // Per-mode bass tallies + cross-mode comparison.
     let (mut sim_bass, mut ser_bass, mut sim_neg, mut ser_neg) = (0, 0, 0, 0);
     let (mut ser_extends, mut diverge) = (0, 0);
-    // Goodness of fit over the BASS, in ppm of relative residual. The key discriminator:
+    // Goodness of fit over the bass, in ppm of relative residual. The key discriminator:
     // `ser_on_clean` = serial's (f0,B) evaluated against simultaneous's clean low-mid
     // partials — if it stays as low as `sim_self`, serial's high partials did not corrupt it.
     // `sim_on_high` = simultaneous's model evaluated against serial's full high-partial set —

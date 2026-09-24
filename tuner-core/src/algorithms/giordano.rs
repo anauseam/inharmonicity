@@ -1,31 +1,17 @@
 //! # Giordano — the sensory-dissonance octave-width recipe
 //!
-//! The *quantity* computed here is Plomp–Levelt sensory dissonance [2] in the
-//! Sethares parametrization [3]; the *recipe* — scanning an interval for its
-//! dissonance-minimal width from measured inharmonic partials — is Giordano's [1].
-//!
-//! Faithful implementation of Giordano's recipe [1] for locating the
-//! dissonance-minimal width of an interval from *measured* partials
-//! (frequencies **and** amplitudes): Plomp–Levelt pure-tone roughness [2] in
-//! the Sethares parametrization [3] (Giordano's Eqs. 3–6),
+//! Giordano's recipe \[1\] for the dissonance-minimal width of an interval from
+//! measured inharmonic partials: Plomp–Levelt pure-tone roughness \[2\] in the
+//! Sethares parametrization \[3\] (Giordano's Eqs. 3–6),
 //!
 //! d₂(Δf, f_min) = e^(−b₁·s·Δf) − e^(−b₂·s·Δf),  with  s = x* / (s₁·f_min + s₂),
 //!
-//! summed over the cross partial pairs of the two notes weighted by the
-//! amplitude product B_{ij} = a_i a_j (his bass-favored variant; design
-//! note defaults #13.1), with each note normalized to equal total power.
-//! The interval is scanned by rigidly shifting the upper note's measured
-//! series — partial n moves by n df, Giordano's shift rule — over the
-//! **coincidence bracket** (the hull of the pair's beatless 2j:j widths;
-//! see [`octave_scan`]) and taking the dissonance-minimum offset.
-//!
-//! This is the perceptual layer of the tuning-curve design (§3.2): it runs
-//! **offline on stable-capture partials only**, never in the live loop, and
-//! its output feeds the octave-type calibration of engine (c) in
-//! [`super::curves`]. Scan-edge minima and starved treble spectra are
-//! excluded by the sufficiency gate (defaults #13.2) — with 3–6 partials the
-//! dissonance well is shallow or absent, an information floor of the source,
-//! not a capture flaw (§3.2, §8).
+//! summed over the two notes' cross partial pairs weighted by the amplitude
+//! product B_{ij} = a_i a_j (his bass-favored variant), each note normalized to
+//! equal total power. The upper note's measured series shifts rigidly, partial n
+//! by n·df (his shift rule), across the coincidence bracket ([`octave_scan`]).
+//! With the treble's 3–6 partials the dissonance well is shallow or absent, an
+//! information floor of the source.
 //!
 //! # References
 //! 1. N. Giordano, "Explaining the Railsback stretch in terms of the
@@ -36,11 +22,10 @@
 //! 3. W. A. Sethares, "Local consonance and the relationship between timbre
 //!    and scale", JASA 94(3):1218–1228 (1993).
 
-/// Sethares/Giordano roughness constants (Giordano Eqs. 3–4 and the
-/// accompanying text; originally Sethares 1993 Eqs. 1–4, where d* = 0.24
-/// derives from the Eq-1 fit and s₁/s₂ from his least-squares interpolation).
-/// Giordano's values, adopted verbatim (design note defaults #13.1); Gràcia &
-/// Sanz-Perela's min-loudness/b_2=5.7 variant noted there and not used.
+/// Sethares/Giordano roughness constants (Giordano Eqs. 3–4; originally Sethares
+/// 1993 Eqs. 1–4, d* = 0.24 from his Eq.-1 fit and s₁/s₂ from his least-squares
+/// interpolation), adopted verbatim. Gràcia & Sanz-Perela's b₂ = 5.7 variant,
+/// noted there, is not used.
 pub const B1: f64 = 3.5;
 /// See [`B1`].
 pub const B2: f64 = 5.75;
@@ -77,17 +62,14 @@ fn normalize_power(partials: &[(f64, f64)]) -> Option<Vec<(f64, f64)>> {
 
 /// Total sensory dissonance between two notes' partial lists
 /// (`(frequency_hz, amplitude)` pairs): amplitude-product-weighted
-/// Plomp–Levelt roughness summed over all **cross** partial pairs
+/// Plomp–Levelt roughness summed over all cross partial pairs
 /// (Giordano Eqs. 5–6, the "amplitude product" model), each note
 /// normalized to equal total power (his §VI.C).
 ///
-/// Cross pairs only is **Giordano's own construction**: his Eq. 5 sums tone
-/// 1's partials against tone 2's and explicitly omits self-dissonance as
-/// immaterial to locating a two-tone minimum (the intra-note terms exist
-/// only in Sethares' fuller 1993 Eq.-6 form). The design note (§3.2) makes
-/// the same argument quantitatively: intra-note terms are (near-)invariant
-/// under the interval scan. Giordano's ½ prefactor is dropped — a constant
-/// scale, inert for the argmin and for downstream weight ratios.
+/// Cross pairs only, as Giordano's Eq. 5: self-dissonance, in Sethares' fuller Eq. 6,
+/// is nearly invariant under the interval scan and so immaterial to its minimum.
+/// Giordano's ½ prefactor is dropped, a constant scale inert for the argmin and for
+/// weight ratios.
 pub fn dissonance(lower: &[(f64, f64)], upper: &[(f64, f64)]) -> f64 {
     let (Some(lo), Some(up)) = (normalize_power(lower), normalize_power(upper)) else {
         return 0.0;
@@ -102,31 +84,22 @@ pub fn dissonance(lower: &[(f64, f64)], upper: &[(f64, f64)]) -> f64 {
 }
 
 /// Scan step. 0.5 ¢ resolves the dissonance well far below the per-key
-/// measurement noise (§4: raw-B scatter ⇒ multi-cent octave-step noise).
+/// measurement noise (raw-B scatter ⇒ multi-cent octave-step noise).
 pub const SCAN_STEP_CENTS: f64 = 0.5;
 
-/// Margin added on both sides of the coincidence bracket, in cents.
-/// **Ours**, documented — the scan window's one remaining soft constant:
-/// the dissonance argmin is a compromise *inside* the hull of the
-/// coincident pairs' beatless widths, but non-coincident cross terms and
-/// per-key B measurement noise can perturb it slightly past the hull edge;
-/// 10 ¢ is comfortable headroom for both (the raw-B scatter's multi-cent
-/// octave-step noise, §4). A low-edge hit is compression evidence — the
-/// optimum at or below the ρ = 1 floor (§2's theorem says a real optimum
-/// cannot be there) — and a high-edge hit means the well is past every
-/// admissible octave type; the caller excludes both from the ρ fit.
+/// Margin on both sides of the coincidence bracket, in cents: headroom for the
+/// non-coincident cross terms and per-key B noise that can push the argmin just past
+/// the hull of the beatless widths.
+// Ours, sized from the measured raw-B scatter (multi-cent octave-step noise), not
+// from Giordano.
+// report 0008
 pub const SCAN_MARGIN_CENTS: f64 = 10.0;
 
-/// Largest coincident pair 2j:j admitted to the scan bracket: j ≤ 7,
-/// **derived** from the downstream consumer's own domain. The scan exists
-/// to produce ρ points for the Eq.-9 fit, whose κ search domain
-/// ([`super::rigaud::RHO_FIT_KAPPA_MAX`] = 6) can express octave
-/// types up to ρ = κ + 1 = 7. Beatless widths of pairs beyond j = 7 imply
-/// octave types the model cannot represent — and lie out where the
-/// Plomp–Levelt terms decouple (d₂ → 0 for wide separation), a regime
-/// whose shallow minima are interval-identity artifacts, not octave
-/// optima. Deep-bass notes carry pairs to j ≈ 15 whose beatless widths
-/// exceed +400 ¢; admitting them would invite exactly those artifacts.
+/// Largest coincident pair 2j:j admitted to the scan bracket: j ≤ 7, the octave
+/// types the Eq.-9 fit can express (ρ ≤ [`super::rigaud::RHO_FIT_KAPPA_MAX`] + 1).
+/// Wider pairs imply octave types the model cannot represent, out where the
+/// Plomp–Levelt terms decouple and shallow minima are artifacts; deep-bass notes
+/// carry pairs to j ≈ 15, beyond +400 ¢.
 fn max_pair_rank() -> u32 {
     super::rigaud::RHO_FIT_KAPPA_MAX as u32 + 1
 }
@@ -134,17 +107,13 @@ fn max_pair_rank() -> u32 {
 /// Result of [`octave_scan`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct OctaveScan {
-    /// Dissonance-minimal offset of the upper note from its **measured**
-    /// position, in cents (positive = retune upward). Relative to the
-    /// note as captured — not to the pure ET octave; the caller applies it
-    /// multiplicatively to the measured F₀ (both conventions scale
-    /// together, design note §1).
+    /// Dissonance-minimal offset of the upper note from its measured position, in
+    /// cents (positive retunes upward): relative to the note as captured, not to the
+    /// pure octave.
     pub offset_cents: f64,
-    /// `true` when the minimum is interior to the scan bracket. An edge hit
-    /// means no dissonance well exists inside the admissible octave-type
-    /// width range — compression evidence at the low edge, a starved or
-    /// decoupled spectrum at the high edge (design note §2, defaults
-    /// #13.2); the caller excludes the pair from the ρ fit either way.
+    /// The minimum is inside the scan bracket. An edge hit means no well within the
+    /// admissible widths: compression at the low edge, a starved or decoupled
+    /// spectrum at the high edge.
     pub interior: bool,
     /// The dissonance value at the minimum (diagnostic only).
     pub dissonance_min: f64,
@@ -152,27 +121,26 @@ pub struct OctaveScan {
 
 /// Giordano's per-octave 1-D scan: shifts the upper note's measured partial
 /// series (partial of rank n moves by n df — his §VI.C shift rule, the
-/// first-order retuning of a stiff string) across the **coincidence
-/// bracket** and returns the dissonance-minimum offset.
+/// first-order retuning of a stiff string) across the coincidence
+/// bracket and returns the dissonance-minimum offset.
 ///
 /// **Scan window (coincidence bracket).** The interval-width axis is
 /// scanned over [min, max] of the pair's beatless widths — the widths at
 /// which the coincident pairs 2j:j present in both measured lists beat out
 /// (pair 2j:j is beatless exactly at the Eq.-6 width with ρ = j;
 /// `curves::interval_width_cents(b_l, b_u, 2j, j, 12)`), j capped by
-/// [`max_pair_rank`] — extended by [`SCAN_MARGIN_CENTS`] on both sides.
+/// `max_pair_rank` — extended by [`SCAN_MARGIN_CENTS`] on both sides.
 /// Widths are computed from the pair's measured B, so the window is
-/// **mistuning-independent** (the notes' current tuning never enters) and
+/// mistuning-independent (the notes' current tuning never enters) and
 /// register-adaptive by construction: tight around the 2:1 width in the
 /// pair-starved treble, wide enough for high octave types in the bass.
 ///
 /// `lower` / `upper` are `(n, frequency_hz, amplitude)` triples of measured
 /// partials; `fb_l` / `fb_u` are the notes' `(F0_hz, B)` (flexible-string
-/// convention, design note §1) — B fixes the bracket, F0 locates the
-/// current width inside it. Returns `None` when either list is empty or
-/// carries no power, when no coincident pair exists, or on non-physical
-/// `(F0, B)`. Callers apply the sufficiency gate ([`coincident_pairs`]
-/// ≥ 8 and `interior`) before trusting the result.
+/// convention): B fixes the bracket, F0 places the current width in it. Returns
+/// `None` when either list is empty or carries no power, when no coincident pair
+/// exists, or on non-physical `(F0, B)`. A result is trustworthy only with
+/// [`coincident_pairs`] ≥ 8 and `interior`.
 pub fn octave_scan(
     lower: &[(u32, f64, f64)],
     upper: &[(u32, f64, f64)],
@@ -237,18 +205,13 @@ pub fn octave_scan(
     })
 }
 
-/// Counts the coincident 2j:j pairs available to an octave scan — pairs
-/// where the lower note's partial 2j and the upper note's partial j are
-/// both present in the measured lists. The sufficiency gate's input
-/// (design note defaults #13.2, ≥ 8 required), **derived from Giordano
-/// §VI.C** (verified against the PDF): reaching the asymptotic stretch for
-/// the A0–A1 / A1–A2 pairs "requires at least 16 partials of the lower
-/// note and 8 of the higher member", i.e. min(⌊16/2⌋, 8) = 8 coincident
-/// pairs; fewer "gives a significantly smaller predicted stretch" — a
-/// biased ρ point. His A2–A3 case converges with 6/3 (= 3 pairs); the
-/// bass-derived 8 is adopted compass-wide as the conservative floor
-/// (mid-register captures carry ≥ ~14 partials, so the stricter bound
-/// costs nothing there and correctly starves the 3–6-partial treble).
+/// Counts the coincident 2j:j pairs available to an octave scan: the lower note's
+/// partial 2j and the upper note's partial j both measured. The sufficiency gate
+/// needs 8, from Giordano §VI.C: the A0–A1 and A1–A2 stretch converges only with
+/// "at least 16 partials of the lower note and 8 of the higher member", and fewer
+/// give "a significantly smaller predicted stretch". His A2–A3 case converges with
+/// 3 pairs; the bass-derived 8 is the floor compass-wide, which costs the
+/// mid-register nothing and starves the 3–6-partial treble.
 pub fn coincident_pairs(lower: &[(u32, f64, f64)], upper: &[(u32, f64, f64)]) -> usize {
     let has_rank = |note: &[(u32, f64, f64)], n: u32| note.iter().any(|&(r, _, _)| r == n);
     let j_max = upper.iter().map(|&(r, _, _)| r).max().unwrap_or(0);
@@ -257,10 +220,9 @@ pub fn coincident_pairs(lower: &[(u32, f64, f64)], upper: &[(u32, f64, f64)]) ->
         .count()
 }
 
-/// First-order sensitivity of the Giordano dissonance functional to one
-/// cent of width error at a coincident partial pair — the design note's
-/// bridge Form 2, **derived** (§6(d)): near coincidence the pair's
-/// roughness term is a_p·a_q·d₂(Δf) with
+/// First-order sensitivity of the Giordano dissonance functional to one cent of
+/// width error at a coincident partial pair. Near coincidence the pair's roughness
+/// term is a_p·a_q·d₂(Δf) with
 ///
 /// d₂(Δf) = e^(−b₁·s·Δf) − e^(−b₂·s·Δf) ≈ (b₂ − b₁)·s·Δf
 ///
@@ -269,25 +231,18 @@ pub fn coincident_pairs(lower: &[(u32, f64, f64)], upper: &[(u32, f64, f64)]) ->
 ///
 /// ∂D/∂ε = a_p·a_q·(b₂ − b₁)·s(f̄)·f̄·ln 2/1200,  s(f̄) = x*/(s₁·f̄ + s₂).
 ///
-/// Every symbol is a published Giordano/Sethares constant
-/// ([`B1`]…[`S2`]) — zero new free parameters. `a_p`/`a_q` are the two
-/// partials' amplitudes under the equal-total-power note normalization
-/// (Giordano's, [`dissonance`]); `f_bar` is the pair's coincidence
-/// frequency in Hz. The linear regime comfortably covers the tempered
-/// targets too (b₁·s·Δf ≈ 0.02 at 2 ¢ / 500 Hz). Consumed by
-/// `curves::multi_interval` as the derived interval weight W_{m,k}.
+/// Every constant is a published Giordano/Sethares one ([`B1`]…[`S2`]), so there is
+/// no free parameter. `a_p`/`a_q` are the partials' amplitudes under the
+/// equal-total-power normalization; `f_bar` is the coincidence frequency in Hz. The
+/// linear regime covers tempered targets too (b₁·s·Δf ≈ 0.02 at 2 ¢, 500 Hz).
 pub fn pair_width_sensitivity(f_bar: f64, a_p: f64, a_q: f64) -> f64 {
     let s = X_STAR / (S1 * f_bar + S2);
     a_p * a_q * (B2 - B1) * s * f_bar * core::f64::consts::LN_2 / 1200.0
 }
 
-/// Cross partial pairs whose members are both strictly above their own
-/// note's median partial amplitude.
-///
-/// **Diagnostic only — do not gate on this.** The product over-counts: it
-/// passes 7×7-partial pairs whose coincident-pair count Giordano's §VI.C
-/// convergence analysis rejects. The sufficiency gate uses
-/// [`coincident_pairs`]; this count exists for harness reporting.
+/// Cross partial pairs whose members are both above their own note's median
+/// amplitude. A diagnostic: do not gate on it, since it passes 7×7-partial pairs
+/// that Giordano's §VI.C analysis rejects; the gate is [`coincident_pairs`].
 pub fn strong_cross_pairs(lower: &[(u32, f64, f64)], upper: &[(u32, f64, f64)]) -> usize {
     fn above_median(note: &[(u32, f64, f64)]) -> usize {
         if note.is_empty() {
@@ -370,8 +325,8 @@ mod tests {
         );
     }
 
-    /// Stiff strings (B > 0) push the optimum strictly wide — the §2
-    /// stretched-octave theorem seen through the perceptual objective.
+    /// Stiff strings (B > 0) push the optimum strictly wide — the stretched-octave
+    /// theorem seen through the perceptual objective.
     #[test]
     fn test_stiff_octave_optimum_is_stretched() {
         let b = 1.0e-3;
@@ -427,7 +382,7 @@ mod tests {
         );
     }
 
-    /// Form-2 derivation check: the closed-form ∂D/∂ε matches the finite
+    /// The closed-form ∂D/∂ε matches the finite
     /// difference of the actual pair term a_p·a_q·d₂ under a width error
     /// of ε cents, across registers.
     #[test]

@@ -1,25 +1,8 @@
-//! # Tuning-Curve Plot Widget
+//! # Tuning-curve plot
 //!
-//! Renders a [`tuner_core::models::TuningCurve`]'s d(m) — cents deviation
-//! from equal temperament per key — across the 88-key compass (strobe design
-//! note §10). One rendering, two scales:
-//!
-//! - **Full**: axes, octave gridlines, cent labels, measured-key dots, and a
-//!   cursor readout (nearest key + its target deviation). The live main-view
-//!   plot and the gallery detail view.
-//! - **Sparkline**: line + zero line only — the §9 gallery thumbnails. All
-//!   thumbnails share one y-range (passed by the gallery) so curve *shapes*
-//!   compare honestly; a per-thumbnail scale would make every engine look
-//!   alike.
-//!
-//! Either scale can also be a **key picker**: given `on_select`, a click
-//! publishes the key nearest the cursor. Display-only otherwise, which is what
-//! the thumbnails want.
-//!
-//! Colors are the dataviz reference palette's dark-mode steps, validated
-//! against the dark chart surface (series slot 1 passes the lightness band,
-//! chroma floor, and ≥3:1 contrast checks): one series per plot, so the panel
-//! title carries identity and no legend is drawn.
+//! A [`tuner_core::models::TuningCurve`]'s d(m), the cents deviation from equal
+//! temperament per key, across the 88-key compass: at full size or as a
+//! sparkline, and optionally as a key picker.
 
 use iced::advanced::text::Alignment;
 use iced::alignment::Vertical;
@@ -27,11 +10,12 @@ use iced::widget::canvas::{self, Canvas, Event, Path, Stroke};
 use iced::{Color, Element, Fill, Point, Rectangle, Renderer, Theme, mouse};
 use tuner_core::models;
 
-/// Dark chart surface (reference palette `--surface-1`, dark). Shared with
-/// the gallery (§9) so plot cards and thumbnails sit on one surface system.
+// The reference palette's dark-mode steps, checked against the dark surface for
+// lightness, chroma and ≥ 3:1 contrast. One series per plot, so no legend.
+
+/// Dark chart surface (reference palette `--surface-1`, dark).
 pub const SURFACE: Color = Color::from_rgb8(0x1a, 0x1a, 0x19);
-/// Series color — categorical slot 1, dark step. Doubles as the gallery's
-/// selected-card accent so "selected" and "the drawn curve" share identity.
+/// Series color — categorical slot 1, dark step.
 pub const SERIES: Color = Color::from_rgb8(0x39, 0x87, 0xe5);
 /// Recessive gridlines / card borders.
 pub const GRID: Color = Color::from_rgb8(0x38, 0x38, 0x35);
@@ -39,8 +23,7 @@ pub const GRID: Color = Color::from_rgb8(0x38, 0x38, 0x35);
 pub const ZERO_LINE: Color = Color::from_rgb8(0x52, 0x51, 0x4e);
 /// Secondary ink for axis labels and readouts.
 pub const INK_SECONDARY: Color = Color::from_rgb8(0xc3, 0xc2, 0xb7);
-/// Suspect-key mark — the reference palette's negative step, the only red in
-/// the plot's system.
+/// Suspect-key mark: the palette's negative step, its only red.
 pub const SUSPECT: Color = Color::from_rgb8(0xe5, 0x5c, 0x4b);
 
 /// Rendering scale of a [`CurvePlot`].
@@ -58,12 +41,11 @@ pub struct CurvePlot {
     cents: [f32; 88],
     /// Keys with a trusted measurement (drawn as dots in [`PlotMode::Full`]).
     measured: [bool; 88],
-    /// Keys whose measurement the curve doubts, from
-    /// [`crate::advisory::suspect_keys`] — a red ✗ in [`PlotMode::Full`].
+    /// Keys whose measurement the curve doubts (a red ✗ in [`PlotMode::Full`]).
     suspect: [bool; 88],
     mode: PlotMode,
-    /// Fixed y-range in cents; `None` auto-ranges from this curve's data.
-    /// The gallery passes a shared range across all thumbnails.
+    /// Fixed y-range in cents; `None` auto-ranges from this curve's data. Plots
+    /// compared side by side share one, or every curve looks alike.
     y_range: Option<(f32, f32)>,
     /// Message a click on a key publishes; `None` makes the plot display-only.
     on_select: Option<fn(u8) -> crate::Message>,
@@ -73,9 +55,7 @@ pub struct CurvePlot {
 }
 
 impl CurvePlot {
-    /// Builds a plot from a curve's cents array, its per-key measured flags,
-    /// and the keys whose measurement is suspect. Display-only until
-    /// [`Self::on_select`] is given.
+    /// Builds a display-only plot; [`Self::on_select`] makes it a picker.
     pub fn new(
         cents: [f32; 88],
         measured: [bool; 88],
@@ -121,9 +101,7 @@ impl CurvePlot {
         }
     }
 
-    /// The key nearest `pos`, or `None` outside the plot area. The x axis is
-    /// one key per 1/87th of the width, so the nearest key is the rounded
-    /// fraction — the same mapping the hover readout draws.
+    /// The key nearest `pos`, or `None` outside the plot area.
     fn key_at(&self, bounds: Rectangle, pos: Point) -> Option<u8> {
         let (left, right, _, _) = self.margins();
         if pos.x < left || pos.x > bounds.width - right {
@@ -133,9 +111,8 @@ impl CurvePlot {
         Some((((pos.x - left) / plot_w * 87.0).round() as u8).min(87))
     }
 
-    /// The y-range actually drawn: fixed if given, else auto from the finite
-    /// data — always spanning zero, padded, and never tighter than ±5 ¢ so a
-    /// flat prior-only curve still renders with headroom.
+    /// The y-range actually drawn: fixed if given, else [`auto_y_range`] of this
+    /// curve.
     fn resolved_y_range(&self) -> (f32, f32) {
         if let Some(r) = self.y_range {
             return r;
@@ -144,8 +121,9 @@ impl CurvePlot {
     }
 }
 
-/// Shared auto-range rule (also used by the gallery to build the common
-/// thumbnail range from several curves' data).
+/// The y-range a curve auto-scales to: its finite values, always spanning
+/// zero, padded by a tenth of their span (at least 1 ¢), and never tighter than
+/// ±5 ¢, so a flat prior-only curve still renders with headroom.
 pub fn auto_y_range(cents: &[f32]) -> (f32, f32) {
     let mut lo = 0.0f32;
     let mut hi = 0.0f32;
@@ -157,9 +135,8 @@ pub fn auto_y_range(cents: &[f32]) -> (f32, f32) {
     ((lo - pad).min(-5.0), (hi + pad).max(5.0))
 }
 
-/// Gridline/label step giving a handful of horizontal lines for a range.
-/// At most ~4 lines: the full plot lives in a ~240 px panel, so a denser
-/// grid collides its own 11 px labels.
+/// Gridline step for a range: at most four lines, since a denser grid collides
+/// its 11 px labels in a short panel.
 fn cent_step(span: f32) -> f32 {
     for step in [1.0, 2.0, 5.0, 10.0, 20.0, 50.0] {
         if span / step <= 4.0 {
@@ -200,9 +177,8 @@ where
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> Vec<canvas::Geometry> {
-        // The cursor readout draws inside the cached closure: widgets are
-        // rebuilt (fresh cache) every Tick in this codebase, so per-instance
-        // caching never holds a stale cursor across frames.
+        // The cursor readout is drawn inside the cache: the plot is rebuilt every
+        // tick, so the cache never holds a stale cursor.
         let geometry = self.cache.draw(renderer, bounds.size(), |frame| {
             let (full, w, h) = (self.mode == PlotMode::Full, bounds.width, bounds.height);
             let (left, right, top, bottom) = self.margins();
@@ -274,9 +250,8 @@ where
                 );
             }
 
-            // The curve. Lyon asserts on non-finite path coordinates and a
-            // canvas must never panic the app: skip bad points, breaking the
-            // line so nothing interpolates across them.
+            // Lyon asserts on non-finite path coordinates, so bad points are
+            // skipped and the line broken, not interpolated across them.
             let series = Path::new(|b| {
                 let mut pen_down = false;
                 for (k, &c) in self.cents.iter().enumerate() {
@@ -300,10 +275,8 @@ where
             );
 
             if full {
-                // Measured-key dots — same series hue: they are the same
-                // entity (the curve), accented where a measurement anchors it.
-                // A suspect key takes a red ✗ instead: the two are exclusive
-                // because a doubted measurement is not an anchor.
+                // Measured keys are dots in the series hue. A suspect key is a
+                // red ✗ instead: a doubted measurement anchors nothing.
                 for (k, &c) in self.cents.iter().enumerate() {
                     if !c.is_finite() {
                         continue;
@@ -327,9 +300,7 @@ where
                     }
                 }
 
-                // Selection marker: a ring around the point, never a fill —
-                // the point it marks may be a ✗, and the whole reason to select
-                // a key is often that ✗.
+                // The selection is a ring, never a fill: the point may be a ✗.
                 if let Some(key) = self
                     .selected
                     .filter(|&k| self.cents[k as usize].is_finite())
@@ -348,11 +319,11 @@ where
                     );
                 }
 
-                // Cursor readout: nearest key + its target deviation.
+                // Cursor readout: nearest key and its target deviation.
                 if let Some(pos) = cursor.position_in(bounds)
-                    && (left..=w - right).contains(&pos.x)
+                    && let Some(key) = self.key_at(bounds, pos)
                 {
-                    let key = (((pos.x - left) / plot_w * 87.0).round() as usize).min(87);
+                    let key = key as usize;
                     let c = self.cents[key];
                     if c.is_finite() {
                         let x = x_of(key as f32);

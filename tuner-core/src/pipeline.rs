@@ -1,26 +1,9 @@
-//! # Audio Processing Pipeline
+//! # Audio pipeline
 //!
-//! This module defines the lock-free memory structures, shared state types,
-//! and the `AudioPipeline` orchestrator for real-time continuous audio analysis.
-//!
-//! ## Architecture
-//!
-//! The pipeline follows the **Split / Handle pattern**:
-//!
-//! - [`AudioPipeline`] is moved to the audio thread. It owns and mediates all
-//!   internal pure DSP components ([`Gatekeeper`], [`Engine`], and the COLA [`CircularFifo`]).
-//!   It acts as a zero-allocation data sink via `push_audio()`, orchestrating overlapping
-//!   FFT frames transparently.
-//!
-//! - [`PipelinePorts`] is kept by the frontend (GUI, WASM, etc.): the shareable
-//!   [`PipelineHandle`] plus the Worker→UI and UI→DSP channel endpoints.
-//!
-//! ```text
-//! AudioPipeline::new() -> (AudioPipeline, PipelinePorts)
-//!       │                         │
-//!       ▼                         ▼
-//!   Audio Thread              GUI Thread
-//! ```
+//! [`AudioPipeline::new`] returns two halves. The [`AudioPipeline`] moves to the
+//! audio thread and runs the [`Gatekeeper`], the [`Engine`] and the [`Strobe`] on
+//! every hop pushed into it; the [`PipelinePorts`] stay with the frontend: the
+//! shared [`PipelineHandle`] and the frontend's end of each channel.
 
 use crossbeam_channel::{Receiver, Sender, bounded};
 use crossbeam_queue::ArrayQueue;
@@ -50,44 +33,33 @@ use crate::worker::{WorkerJob, WorkerManager, WorkerOutput};
 
 // ─── Memory Infrastructure ───────────────────────────────────────────────────
 
-// Buffer capacity for non-causal pre-roll.
-// 32,768 samples provides ~743ms of history at 44.1kHz, safely accommodating
-// the 15-frame (15,360 sample) pre-roll requirement.
+/// Raw-stream history kept for a capture's pre-roll: ≈ 743 ms, over the 15-hop
+/// pre-roll.
 const ONSET_HISTORY_SAMPLES: usize = 32768;
 
-/// Shipped fill target for a capture: 1.5 s.
-///
-/// **Do not move it without an ADR.** Every capture set the project measures
-/// against was recorded at this length (`06-capture-sets.md`), so a changed
-/// default makes new measurements incomparable with all of them. A measurement
-/// session moves the runtime target ([`ArmRequest::target_samples`]) instead,
-/// which does not touch what is analysed.
+/// Shipped fill target for a capture: 1.5 s. A session wanting longer records
+/// raises [`ArmRequest::target_samples`] instead.
+// Do not move it: every capture set was recorded at this length.
+// capture-sets.md
 pub const CAPTURE_DEFAULT_SAMPLES: usize = 3 * SAMPLE_RATE as usize / 2;
 
 /// How much of a record the Worker analyses, however long the record is.
-///
-/// Deliberately **not** defined in terms of [`CAPTURE_DEFAULT_SAMPLES`], though
-/// it holds the same value: this one is pinned to the length the capture sets
-/// were recorded at (`06-capture-sets.md`), so if the default fill ever moves,
-/// the analysed span must stay put or every new measurement silently stops
-/// being comparable with them.
+// Equal to `CAPTURE_DEFAULT_SAMPLES` but not derived from it: if the default
+// fill moves, the analysed span must not, or new measurements stop being
+// comparable with the capture sets.
 pub const CAPTURE_ANALYSIS_SAMPLES: usize = 3 * SAMPLE_RATE as usize / 2;
 
 /// Ceiling the pool allocates every buffer to, so raising the fill target never
-/// allocates on the audio thread (`03-dsp-pipeline.md`).
-///
-/// 5 s. Ours, measured (`06-capture-sets.md`): a struck string's usable record
-/// ends when it decays into the noise floor, and past that a longer window adds
-/// noise-only samples, which sharpen no line — a decaying sinusoid's frequency
-/// resolution saturates near its own decay constant. The cost is resident
-/// whatever the knob says: 8 pool buffers × 5 s × 4 B ≈ 7 MB.
+/// allocates on the audio thread. The memory is resident whatever the target:
+/// 8 buffers × 5 s × 4 B ≈ 7 MB.
+// 5 s: a struck string's record ends when it decays into the recording's noise,
+// and noise-only samples sharpen no line (a decaying sinusoid's frequency
+// resolution saturates near its own decay constant).
+// capture-sets.md
 pub const CAPTURE_MAX_SAMPLES: usize = 5 * SAMPLE_RATE as usize;
 
-/// Length of the diagnostic full-event record (pre-roll + attack + decay).
-///
-/// Fixed at 1.5 s and deliberately **not** moved by the fill-target knob: the
-/// stable record is the one that grows, and between them they cover the event
-/// from before the strike to the end of the decay.
+/// Length of the diagnostic full-event record: pre-roll, attack and decay. Fixed;
+/// a longer take grows the stable record instead.
 const FULL_EVENT_SAMPLES: usize = CAPTURE_DEFAULT_SAMPLES;
 
 /// Payload dispatched from the pipeline to the Worker thread.
@@ -100,24 +72,25 @@ pub struct CapturePayload {
     /// Only the first [`CAPTURE_ANALYSIS_SAMPLES`] are measured; the rest is
     /// stored audio.
     pub stable_sample_count: usize,
-    /// Purely diagnostic buffer containing the full acoustic event (pre-roll, strike, and decay).
-    /// This is written to disk for analysis tooling (`diagnose_engine.rs`) and is NEVER
-    /// fed back into the Engine or MAT algorithms.
+    /// The full event (pre-roll, strike and decay), written to the dump for
+    /// offline analysis and never measured.
     pub full_event_buffer: Option<Box<[f32]>>,
     /// Number of valid samples written to the full event buffer.
     pub full_event_sample_count: usize,
-    /// The target note index the UI requested, or 255 for Auto.
+    /// The key the capture is of: the named target, or in Auto the key
+    /// discovery latched.
     pub target_note: u8,
     /// Fixed sampling rate of the pipeline.
     pub sample_rate: u32,
-    /// Calibrated noise floor for the capture.
+    /// The silence threshold when the capture was dispatched.
     pub noise_floor: f32,
-    /// Highly accurate unified Goertzel seed for MAT (None if tracking failed)
+    /// The gate's NHWRSF onset threshold when the capture was dispatched.
+    pub nhwrsf_threshold: f32,
+    /// The gate's sustain-stability threshold when the capture was dispatched.
+    pub sustain_stability_threshold: f32,
+    /// The engine's partial-1 frequency, MAT's seed; `None` if tracking failed.
     pub measured_f0: Option<f32>,
-    /// Capture provenance: `true` when the key identity came from the
-    /// auto-discovery latch rather than a user-named target. Recorded on
-    /// [`crate::models::KeyMeasurement`] — the tuning curve trusts manual
-    /// captures only (ADR 0006 item 3).
+    /// The key came from discovery's latch rather than a named target.
     pub captured_in_auto: bool,
     /// The operator's string declaration, latched from the standing
     /// [`ArmRequest`] when the audio began; `None` when nothing was declared,
@@ -126,109 +99,51 @@ pub struct CapturePayload {
 }
 
 // ─── Profile Updates (Crossing #4: UI → DSP) ─────────────────────────────────
-//
-// SPSC `ringbuf` of heap-free `KeyProfileUpdate`s. The frontend pushes via
-// [`ProfileSender`]; the pipeline drains the queue and swaps templates into
-// `live_profiles` on a frame boundary. See
-// docs/internals/02-cross-thread-communication.md §4.
 
-/// **MEASURED-B DISCOVERY SEEDING — DISABLED PENDING FIX (flip to `true` to re-enable).**
-///
-/// When `true`, measured per-key inharmonicity `B` (from the persisted
-/// [`InharmonicityProfile`]) seeds the live discovery templates — at startup and on
-/// every capture/undo/load via [`ProfileSender`]. When `false`, the engine always
-/// uses the Rigaud prior for discovery (the worker still measures `B` and the UI
-/// still stores/persists/displays it — only the *discovery template* path is gated).
-///
-/// ## Why it's off
-/// The synthetic oracle-B ablation predicted a bass false-lock collapse (27%→1.5%,
-/// ADR 0006 §oracle-B). But validation on the one real instrument (2026-06-27,
-/// `test_engine_all.py --profile tuning_profile.json` over the captures) showed the
-/// **opposite**: applying the MAT-measured `B` to discovery was a net regression
-/// (74→73/87), and the highest-ratio bass keys (3/16/17 at 18–25× the prior) *broke*.
-/// Root cause (per `docs/adr/0006-...md` + `mobo-methodology.md` §8.2): on this
-/// out-of-tune upright there is **no trusted `B` reference**, and MAT appears to
-/// **over-estimate bass `B`**; the oracle was also asymmetric (only the true key got
-/// perfect `B`, whereas here impostors are boosted too). The only clean wins were
-/// *treble* keys where the prior over-estimates `B`.
-///
-/// The full pathway (conversion, crossing #4, GUI pushes) is built and tested; this
-/// flag is the single switch. **Re-enable once a second, in-tune instrument
-/// validates the measured values** (the standing gate in ADR 0006).
+/// Whether measured per-key B seeds the discovery templates. While `false`,
+/// discovery runs on the Rigaud prior; the Worker still measures B.
+// Off: measured B also sharpens the sub-harmonic impostors' templates, and no
+// regulariser separates the true bass key from them; at settings that reach the
+// real bass B it netted −2 keys. Re-open with an in-tune instrument.
+// report 0006
 pub const APPLY_MEASURED_B_TO_DISCOVERY: bool = false;
 
-/// Ring-buffer capacity for the profile-update channel.
-///
-/// One slot per piano key (88) — the upper bound for a single coherent profile
-/// refresh ([`ProfileSender::update_all`]) pushed between two DSP hops. Per-capture
-/// live updates arrive one at a time, seconds apart, so this never backs up in
-/// normal use; sizing to a full refresh means even a whole-instrument profile load
-/// is delivered without dropping a key.
+/// Ring-buffer capacity for the profile-update channel: one slot per key, so a
+/// whole-profile refresh arrives between two hops without dropping one.
 pub const PROFILE_QUEUE_CAPACITY: usize = 88;
 
-/// Ring-buffer capacity for the strobe-reference channel (UI → DSP, the
-/// second crossing-#4 instance).
-///
-/// Updates arrive only on key change / re-lock — user-rate events, orders of
-/// magnitude slower than the hop rate — and the pipeline drains to the
-/// newest update each hop (stale reference sets are worthless). Two slots
-/// absorb a same-tick change pair; on a full buffer the UI simply re-sends
-/// next tick.
+/// Ring-buffer capacity for the strobe-reference channel (UI → DSP, crossing #4).
+/// The pipeline keeps only each hop's newest update; two slots absorb a
+/// same-tick pair.
 pub const STROBE_REF_QUEUE_CAPACITY: usize = 2;
 
-/// Ring-buffer capacity for the capture-command channel (UI → DSP, the third
-/// crossing-#4 instance).
-///
-/// Commands are operator actions — an arm, a cancel, a changed declaration —
-/// so they arrive orders of magnitude slower than the hop rate, and the
-/// pipeline drains to the newest each hop. Two slots absorb a same-tick pair;
-/// on a full buffer the caller re-sends next tick.
+/// Ring-buffer capacity for the capture-command channel (UI → DSP, crossing #4).
+/// The pipeline keeps only each hop's newest command; two slots absorb a
+/// same-tick pair.
 pub const CAPTURE_COMMAND_QUEUE_CAPACITY: usize = 2;
 
 /// Capacity of the capture-dispatch channel (DSP → Worker, crossing #5).
-///
-/// The real backpressure ceiling is the [`AudioPool`]
-/// ([`AUDIO_POOL_CAPACITY`]); this channel is subordinate.
-/// Captures are serialised at the source (a note is held ~1.5 s and the worker
-/// finishes well within that), so at most one capture is genuinely in flight.
-/// Two = one being processed + one just-completed slot before the `try_send`
-/// backpressure path (`Recording → Armed` recovery) trips.
+/// Captures are serialised at the source, so at most one is in flight; the
+/// second slot holds a just-completed one before `try_send` backpressure trips.
+/// The pool, not this channel, is the real ceiling.
 pub const CAPTURE_QUEUE_CAPACITY: usize = 2;
 
-/// Capacity of the worker-result channel (Worker → UI, crossing #5).
-///
-/// The UI drains it every ~16 ms (60 FPS) and the worker `try_send`s (dropping
-/// on full — a lost result is only a missed display update, recoverable by
-/// re-capture). Four is generous slack over the ≤ 1 result the serialised
-/// capture cadence can leave pending, so a drop is effectively impossible. The
-/// channel is shared with the curve-bundle result ([`WorkerOutput`]), but
-/// bundles are coalesced and infrequent (one per settled edit), so four still
-/// holds for the combined traffic.
+/// Capacity of the worker-result channel (Worker → UI, crossing #5), shared by
+/// measurements and curve bundles. The Worker drops a result on a full channel,
+/// which costs a re-capture; four is ample for a consumer that drains every tick.
 pub const WORKER_RESULT_QUEUE_CAPACITY: usize = 4;
 
-/// Capacity of the worker-job channel (UI → Worker, crossing #6).
-///
-/// Latest-wins: a queued job superseded by a newer profile edit is worthless,
-/// so a single slot suffices — the UI re-requests from its `curve_dirty` flag
-/// if a send finds the slot full, and the worker coalesces to the newest job
-/// on receipt. One in-flight compute + this one pending slot is the whole
-/// pipeline depth a curve recompute ever needs.
+/// Capacity of the worker-job channel (UI → Worker, crossing #6). One slot: a
+/// superseded job is worthless, and the Worker coalesces to the newest.
 pub const WORKER_JOB_QUEUE_CAPACITY: usize = 1;
 
-/// Buffers the [`AudioPool`] holds, sized so a `pop` can never fail.
-///
-/// Starvation is silent — `pop` returning `None` means the capture simply never
-/// starts, with nothing on screen to say so — so the pool is sized to the worst
-/// case rather than the expected one. A capture borrows **two** buffers (the
-/// stable record and the full-event diagnostic), and three can be outstanding
-/// at once: one filling in the pipeline, [`CAPTURE_QUEUE_CAPACITY`] queued for
-/// the worker, and one the worker is processing.
+/// Buffers the [`AudioPool`] holds, sized for the worst case because starvation
+/// is silent: the capture just never starts. A capture borrows two, and one can
+/// be filling, [`CAPTURE_QUEUE_CAPACITY`] queued and one with the Worker.
 pub const AUDIO_POOL_CAPACITY: usize = 2 * (1 + CAPTURE_QUEUE_CAPACITY + 1);
 
-/// A single key's recompiled discovery template, in transit UI → DSP (crossing #4).
-///
-/// Heap-free (`KeyProfile` is `{f32, f32, [f32; MAX_PARTIALS], usize}`), so it is
-/// legal across the real-time boundary.
+/// One key's recompiled discovery template, in transit UI → DSP (crossing #4).
+/// Heap-free, so it may cross to the audio thread.
 pub struct KeyProfileUpdate {
     /// 0–87 piano key index whose template this replaces.
     pub key_index: u8,
@@ -236,23 +151,15 @@ pub struct KeyProfileUpdate {
     pub profile: KeyProfile,
 }
 
-/// Frontend-side producer for the profile-update channel (crossing #4). Lives in
-/// [`HostHandle`](crate::audio::HostHandle) and hides the `ringbuf` producer.
+/// The frontend's producer for the profile-update channel (crossing #4).
 pub struct ProfileSender {
     tx: HeapProd<KeyProfileUpdate>,
 }
 
 impl ProfileSender {
-    /// Pushes the authoritative template for one key to the DSP thread.
-    ///
-    /// Pass the key's current [`KeyMeasurement`] (from the UI's `InharmonicityProfile`)
-    /// or `None`. A valid measured `B` yields a measured template; otherwise the key
-    /// is reset to its Rigaud-prior template — so undoing a capture cleanly reverts
-    /// the live engine. A full ring buffer drops the update (the next capture
-    /// re-sends, and startup-load reconciles), so this never blocks the UI.
+    /// Pushes one key's template to the DSP thread: from `measurement`'s B when it
+    /// is valid, else the Rigaud prior. Never blocks; a full ring drops the update.
     pub fn update_key_profile(&mut self, key_index: u8, measurement: Option<&KeyMeasurement>) {
-        // Gated: measured B regresses discovery on the one validated instrument.
-        // See `APPLY_MEASURED_B_TO_DISCOVERY`. No-op keeps the engine on the prior.
         if !APPLY_MEASURED_B_TO_DISCOVERY {
             return;
         }
@@ -265,7 +172,6 @@ impl ProfileSender {
     /// Pushes the whole instrument's templates (e.g. a mid-session profile load):
     /// every key is set from its measurement when present, else its prior.
     pub fn update_all(&mut self, profile: &InharmonicityProfile) {
-        // See `APPLY_MEASURED_B_TO_DISCOVERY` — gated pending a second instrument.
         if !APPLY_MEASURED_B_TO_DISCOVERY {
             return;
         }
@@ -275,47 +181,35 @@ impl ProfileSender {
     }
 }
 
-/// Frontend-side producer for the strobe-reference channel (the second
-/// crossing-#4 instance: grouped UI → DSP parameters applied on a frame
-/// boundary). Lives in [`HostHandle`](crate::audio::HostHandle) and hides
-/// the `ringbuf` producer.
+/// The frontend's producer for the strobe-reference channel (crossing #4).
 pub struct StrobeSender {
     tx: HeapProd<StrobeRefUpdate>,
 }
 
 impl StrobeSender {
-    /// Pushes a new reference set for the strobe (key change /
-    /// re-lock; `count: 0` clears the strobe). Returns `false` when the ring
-    /// is full — the caller re-sends on its next tick, the same retry
-    /// pattern as the curve-job dirty flag.
+    /// Pushes a new reference set for the strobe; `count: 0` clears it. Returns
+    /// `false` when the ring is full.
     pub fn set_refs(&mut self, update: StrobeRefUpdate) -> bool {
         self.tx.try_push(update).is_ok()
     }
 }
 
-/// Frontend-side producer for the capture-command channel (the third
-/// crossing-#4 instance). Lives in [`HostHandle`](crate::audio::HostHandle)
-/// and hides the `ringbuf` producer.
+/// The frontend's producer for the capture-command channel (crossing #4).
 pub struct CaptureSender {
     tx: HeapProd<CaptureCommand>,
 }
 
 impl CaptureSender {
     /// Pushes one capture-lifecycle command to the DSP thread. Returns `false`
-    /// when the ring is full — the caller re-sends on its next tick, the same
-    /// retry pattern as [`StrobeSender::set_refs`].
+    /// when the ring is full.
     pub fn send(&mut self, command: CaptureCommand) -> bool {
         self.tx.try_push(command).is_ok()
     }
 }
 
 /// Where the capture lifecycle stands: Idle → Armed → Recording → Processing
-/// → Idle.
-///
-/// Owned by [`AudioPipeline`], which makes every transition; a consumer reads
-/// it off [`FrameOutput`] and asks for one with a [`CaptureCommand`]. The end
-/// of `Processing` is the exception it cannot see for itself — the Worker
-/// signals that by clearing [`PipelineAtomics::capture_in_flight`].
+/// → Idle. The pipeline makes every transition; the Worker ends `Processing` by
+/// clearing `capture_in_flight`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CaptureState {
     /// Nothing pending.
@@ -330,7 +224,7 @@ pub enum CaptureState {
 }
 
 /// What a [`CaptureCommand::Arm`] asks the next record to be: how long it
-/// fills for, and what it is *of*. Heap-free and `Copy`.
+/// fills for, and what it is of. Heap-free and `Copy`.
 #[derive(Debug, Clone, Copy)]
 pub struct ArmRequest {
     /// Samples to fill to. Clamped into `HOP_SIZE..=CAPTURE_MAX_SAMPLES` on
@@ -354,25 +248,18 @@ impl Default for ArmRequest {
 /// Heap-free and `Copy`.
 #[derive(Debug, Clone, Copy)]
 pub enum CaptureCommand {
-    /// Arm for one record, and state what that record will be.
-    ///
-    /// Arriving while already `Armed` it updates the request and moves
-    /// nothing, so the last `Arm` before the strike is the one the record
-    /// carries — a sender may restate a changed request without re-arming.
+    /// Arm for one record, and state what that record will be. While `Armed` it
+    /// only updates the request, so the last `Arm` before the strike is the one
+    /// the record carries.
     Arm(ArmRequest),
-    /// Drop what is pending: disarms from `Armed`, and drops the take in
-    /// progress from `Recording`. Nothing dispatched, so neither the profile
-    /// nor the disk sees it.
+    /// Disarms from `Armed`, and drops the take in progress from `Recording`;
+    /// nothing is dispatched.
     Cancel,
 }
 
-/// What the recording in progress is: the request that armed it, plus the key
-/// that stood when the string was struck.
-///
-/// `target_note` is sampled at `Armed → Recording` rather than read at
-/// dispatch, because a record can run for seconds: by the end the operator may
-/// have selected the next key, and reading it then would file the record under
-/// a later moment.
+/// What the recording in progress is: the request that armed it, and the key
+/// selected when the string was struck. Sampled at `Armed → Recording`, since
+/// by dispatch, seconds later, the operator may have selected the next key.
 struct CaptureLatch {
     /// The request in force when the audio began, already clamped.
     request: ArmRequest,
@@ -389,43 +276,25 @@ impl Default for CaptureLatch {
     }
 }
 
-/// A lock-free Object Pool for audio captures.
-///
-/// Thread 2 (The Brains) borrows a pre-allocated buffer from this pool when the
-/// Gatekeeper triggers. Once filled to the current fill target, the buffer is
-/// dispatched to Thread 3 (Background Worker) for heavy DSP (like inharmonicity
-/// mapping). Thread 3 returns it to the pool when finished.
-///
-/// Every buffer is [`CAPTURE_MAX_SAMPLES`] long regardless of the target, so a
-/// changed target never allocates on the audio thread.
+/// A lock-free pool of capture buffers: the pipeline borrows one for a record
+/// and the Worker returns it. Every buffer is [`CAPTURE_MAX_SAMPLES`] long, so a
+/// changed fill target never allocates on the audio thread.
 pub type AudioPool = ArrayQueue<Box<[f32]>>;
 
-/// Thread-Local Scratch Buffers for Thread 2 (The F0 Engine).
-///
-/// This structure holds statically-sized, pre-allocated working arrays.
-/// It is meant to be owned by Thread 2 and reused every frame to perform
-/// continuous fundamental frequency ($f_0$) detection without ever calling
-/// `Vec::new()` or `Vec::push()`.
+/// The analysis thread's per-hop buffers, allocated once and reused, so a hop
+/// never allocates.
 pub struct ProcessingFrame {
-    /// Holds the raw linear audio samples popped from the Elastic Ring Buffer.
-    /// Needs to be up to 8192 samples to support the Bass Engine.
+    /// The hop's window of raw samples, [`BASS_WINDOW_SIZE`] long, newest last.
     pub audio_buffer: Box<[f32]>,
-
-    /// A generic time-domain working space (e.g., for the YIN difference function).
-    /// Size matches the audio_buffer (8192) to accommodate the Bass Engine.
+    /// Time-domain scratch for windowing before the FFT.
     pub time_buffer: Box<[f32]>,
-
-    /// A frequency-domain working space for in-place FFT operations.
-    /// The Scout and Treble Engines use 2048-sample windows.
+    /// The [`WINDOW_SIZE`] FFT of the newest samples.
     pub frequency_buffer: Box<[Complex<f32>]>,
-
-    /// High-resolution frequency-domain buffer strictly for the 8192-point Bass TWM.
+    /// The [`BASS_WINDOW_SIZE`] FFT of the whole window.
     pub bass_frequency_buffer: Box<[Complex<f32>]>,
-
-    /// Pre-allocated 1024-bin magnitude scratch buffer for Stage 1 (and the GUI spectrogram).
+    /// Magnitudes of `frequency_buffer`.
     pub treble_magnitude_buffer: Box<[f32]>,
-
-    /// Pre-allocated 4096-bin magnitude scratch buffer strictly for Stage 2 (Bass localization)
+    /// Magnitudes of `bass_frequency_buffer`.
     pub bass_magnitude_buffer: Box<[f32]>,
 }
 
@@ -436,8 +305,7 @@ impl Default for ProcessingFrame {
 }
 
 impl ProcessingFrame {
-    /// Instantiates a new ProcessingFrame, zeroing out all internal arrays.
-    /// This should be called **once** during application startup/thread initialization.
+    /// Zeroed buffers, allocated once at startup.
     pub fn new() -> Self {
         Self {
             audio_buffer: vec![0.0; BASS_WINDOW_SIZE].into_boxed_slice(),
@@ -485,62 +353,42 @@ pub fn store_option_f32(atom: &AtomicU32, val: Option<f32>) {
     atom.store(bits, Ordering::Relaxed);
 }
 
-/// UI-editable configuration parameters. The audio thread reads only.
-///
-/// Each field is an individual [`AtomicU32`] or [`AtomicU8`] — wait-free reads with zero
-/// risk of priority inversion or lock contention.
+/// Parameters a frontend writes and the audio thread only reads, each its own
+/// atomic.
 pub struct ConfigAtomics {
-    /// Minimum RMS amplitude required to exit the `Silence` state.
+    /// Minimum RMS amplitude required to leave `Silence`.
     pub silence_threshold: AtomicU32,
-    /// NHWRSF threshold required to declare a new transient note event.
+    /// NHWRSF above which a frame is an onset.
     pub nhwrsf_threshold: AtomicU32,
-    /// NINOS2 threshold required to declare a stable harmonic sustain.
-    pub ninos2_stability_threshold: AtomicU32,
-    /// Pre-calculated base inharmonicity metric. `NaN` = `None`.
-    pub inharmonicity_b: AtomicU32,
-    /// GUI → Pipeline: Unison target selection. Indicates the 0-87 key index
-    /// the user currently has selected in the UI. 255 represents 'Auto'.
+    /// Sustain stability above which the signal counts as stable.
+    pub sustain_stability_threshold: AtomicU32,
+    /// The nominated key (0–87), or 255 for none.
     pub target_note: AtomicU8,
 }
 
-/// Audio-thread-owned runtime observations. Framework consumers read only.
-///
-/// Updated by the pipeline after each frame. Framework consumers can poll these
-/// atomics from multiple independent threads simultaneously without breaking the
-/// SPSC constraint of the primary `FrameOutput` triple buffer.
+/// Observations the audio thread writes each hop, readable from any number of
+/// threads (the `FrameOutput` buffer has a single reader).
 pub struct RuntimeAtomics {
-    /// The current smoothed RMS amplitude (Exponential Moving Average).
+    /// Smoothed RMS amplitude.
     pub current_rms_ema: AtomicU32,
-    /// The current signal flux.
+    /// Spectral flux.
     pub current_nhwrsf: AtomicU32,
 }
 
-/// Combined wait-free shared state between the DSP thread and the GUI thread.
-///
-/// Shared via `Arc<PipelineAtomics>` — both threads get a cheap clone.
-/// All operations are `Ordering::Relaxed` — sufficient for independent
-/// scalar parameters that are not part of a happens-before chain.
+/// The wait-free state the DSP thread and a frontend share. `Ordering::Relaxed`
+/// throughout: the scalars are independent, with no happens-before chain.
 pub struct PipelineAtomics {
-    /// UI → DSP: configuration parameters (silence threshold, target key, etc.).
+    /// UI → DSP parameters.
     pub config: ConfigAtomics,
-    /// DSP → UI/Consumers: runtime observations (RMS, NHWRSF).
+    /// DSP → UI observations.
     pub runtime: RuntimeAtomics,
-    /// UI → DSP: shutdown signal. The audio thread checks this every loop iteration.
+    /// UI → DSP: shutdown, checked every loop iteration.
     pub shutdown: AtomicBool,
-    /// Worker → DSP: a dispatched capture is still with the Worker.
-    ///
-    /// The only scalar that travels this way, and the pipeline's one blind
-    /// spot — it knows when it handed a capture over but not when the Worker
-    /// finished. Set by the pipeline as it dispatches, cleared by the Worker
-    /// once it has recycled the buffers, which is what returns the lifecycle
-    /// to [`CaptureState::Idle`].
-    ///
-    /// Needs no `compare_exchange`: the pipeline holds `Processing` until it
-    /// reads this clear, so a second capture cannot be dispatched while one is
-    /// outstanding and the two writers strictly alternate.
-    ///
-    /// Internal to the pipeline ↔ Worker pair; a frontend reads the lifecycle
-    /// off [`FrameOutput::capture_state`](crate::FrameOutput::capture_state).
+    /// Worker → DSP: a dispatched capture is still with the Worker. Set by the
+    /// pipeline as it dispatches, and cleared by the Worker once the buffers are
+    /// back, which returns the lifecycle to Idle.
+    // No `compare_exchange` needed: the pipeline holds `Processing` until it
+    // reads the flag clear, so the two writers strictly alternate.
     pub(crate) capture_in_flight: AtomicBool,
 }
 
@@ -550,9 +398,8 @@ impl Default for PipelineAtomics {
             config: ConfigAtomics {
                 silence_threshold: AtomicU32::new(0.005_f32.to_bits()),
                 nhwrsf_threshold: AtomicU32::new(0.9_f32.to_bits()),
-                ninos2_stability_threshold: AtomicU32::new(10.0_f32.to_bits()),
-                inharmonicity_b: AtomicU32::new(f32::NAN.to_bits()),
-                target_note: AtomicU8::new(255), // Default to Auto
+                sustain_stability_threshold: AtomicU32::new(10.0_f32.to_bits()),
+                target_note: AtomicU8::new(255), // No key nominated
             },
             runtime: RuntimeAtomics {
                 current_rms_ema: AtomicU32::new(0.0_f32.to_bits()),
@@ -566,77 +413,56 @@ impl Default for PipelineAtomics {
 
 // ─── AudioPipeline (Mediator) ────────────────────────────────────────────────
 
-/// The orchestrator that coordinates all DSP components on the audio thread.
-///
-/// `AudioPipeline` owns the pure DSP components (like [`Gatekeeper`]) and
-/// reads/writes the shared [`PipelineAtomics`] for parameter and observation
-/// exchange with the frontend.
-///
-/// Created via [`AudioPipeline::new()`].
+/// The audio thread's half of the pipeline: it owns the DSP components and
+/// exchanges parameters and observations with a frontend through
+/// [`PipelineAtomics`].
 pub struct AudioPipeline {
-    /// The Gatekeeper — pure DSP, evaluates signal stability.
+    /// The signal validator.
     pub gatekeeper: Gatekeeper,
-    /// The Engine — F0 detection chain
+    /// The fundamental-frequency engine.
     pub engine: Engine,
-
-    /// Live per-key discovery templates, lent to `engine.process` each frame.
-    /// Allocated once; updated in place by draining `profile_rx`.
+    /// Live per-key discovery templates, updated in place from `profile_rx`.
     live_profiles: Box<[KeyProfile; 88]>,
-    /// Crossing #4 consumer for template updates; drained into `live_profiles`.
+    /// Crossing #4 consumer for template updates.
     profile_rx: HeapCons<KeyProfileUpdate>,
-    /// The strobe phase-comparator (Path A) — runs every hop while
-    /// references are set, independent of the engine's note lock.
+    /// The strobe bank, which runs every hop while references are set, whatever
+    /// the engine's lock.
     strobe: Strobe,
-    /// Crossing-#4-instance consumer for strobe reference updates; drained
-    /// (newest wins) into the strobe each hop.
+    /// Crossing #4 consumer for strobe reference updates.
     strobe_rx: HeapCons<StrobeRefUpdate>,
-    /// Crossing-#4-instance consumer for capture-lifecycle commands; drained
-    /// (newest wins) at step 0 and applied at step 6.
+    /// Crossing #4 consumer for capture-lifecycle commands.
     command_rx: HeapCons<CaptureCommand>,
-
-    // Wait-free shared state
     atomics: Arc<PipelineAtomics>,
-
-    // Memory infrastructure
-    #[allow(dead_code)] // To be utilized upon full implementation
     audio_pool: Arc<AudioPool>,
-
-    // Internal COLA State
     cola: CircularFifo,
     fft_instance: Arc<dyn RealToComplex<f32>>,
     fft_bass_instance: Arc<dyn RealToComplex<f32>>,
     processing_frame: ProcessingFrame,
-
-    // Worker Thread Dispatch
     pub capture_tx: Sender<CapturePayload>,
-
-    // Capture Accumulation State
-    /// Where the lifecycle stands. Owned outright — every transition is made
-    /// here, so an out-of-sequence one has no code path to come from.
+    /// Where the lifecycle stands. Every transition is made here, so an
+    /// out-of-sequence one has no code path to come from.
     capture_state: CaptureState,
     capture_buffer: Option<Box<[f32]>>,
     capture_count: usize,
     /// This hop's capture command, drained at step 0 and consumed at step 6 —
     /// so an arm can start a record on the hop it arrives.
     pending_command: Option<CaptureCommand>,
-    /// What the *next* record will be: the standing [`CaptureCommand::Arm`],
+    /// What the next record will be: the standing [`CaptureCommand::Arm`],
     /// already clamped. Latched at `Armed → Recording`.
     arm: ArmRequest,
     /// What the recording in progress is, sampled at `Armed → Recording`.
     latch: CaptureLatch,
-    /// Parallel accumulator for the diagnostic `full_event_buffer`.
     full_event_buffer: Option<Box<[f32]>>,
     full_event_count: usize,
-    /// Continuous circular history of the raw audio stream.
-    /// Maintained strictly to provide non-causal pre-roll for diagnostic captures.
+    /// Circular history of the raw stream, for a diagnostic capture's pre-roll.
     history_buffer: Box<[f32; ONSET_HISTORY_SAMPLES]>,
     history_idx: usize,
-    /// Latches 'true' when a new onset is detected while Armed.
-    /// Reset to 'false' upon capture start or Silence.
+    /// An onset arrived while Armed; cleared when a record starts or on silence.
     capture_onset_pending: bool,
-    /// Latched fundamental frequency for Auto-Mode dispatch validation
+    /// The key discovery latched during the record: what an Auto capture is
+    /// filed under.
     latched_auto_key: Option<u8>,
-    /// Last measured physical frequency from the Engine
+    /// The engine's last partial-1 frequency.
     pub last_measured_f0: Option<f32>,
 }
 
@@ -644,8 +470,7 @@ pub struct AudioPipeline {
 /// wait-free config writes and runtime reads. Cloneable.
 #[derive(Clone)]
 pub struct PipelineHandle {
-    /// Shared atomic state — the frontend reads runtime observations and
-    /// writes configuration parameters.
+    /// The shared atomic state.
     pub atomics: Arc<PipelineAtomics>,
 }
 
@@ -669,10 +494,8 @@ impl std::fmt::Debug for PipelineHandle {
     }
 }
 
-/// The frontend's side of the **Split / Handle** pattern: everything
-/// [`AudioPipeline::new()`] hands back when the pipeline itself is moved to the
-/// audio thread. Transient — `spawn_analysis_thread` immediately distributes these
-/// into a [`HostHandle`](crate::audio::HostHandle).
+/// The frontend's end of every channel, returned by [`AudioPipeline::new`] beside
+/// the pipeline.
 pub struct PipelinePorts {
     /// Shareable atomic config/runtime view (crossing #3).
     pub handle: PipelineHandle,
@@ -693,24 +516,13 @@ pub struct PipelinePorts {
 }
 
 impl AudioPipeline {
-    /// Creates a new AudioPipeline and the frontend's [`PipelinePorts`].
-    ///
-    /// This follows the **Split / Handle pattern**: the `AudioPipeline` is moved to
-    /// the audio thread; the `PipelinePorts` (atomics handle + worker receiver +
-    /// profile producer) are kept by the frontend. `spawn_analysis_thread`
-    /// distributes the ports into a [`HostHandle`](crate::audio::HostHandle).
-    ///
-    /// Startup also seeds the live templates from a persisted
-    /// [`InharmonicityProfile`] at [`PROFILE_PATH`] — but only when
-    /// [`APPLY_MEASURED_B_TO_DISCOVERY`] is enabled. It is `false` by default
-    /// (see that flag), so the engine runs on the Rigaud prior.
-    ///
-    /// # Returns
-    /// `(AudioPipeline, PipelinePorts)`.
+    /// Creates the pipeline, to move to the audio thread, and the frontend's
+    /// [`PipelinePorts`], and starts the Worker. `dump_dir` is where the Worker
+    /// writes capture dumps; `None` writes none. With
+    /// [`APPLY_MEASURED_B_TO_DISCOVERY`] on, it also seeds the templates from the
+    /// profile at [`PROFILE_PATH`].
     pub fn new(dump_dir: Option<PathBuf>) -> (Self, PipelinePorts) {
         let audio_pool = Arc::new(ArrayQueue::new(AUDIO_POOL_CAPACITY));
-        // Every buffer takes the ceiling, not the current fill target: the
-        // target is a runtime knob and the audio thread allocates nothing.
         for _ in 0..AUDIO_POOL_CAPACITY {
             let _ = audio_pool.push(vec![0.0; CAPTURE_MAX_SAMPLES].into_boxed_slice());
         }
@@ -718,11 +530,8 @@ impl AudioPipeline {
         let atomics = Arc::new(PipelineAtomics::default());
 
         let gatekeeper = Gatekeeper::new();
-        let engine = Engine::new(44100);
+        let engine = Engine::new(SAMPLE_RATE);
 
-        // Rigaud prior by default. When the measured-B path is enabled (see
-        // `APPLY_MEASURED_B_TO_DISCOVERY`), a persisted profile seeds measured keys
-        // here so a calibrated instrument is live on frame one.
         let mut live_profiles = build_default_profiles();
         if APPLY_MEASURED_B_TO_DISCOVERY
             && let Ok(profile) = InharmonicityProfile::from_file(PROFILE_PATH)
@@ -819,10 +628,8 @@ impl AudioPipeline {
         (pipeline, ports)
     }
 
-    /// Pushes new raw audio samples directly into the internal COLA FIFO.
-    ///
-    /// Returns `Some` containing the DSP results IF a full hop boundary was reached.
-    /// The returned `FrameOutput` is a fixed-size struct ready for the triple buffer.
+    /// Pushes raw samples into the pipeline, returning the hop's [`FrameOutput`]
+    /// when a hop completes.
     pub fn push_audio(&mut self, samples: &[f32]) -> Option<FrameOutput> {
         self.cola.push_samples(samples);
 
@@ -849,20 +656,17 @@ impl AudioPipeline {
         self.latched_auto_key = None;
     }
 
-    /// Internal helper that processes a single hop of audio data pulled from the COLA.
+    /// Processes one hop of the COLA buffer.
     fn process_cola_hop(&mut self) -> Option<FrameOutput> {
         // ─── Step 0: Drain Profile Updates (Crossing #4) ───
-        // Apply any measured-B templates the UI pushed since the last hop, before
-        // discovery runs this frame. `try_pop` is wait-free and the swap is a plain
-        // move into the pre-allocated array — no allocation on the audio thread.
+        // A plain move into the pre-allocated table: no allocation.
         while let Some(update) = self.profile_rx.try_pop() {
             if let Some(slot) = self.live_profiles.get_mut(update.key_index as usize) {
                 *slot = update.profile;
             }
         }
 
-        // Strobe references: drain to the newest update — a superseded
-        // reference set is worthless (the key changed again mid-hop).
+        // Strobe references: only the newest update matters.
         let mut strobe_update = None;
         while let Some(update) = self.strobe_rx.try_pop() {
             strobe_update = Some(update);
@@ -871,24 +675,19 @@ impl AudioPipeline {
             self.strobe.retarget(update);
         }
 
-        // Capture commands: likewise the newest, because a command supersedes
-        // the one before it — an `Arm` then a `Cancel` leaves nothing armed,
-        // and the reverse order arms. Applied at step 6, where the lifecycle
-        // it drives lives.
+        // Capture commands: the newest supersedes the rest. Applied at step 6.
         while let Some(command) = self.command_rx.try_pop() {
             self.pending_command = Some(command);
         }
 
         // ─── Step 1: COLA & Windowing ───
 
-        // Read the FULL history of audio out of the sliding queue
         self.cola.read_window(
             BASS_WINDOW_SIZE,
             &mut self.processing_frame.audio_buffer[..BASS_WINDOW_SIZE],
         );
 
-        // Populate the frame's generic frequency buffer in place
-        // The newest WINDOW_SIZE samples are at the END of the buffer
+        // The newest WINDOW_SIZE samples are at the end of the buffer.
         let newest_start = BASS_WINDOW_SIZE - WINDOW_SIZE;
         spectral::fft(
             &self.processing_frame.audio_buffer[newest_start..BASS_WINDOW_SIZE],
@@ -908,9 +707,8 @@ impl AudioPipeline {
 
         self.cola.acknowledge_hop(HOP_SIZE);
 
-        // --- Synchronous History Accumulator ---
-        // Perfectly aligned with the DSP clock to prevent OS buffer chunk misalignment
-        // Placed AFTER read_window() so the audio_buffer contains the freshest data
+        // The pre-roll history takes the hop's newest samples, so it follows the
+        // DSP clock rather than the driver's chunks.
         let start_idx = BASS_WINDOW_SIZE - HOP_SIZE;
         let new_samples = &self.processing_frame.audio_buffer[start_idx..BASS_WINDOW_SIZE];
         for &s in new_samples {
@@ -922,24 +720,22 @@ impl AudioPipeline {
 
         self.gatekeeper.config.silence_threshold = load_f32(&self.atomics.config.silence_threshold);
         self.gatekeeper.config.nhwrsf_threshold = load_f32(&self.atomics.config.nhwrsf_threshold);
-        self.gatekeeper.config.ninos2_stability_threshold =
-            load_f32(&self.atomics.config.ninos2_stability_threshold);
+        self.gatekeeper.config.sustain_stability_threshold =
+            load_f32(&self.atomics.config.sustain_stability_threshold);
         self.engine.noise_floor = load_f32(&self.atomics.config.silence_threshold);
 
         let target_note = match self.atomics.config.target_note.load(Ordering::Relaxed) {
             255 => None,
-            val if val < 88 => Some(val), // Bounds Safety
+            val if val < 88 => Some(val),
             _ => None,
         };
 
         // ─── Step 3: Signal Gating (Gatekeeper) ───
 
-        // Pure DSP — Gatekeeper evaluates signal stability and returns result
         let gate_result = self.gatekeeper.process_frame(&self.processing_frame);
         let is_silence = gate_result.state == SignalState::Silence;
         let is_stable = gate_result.state == SignalState::Stable;
 
-        // Sync runtime observations to shared atomics for framework consumers
         store_f32(&self.atomics.runtime.current_rms_ema, gate_result.rms_ema);
         store_f32(&self.atomics.runtime.current_nhwrsf, gate_result.nhwrsf);
 
@@ -1012,8 +808,6 @@ impl AudioPipeline {
                     }
                 }
                 CaptureCommand::Cancel => {
-                    // One command for both: disarming before the strike, and
-                    // dropping the take in progress.
                     if matches!(
                         self.capture_state,
                         CaptureState::Armed | CaptureState::Recording
@@ -1027,7 +821,7 @@ impl AudioPipeline {
 
         if gate_result.state == SignalState::Silence {
             self.capture_onset_pending = false;
-            // Proactively recover diagnostic buffer on false transients
+            // A false transient's diagnostic buffer goes back to the pool.
             if self.capture_state == CaptureState::Armed {
                 if let Some(dbuf) = self.full_event_buffer.take() {
                     let _ = self.audio_pool.push(dbuf);
@@ -1036,18 +830,19 @@ impl AudioPipeline {
             }
         }
 
-        // ─── MUST Split the original else-if chain into two if blocks here ───
+        // Two `if`s, not `else if`: a capture that starts recording here must
+        // record this same hop in the `Recording` block below.
 
         if self.capture_state == CaptureState::Armed {
             if gate_result.is_new_onset {
                 self.capture_onset_pending = true;
-                // Prevent memory leak if an old diagnostic buffer was abandoned (e.g. decayed to silence)
+                // An abandoned diagnostic buffer goes back to the pool first.
                 if let Some(old_buf) = self.full_event_buffer.take() {
                     let _ = self.audio_pool.push(old_buf);
                 }
-                self.full_event_count = 0; // Unconditionally reset stale state
+                self.full_event_count = 0;
 
-                // Grab non-causal pre-roll from history for the diagnostic buffer
+                // Pre-roll from the history.
                 if let Some(mut buf) = self.audio_pool.pop() {
                     let pre_roll_samples = 15 * HOP_SIZE; // 15360 samples (~348ms)
                     let hist_len = self.history_buffer.len();
@@ -1076,10 +871,8 @@ impl AudioPipeline {
             }
         }
 
-        // --- Diagnostic Accumulator ---
-        // Accumulate the full event buffer globally. This runs unconditionally
-        // AFTER the initialization block to ensure the very first frame of the onset is captured seamlessly.
-        // This audio is solely for CLI diagnostics and is isolated from the live Engine.
+        // The diagnostic record, after the block above so it includes the
+        // onset's first hop.
         if let Some(mut buf) = self.full_event_buffer.take() {
             let start_idx = BASS_WINDOW_SIZE - HOP_SIZE;
             let src_slice = &self.processing_frame.audio_buffer[start_idx..BASS_WINDOW_SIZE];
@@ -1134,13 +927,17 @@ impl AudioPipeline {
                             full_event_buffer: self.full_event_buffer.take(),
                             full_event_sample_count: self.full_event_count,
                             target_note: note_to_send,
-                            sample_rate: 44100,
+                            sample_rate: SAMPLE_RATE,
                             noise_floor: load_f32(&self.atomics.config.silence_threshold),
+                            nhwrsf_threshold: load_f32(&self.atomics.config.nhwrsf_threshold),
+                            sustain_stability_threshold: load_f32(
+                                &self.atomics.config.sustain_stability_threshold,
+                            ),
                             measured_f0: self.last_measured_f0,
                             captured_in_auto: target_note == 255,
                             sounding_strings: self.latch.request.declared_strings,
                         };
-                        self.full_event_count = 0; // Clear state after dispatch
+                        self.full_event_count = 0;
 
                         // Raised before the payload goes over, so the Worker
                         // cannot clear it before this thread has set it.
@@ -1163,12 +960,12 @@ impl AudioPipeline {
                             self.capture_state = CaptureState::Armed;
                         }
                     } else {
-                        // Garbage detected (No Lock). Recycle buffer and reset to Armed.
+                        // No key to file it under: recycle and re-arm.
                         let _ = self.audio_pool.push(buf);
                         if let Some(dbuf) = self.full_event_buffer.take() {
                             let _ = self.audio_pool.push(dbuf);
                         }
-                        self.full_event_count = 0; // Clear state on garbage
+                        self.full_event_count = 0;
                         self.capture_state = CaptureState::Armed;
                     }
                     self.latched_auto_key = None;
@@ -1180,20 +977,18 @@ impl AudioPipeline {
 
         // ─── Step 7: Triple Buffer Telemetry Assembly ───
 
-        // Build fixed-size FrameOutput — zero heap allocations
         let mut frame_output = FrameOutput::default();
         frame_output.magnitudes[..mag_count]
             .copy_from_slice(&self.processing_frame.treble_magnitude_buffer[..mag_count]);
         frame_output.magnitude_len = mag_count;
 
-        // Map gate telemetry (is_new_onset intentionally dropped — internal to DSP)
+        // The onset flag stays internal.
         frame_output.rms_ema = gate_result.rms_ema;
         frame_output.nhwrsf = gate_result.nhwrsf;
-        frame_output.ninos2 = gate_result.ninos2_ema;
+        frame_output.sustain_stability = gate_result.sustain_stability_ema;
         frame_output.is_silence = is_silence;
 
-        // Strobe telemetry — unconditional: the band must render (frozen or
-        // spinning) whether or not the engine holds a note lock.
+        // Strobe telemetry, whether or not the engine holds a lock.
         frame_output.strobe_angle = strobe_result.angle;
         frame_output.strobe_gated = strobe_result.gated;
         frame_output.strobe_beat_hz = strobe_result.beat_hz;
@@ -1205,8 +1000,7 @@ impl AudioPipeline {
         frame_output.unison_verdict = strobe_result.verdict;
         frame_output.coarse_hz = strobe_result.coarse_hz;
         frame_output.capture_state = self.capture_state;
-        // The buffer is held only while a record is in progress, so its
-        // presence is exactly the condition a progress figure is meaningful in.
+        // The buffer is held exactly while a record is in progress.
         frame_output.capture_progress_samples = if self.capture_buffer.is_some() {
             self.capture_count
         } else {
@@ -1215,10 +1009,8 @@ impl AudioPipeline {
 
         if let Some(result) = pitch_result {
             frame_output.detected_frequency = result.measured_f0;
-            frame_output.confidence = None;
             frame_output.note_index = Some(result.key_index);
 
-            // Populate live tracked partials (cap at buffer capacity for rendering)
             let n = result.partial_count.min(frame_output.tracked_freqs.len());
             frame_output.tracked_freqs[..n].copy_from_slice(&result.partial_freqs[..n]);
             frame_output.tracked_ns[..n].copy_from_slice(&result.partial_ns[..n]);
@@ -1238,7 +1030,7 @@ mod tests {
     fn measurement(key_index: u8, calculated_b: Option<f32>) -> KeyMeasurement {
         KeyMeasurement {
             key_index,
-            // Deliberately implausible measured_f0 — it must NOT leak into the
+            // Deliberately implausible measured_f0 — it must not leak into the
             // template (ET-centered, β-only is the contract).
             measured_f0: 9999.0,
             partials: Vec::new(),
@@ -1249,8 +1041,8 @@ mod tests {
         }
     }
 
-    /// The capture lengths are *durations* — 1.5 s is the figure every capture
-    /// set was recorded at, and the one ADR 0009's σ model was measured on.
+    // The capture lengths are durations — 1.5 s is the figure every capture
+    // set was recorded at, and the one report 0009's σ model was measured on.
     #[test]
     fn capture_lengths_are_the_durations_they_claim() {
         let secs = |n: usize| n as f32 / SAMPLE_RATE as f32;
@@ -1270,7 +1062,7 @@ mod tests {
             .expect("valid B should convert");
         // Measured B adopted…
         assert_eq!(kp.beta, 0.002);
-        // …at the equal-temperament center, NOT the (stale) measured_f0.
+        // …at the equal-temperament center, not the (stale) measured_f0.
         assert_eq!(kp.f0_et, NOTES[key as usize].frequency);
         assert_ne!(kp.f0_et, 9999.0);
     }
@@ -1368,7 +1160,7 @@ mod tests {
         let mut readings = Vec::new();
         let mut n = 0u64;
         // f64 phase from an absolute sample index: an f32 accumulator loses
-        // enough precision over two seconds to detune the *test signal*.
+        // enough precision over two seconds to detune the test signal.
         let step = 2.0 * std::f64::consts::PI * f_live as f64 / SAMPLE_RATE as f64;
         let mut hop = [0.0f32; HOP_SIZE];
         for _ in 0..(2 * SAMPLE_RATE as usize / HOP_SIZE) {
@@ -1491,7 +1283,7 @@ mod tests {
         assert_eq!(pipeline.capture_state, CaptureState::Idle);
     }
 
-    /// A request changed *after* arming must still reach the capture, so a
+    /// A request changed after arming must still reach the capture, so a
     /// second `Arm` restates it without disturbing the lifecycle — which is
     /// what lets a sender that arms on its own schedule stay correct.
     #[test]

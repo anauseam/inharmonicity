@@ -5,55 +5,46 @@
 
 use crate::models::{KeyProfile, SpectralPeak};
 
+/// The TWM error's weights, and its experimental terms, which ship off.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TwmConfig {
-    pub p: f32,              // frequency weighting exponent
-    pub q: f32,              // amplitude penalty scaling
-    pub r: f32,              // reward constant
-    pub rho: f32,            // reverse error weight
-    pub lambda_penalty: f32, // Duan M→P error ceiling
-    /// EXPERIMENT (test #1): when true, the forward error Err_{p→m} is SUMMED
-    /// instead of averaged (no /N). Tests the deep-research claim that the /N
-    /// normalization launders a dense candidate's many predicted-but-absent
-    /// partials into a small average (the bass-attractor root-cause hypothesis).
-    /// Default false ⇒ canonical M&B behavior, byte-identical.
+    /// Frequency weighting exponent.
+    pub p: f32,
+    /// Amplitude penalty scaling.
+    pub q: f32,
+    /// Reward for an aligned strong peak.
+    pub r: f32,
+    /// Weight of the measured-to-predicted error.
+    pub rho: f32,
+    /// Ceiling on each measured-to-predicted term.
+    pub lambda_penalty: f32,
+    /// Experimental: sum the forward error instead of averaging it over N, testing
+    /// whether the average hides a dense candidate's absent partials. `false` is
+    /// canonical.
     pub sum_forward: bool,
-    /// EXPERIMENT (n-kernel): forward-error deadzone scaling. The predicted
-    /// partial n carries a B-uncertainty `δf_n ≈ c·B·n²·f_n / (2(1+Bn²))` (the
-    /// stiff-string law's ∂f_n/∂B propagated with relative σ_B absorbed into c).
-    /// We forgive forward distance up to that deadzone: `eff_Δf = max(0, Δf − tol_n)`.
-    /// Trades B-tolerance (wider = absorb per-note B scatter) against octave
-    /// discrimination (wider = forgive the octave candidate's inharmonic
-    /// divergence). c≈0.14 ≈ the Rigaud σ_B; c=0 ⇒ off (byte-identical default).
+    /// Experimental: forgive forward distance up to partial n's B-uncertainty,
+    /// `c·B·n²·f_n / (2(1 + Bn²))` with c this value (≈ 0.14 is Rigaud's σ_B). Wider
+    /// absorbs per-note B scatter but forgives an octave candidate's divergence.
+    /// 0 is off.
     pub b_deadzone: f32,
-    /// EXPERIMENT (Duan non-peak): per-partial penalty charged for each predicted
-    /// partial that falls in the OBSERVED ACTIVE BAND `[min_obs, max_obs]` with no
-    /// peak within the match tolerance — a "hallucinated" harmonic. UN-normalized
-    /// (a count), so it scales with how many partials a candidate predicts where
-    /// none exist — the principled inverse of the /N laundering, charging dense
-    /// (bass) impostors for the N_gap channel. Below the lowest peak (the
-    /// missing-fundamental zone) it does NOT apply, sparing legitimately-absent
-    /// bass fundamentals. 0 ⇒ off (byte-identical default). See
-    /// `docs/design/duan-likelihood-design.md`.
+    /// Experimental: a penalty per predicted partial inside the observed band with
+    /// no peak within 2 %, un-normalized so it charges dense bass impostors (Duan,
+    /// Pardo & Zhang 2010). Below the lowest peak, where a fundamental may be
+    /// missing, it does not apply. 0 is off.
+    // Scoped in the Duan likelihood design note.
     pub nonpeak_penalty: f32,
-    /// EXPERIMENT (Emiya smoothness): penalize the amplitude INCOHERENCE of the
-    /// partials that ARE matched — Σ of squared second-differences of their
-    /// log-amplitude sequence. A true note's matched partials follow a smooth decay
-    /// (2nd-diff ≈ 0); a dense impostor's coincidental matches have random
-    /// amplitudes (jagged). Distinguishes via amplitude coherence, NOT gap count,
-    /// so a sparse-but-coherent bass note is spared (gated to ≥3 matched partials)
-    /// while an incoherent impostor is charged — the inverse of the non-peak count's
-    /// bass-crushing failure. 0 ⇒ off (byte-identical default).
+    /// Experimental: a penalty on the jaggedness of the matched partials'
+    /// log-amplitudes (Emiya's spectral smoothness), over at least three. A true
+    /// note decays smoothly; an impostor's coincidental matches do not. 0 is off.
     pub smoothness_penalty: f32,
 }
 
 impl Default for TwmConfig {
     fn default() -> Self {
-        // Conservative tuned constants (ADR 0006): MOBO-tuned amplitude terms
-        // (q, r raised) with p and the λ ceiling held at canonical values for
-        // robustness. Real-capture validation: 71/87 → 74/87, bass preserved.
-        // The canonical M&B constants (q=1.4, r=0.5, ρ=0.33) are pinned in
-        // `test_twm_regression` as the math-regression guard.
+        // NSGA-II-tuned amplitude terms (q, r), with p and the λ ceiling at their
+        // canonical values: 76/87 discrete, 77/87 refined on real captures.
+        // `test_twm_regression` pins the canonical M&B constants.
+        // report 0006
         Self {
             p: 0.5,
             q: 3.88,
@@ -68,49 +59,21 @@ impl Default for TwmConfig {
     }
 }
 
-/// Scores a single key profile against observed peaks using the canonical
-/// Maher & Beauchamp (1994) Two-Way Mismatch formulation.
+/// Scores a key profile, scaled by `scale`, against observed peaks: the Two-Way
+/// Mismatch error of Maher & Beauchamp (1994), JASA 95(4), 2254–2263, DOI
+/// 10.1121/1.408685, Eqs. 1–3.
 ///
-/// Implements Equations (1)–(3) from:
-///   Maher, R.C. & Beauchamp, J.W. (1994). JASA 95(4), pp. 2256–2257.
-///   DOI: 10.1121/1.408685
+/// Each term is `E_w = Δf·f^−p + (a/A_max)·[q·Δf·f^−p − r]`, and the total is
+/// `Err_{p→m}/N + ρ·Err_{m→p}/K`. The paper's values are p = 0.5, q = 1.4, r = 0.5,
+/// ρ = 0.33. The score is a figure of merit, not Hz: `Δf·f^−p` has units Hz^(1−p)
+/// while `r` is a pure number.
 ///
-/// Per-term error weighting function E_w (applied in both Err_{p-m} and Err_{m-p}):
-///   E_w = Δf·(f^-p) + (a/A_max) × [q·Δf·(f^-p) − r]
-///
-/// Total error (Eq. 3):
-///   Err_total = Err_{p-m}/N + ρ·Err_{m-p}/K
-///
-/// The paper's empirically calibrated values (NOT the shipped defaults — see
-/// `TwmConfig::default` and ADR 0006):
-///   p = 0.5  (frequency weighting exponent)
-///   q = 1.4  (amplitude penalty scaling)
-///   r = 0.5  (reward constant for aligned strong peaks)
-///   ρ = 0.33 (reverse error combination weight)
-///
-/// Returns Err_total. Note on units: the paper's E_w mixes dimensions —
-/// Δf·f^-p carries Hz^(1-p) (Hz^0.5 at p = 0.5) while the r reward is a pure
-/// number — so the score is a figure of merit, not a quantity in Hz. The /N
-/// and /K normalizations make scores comparable across candidates regardless
-/// of the number of active partials or observed peaks.
-///
-/// # Noise Floor Boundary
-/// To prevent unbounded error accumulation from low-frequency noise (which causes
-/// high-treble ghost locks), we enforce a topological boundary on the
-/// Measured-to-Predicted error, adapting the noise-floor asymptote shown by:
-///
-/// Duan, Z., Pardo, B., & Zhang, C. (2010). "Multiple Fundamental Frequency
-/// Estimation by Modeling Spectral Peaks and Non-Peak Regions."
-/// IEEE TASLP 18(8). DOI: 10.1109/TASL.2010.2042119
-///
-/// We apply a ceiling to the distance penalty to model the asymptote to the
-/// uniform noise distribution for distant peaks. The hard ceiling is our
-/// approximation — a deliberate adaptation, not a port of Duan's likelihood
-/// (see docs/audits/faithfulness-audit-01-twm.md).
-///
-/// Note: Parameters come from TwmConfig. The shipped default is the MOBO-tuned
-/// conservative config (ADR 0006); the paper's canonical values are pinned in
-/// `test_twm_regression` as the math-regression guard.
+/// Each measured-to-predicted term is capped at `lambda_penalty`, so distant
+/// low-frequency noise cannot pile up error and lock the treble onto a ghost. The
+/// cap approximates the bounded noise asymptote of Duan, Pardo & Zhang (2010),
+/// IEEE TASLP 18(8), DOI 10.1109/TASL.2010.2042119; a hard ceiling is our
+/// adaptation, not a port of their likelihood.
+// audit 01
 pub fn score_candidate(
     peaks: &[SpectralPeak],
     profile: &KeyProfile,
@@ -122,8 +85,7 @@ pub fn score_candidate(
         return f32::MAX;
     }
 
-    // A_max: maximum amplitude across all K measured peaks (paper: A_max = max(a_k))
-    // Peaks are passed sorted by frequency ascending, so we must scan for A_max.
+    // A_max = max(a_k), scanned: the peaks arrive sorted by frequency.
     let mut a_max = 0.0_f32;
     let mut max_obs_freq = 0.0_f32;
     let mut min_obs_freq = f32::MAX;
@@ -142,24 +104,11 @@ pub fn score_candidate(
     // would make a/A_max divide by zero. Inert whenever any peak has magnitude.
     a_max = a_max.max(1e-6);
 
-    // ── Dynamic Bandwidth Cap (M&B Step 2, generalized) ──────────────────────
-    // The paper predicts N = ⌈f_max/f_fund⌉ harmonics (Step 2): the series ends
-    // at the first harmonic at/above the highest measured partial. For the
-    // harmonic series {n·f0} that count-form is equivalent to the cutoff-form
-    //   n·f0 < f_max + f0,
-    // because consecutive harmonics are spaced exactly f0 apart (exact for
-    // non-integer f_max/f0; the integer case is measure-zero). We keep the
-    // cutoff-form for the inharmonic series: include predicted partials with
-    // f_n·scale ≤ max_obs + f0·scale. At B = 0 this IS Step 2. For B > 0 the
-    // stiff-string spacing is stretched (f_{n+1} − f_n > f0), so this is the
-    // conservative generalization: versus the count-form reading ("through the
-    // first partial ≥ max_obs") it differs by at most the single edge partial
-    // m = min{n : f_n ≥ max_obs}, dropped iff f_m > max_obs + f0·scale — i.e.,
-    // we never evaluate a partial more than one fundamental above the observed
-    // band, where it carries no discriminative value and would inflate
-    // Err_{p-m} with unconstrained forward error from harmonics the instrument
-    // does not physically produce in this frame. See
-    // docs/audits/faithfulness-audit-01-twm.md, finding 3.
+    // ── Bandwidth cap (M&B Step 2, generalized) ──
+    // Step 2 predicts harmonics up to the first at or above the highest measured
+    // peak. Its cutoff form, f_n ≤ max_obs + f0·scale, is Step 2 exactly at B = 0;
+    // for B > 0 it differs by at most one edge partial more than a fundamental above
+    // the observed band, which would only add forward error. audit 01
     let cutoff_freq = max_obs_freq + profile.f0_et * scale;
     let mut active_predicted = 0_usize;
     for &p_freq in &profile.predicted_partials[..valid_count] {
@@ -178,23 +127,10 @@ pub fn score_candidate(
     }
     let predicted = &profile.predicted_partials[..active_predicted]; // N terms
 
-    // ── Eq. (1): Err_{p-m} (Predicted-to-Measured) ──────────────────────────
-    // For each of N predicted harmonics f_n, find the nearest measured partial.
-    // a_n is the amplitude of that nearest measured partial.
-    // Δf_n = |f_n - f_nearest_measured|
-    //
-    // Per-term:  Δf_n·(f_n^-p) + (a_n/A_max)·[q·Δf_n·(f_n^-p) − r]
-    // O(N + K) Two-Pointer Sweep: Find nearest peak for each predicted partial
-    //
-    // Note on Architectural Constraints (Duan et al. 2010, Eq 7)
-    // While we use Duan's Eq 3 for the M-to-P bound below, we do not apply
-    // Duan's Eq 7 (Non-Peak Region Likelihood) for this P-to-M calculation.
-    // Duan is a polyphonic estimator, which uses a strict likelihood cliff to
-    // harshly punish missing partials (preventing false polyphonic combinations).
-    // Because TWM is a monophonic acoustic estimator, applying a cliff here
-    // would negatively penalize low bass strings (like C1) that naturally exhibit
-    // "missing fundamentals" due to soundboard impedance. We therefore rely on
-    // M&B's f_n^-p diluted distance penalty to preserve missing-fundamental robustness.
+    // ── Eq. (1): Err_{p→m} ──
+    // For each predicted partial, the nearest measured peak, by a two-pointer
+    // sweep. Duan's non-peak likelihood (Eq. 7) is not applied by default: its
+    // cliff would punish the missing fundamentals of bass strings.
     let mut err_pm = 0.0_f32;
     let mut nonpeak_count = 0_u32; // Duan: predicted partials hallucinated in-band
     // Emiya smoothness: incremental Σ(2nd-diff)² of matched-partial log-amplitudes.
@@ -216,17 +152,14 @@ pub fn score_candidate(
         let mut delta_f_n = raw_delta;
         let a_n = peaks[j].magnitude;
 
-        // Duan non-peak: count this predicted partial as "hallucinated" if it sits in
-        // the observed active band with no peak within the match tolerance (2% ≈ 35¢).
-        // Below min_obs_freq is the missing-fundamental zone → never counted.
+        // In the observed band with no peak within 2 % (≈ 35 ¢); below the lowest
+        // peak a fundamental may be missing, so it is never counted.
         let matched = raw_delta <= 0.02 * f_n;
         if cfg.nonpeak_penalty > 0.0 && f_n >= min_obs_freq && f_n <= max_obs_freq && !matched {
             nonpeak_count += 1;
         }
 
-        // Emiya smoothness: accumulate the second difference of consecutive MATCHED
-        // partials' log-amplitudes (a true note decays smoothly → ~0; coincidental
-        // impostor matches jump → large). Gated to matched partials only.
+        // Second differences of consecutive matched partials' log-amplitudes.
         if cfg.smoothness_penalty > 0.0 && matched {
             let la = (a_n.max(1e-6)).ln();
             if matched_n >= 2 {
@@ -246,12 +179,9 @@ pub fn score_candidate(
             delta_f_n = (delta_f_n - tol_n).max(0.0);
         }
 
-        // Standard M&B diluted penalty (Maher & Beauchamp 1994).
-        // `.max(1.0)` is a numerical guard (ours, not in the paper — Eq 1 uses
-        // f^-p unguarded): caps the weight blow-up as f → 0. Inert in-band
-        // (lowest predicted partial ≈ A0 at 27.5 Hz); upstream peak admission
-        // only guarantees f > 0. The p == 0.5 branch is a fast path preserving
-        // the original 1/sqrt bit pattern (powf(-0.5) may differ in ULPs).
+        // `.max(1.0)` is ours, not Eq. 1's: it caps the weight as f → 0, and is inert
+        // in band. The p == 0.5 branch keeps the 1/sqrt bit pattern, which
+        // `powf(-0.5)` may not reproduce.
         let f_weight = if cfg.p == 0.5 {
             1.0 / f_n.max(1.0).sqrt()
         } else {
@@ -263,24 +193,9 @@ pub fn score_candidate(
         err_pm += err_pm_n;
     }
 
-    // ── Eq. (2): Err_{m-p} (Measured-to-Predicted) ──────────────────────────
-    // For each of K measured peaks, find the nearest predicted harmonic.
-    // f_k and a_k both refer to the measured peak itself.
-    // Δf_k = |f_k - f_nearest_predicted|
-    //
-    // Per-term:  Δf_k·(f_k^-p) + (a_k/A_max)·[q·Δf_k·(f_k^-p) − r]
-    // O(N + K) Two-Pointer Sweep: Find nearest predicted partial for each peak
-    //
-    // Bounded-error adaptation of Duan et al. (2010) Peak Mixture Model (Eq. 3):
-    // We adapt the topological bound proved by Duan et al. Eq (3): as a peak
-    // diverges from all predicted harmonics, the log-likelihood asymptotes to a
-    // constant noise floor. We approximate this smooth asymptote with a piecewise
-    // hard ceiling (.min(LAMBDA_PENALTY)), which preserves the bounded error
-    // topology without computing Gaussians at runtime.
-    //
-    // Duan, Z., Pardo, B., & Zhang, C. (2010). "Multiple Fundamental Frequency
-    // Estimation by Modeling Spectral Peaks and Non-Peak Regions."
-    // IEEE TASLP 18(8). DOI: 10.1109/TASL.2010.2042119
+    // ── Eq. (2): Err_{m→p} ──
+    // For each measured peak, the nearest predicted partial, by a two-pointer sweep;
+    // each term capped at λ, Duan's Eq. 3 asymptote as a hard ceiling.
     let mut err_mp = 0.0_f32;
     let mut i = 0;
     for peak in peaks {
@@ -315,10 +230,9 @@ pub fn score_candidate(
     let k = peaks.len() as f32;
 
     let fwd_norm = if cfg.sum_forward { 1.0 } else { n };
-    // Duan non-peak term: UN-normalized count of hallucinated in-band partials.
-    // Deliberately not /N — it must scale with the number of bad predictions.
+    // Not divided by N: it must grow with the number of bad predictions.
     let nonpeak_term = cfg.nonpeak_penalty * nonpeak_count as f32;
-    // Emiya smoothness term: mean squared 2nd-diff over matched partials (≥3 needed).
+    // The mean squared second difference, which needs three matched partials.
     let smooth_term = if matched_n >= 3 {
         cfg.smoothness_penalty * smooth_accum / (matched_n - 2) as f32
     } else {
@@ -334,7 +248,7 @@ mod tests {
 
     /// Canonical Maher & Beauchamp (1994) constants. Pinned here (rather than
     /// using `TwmConfig::default()`) so this regression test guards the scoring
-    /// *math* independently of whatever tuned constants the default carries —
+    /// math independently of whatever tuned constants the default carries —
     /// the golden bit patterns below were computed with these exact values.
     fn canonical_cfg() -> TwmConfig {
         TwmConfig {
@@ -347,11 +261,10 @@ mod tests {
         }
     }
 
-    /// Guards the *shipped* default constants (ADR 0006, provisional conservative
-    /// config). `test_twm_regression` deliberately pins the canonical M&B values, so
-    /// nothing else would catch an accidental edit to `Default`. This is a value
-    /// assertion, not a score-bits golden — update it intentionally when the adopted
-    /// config changes (which, per 0006, is still under review).
+    // Guards the shipped default constants (report 0006). `test_twm_regression`
+    // deliberately pins the canonical M&B values, so nothing else would catch an
+    // accidental edit to `Default`. This is a value assertion, not a score-bits
+    // golden — update it intentionally when the adopted config changes.
     #[test]
     fn test_shipped_default_constants() {
         let d = TwmConfig::default();
@@ -360,7 +273,7 @@ mod tests {
         assert_eq!(d.r, 1.426);
         assert_eq!(d.rho, 0.298);
         assert_eq!(d.lambda_penalty, 18.0);
-        // Experimental terms must ship OFF.
+        // Experimental terms must ship off.
         assert!(!d.sum_forward);
         assert_eq!(d.b_deadzone, 0.0);
         assert_eq!(d.nonpeak_penalty, 0.0);

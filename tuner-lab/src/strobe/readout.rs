@@ -7,10 +7,13 @@
 
 use std::path::{Path, PathBuf};
 
+use anyhow::Result;
 use realfft::RealFftPlanner;
 use rustfft::num_complex::Complex;
 
+use crate::strobe::ReadOpts;
 use crate::truth::*;
+use crate::{capture, raw};
 use tuner_core::algorithms::curves;
 use tuner_core::algorithms::peaks;
 use tuner_core::algorithms::spectral::{fft, magnitude_spectrum};
@@ -19,8 +22,8 @@ use tuner_core::models::{NOTES, get_expected_beta};
 use tuner_core::strobe::MAX_STROBE_REFS;
 
 fn process_capture(dir: &Path, planner: &mut RealFftPlanner<f32>) -> Option<u8> {
-    let key = crate::capture::key_from_dirname(dir.file_name()?.to_str()?)?;
-    let signal = crate::raw::read(&dir.join("audio.raw"))?;
+    let key = capture::key_from_dirname(dir.file_name()?.to_str()?)?;
+    let signal = raw::read(&dir.join("audio.raw"))?;
     if signal.len() < BASS_WINDOW_SIZE {
         return None;
     }
@@ -65,7 +68,7 @@ fn process_capture(dir: &Path, planner: &mut RealFftPlanner<f32>) -> Option<u8> 
     Some(key)
 }
 
-/// Validates the arbiter (`truth`) and `yin` against *known* detunings before
+/// Validates the arbiter (`truth`) and `yin` against known detunings before
 /// we trust either on real audio. A biased estimator here disqualifies its
 /// column on the real captures.
 fn selftest(planner: &mut RealFftPlanner<f32>) {
@@ -102,11 +105,11 @@ fn selftest(planner: &mut RealFftPlanner<f32>) {
     }
 }
 
-/// **#2 test.** Quantifies YIN (whole-signal) sharpness vs inharmonicity `B`
+/// Quantifies YIN (whole-signal) sharpness vs inharmonicity `B`
 /// and partial richness. Mechanism claim: a partial-weighted estimate reads
 /// sharp by ≈ `866·B·⟨n²⟩`, where `⟨n²⟩` is the power-weighted mean-square
 /// partial index — because partial n implies a fundamental `f₀·√(1+Bn²)`,
-/// sharp by `866·B·n²` cents. A *harmonic* signal (B=0) has an exact period
+/// sharp by `866·B·n²` cents. A harmonic signal (B=0) has an exact period
 /// ⇒ zero drift at any partial count (missing-fundamental recovered). Our
 /// strobe reads n=1 ⇒ ⟨n²⟩=1 ⇒ B-immune.
 fn inharm_sweep() {
@@ -152,11 +155,11 @@ fn window_sweep(dir: &Path, planner: &mut RealFftPlanner<f32>) {
     let Some(key) = dir
         .file_name()
         .and_then(|n| n.to_str())
-        .and_then(crate::capture::key_from_dirname)
+        .and_then(capture::key_from_dirname)
     else {
         return;
     };
-    let Some(signal) = crate::raw::read(&dir.join("audio.raw")) else {
+    let Some(signal) = raw::read(&dir.join("audio.raw")) else {
         return;
     };
     let f_et = NOTES[key as usize].frequency;
@@ -188,16 +191,16 @@ fn window_sweep(dir: &Path, planner: &mut RealFftPlanner<f32>) {
 /// **Out-of-range test.** For each capture, place the strobe reference a known
 /// `Δ` Hz below the string's true pitch and read the band-slope back. It should
 /// track the true detuning up to ≈ [`ALIAS_HZ`], then break (alias) — the case
-/// the regime-aware D4 routing must guard against.
+/// the regime-aware coarse-readout routing must guard against.
 fn alias_sweep(dir: &Path, planner: &mut RealFftPlanner<f32>) {
     println!("Band-slope vs reference offset — 'what happens out of tune'.");
     println!("readable range = ±{ALIAS_HZ:.1} Hz (hop/unwrap limit). Δ = string − reference.\n");
     let key = dir
         .file_name()
         .and_then(|n| n.to_str())
-        .and_then(crate::capture::key_from_dirname);
+        .and_then(capture::key_from_dirname);
     let Some(key) = key else { return };
-    let Some(signal) = crate::raw::read(&dir.join("audio.raw")) else {
+    let Some(signal) = raw::read(&dir.join("audio.raw")) else {
         return;
     };
     let f_et = NOTES[key as usize].frequency;
@@ -231,13 +234,13 @@ fn alias_sweep(dir: &Path, planner: &mut RealFftPlanner<f32>) {
     println!();
 }
 
-// ─── Three-way readout comparison (Prompt N) ─────────────────────────────────
+// ─── Three-way readout comparison (report 0011) ──────────────────────────────
 //
-// The prompt's decision experiment: **tracker as-is** vs **tracker with the
-// Defect-1 register window** vs **bounded spectral peak + jacobsen**, scored on
+// The decision experiment: tracker as-is vs tracker with the
+// long-window rule vs bounded spectral peak + jacobsen, scored on
 // availability (fraction of hops yielding any value — the treble's real
 // limit), accuracy vs `truth`, and jitter. Availability is measured over the
-// note's WHOLE life, not the settled tail: a fast-decaying treble note is
+// note's whole life, not the settled tail: a fast-decaying treble note is
 // already dead by the tail, so a tail-only measurement scores its availability
 // as 0 for reasons that have nothing to do with the estimator.
 
@@ -247,11 +250,11 @@ fn readout_compare(dir: &Path, planner: &mut RealFftPlanner<f32>, span_cents: f3
     let Some(key) = dir
         .file_name()
         .and_then(|n| n.to_str())
-        .and_then(crate::capture::key_from_dirname)
+        .and_then(capture::key_from_dirname)
     else {
         return;
     };
-    let Some(signal) = crate::raw::read(&dir.join("audio.raw")) else {
+    let Some(signal) = raw::read(&dir.join("audio.raw")) else {
         return;
     };
     if signal.len() < BASS_WINDOW_SIZE {
@@ -259,12 +262,12 @@ fn readout_compare(dir: &Path, planner: &mut RealFftPlanner<f32>, span_cents: f3
     }
     let f_et = NOTES[key as usize].frequency;
     let noise_floor = 0.001;
-    // Every method is seeded/referenced at the SAME place the live app would
+    // Every method is seeded/referenced at the same place the live app would
     // have it: the ET target of the key the user selected.
     let seed = f_et;
     let truth_c = dtft_truth(&signal, f_et, planner).map(|f| cents(f, f_et));
 
-    // The tracker seeded at the string's ACTUAL pitch. The ET-seeded rows can
+    // The tracker seeded at the string's actual pitch. The ET-seeded rows can
     // fail two different ways — the seed is too far off to unwrap (aliasing,
     // an accuracy failure) or the partial is too weak/short to gate through (an
     // availability failure). Only a perfectly-seeded tracker separates them:
@@ -343,17 +346,17 @@ fn readout_compare(dir: &Path, planner: &mut RealFftPlanner<f32>, span_cents: f3
 //
 // Every n = 1 method is junk below ≈ E1: the fundamental is not acoustically
 // present, and even a 32k-sample DFT disagrees with itself across repeat
-// captures of the same key. But the string's mistuning is observable on ANY
+// captures of the same key. But the string's mistuning is observable on any
 // partial, exactly: f_n = n·f₀·√(1+Bn²) is linear in f₀, so scaling the string
-// by x cents scales every partial by x cents. Partial-relative cents IS
+// by x cents scales every partial by x cents. Partial-relative cents is
 // string-relative cents, with no B correction at display time. This mode asks
-// whether a bounded search centered on a *strong* partial reads cleanly where
+// whether a bounded search centered on a strong partial reads cleanly where
 // the fundamental cannot.
 
 /// Pre-registered success criterion, fixed before the first run so the result
 /// is a verdict rather than a curve-fit: at least one partial n ∈ 2..=6 must
-/// reach **≥ 90 % availability**, **|median − truth_n| ≤ 2 ¢**, and
-/// **jitter ≤ 10 ¢** on the deep-bass keys.
+/// reach ≥ 90 % availability, |median − truth_n| ≤ 2 ¢, and
+/// jitter ≤ 10 ¢ on the deep-bass keys.
 const BASS_PASS_AVAIL: f32 = 0.90;
 const BASS_PASS_ERR_CENTS: f32 = 2.0;
 const BASS_PASS_JITTER_CENTS: f32 = 10.0;
@@ -370,8 +373,8 @@ fn bass_partials(
     let key = dir
         .file_name()
         .and_then(|n| n.to_str())
-        .and_then(crate::capture::key_from_dirname)?;
-    let signal = crate::raw::read(&dir.join("audio.raw"))?;
+        .and_then(capture::key_from_dirname)?;
+    let signal = raw::read(&dir.join("audio.raw"))?;
     if signal.len() < BASS_WINDOW_SIZE {
         return None;
     }
@@ -439,17 +442,17 @@ fn bass_partials(
     Some(any_pass)
 }
 
-/// **Measurement A — fixed n\* vs strongest-partial-per-hop.**
+/// Fixed n\* against the strongest partial per hop.
 ///
 /// Both policies exploit the equal-cents identity: because `fₙ = n·f₀·√(1+Bn²)`
 /// is linear in f₀, scaling the string by x cents scales every partial by
-/// exactly x cents, so *any* partial's deviation from its own reference is the
+/// exactly x cents, so any partial's deviation from its own reference is the
 /// string's deviation. The policies differ only in which partial supplies it.
 ///
 /// The strongest policy picks, each hop, the admitted partial with the largest
 /// CFAR margin (comparable across partials — each is normalized by its own
 /// local noise). Reported per policy: availability, median cents, jitter; and
-/// for the strongest policy the **switch rate** — the fraction of consecutive
+/// for the strongest policy the switch rate — the fraction of consecutive
 /// admitted hops that changed partial, each of which steps the displayed
 /// number by the reference error `866·ΔB·(n₂²−n₁²)` if B is imperfect.
 #[allow(clippy::too_many_arguments)]
@@ -464,8 +467,8 @@ fn partial_policy(
     let key = dir
         .file_name()
         .and_then(|n| n.to_str())
-        .and_then(crate::capture::key_from_dirname)?;
-    let signal = crate::raw::read(&dir.join("audio.raw"))?;
+        .and_then(capture::key_from_dirname)?;
+    let signal = raw::read(&dir.join("audio.raw"))?;
     if signal.len() < BASS_WINDOW_SIZE {
         return None;
     }
@@ -512,7 +515,7 @@ fn partial_policy(
         })
         .collect();
 
-    // Strongest-margin policy, tracking partial switches AND the cents step
+    // Strongest-margin policy, tracking partial switches and the cents step
     // each switch puts on screen — the user-visible cost, whose analytic form
     // is 866·ΔB·(n₂²−n₁²) when the reference B is imperfect. A switch rate
     // alone cannot say whether switching is harmless or a visible jump.
@@ -615,7 +618,7 @@ fn partial_policy(
     Some(())
 }
 
-/// **Measurement B — per-partial scores with references built from `b`.**
+/// Per-partial scores with references built from `b`.
 /// Same shape as [`bass_partials`] but takes the B to use, so the fixed-n
 /// table can be re-run with the capture's own measured B.
 fn partial_table_row(
@@ -628,8 +631,8 @@ fn partial_table_row(
     let key = dir
         .file_name()
         .and_then(|n| n.to_str())
-        .and_then(crate::capture::key_from_dirname)?;
-    let signal = crate::raw::read(&dir.join("audio.raw"))?;
+        .and_then(capture::key_from_dirname)?;
+    let signal = raw::read(&dir.join("audio.raw"))?;
     if signal.len() < BASS_WINDOW_SIZE {
         return None;
     }
@@ -672,30 +675,21 @@ fn partial_table_row(
     Some(rows)
 }
 
-/// **Reference-offset reach.** The live substitute for detuning a real piano:
-/// hold the capture fixed and move the *reference* instead. A reference `x` ¢
-/// below the string is indistinguishable, to the bounded search, from a string
-/// `x` ¢ above the reference — so this measures how far off pitch the coarse
-/// read still works, on real audio, without touching an instrument.
-///
-/// Reports availability and |read − DFT truth| per offset. The band's own limit
-/// is printed alongside: it hands over at `BAND_READABLE_HZ` = 18 Hz, which in
-/// cents is ≈ 37200/f, so the coarse read only *adds* range where that is narrow.
-/// **T6 — regime-switch chatter.** `main_view` shows the band-slope read while
-/// `!gated && !out_of_range && band_cents.is_some()`, and the coarse read
-/// otherwise. `out_of_range` is decided from the **coarse** read's cents,
-/// converted to Hz at the displayed reference and compared with
-/// `BAND_READABLE_HZ` — so near the boundary the decision is made by an
-/// estimator whose own treble error is comparable to the 3.5 Hz margin it
-/// protects, and the displayed *source* can flip hop to hop.
+/// Regime-switch chatter. The GUI shows the band-slope read while the band is
+/// ungated and in range, and the coarse read otherwise. The range verdict comes
+/// from the coarse read's cents, converted to Hz at the displayed reference and
+/// compared with `BAND_READABLE_HZ`, so near the boundary it is decided by an
+/// estimator whose treble error is comparable to the 3.5 Hz margin it protects,
+/// and without a debounce the displayed source flips hop to hop. The GUI ships
+/// the symmetric (8, 8) variant.
 ///
 /// Sweeps the reference offset across each key's boundary and reports how often
 /// the source changes between consecutive hops. Assumes the band is ungated and
 /// filled, which is the worst case for chatter and the normal case in a treble
 /// sustain; a `None` coarse read leaves `out_of_range` false and so shows the
-/// band, exactly as shipped, and is counted as a source change too.
+/// band, as the GUI does, and is counted as a source change too.
 fn switch_chatter(caps: &[PathBuf], planner: &mut RealFftPlanner<f32>) {
-    const BAND_READABLE_HZ: f32 = 18.0; // mirrors tuner-gui/src/views/main_view.rs
+    const BAND_READABLE_HZ: f32 = 18.0; // the GUI's `BAND_READABLE_HZ`, 18.03 Hz
     println!(
         "Readout-source chatter at the band/coarse boundary. Offsets are relative to each\n\
          key's own boundary (1.0 = exactly at it). flip% = consecutive hops that changed\n\
@@ -711,11 +705,11 @@ fn switch_chatter(caps: &[PathBuf], planner: &mut RealFftPlanner<f32>) {
         let Some(key) = dir
             .file_name()
             .and_then(|n| n.to_str())
-            .and_then(crate::capture::key_from_dirname)
+            .and_then(capture::key_from_dirname)
         else {
             continue;
         };
-        let Some(signal) = crate::raw::read(&dir.join("audio.raw")) else {
+        let Some(signal) = raw::read(&dir.join("audio.raw")) else {
             continue;
         };
         if signal.len() < BASS_WINDOW_SIZE {
@@ -745,7 +739,7 @@ fn switch_chatter(caps: &[PathBuf], planner: &mut RealFftPlanner<f32>) {
 
         // Verdicts are pooled over offsets straddling the boundary — the state
         // the chatter lives in. Each offset is replayed independently.
-        // (hops to switch TO coarse, hops to switch BACK to the band)
+        // (hops to switch to coarse, hops to switch back to the band)
         const VARIANTS: [(usize, usize); 5] = [(1, 1), (8, 8), (1, 8), (2, 8), (4, 8)];
         let mut flips = [0usize; VARIANTS.len()];
         let mut stale = [0usize; VARIANTS.len()];
@@ -796,7 +790,7 @@ fn switch_chatter(caps: &[PathBuf], planner: &mut RealFftPlanner<f32>) {
             }
             pairs += verdicts.len() - 1;
             // Debounce, in three symmetries. `(m_out, m_back)` = hops of opposing
-            // evidence needed to switch *to* coarse and back *to* the band.
+            // evidence needed to switch to coarse and back to the band.
             // Asymmetric variants matter because holding the band past the
             // boundary means displaying an aliased number, while holding the
             // coarse read merely means displaying a jitterier true one.
@@ -856,6 +850,15 @@ fn switch_chatter(caps: &[PathBuf], planner: &mut RealFftPlanner<f32>) {
     }
 }
 
+/// Reference-offset reach, the substitute for detuning a real piano: hold the
+/// capture fixed and move the reference instead. A reference `x` ¢ below the
+/// string is indistinguishable, to the bounded search, from a string `x` ¢ above
+/// the reference, so this measures how far off pitch the coarse read still works,
+/// on real audio, without touching an instrument.
+///
+/// Reports availability and |read − DFT truth| per offset. The band's own limit
+/// is printed alongside: it hands over at `BAND_READABLE_HZ` = 18 Hz, which in
+/// cents is ≈ 37200/f, so the coarse read only adds range where that is narrow.
 fn reach_sweep(caps: &[PathBuf], planner: &mut RealFftPlanner<f32>) {
     println!(
         "Reference-offset reach — how far off pitch the coarse read still reads.\n\
@@ -872,11 +875,11 @@ fn reach_sweep(caps: &[PathBuf], planner: &mut RealFftPlanner<f32>) {
         let Some(key) = dir
             .file_name()
             .and_then(|n| n.to_str())
-            .and_then(crate::capture::key_from_dirname)
+            .and_then(capture::key_from_dirname)
         else {
             continue;
         };
-        let Some(signal) = crate::raw::read(&dir.join("audio.raw")) else {
+        let Some(signal) = raw::read(&dir.join("audio.raw")) else {
             continue;
         };
         if signal.len() < BASS_WINDOW_SIZE {
@@ -902,7 +905,7 @@ fn reach_sweep(caps: &[PathBuf], planner: &mut RealFftPlanner<f32>) {
             key, NOTES[key as usize].name, band_c
         );
         for &off in &offsets {
-            // Reference moved DOWN by `off` cents == string `off` cents sharp of it.
+            // Reference moved down by `off` cents == string `off` cents sharp of it.
             let c_off = center * 2f32.powf(-off / 1200.0);
             let s_off = spacing * 2f32.powf(-off / 1200.0);
             let fftp = planner.plan_fft_forward(BASS_WINDOW_SIZE);
@@ -952,16 +955,16 @@ fn reach_sweep(caps: &[PathBuf], planner: &mut RealFftPlanner<f32>) {
     }
 }
 
-/// **Q4 — does a readout survive a fast-moving string?** Synthesizes a note
+/// Whether a readout survives a fast-moving string. Synthesizes a note
 /// whose f₀ glides at a known rate (turning a peg) and scores each method
-/// against the known instantaneous truth **at the newest sample** — "what is
+/// against the known instantaneous truth at the newest sample — "what is
 /// the string doing now", the only epoch a live readout is judged on.
 ///
 /// Two effects separate in this table. Every method is centred on its own
 /// analysis window, so it necessarily lags the newest sample by `win/2`
 /// samples (1024 → 11.6 ms, 2048 → 23.2, 4096 → 46.4, 8192 → 92.9); against a
 /// glide of `R` ¢/s that shows up as a floor of `R·win/(2·fs)` cents, and that
-/// floor **is** the latency cost of the window (Prompt N open question 2).
+/// floor is the latency cost of the window (report 0011).
 /// Errors far above the floor are the second effect: the adaptive tracker's
 /// EMA (α = 0.05, τ ≈ 0.46 s) losing the string, whereupon `|f_live − f_target|`
 /// passes the ±21.5 Hz unwrap limit and the reading aliases. A fixed-reference
@@ -1019,7 +1022,7 @@ fn detune_sweep(span_cents: f32, min_bins: f32, gate: Gate, planner: &mut RealFf
             // Both spectra are computed every hop anyway, so read both and
             // prefer 8192 when it is admitted, falling back to 2048. No
             // constants and no state: 8192's bins smear when the tone moves,
-            // so its own availability collapse IS the motion signal. `churn`
+            // so its own availability collapse is the motion signal. `churn`
             // counts hops whose source differs from the previous hop — the
             // mixed-source artifact, where a 93 ms-lagged read can sit beside
             // a 23 ms one.
@@ -1027,7 +1030,7 @@ fn detune_sweep(span_cents: f32, min_bins: f32, gate: Gate, planner: &mut RealFf
             let (mut churn, mut prev_src, mut picks) = (0usize, None::<u8>, 0usize);
             // Per-source error, so a surprising pooled median can be attributed:
             // an accounting bug would show each source matching its own column,
-            // whereas a *selection* effect shows the 2048-sourced subset worse
+            // whereas a selection effect shows the 2048-sourced subset worse
             // than 2048's own column — those are exactly the hops where 8192
             // rejected, i.e. where the tone was smearing hardest.
             let (mut e8, mut e2): (Vec<f32>, Vec<f32>) = (Vec::new(), Vec::new());
@@ -1161,17 +1164,10 @@ fn detune_sweep(span_cents: f32, min_bins: f32, gate: Gate, planner: &mut RealFf
     }
 }
 
-// ── The ambient-σ gates, measured (ADR 0015) ────────────────────────────────
-
 // ── Mode entry points ────────────────────────────────────────────────────────
 //
 // Each reproduces one of the harness's modes: the same header, the same
 // population, the same call.
-
-use anyhow::Result;
-
-use crate::capture;
-use crate::strobe::ReadOpts;
 
 /// The captures a readout mode runs over, honouring `--keys`.
 fn population(o: &ReadOpts) -> Result<Vec<PathBuf>> {

@@ -1,10 +1,8 @@
-//! # Band slope — the strobe band's rotation *rate*
+//! # Band slope — the strobe band's rotation rate
 //!
 //! A sliding-window ordinary-least-squares fit of one reference's unwrapped
-//! beat phase (cycles) against hop index. Rotation is exactly `f_live − f_ref`
-//! (strobe design §3), so the slope is the detuning in Hz — the fine half of
-//! the readout pair, phase-integrated and therefore far steadier than a per-hop
-//! frequency estimate.
+//! beat phase (cycles) against hop index. Rotation is exactly `f_live − f_ref`,
+//! so the slope is the detuning in Hz.
 //!
 //! The hop cadence is regular, so the abscissae are a fixed integer sequence:
 //! the normal equations reduce to running sums, and the window's span follows
@@ -12,43 +10,27 @@
 
 use crate::audio::HOP_RATE_HZ;
 
-/// Sliding window the band-slope fit spans (strobe design §5.5 / R12).
-///
-/// The trade is **linear cost against an inelastic benefit** (ADR 0011 §11): the
-/// fit lags a turning peg by exactly `T/2` — an OLS slope estimates the rate at
-/// the window's *midpoint* — while the jitter it buys falls far slower than the
-/// `T⁻³` law, because the bank's analysis windows overlap 75–87 % and extra hops
-/// are mostly the same audio. Measured, tripling `T` buys 1.8× on piano and
-/// nothing measurable on guitar.
-///
-/// 0.6 s is the responsive-enough end of that trade in use, and 1 ¢ of steadiness
-/// is inside the range a professional tuner works in. To trade the 300 ms of lag
-/// back, shorten this; two lengths are derived rather than arbitrary, and each
-/// *removes* a constant by absorbing [`BAND_SLOPE_MIN_SPAN_SECS`] (which can never
-/// exceed it): `BASS_WINDOW_SIZE / SAMPLE_RATE` ≈ 0.186 s matches the coarse
-/// read's own group delay, so the two readouts lag equally and the source switch
-/// stops stepping the number; 0.25 s simply collapses the two constants. Escaping
-/// the trade rather than moving along it needs a two-state (g–h / Kalman)
-/// estimator on (phase, rate), which weights old data instead of discarding it.
+/// Sliding window the band-slope fit spans. The fit lags a turning peg by `T/2`,
+/// since an OLS slope estimates the rate at the window's midpoint.
+// 0.6 s: jitter falls far slower than T⁻³ because the analysis windows overlap
+// 75–87 % (tripling T bought 1.8× on piano, nothing on guitar). To win back the
+// 300 ms of lag, 0.186 s matches the coarse read's group delay and 0.25 s merges
+// the two constants; escaping the trade needs a two-state estimator.
+// report 0011
 pub const BAND_SLOPE_WINDOW_SECS: f32 = 0.6;
 
 /// Points the fit retains — one per hop across [`BAND_SLOPE_WINDOW_SECS`], plus
 /// the current hop.
 pub const BAND_SLOPE_POINTS: usize = (BAND_SLOPE_WINDOW_SECS * HOP_RATE_HZ) as usize + 1;
 
-/// Minimum span before a rate is published; the coarse read covers the fill-in.
-///
-/// Floored by the analysis window itself: the bank integrates over
-/// `BASS_WINDOW_SIZE` samples ≈ 0.186 s, so a fit spanning less than that is
-/// drawing a line through repeats of *one* window's audio and has no independent
-/// information about the rate. This value clears that floor by 1.34×
-/// (`span_clears_the_analysis_window` pins it).
+/// Minimum span before a rate is published.
+// At least one analysis window (≈ 0.186 s): a shorter fit draws a line through
+// repeats of one window's audio.
+// asserted: span_clears_the_analysis_window
 pub const BAND_SLOPE_MIN_SPAN_SECS: f32 = 0.25;
 
 /// Points needed to span [`BAND_SLOPE_MIN_SPAN_SECS`]: `n` points bridge `n − 1`
-/// hop intervals, and the truncating cast has to round *up* to reach the span —
-/// hence `+ 2`, which `point_counts_bracket_their_durations` pins in both
-/// directions.
+/// hop intervals, and the truncating cast must round up, hence `+ 2`.
 pub const BAND_SLOPE_MIN_POINTS: usize = (BAND_SLOPE_MIN_SPAN_SECS * HOP_RATE_HZ) as usize + 2;
 
 /// Sliding-window OLS fit of one reference's unwrapped beat phase, indexed by hop.
@@ -148,8 +130,8 @@ mod tests {
     use super::*;
     use crate::audio::BASS_WINDOW_SIZE;
 
-    /// The fit's minimum span must clear one analysis window, or it is drawing a
-    /// line through repeats of the same audio (ADR 0011 §11).
+    // The fit's minimum span must clear one analysis window, or it is drawing a
+    // line through repeats of the same audio. report 0011
     #[test]
     fn span_clears_the_analysis_window() {
         let analysis_secs = BASS_WINDOW_SIZE as f32 / 44_100.0;
@@ -161,7 +143,7 @@ mod tests {
 
     /// Both point counts are truncating casts of a duration, so pin them from
     /// both sides: the retained window must cover its seconds, and the minimum
-    /// must be the *first* count that spans its own.
+    /// must be the first count that spans its own.
     #[test]
     fn point_counts_bracket_their_durations() {
         let span = |points: usize| (points - 1) as f32 / HOP_RATE_HZ;

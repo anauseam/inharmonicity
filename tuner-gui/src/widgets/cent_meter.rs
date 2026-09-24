@@ -1,41 +1,26 @@
-//! # Cent Meter Widget
+//! # Cent meter
 //!
-//! This module provides a visual cent deviation meter for piano tuning.
-//! It displays the tuning accuracy with color-coded feedback and a
-//! needle indicator showing how far off the current pitch is from the target.
-//!
-//! ## Features
-//! - Real-time cent deviation display
-//! - Color-coded accuracy zones (green/yellow/red)
-//! - Smooth needle animation
-//! - Professional tuning meter appearance
+//! A needle on a ±50 ¢ bar, coloured by its distance from the target — green
+//! inside 5 ¢, yellow inside 20 ¢, red beyond, grey while the reading is stale —
+//! under the note name, frequency and tracking status.
 
 use iced::widget::canvas::{self, Canvas, Geometry, Path, Stroke};
 use iced::widget::{Space, column, container, row, text};
 use iced::{Alignment, Color, Element, Length, Point, Rectangle, Renderer, Size, Theme, mouse};
 
-/// Maximum cent deviation range for the meter display.
-/// The meter shows deviations from -50 to +50 cents.
+/// Half-width of the meter, in cents.
 const METER_RANGE: f32 = 50.0;
 
-/// Cent meter widget for displaying tuning accuracy.
-///
-/// This widget provides a visual representation of how far the current
-/// pitch deviates from the target note, with color-coded feedback
-/// for different accuracy levels.
+/// The needle bar.
 pub struct CentMeter {
-    /// Current cent deviation (None if no pitch detected)
     cents: Option<f32>,
-    /// Whether the data is stale (unstable pitch engine)
+    /// Audio without a locked note.
     is_stale: bool,
     cache: canvas::Cache,
 }
 
 impl CentMeter {
-    /// Creates a new cent meter widget.
-    ///
-    /// # Arguments
-    /// * `cents` - Current cent deviation (None if no pitch detected)
+    /// A meter showing `cents`, grey while `is_stale`.
     pub fn new(cents: Option<f32>, is_stale: bool) -> Self {
         Self {
             cents,
@@ -65,11 +50,9 @@ impl<Message> canvas::Program<Message> for CentMeter {
         _cursor: mouse::Cursor,
     ) -> Vec<Geometry> {
         let geometry = self.cache.draw(renderer, bounds.size(), |frame| {
-            // Draw meter background
             let background = Path::rectangle(Point::ORIGIN, bounds.size());
             frame.fill(&background, Color::from_rgb8(0x40, 0x40, 0x40));
 
-            // Draw center line
             let center_x = bounds.width / 2.0;
             let center_line = Path::line(
                 Point::new(center_x, 0.0),
@@ -80,22 +63,20 @@ impl<Message> canvas::Program<Message> for CentMeter {
                 Stroke::default().with_width(2.0).with_color(Color::WHITE),
             );
 
-            // Draw needle. Last-resort finite guard: `clamp` PROPAGATES NaN
-            // (needle_pos would stay NaN) and lyon asserts on non-finite
-            // path coordinates — a canvas must never panic the app, whatever
-            // upstream feeds it.
+            // Finite only: `clamp` passes NaN through, and lyon asserts on
+            // non-finite path coordinates.
             if let Some(c) = self.cents.filter(|c| c.is_finite()) {
                 let clamped_cents = c.clamp(-METER_RANGE, METER_RANGE);
                 let needle_pos = (clamped_cents + METER_RANGE) / (2.0 * METER_RANGE) * bounds.width;
 
                 let color = if self.is_stale {
-                    Color::from_rgb8(0x80, 0x80, 0x80) // Gray
+                    Color::from_rgb8(0x80, 0x80, 0x80)
                 } else if c.abs() < 5.0 {
-                    Color::from_rgb8(0x34, 0xDB, 0x98) // Green
+                    Color::from_rgb8(0x34, 0xDB, 0x98)
                 } else if c.abs() < 20.0 {
-                    Color::from_rgb8(0xFF, 0xC3, 0x00) // Yellow
+                    Color::from_rgb8(0xFF, 0xC3, 0x00)
                 } else {
-                    Color::from_rgb8(0xFF, 0x33, 0x33) // Red
+                    Color::from_rgb8(0xFF, 0x33, 0x33)
                 };
 
                 let needle = Path::rectangle(
@@ -110,8 +91,7 @@ impl<Message> canvas::Program<Message> for CentMeter {
     }
 }
 
-/// A "rich" cent meter that includes text readouts for the note name,
-/// frequency, and confidence above the animated cent meter bar.
+/// The meter under the note name, frequency and tracking status.
 pub struct CentMeterDisplay {
     cents: Option<f32>,
     note_name: String,
@@ -121,7 +101,6 @@ pub struct CentMeterDisplay {
 }
 
 impl CentMeterDisplay {
-    /// Creates a new rich cent meter display.
     pub fn new(
         cents: Option<f32>,
         note_name: String,
@@ -138,7 +117,6 @@ impl CentMeterDisplay {
         }
     }
 
-    /// Creates the view element for the rich cent meter display.
     pub fn view(self) -> Element<'static, crate::Message> {
         let text_color = if self.is_stale {
             Color::from_rgb8(0xAA, 0xAA, 0xAA)
@@ -147,9 +125,9 @@ impl CentMeterDisplay {
         };
 
         let status_color = if self.status_text == "Dropped" {
-            Color::from_rgb8(0xFF, 0x88, 0x00) // Orange/Amber
+            Color::from_rgb8(0xFF, 0x88, 0x00)
         } else if self.status_text == "Tracking" {
-            Color::from_rgb8(0x34, 0xDB, 0x98) // Green
+            Color::from_rgb8(0x34, 0xDB, 0x98)
         } else {
             text_color
         };

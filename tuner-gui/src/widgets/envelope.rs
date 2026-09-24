@@ -1,42 +1,30 @@
-//! # Envelope Viewer Widget
+//! # Envelope viewer
 //!
-//! A real-time time-domain visualization of the audio stream's RMS envelope,
-//! primarily used for noise floor adjustment. It renders a scrolling line graph
-//! of the smoothed RMS amplitude with an optional horizontal silence threshold line.
-//!
-//! ## Features
-//! - Scrolling RMS envelope (connected line graph)
-//! - Horizontal silence threshold marker
-//! - Dynamic Y-axis scaling
+//! A scrolling trace of the smoothed RMS against the silence threshold, on a
+//! fixed axis matching the threshold slider's range.
 
 use iced::widget::canvas::{self, Canvas, Geometry, Text, path};
 use iced::{Color, Element, Fill, Point, Rectangle, Renderer, Theme, alignment, mouse};
 
-/// Maximum number of RMS history samples to display.
-/// At 60 FPS this represents approximately 2 seconds of history.
-/// Adjust this constant to change the visible time window.
+/// Samples of history a scope shows, one per tick: ≈ 2 s.
 pub const ENVELOPE_HISTORY_LENGTH: usize = 120;
 
-/// Envelope Viewer widget for displaying the RMS amplitude envelope
-/// and the silence threshold over time.
-///
-/// This widget visualizes the smoothed RMS output from the Gatekeeper's
-/// EMA filter, allowing the user to see the noise floor of their audio
-/// environment and adjust the silence threshold accordingly.
+/// The RMS trace's colour.
+const TRACE: Color = Color::from_rgb8(0x2E, 0xCC, 0x71);
+
+/// The threshold line's colour, before its transparency.
+const THRESHOLD: Color = Color::from_rgb8(0xE7, 0x4C, 0x3C);
+
 pub struct EnvelopeViewer {
-    /// RMS history data (newest sample at the end)
+    /// Newest last.
     rms_history: Vec<f32>,
-    /// Current silence threshold value
     silence_threshold: f32,
     cache: canvas::Cache,
 }
 
 impl EnvelopeViewer {
-    /// Creates a new Envelope Viewer widget.
-    ///
-    /// # Arguments
-    /// * `rms_history` - Slice of smoothed RMS values (newest at the end)
-    /// * `silence_threshold` - The current silence threshold to draw
+    /// Creates an Envelope Viewer over `rms_history` (smoothed RMS, newest last), with
+    /// the current `silence_threshold` drawn against it.
     pub fn new(rms_history: Vec<f32>, silence_threshold: f32) -> Self {
         Self {
             rms_history,
@@ -67,7 +55,6 @@ impl<Message> canvas::Program<Message> for EnvelopeViewer {
                 return;
             }
 
-            // Draw background
             let bg = canvas::Path::rectangle(Point::ORIGIN, bounds.size());
             frame.fill(&bg, Color::from_rgb8(0x1A, 0x1A, 0x2E));
 
@@ -75,15 +62,13 @@ impl<Message> canvas::Program<Message> for EnvelopeViewer {
                 return;
             }
 
-            // Fixed Y-axis: anchored at 0.5 to match the slider's absolute range.
-            // Both RMS and threshold lines represent true values — moving the slider
-            // visibly moves the red line independently of the green RMS line.
+            // A fixed axis, the slider's range, so moving the slider moves only
+            // the threshold line.
             let y_max = 0.5_f32;
 
             let len = self.rms_history.len();
             let x_step = bounds.width / (ENVELOPE_HISTORY_LENGTH as f32 - 1.0).max(1.0);
 
-            // Build the RMS envelope path as a connected line graph
             let mut builder = path::Builder::new();
             let x_offset = (ENVELOPE_HISTORY_LENGTH - len) as f32 * x_step;
 
@@ -101,15 +86,11 @@ impl<Message> canvas::Program<Message> for EnvelopeViewer {
 
             let envelope_path = builder.build();
 
-            // Draw the RMS envelope line
             frame.stroke(
                 &envelope_path,
-                canvas::Stroke::default()
-                    .with_color(Color::from_rgb8(0x2E, 0xCC, 0x71)) // green
-                    .with_width(2.0),
+                canvas::Stroke::default().with_color(TRACE).with_width(2.0),
             );
 
-            // Draw the silence threshold as a horizontal dashed line
             let threshold_normalized = (self.silence_threshold / y_max).clamp(0.0, 1.0);
             let threshold_y = bounds.height - (threshold_normalized * bounds.height);
 
@@ -121,11 +102,13 @@ impl<Message> canvas::Program<Message> for EnvelopeViewer {
             frame.stroke(
                 &threshold_line,
                 canvas::Stroke::default()
-                    .with_color(Color::from_rgba8(0xE7, 0x4C, 0x3C, 0.8)) // red, slightly transparent
+                    .with_color(Color {
+                        a: 0.8,
+                        ..THRESHOLD
+                    })
                     .with_width(1.5),
             );
 
-            // Draw grid lines (horizontal)
             let grid_color = Color::from_rgba8(0x44, 0x44, 0x66, 0.3);
             for i in 1..4 {
                 let y = bounds.height * (i as f32 / 4.0);
@@ -138,7 +121,6 @@ impl<Message> canvas::Program<Message> for EnvelopeViewer {
                 );
             }
 
-            // Draw grid lines (vertical)
             for i in 1..4 {
                 let x = bounds.width * (i as f32 / 4.0);
                 let grid_line =
@@ -151,7 +133,6 @@ impl<Message> canvas::Program<Message> for EnvelopeViewer {
                 );
             }
 
-            // Draw Text Labels
             let label_color = Color::from_rgba8(0xBD, 0xC3, 0xC7, 0.6);
             for i in 1..4 {
                 let value = y_max * (1.0 - i as f32 / 4.0);
@@ -168,12 +149,11 @@ impl<Message> canvas::Program<Message> for EnvelopeViewer {
                 frame.fill_text(label);
             }
 
-            // Current RMS value (latest sample)
             if let Some(&latest_rms) = self.rms_history.last() {
                 let rms_text = Text {
                     content: format!("RMS {:.4}", latest_rms),
                     position: Point::new(bounds.width - 5.0, 5.0),
-                    color: Color::from_rgb8(0x2E, 0xCC, 0x71), // Match envelope color
+                    color: TRACE,
                     align_x: alignment::Horizontal::Right.into(),
                     align_y: alignment::Vertical::Top,
                     ..Default::default()
@@ -181,11 +161,13 @@ impl<Message> canvas::Program<Message> for EnvelopeViewer {
                 frame.fill_text(rms_text);
             }
 
-            // Silence threshold value
             let threshold_text = Text {
                 content: format!("Threshold: {:.4}", self.silence_threshold),
                 position: Point::new(5.0, threshold_y - 5.0),
-                color: Color::from_rgba8(0xE7, 0x4C, 0x3C, 0.9), // Match threshold color
+                color: Color {
+                    a: 0.9,
+                    ..THRESHOLD
+                },
                 align_x: alignment::Horizontal::Left.into(),
                 align_y: alignment::Vertical::Bottom,
                 ..Default::default()

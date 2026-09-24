@@ -14,7 +14,14 @@ tuner-core = { path = "../tuner-core" }
 
 anyhow = { workspace = true }
 clap = { version = "4.5", features = ["derive"] }
+# Figures. `ttf` finds the system's fonts on each OS (fontconfig, Core Text,
+# DirectWrite), so no font file ships with the lab.
+plotters = { version = "0.3.7", default-features = false, features = [
+    "bitmap_backend",
+    "bitmap_encoder",
+    "line_series",
+    "ttf",
+] }
 realfft = { workspace = true }
 rustfft = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }

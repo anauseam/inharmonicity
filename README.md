@@ -1,52 +1,39 @@
-# Inharmonicity — an Electronic Tuner for Inharmonic Stringed Instruments
+# Inharmonicity: An Electronic Tuner for Inharmonic Stringed Instruments
 
 ![Inharmonicity Interface](images/interface-screenshot.png)
 
-An open-source, electronic tuner built in Rust designed for precision tuning of **stiff stringed, inharmonic instruments**. With real-time audio analysis, pitch detection, and cent-deviation measurement, it measures each string's inharmonicity and drives a strobe display for tuning each string to its own partial targets. The **current focus is the piano** for which it computes a per-instrument stretch curve; an instrument-agnostic ET reference mode already works, and the inharmonicity measurement and strobe **generalize to any stiff string**. Full-piano validation is ongoing, and other stiff stringed instruments will benefit from the work in the future.
+Inharmonicity is an open-source tuner built for the measurement and tuning of **stiff stringed inharmonic** instruments. Inharmonic instruments are not traditionally tuned via equal temperament (ET), and must be tuned in a "stretched" manner, where each key is tuned to a specific pitch that is slightly sharp or flat relative to ET. When measuring an instrument the program generates a tuning curve based on the characteristics of each key. Then, using real-time pitch tracking, the user can tune a key against this curve.
 
-For a detailed WIP overview of the algorithms used, see the [Anauseam documentation](https://docs.anauseam.org/project-docs/inharmonicity-tuner/00_intro).
-For the design rationale and open observations, see [ARCHITECTURE.md](ARCHITECTURE.md). For contribution guidelines, see [CONTRIBUTING.md](CONTRIBUTING.md).
+The **current focus is the piano**, though the measurement and the strobe tuner are designed to **generalize to any stiff string**. Full-piano validation is ongoing, and other stiff stringed instruments will benefit from the work in the future.
+
+For a detailed WIP overview of the algorithms used, see the [Anauseam documentation](https://docs.anauseam.org/project-docs/inharmonicity-tuner).
 
 > [!IMPORTANT]
 > **Project Status — pre-release, and usable**
 >
-> The full path a piano tuning needs — measure each string, compute the
-> instrument's stretch curve, tune each string to it on a strobe — is built and
-> works. No binary has shipped yet, and the tuner has not yet been validated by
-> tuning a piano end to end, so treat it as a capable alpha rather than a
-> finished product.
+> The full path for piano tuning is built and working: measure each note, compute
+> the instrument's stretch curve, tune each string to it on a strobe tuner. No binary has
+> shipped yet, and the efficacy has not been validated by a professional. Treat the project as a capable alpha rather than a finished product.
 >
 > Current limits:
 >
-> - **Manual mode only** — Auto-mode captures and the strobe tuner are excluded from the curve by design.
+> - **Manual mode only.** You pick each key yourself. Captures taken in Auto mode
+>   are kept but never count toward the curve, and the strobe tuner needs a selected key,
+>   so a whole compass captured in Auto gives a curve with no measurements in it.
 > - **A suspect capture is caught by eye, not automatically.** The measurement
 >   inspector shows every retained measurement of a key and lets you drop or
->   re-measure it, and the curve marks the keys it doubts — but no automatic
->   acceptance gate exists, and two candidates have been measured and rejected.
-> - **Unison assist sees only fast beats, and says so.** The strings of the
->   selected note are resolved as separate spectral lines with their beat rate,
->   and the panel leads with the limit it is working under: it cannot see a beat
->   slower than about 1.5 per second. That limit is fixed in Hz while a unison is
->   judged in cents, so the same panel resolves ~6 ¢ at A4 and ~40 ¢ at C2 — it
->   is a coarse-error instrument in the bass and a genuinely fine one in the
->   treble. Below its limit it hands off rather than guessing. The test that
->   separates a real unison from one string beating with itself still returns
->   "undetermined" on most notes, and in the bass it withholds the claim almost
->   always — correctly: those keys carry a second line that is real spectral
->   content but is not a second string, and what it *is* is unsettled.
-> - **The top two octaves are modelled, not measured.** Above A6 a string's
->   partials are 30–60 dB below its own fundamental and partly above Nyquist, so
->   no capture can resolve their inharmonicity; the curve shrinks continuously
->   onto a parametric model there. That model has been checked on both
->   validation uprights and any error in it is worth **under ~3 ¢ at C8**, and
->   the strobe target in that register is inharmonicity-immune — so it costs
->   accuracy in the curve, not in what you read at the pin. See
->   [ARCHITECTURE.md](ARCHITECTURE.md#what-the-tuning-curve-is-grounded-on).
-> - **Which curve is "best" is not settled.** The five engines agree across the
->   temperament region but disagree by over 30 ¢ at A0, and no measurement
->   resolves it — octave, fifth and twelfth beats are mutually incompatible
->   objectives. Engine (d) Balanced is the default; the comparison gallery and the
->   offline auralization exist so the choice can be made by ear.
+>   re-measure it, and the curve marks the keys it doubts, but the app never
+>   rejects a capture on its own.
+> - **The top of the keyboard is modelled, not measured.** Up there a string
+>   radiates almost nothing but its fundamental, so there are no overtones left to
+>   measure its inharmonicity from and the curve follows a standardized treble model that most pianos share
+>   instead. That is a limit on what can be heard, not a fault in the piano, but
+>   it does mean the app cannot check the model against the instrument in front of
+>   it, and the top octave's targets rest on it.
+> - **Which curve is "best" is not settled.** *Curve Select* offers three curves.
+>   They agree through the middle of the keyboard but pull well apart in the
+>   lowest octave, and no measurement will ever say which is right since it can be subjective. *Multi-interval ·
+>   Balanced* is the default.
 > - **No pitch-raise over-pull targets.**
 > - **A440 only**, no user-adjustable temperaments. On a piano sitting well below
 >   pitch the app therefore prescribes a full pitch raise with no way to tune the
@@ -58,17 +45,24 @@ For the design rationale and open observations, see [ARCHITECTURE.md](ARCHITECTU
 
 ### Building and Running
 
+Building needs a Rust toolchain (`rustup`, stable). On Linux it also needs
+`pkg-config` and the ALSA development files the audio library links against:
+`libasound2-dev` on Debian and Ubuntu, `alsa-lib-devel` on Fedora.
+
 ```bash
 # Clone the repository
-git clone <repository-url>
+git clone https://github.com/anauseam/inharmonicity.git
 cd inharmonicity
 
 # Build the project
-cargo build
+cargo build --release
 
 # Run the GUI application
-cargo run -p tuner-gui
+cargo run --release -p tuner-gui
 ```
+
+Build in release. A debug build is too slow to keep up with the microphone and
+drops audio.
 
 > [!NOTE]
 > **Pre-built binaries are coming.** Building from source is the only route
@@ -78,63 +72,92 @@ cargo run -p tuner-gui
 
 ### Tuning a piano
 
-Work in **Manual mode** — you name each key, which is the only provenance the
-tuning curve accepts.
+Work in **Manual mode**: only a key you selected counts toward the tuning
+curve. Automatic note detection is still being validated, so a capture taken in
+Auto mode is kept but left out.
 
-1. **Calibrate.** The app measures the room's noise floor for ~3 s at launch;
-   keep quiet until `Calibrating…` clears.
+1. **Calibrate.** The app listens to the room for a few seconds at launch to
+   learn how loud it is; keep quiet until `Calibrating…` clears.
 2. **Select a key** on the *Key select* keyboard (clicking it again returns to
    automatic detection).
-3. **Measure.** Enable *Measurement Mode*, press capture, strike the string.
-   1.5 s of stable decay is captured and $f_0$/$B$ measured off-thread. *Undo*
-   reverts the last capture.
-4. **Watch the curve form** in the *Curve Plot* panel — unmeasured keys follow
-   the model, so it settles as the compass fills in.
+3. **Measure.** Enable *Measurement Mode* (it arms straight away) and strike
+   the note. The capture button tracks the take: *Armed* → *Capturing…* →
+   *Processing…* → *Ready*. Press *Ready* to arm the next one; pressing it while
+   *Armed* cancels instead. *Undo* takes back the last capture.
+4. **Watch the curve form** in the *Curve Plot* panel (unmeasured keys follow
+   the model, so it settles as the compass fills in).
 5. **Tune** in the *Strobe* panel: stationary band = in tune, direction = sharp
-   or flat, and it falls back to a coarse cents number when the string is too
-   far off to read. The curve locks on entry so targets cannot shift mid-pass.
+   or flat, and it shows a cents number instead when the string is too far off
+   to read. The curve locks on entry so targets cannot shift mid-pass.
 
-Measurements autosave to the open instrument's profile as they land — there is
-nothing to save, and the curve is recomputed rather than stored. The instrument
-is named beside the title; **Settings → Instrument Library** switches or creates
-one, so check the name before measuring a different instrument.
+Measurements autosave to the open instrument as they land and the curve is recomputed rather than stored. The open instrument is
+named beside the title; **Settings → Instrument Library** switches or creates
+one, so check the name before measuring a different piano.
 
-For a non-piano instrument, switch the sidebar's reference toggle to **Ref: ET**
+If for some reason you want to tune to equal temperament (using a different instrument), switch the sidebar's reference toggle to **Ref: ET**
 for a pure equal-temperament strobe with no stretch curve.
 
-> [!IMPORTANT]
-> **Capture in Manual mode.** Automatic note discovery is still under
-> validation, so captures taken in Auto mode are recorded as untrusted and are
-> **excluded from the tuning curve** by design. A full compass captured in Auto
-> yields a model-only curve with no measurements in it.
-
-Every capture also writes its raw audio and analysis under the open instrument's
-own dump directory — `diagnostics/<instrument id>/` in the per-user data
-directory, with an `instrument.json` naming whose captures they are (path printed
-at startup; not yet pruned). Keying on the instrument's identity rather than its
-name means renaming an instrument moves nothing. That data exists for
-development — the format and the offline harnesses that read it are documented in
-[`tuner-lab/README.md`](tuner-lab/README.md).
+Every capture also writes its audio and its analysis to a diagnostics folder in
+the app's data directory — `~/.local/share/inharmonicity/diagnostics/` on Linux,
+the equivalent on macOS and Windows — one folder per instrument. The exact path
+is printed at startup. That is there for development; nothing in the app reads it
+back, and nothing clears it, so it grows until you delete it.
 
 ## Interface
 
-An `iced` 0.14 GUI. Everything below is built and in the app today; planned
-features live in [TODO.md](TODO.md).
+Everything below is built and in the app today; planned features live in
+[TODO.md](TODO.md).
 
 ### Features
 
-- **Spectrogram Visualization**: Real-time frequency spectrum display
-- **Cent Meter**: Visual tuning accuracy indicator with color-coded feedback
-- **Piano Keyboard Select**: 88-key piano interface with click-to-select frequency functionality
-- **Inharmonicity Measurement**: Capture and analyze piano-specific inharmonicity characteristics
-- **Tuning Curve Display**: Live per-key stretch curve plot, recomputed off-thread as you capture
-- **Manual-Mode Strobe**: Tune each string to its own per-partial curve targets — a fine phase band with an OS-CFAR coarse readout for out-of-range strings, per-key Smart-Partials selection, and a curve lock that freezes targets for a pass
-- **ET Reference Mode**: Instrument-agnostic pure-equal-temperament strobe (no stretch curve) for non-piano use
-- **Profile Management**: Per-instrument profiles, autosaved as you measure, with a searchable library and the last instrument reopened at launch
-- **Transient Detection Calibration**: Manual and automatic transient detection calibration
-- **Noise Floor Calibration**: Manual and automatic noise floor calibration
-- **NINOS2 Stability Calibration**: Live oscilloscope with adjustable threshold for tuning the NINOS2 tonal stability gate
-- **Measurement-session controls** (Settings → Advanced, off by default): declare which of a key's strings sounded, so a note can be recorded one string at a time; and record past the shipped 1.5 s when a capture needs the decay tail. Neither changes what is measured — the analysis window is fixed so every measurement stays comparable.
+#### Measurement
+
+- **Per-note inharmonicity measurement** — a struck note is captured and
+  analysed for how far its overtones stray from whole-number multiples of its
+  fundamental.
+- **Measurement inspector** — every capture kept for a key, with the curve's
+  verdict on each; drop one, or take the key again. *Undo* reverts the last
+  capture.
+- **Suspect-measurement flags** — a key whose measurement disagrees with the
+  octave around it is marked on the keyboard, the curve and the strobe, and left
+  out of the curve.
+
+#### Tuning curve
+
+- **Per-instrument stretch curve** — built from the piano's own measurements,
+  with unmeasured keys following a model. It redraws after every capture, and
+  doubles as a key picker.
+- **Curve selection** — three curve styles side by side: a smooth model of the
+  whole piano, a balanced curve that puts octaves first (the default), or one
+  that favours pure twelfths.
+
+#### Tuning
+
+- **Strobe tuner** — a band that stands still on target and drifts one way for
+  sharp, the other for flat. Measured keys are read on the overtone chosen for
+  them, unmeasured keys on the fundamental, and a string too far off for the band
+  to follow gets a cents readout instead.
+- **Curve lock** — targets freeze for the length of a tuning pass, so a later
+  measurement cannot move a string already tuned.
+- **Cent meter and live spectrum** — color-coded distance from the target,
+  beside the current frame's spectrum.
+- **ET reference mode** — plain equal temperament with no stretch curve, for any
+  instrument.
+
+#### Instruments
+
+- **Instrument library** — make, model, serial number, owner and notes per
+  piano, with search, sort, duplicate and delete.
+- **Autosave** — measurements, the chosen curve and the instrument's settings are
+  written as they change, and the last instrument reopens at launch.
+
+#### Calibration
+
+- **Room check** — run at launch to learn how loud a sound must be to stand out
+  from the room, re-runnable or settable by hand.
+- **Detection thresholds** — live traces for how sharp a strike must be to count
+  as one and how steady a tone must be before it is measured, each with a slider,
+  both saved with the instrument.
 
 > [!TIP]
 > **Graphics Issues? Check Your Vulkan Drivers**
@@ -144,132 +167,24 @@ features live in [TODO.md](TODO.md).
 > incompatible Vulkan drivers. Ensure your GPU drivers are fully up-to-date before
 > reporting rendering bugs.
 
-See [tuner-gui](tuner-gui/README.md) for more information.
+## For developers
 
-## Architecture
+The workspace is three crates. **`tuner-core`** is the headless engine — audio
+input, the real-time DSP pipeline and the background measurement — with no GUI
+dependency, so any frontend can drive it. **`tuner-gui`** is the frontend built
+on it ([its README](tuner-gui/README.md)). **`tuner-lab`** holds the measurement
+harnesses that reproduce the reports, and ships in nothing.
 
-### Project Structure
+- [ARCHITECTURE.md](ARCHITECTURE.md) — the codemap, the threading model, how
+  settled each module is, and the decisions that shape the system.
+- [reports/](reports/) — the measurements those decisions rest on, indexed by
+  what each one decided.
+- [CONTRIBUTING.md](CONTRIBUTING.md) — how to propose a change, and the rules a
+  change resting on a measurement has to meet.
+- [tuner-lab/README.md](tuner-lab/README.md) — the harnesses, and the capture
+  format they read.
+- [TODO.md](TODO.md) — the backlog, with what each item is blocked on.
 
-```text
-inharmonicity/
-├── tuner-core/                     # Headless audio processing & analysis (no GUI code)
-│   ├── src/
-│   │   ├── algorithms/             # Stateless DSP building blocks
-│   │   │   ├── spectral.rs         # FFT, Hann windowing, magnitude spectrum, CSPE + Jacobsen sub-bin estimators
-│   │   │   ├── peaks.rs            # Spectral peak extraction (Jacobsen sub-bin) + SMS masking + OS-CFAR coarse read
-│   │   │   ├── twm.rs              # Canonical Two-Way Mismatch (Primary F0 discovery)
-│   │   │   ├── mat.rs              # Median-Adjustive Trajectories — faithful serial (f₀,B) estimator w/ CSPE
-│   │   │   ├── metrics.rs          # RMS, EMA, NHWRSF, NINOS2 signal metrics
-│   │   │   ├── discovery.rs        # Split discovery search (Stage A 88-key scan → Stage B refine)
-│   │   │   ├── curves.rs           # Tuning-curve engines (a)–(d) — orchestrates the three leaves below
-│   │   │   ├── rigaud.rs           # Rigaud parametric inharmonicity + tuning model (B_ξ fit, ρ_φ, F₀)
-│   │   │   ├── giordano.rs         # Giordano sensory-dissonance octave-width recipe (Plomp–Levelt/Sethares)
-│   │   │   └── whittaker.rs        # Whittaker smoother + shared banded LS solver
-│   │   ├── cola.rs                 # CircularFifo — COLA circular FIFO for overlapping frame analysis
-│   │   ├── models.rs               # Domain types: Note, Partial, KeyMeasurement, KeyProfile, InharmonicityProfile (schema v1)
-│   │   ├── pipeline.rs             # AudioPipeline mediator — Dual-FFT unconditional execution
-│   │   ├── engine.rs               # F0 Engine — TWM Discovery + M-of-N lock + Goertzel Phase Tracking
-│   │   ├── strobe.rs               # Manual-mode strobe: fixed-reference beat phase + OS-CFAR coarse readout (pipeline tap)
-│   │   ├── strobe/
-│   │   │   ├── band_slope.rs       # Sliding-window OLS fit of the band's rotation rate
-│   │   │   └── unison.rs           # Per-reference baseband record → the note's individual strings
-│   │   ├── gatekeeper.rs           # 5-state signal validator (DSP only, no shared state)
-│   │   ├── worker.rs               # Background worker for heavy offline DSP
-│   │   ├── audio.rs                # CPAL audio capture, stream management, DC blocking
-│   │   ├── synth.rs                # Offline additive resynthesis of a tuning curve → audio (cold-path, no audio stream)
-│   │   └── lib.rs                  # Crate root
-│   └── Cargo.toml
-├── tuner-gui/                      # Iced-based GUI frontend
-└── Cargo.toml                      # Workspace configuration
-```
+## License
 
-See [tuner-gui/README.md](tuner-gui/README.md) for more information about the GUI.
-
-### The AudioPipeline (Mediator Pattern)
-
-The `tuner-core` crate is designed to be **frontend-agnostic**. Any GUI (Iced, egui, WASM, etc.) can consume it through the `AudioPipeline` — the single entry point that orchestrates all DSP components and manages cross-thread shared state.
-
-```text
-AudioPipeline::new()  →  (AudioPipeline, PipelinePorts)
-        │                         │
-        ▼                         ▼
-    Audio Thread              Frontend Thread
-    ┌─────────────────┐       ┌──────────────────────────────┐
-    │ Gatekeeper      │       │ PipelinePorts                │
-    │   (5-state SM)  │       │   .handle.atomics  ← rw/ro   │ (config + runtime observations)
-    │       ↓         │       │   .worker_rx       ← recv    │ (WorkerOutput: measurements + curves)
-    │ Engine (F0 DSP) │       │   .worker_job_tx   ← send    │ (WorkerJob: curve recomputes)
-    │       ↓         │       │   .profiles        ← send    │ (template updates → DSP; gated)
-    │ Strobe (tap)    │       │   .strobe_refs     ← send    │ (strobe references → DSP)
-    │       ↓         │       └──────────────────────────────┘
-    │ Capture Accum.  │              ↑ polls via Arc<Atomic*>
-    │   (AudioPool)   │──────────────┘ triple_buffer (FrameOutput: viz + strobe angles)
-    │       ↓         │
-    └───────┬─────────┘
-            │ crossbeam SPSC (CapturePayload)   [DSP → Worker]
-            ▼
-      Worker Thread   ◄─── crossbeam SPSC (WorkerJob: curve recompute)  [UI → Worker]
-      ┌───────────────────┐
-      │ High-res FFT+CSPE │ ← 65536-pt + shifted frame   (captures serviced first;
-      │ MAT (f₀,B solver) │ ← partials + inharmonicity     curve recompute when idle)
-      │ Curve engines a–d │ ← CurveBundle (cold, ~1.3 s)
-      │ Diagnostics I/O   │ ← analysis.json + audio.raw
-      └────────┬──────────┘
-               │ crossbeam SPSC (WorkerOutput: measurements + curves) → Frontend
-               │ returns buffer → AudioPool (recycled)
-               ▼
-```
-
-The pipeline–GUI relationship follows the **Split / Handle pattern** (the same convention used by `crossbeam_channel`, `ringbuf::split()`, `std::thread::spawn`):
-
-- **`AudioPipeline`** is moved to the audio thread. It owns the pure DSP components (`Gatekeeper`, `Engine`) and is the **only** thing that mutates the pipeline's internal state. After calling each DSP component's `process_frame()`, the pipeline reads their returned `GateResult` and syncs observations to the shared atomic state. It also manages inline capture accumulation — when `CaptureState` is `Recording`, it copies each hop's newest samples into a pooled buffer.
-- **`PipelinePorts`** is kept by the frontend (everything `new()` hands back once the pipeline is moved to the audio thread). It bundles:
-  - `handle` — a cloneable `PipelineHandle` carrying `Arc<PipelineAtomics>`:
-    - `atomics.config` — wait-free reading and writing of configuration values (e.g., silence threshold, target key)
-    - `atomics.runtime` — wait-free polling of runtime observations (e.g., smoothed RMS for the Envelope Viewer)
-    - `atomics.capture_in_flight` — the Worker → DSP flag that ends a capture's lifecycle; the lifecycle itself is a pipeline-owned `CaptureState` published on `FrameOutput`
-  - `worker_rx` — crossbeam SPSC receiver for `WorkerOutput` results from the Worker: `Measurement(KeyMeasurement)` per capture and `Curve(CurveBundle)` per curve recompute (one enum stream, so a new result kind is a variant, not a new channel)
-  - `worker_job_tx` — crossbeam SPSC sender for `WorkerJob` background requests to the Worker (today curve recomputes; latest-wins). The GUI uses `HostHandle::send_curve_job` so the crossbeam types stay out of the frontend crate
-  - `profiles` — `ringbuf` SPSC producer for pushing recompiled inharmonicity templates back to the live engine (UI → DSP; the measured-B discovery path is **gated off** by default — see [TODO.md](TODO.md))
-  - `strobe_refs` / `capture_commands` — the other two `ringbuf` SPSC producers of the same class (UI → DSP): the strobe's reference set, and the capture-lifecycle commands (`Arm` carrying the fill target and string declaration, `Cancel`) the pipeline acts on itself
-
-  The single-owner endpoints (`worker_rx`, `worker_job_tx`, `profiles`, `strobe_refs`) cannot be cloned: `spawn_analysis_thread()` folds them, with the handle, into a `HostHandle`.
-
-A frontend contributor just calls `AudioPipeline::new()`, gets a `PipelinePorts`, and never needs to know about Gatekeeper internals, EMA calculations, or lock management.
-
-The pipeline also manages the **`WorkerManager`** (`worker.rs`), which owns a single dedicated background thread for the heavy, non-realtime DSP. A filled capture reaches it as a `CapturePayload`; the worker runs a high-resolution FFT and CSPE map and then MAT, producing the key's partials, refined fundamental and inharmonicity coefficient ($B$). It returns a `KeyMeasurement` on `worker_rx` and recycles the audio buffer into the `AudioPool`. The same thread also serves **tuning-curve recomputes** requested by the UI (`WorkerJob` → `CurveBundle`), with **captures always serviced first**. Why that work is off-thread, and why one thread is enough, is argued in [ARCHITECTURE.md](ARCHITECTURE.md#heavy-dsp-runs-off-thread-in-the-worker).
-
-> [!NOTE]
-> **Module Status**
->
-> Every module below is built and running; the status reflects how settled each
-> one is and whether more work is expected. All are `tuner-core` except
-> `app.rs`, which is the GUI's state hub.
->
-> | Module | Status |
-> | --- | --- |
-> | `pipeline.rs` — AudioPipeline orchestrator + shared state | 🟢 Stable |
-> | `gatekeeper.rs` — 5-state signal validator (pure DSP) | ✅ Mature |
-> | `engine.rs` — TWM discovery + Goertzel phase tracking | 🔬 R&D |
-> | `worker.rs` — background (f₀, B) measurement (single thread) | 📐 Provisional |
-> | `curves.rs` + `rigaud.rs`/`giordano.rs`/`whittaker.rs` — tuning-curve engines (a)–(d) | 📐 Provisional |
-> | `strobe.rs` + `strobe/` — manual-mode strobe (fixed-ref beat phase, its band-slope rate, the unison line estimator, + OS-CFAR coarse readout, Path A) | 📐 Provisional |
-> | `synth.rs` — offline curve → audio resynthesis (cold-path, no audio stream) | 📐 Provisional |
-> | `peaks.rs` — Jacobsen sub-bin peak extraction + OS-CFAR coarse read + unison line estimator | 🧩 Extensible |
-> | `twm.rs` — canonical Two-Way Mismatch scoring | 🔬 R&D |
-> | `app.rs` — GUI state hub | 🚧 In Development |
->
-> **Legend** — ✅ **Mature**: solved, unlikely to change · 🟢 **Stable**: complete for its role · 📐 **Provisional**: functional now, but a specific required feature isn't built on it yet · 🧩 **Extensible**: works today, could grow, no commitment either way · 🚧 **In Development**: functional, more features actively coming · 🔬 **R&D**: algorithm still being developed and validated. (The two "done" tiers follow the PyPI convention where Mature ranks above Stable.)
->
-> Reading the table: gating and orchestration are settled. The **curve layer**
-> and the **strobe** are complete and wired together, and stay Provisional only
-> until a piano has actually been tuned to a curve. **synth** is cold-path — it
-> renders a curve to audio offline for the auralization A/B and owns no audio
-> stream. The **Engine** and **twm** are the open research front: discovery
-> locks reliably but the deep bass is inharmonicity-limited, gated on a second
-> instrument ([ADR 0006](docs/adr/0006-discovery-refinement-validation.md)). What
-> each module is still waiting on is in [TODO.md](TODO.md).
-
-## License & Contact
-
-This project is licensed under the terms specified in the LICENSE file.
+Mozilla Public License 2.0. See [LICENSE](LICENSE).

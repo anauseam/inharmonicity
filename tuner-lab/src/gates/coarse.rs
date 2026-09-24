@@ -11,10 +11,13 @@
 
 use std::path::{Path, PathBuf};
 
+use anyhow::Result;
 use realfft::RealFftPlanner;
 use rustfft::num_complex::Complex;
 
+use crate::gates::GateOpts;
 use crate::truth::*;
+use crate::{capture, raw};
 use tuner_core::algorithms::curves;
 use tuner_core::algorithms::peaks;
 use tuner_core::algorithms::spectral::{fft, magnitude_spectrum};
@@ -24,10 +27,9 @@ use tuner_core::models::{NOTES, get_expected_beta};
 use tuner_core::pipeline::ProcessingFrame;
 use tuner_core::strobe::MAX_STROBE_REFS;
 
-/// **T1 — the per-key × per-partial CFAR profile.** The objective input to the
-/// coarse-`n*` decision, and the closure of the coverage gap that let round 1
-/// crown n = 3 from an *ambient*-gate aggregate while the real gate behaves
-/// entirely differently (A0: n = 5 perfect, n = 6 starved).
+/// The per-key × per-partial CFAR profile, the objective input to the coarse-`n*`
+/// decision: an ambient-gate aggregate cannot stand in for it, because the real
+/// gate behaves entirely differently (A0: n = 5 perfect, n = 6 starved).
 ///
 /// One row per (key, partial), aggregated over that key's repeat captures:
 /// availability, |median − partial-truth|, jitter, and median CFAR margin (the
@@ -51,11 +53,11 @@ fn cfar_profile(
         let Some(key) = dir
             .file_name()
             .and_then(|n| n.to_str())
-            .and_then(crate::capture::key_from_dirname)
+            .and_then(capture::key_from_dirname)
         else {
             continue;
         };
-        let Some(signal) = crate::raw::read(&dir.join("audio.raw")) else {
+        let Some(signal) = raw::read(&dir.join("audio.raw")) else {
             continue;
         };
         if signal.len() < BASS_WINDOW_SIZE {
@@ -151,15 +153,14 @@ fn cfar_profile(
     }
 }
 
-/// **T3 — realized false-alarm rate.** Converts the finite-N and
-/// bin-correlation corrections from "conservative reasoning" into a measured
-/// number, the same empirical-closure standard the NP gate audit set.
+/// Realized false-alarm rate: the finite-N and bin-correlation corrections as a
+/// measured number rather than conservative reasoning.
 ///
 /// Runs the gated read over noise with no tone present and counts admissions.
 /// Two populations: synthetic AWGN at the calibrated floor (exact H₀ — the
 /// clean calibration), and the pre-onset segments of real captures
-/// (`audio_full_event.raw` carries ~348 ms of pre-roll before the strike — real
-/// room noise, the honest H₀). Nominal is P_fa = 0.001.
+/// (`audio_full_event.raw` carries ≈ 348 ms of pre-roll before the strike: real
+/// room noise). Nominal is P_fa = 0.001.
 fn pfa_calibration(
     caps: &[PathBuf],
     planner: &mut RealFftPlanner<f32>,
@@ -261,11 +262,11 @@ fn pfa_calibration(
             let Some(key) = dir
                 .file_name()
                 .and_then(|n| n.to_str())
-                .and_then(crate::capture::key_from_dirname)
+                .and_then(capture::key_from_dirname)
             else {
                 continue;
             };
-            let Some(full) = crate::raw::read(&dir.join("audio_full_event.raw")) else {
+            let Some(full) = raw::read(&dir.join("audio_full_event.raw")) else {
                 continue;
             };
             if full.len() < preroll {
@@ -311,17 +312,16 @@ fn pfa_calibration(
         println!();
     }
 
-    // ── F8: is the pre-onset region actually Gatekeeper-Silence? ──────────
-    // If it is, the room-noise false-alarm rate is moot for the shipped design:
-    // the coarse read would never be computed there. If it is NOT, the gate has
-    // to carry that load itself and 0.34 is a real problem.
+    // ── Is the pre-onset region Gatekeeper-Silence? ───────────────────────
+    // Where it is, the room-noise false-alarm rate is moot: the coarse read is
+    // not computed there. Where it is not, the gate carries that load itself.
     let mut silent_frames = 0usize;
     let mut total_frames = 0usize;
     let mut planner2 = RealFftPlanner::<f32>::new();
     let fft_t = planner2.plan_fft_forward(WINDOW_SIZE);
     let fft_b = planner2.plan_fft_forward(BASS_WINDOW_SIZE);
     for dir in caps.iter().take(20) {
-        let Some(full) = crate::raw::read(&dir.join("audio_full_event.raw")) else {
+        let Some(full) = raw::read(&dir.join("audio_full_event.raw")) else {
             continue;
         };
         if full.len() < preroll {
@@ -330,7 +330,7 @@ fn pfa_calibration(
         let quiet = &full[..preroll];
         let mut frame = ProcessingFrame::new();
         let mut gate = Gatekeeper::new();
-        // The LIVE default, not the harness's analysis floor: `PipelineAtomics`
+        // The live default, not the harness's analysis floor: `PipelineAtomics`
         // ships silence_threshold = 0.005, and the calibration flow exists to
         // raise it above the room. Measuring Silence at 0.001 answers a
         // question the shipped app never asks.
@@ -373,10 +373,6 @@ fn pfa_calibration(
     }
 }
 
-/// Per-hop reads of **every** reference partial from a single FFT — the
-/// structure the pipeline would actually use (one spectrum, several bounded
-/// searches). Returns `[hop][partial] = (reading, CFAR margin)`.
-#[allow(clippy::too_many_arguments)]
 /// **T5 — reference-set anatomy.** The two questions Rohling's §V raises about
 /// our reference window, measured rather than argued.
 ///
@@ -385,18 +381,15 @@ fn pfa_calibration(
 ///    resolution cells". Our interferer is a harmonic comb, so with partial
 ///    spacing `s` bins and a Hann main lobe `W_lobe = 4` bins wide null-to-null
 ///    the criterion reads `k/N ≤ 1 − W_lobe/s`. This run classifies every
-///    reference cell as **lobe** (within a main-lobe half-width of a partial) or
-///    **valley**, reports the lobe fraction against that bound, and says which
-///    class the selected order statistic actually landed in — the standing claim
-///    that the wide flank "lets a low order statistic find the valleys between
-///    partials" has never been checked.
+///    reference cell as lobe (within a main-lobe half-width of a partial) or
+///    valley, reports the lobe fraction against that bound, and says which
+///    class the selected order statistic landed in.
 /// 2. **Guard cells.** §V states they "become unnecessary" for OS CFAR, since a
 ///    small number of target amplitudes in the reference window "have almost no
-///    influence on the clutter level estimation by quantiles". We keep ±2 on the
-///    CA-CFAR rationale, so this sweeps `guard_bins` and reports what the guard
-///    actually buys.
+///    influence on the clutter level estimation by quantiles". This sweeps
+///    `guard_bins` from the shipped 0 and reports what a guard buys.
 ///
-/// Both parts read the **coarse partial** (`curves::coarse_read_partial`), the
+/// Both parts read the coarse partial (`curves::coarse_read_partial`), the
 /// one the shipped readout centres on.
 fn ref_anatomy(
     caps: &[PathBuf],
@@ -432,11 +425,11 @@ fn ref_anatomy(
         let Some(key) = dir
             .file_name()
             .and_then(|n| n.to_str())
-            .and_then(crate::capture::key_from_dirname)
+            .and_then(capture::key_from_dirname)
         else {
             continue;
         };
-        let Some(signal) = crate::raw::read(&dir.join("audio.raw")) else {
+        let Some(signal) = raw::read(&dir.join("audio.raw")) else {
             continue;
         };
         if signal.len() < BASS_WINDOW_SIZE {
@@ -606,11 +599,11 @@ fn ref_anatomy(
             let Some(key) = dir
                 .file_name()
                 .and_then(|n| n.to_str())
-                .and_then(crate::capture::key_from_dirname)
+                .and_then(capture::key_from_dirname)
             else {
                 continue;
             };
-            let Some(signal) = crate::raw::read(&dir.join("audio.raw")) else {
+            let Some(signal) = raw::read(&dir.join("audio.raw")) else {
                 continue;
             };
             if signal.len() < BASS_WINDOW_SIZE {
@@ -676,14 +669,12 @@ fn ref_anatomy(
     }
 }
 
-/// **Port verification — this harness's read vs the shipped one.**
+/// Port verification — this harness's read vs the shipped one.
 ///
-/// The measurement rounds settled the coarse read here, in [`spectral_read`]
-/// under [`shipping_gate`]; the hot path now carries its own copy in
-/// `peaks::coarse_read`. Every number on record was produced by *this* code, so
-/// the shipped one has to reproduce it bit-for-bit or the record does not
-/// transfer. Run over real captures at both analysis sizes, on the partial the
-/// shipped rule (`curves::coarse_read_partial`) actually selects.
+/// Every coarse-read number on record came from [`spectral_read`] under
+/// [`shipping_gate`], so the shipped `peaks::coarse_read` must reproduce it
+/// bit-for-bit or the record does not transfer. Runs over real captures at both
+/// analysis sizes, on the partial `curves::coarse_read_partial` selects.
 ///
 /// Reports per FFT size: hops compared, admission agreement, and the largest
 /// frequency disagreement among hops both admitted.
@@ -709,11 +700,11 @@ fn verify_shipped(caps: &[PathBuf], planner: &mut RealFftPlanner<f32>) {
             let Some(key) = dir
                 .file_name()
                 .and_then(|n| n.to_str())
-                .and_then(crate::capture::key_from_dirname)
+                .and_then(capture::key_from_dirname)
             else {
                 continue;
             };
-            let Some(signal) = crate::raw::read(&dir.join("audio.raw")) else {
+            let Some(signal) = raw::read(&dir.join("audio.raw")) else {
                 continue;
             };
             if signal.len() < BASS_WINDOW_SIZE {
@@ -807,12 +798,12 @@ fn verify_shipped(caps: &[PathBuf], planner: &mut RealFftPlanner<f32>) {
     );
 }
 
-/// **Gate A/B.** The same bounded spectral read under every gate in
+/// The same bounded spectral read under every gate in
 /// [`gate_variants`], on one capture, at the partial given by `partial`.
 ///
-/// Two opposite tests share this table. On the **deep bass** it is a rejection
+/// Two opposite tests share this table. On the deep bass it is a rejection
 /// test: the n = 1 readings there are known junk, and the ambient gate admits
-/// them at ~98 % — a better gate should reject. On **A7/C8** it is an
+/// them at ~98 % — a better gate should reject. On A7/C8 it is an
 /// admission test: the readings are accurate but scarce, and a better gate
 /// should recover availability without losing accuracy.
 #[allow(clippy::too_many_arguments)]
@@ -827,8 +818,8 @@ fn gate_ab(
     let key = dir
         .file_name()
         .and_then(|n| n.to_str())
-        .and_then(crate::capture::key_from_dirname)?;
-    let signal = crate::raw::read(&dir.join("audio.raw"))?;
+        .and_then(capture::key_from_dirname)?;
+    let signal = raw::read(&dir.join("audio.raw"))?;
     if signal.len() < BASS_WINDOW_SIZE {
         return None;
     }
@@ -874,11 +865,6 @@ fn gate_ab(
 }
 
 // ── Mode entry points ────────────────────────────────────────────────────────
-
-use anyhow::Result;
-
-use crate::capture;
-use crate::gates::GateOpts;
 
 /// The captures a gate study runs over, honouring `--keys`.
 fn population(o: &GateOpts) -> Result<Vec<PathBuf>> {

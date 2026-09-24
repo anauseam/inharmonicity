@@ -1,14 +1,12 @@
 //! # Per-key advisories — what a curve's [`CurveKeyFlags`] tell the user
 //!
-//! One home for two decisions the flag data does not make on its own: which
-//! flags mean *this measurement is suspect* (a red ✗ and a recapture hint) and
-//! which are merely informational, plus the words for each. The curve plot, the
-//! keyboard, the strobe panel and the inspector all read from here, so the same
-//! flag never says two different things in two places.
-//!
-//! Only `excluded` and `negative_stretch` are suspect. The other three are
-//! ordinary states of a healthy curve — the counts that decided it are in
-//! `docs/design/strobe-and-manual-tuning-ui-design.md` §5.6.
+//! Which flags mark a measurement as suspect and which are informational, and
+//! the words for each, so a flag reads the same wherever it is shown.
+//
+// Only `excluded` and `negative_stretch` are suspect. Over both capture sets
+// that pair fires on no key, while `curve_b_fallback` marks 21–22 of 88 (20 of
+// them treble, plus every unmeasured key) and `giordano_excluded` 39–40: styled
+// as errors, those two would paint most of the keyboard red.
 
 use tuner_core::models::CurveKeyFlags;
 
@@ -24,7 +22,6 @@ pub enum Severity {
 /// One line about one key, ready to render.
 #[derive(Debug, Clone, Copy)]
 pub struct Advisory {
-    /// How it should read on screen.
     pub severity: Severity,
     /// What the curve found, in one line.
     pub reason: &'static str,
@@ -46,7 +43,7 @@ pub fn suspect(flags: &CurveKeyFlags) -> Option<Advisory> {
         .find(|a| a.severity == Severity::Suspect)
 }
 
-/// Every advisory for a key, suspect ones first — the inspector's list.
+/// Every advisory for a key, suspect ones first.
 pub fn advisories(flags: &CurveKeyFlags) -> Vec<Advisory> {
     let mut out = Vec::new();
     if flags.excluded {
@@ -85,8 +82,7 @@ pub fn advisories(flags: &CurveKeyFlags) -> Vec<Advisory> {
     out
 }
 
-/// Per-key suspect marks for a whole curve — what the plot and the keyboard
-/// draw.
+/// Per-key suspect marks for a whole curve.
 pub fn suspect_keys(flags: &[CurveKeyFlags; 88]) -> [bool; 88] {
     core::array::from_fn(|k| is_suspect(&flags[k]))
 }

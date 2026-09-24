@@ -1,41 +1,9 @@
-//! # Background Worker (Thread 3) — Heavy Offline DSP
+//! # Background worker
 //!
-//! The "Heavy Lifter" of the pipeline. A single dedicated background thread
-//! that receives filled audio captures from the Gatekeeper (via the
-//! [`AudioPool`](crate::pipeline::AudioPool)) and performs computationally
-//! expensive offline DSP, such as extracting up to 32 partials and calculating
-//! the inharmonicity constant ($B$).
-//!
-//! A capture is 1.5 s by default and a measurement session may record longer
-//! ones, but the span this thread *measures* is fixed at
-//! [`CAPTURE_ANALYSIS_SAMPLES`](crate::pipeline::CAPTURE_ANALYSIS_SAMPLES) —
-//! the extra audio is written to disk and never analysed here.
-//!
-//! ## Why a Single Thread?
-//!
-//! Captures are infrequent (one stable note at a time, triggered by the Gatekeeper's
-//! State 4 RELEASE). The MAT / ICF algorithms are fast enough to complete well before
-//! the next capture could arrive, so a single dedicated thread avoids the overhead
-//! of a full thread pool.
-//!
-//! ## Implementation
-//!
-//! The `WorkerManager` spawns a single background thread at pipeline startup.
-//! The thread blocks on a crossbeam receiver and processes payloads as they arrive:
-//!
-//! 1. Receive a `CapturePayload` (an audio buffer + metadata, including the
-//!    already-identified `target_note`)
-//! 2. Perform a high-resolution FFT on the first
-//!    [`CAPTURE_ANALYSIS_SAMPLES`](crate::pipeline::CAPTURE_ANALYSIS_SAMPLES) of
-//!    the captured audio + a one-sample-shifted frame, and derive a CSPE
-//!    super-resolution frequency map
-//! 3. Take the note identity from the payload (the Engine's discovery lock in
-//!    Auto mode, the user selection in Manual mode) — the worker does not
-//!    re-identify the note
-//! 4. Run MAT to extract partials and jointly refine ($f_0$, $B$)
-//! 5. Write diagnostic files (audio.raw + analysis.json) to disk
-//! 6. Send a `KeyMeasurement` result to the UI via crossbeam SPSC channel
-//! 7. Recycle the buffer back to the `AudioPool`
+//! The thread that measures captures and recomputes tuning curves. A capture is
+//! analysed over its first [`CAPTURE_ANALYSIS_SAMPLES`], however long the record:
+//! a CSPE frequency map, then MAT's joint (f₀, B) for the key the pipeline named.
+//! The result returns as a [`KeyMeasurement`] and the audio goes to the dump.
 
 use crate::algorithms::curves::{self, BALANCED_INTERVALS, CurveParams, PURE_TWELFTHS_INTERVALS};
 use crate::algorithms::{
@@ -54,51 +22,35 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-/// Relative band around the named key's ET frequency inside which the live
-/// tracker's seed is trusted for MAT. **Ours, from validation**: the joint
-/// (f0, B) association recovers known B to < 1 % only when seeded within
-/// ±10 % of the true fundamental (`examples/mat_b_recovery.rs`); honest
-/// mistuning of the named key is far smaller (a whole semitone is 5.9 %),
-/// so anything outside the basin is tracker garbage, not signal.
+/// Relative band around the named key's ET frequency within which the live
+/// tracker's seed is trusted for MAT; outside it, MAT seeds from ET.
+// MAT recovers B to < 1 % only when seeded within ±10 % of the true f₀, and a
+// whole semitone of mistuning is 5.9 %. Do not widen it: the deep-bass tracker
+// can walk onto rumble and seed A0 at 5–16 Hz, mis-associating the whole comb.
+// asserted: tests/mat_b_recovery.rs
 pub const MAT_SEED_TOLERANCE: f32 = 0.10;
 
-/// A UI → Worker request to (re)compute the tuning-curve bundle from a
-/// trust-filtered profile snapshot (crossing #6, UI → Worker).
-///
-/// The UI sends the already-filtered [`CurveInput`] — **not** the raw profile —
-/// so the worker stays free of the trust/provenance policy (ADR 0006 item 3
-/// lives on the UI side, where the profile does). `generation` is a
-/// monotonic counter the UI stamps on every job; the returned [`CurveBundle`]
-/// echoes it so the UI can drop a bundle superseded by a newer edit
-/// (latest-wins — a stale curve is worthless).
+/// A request to recompute the curve bundle from a trust-filtered [`CurveInput`]
+/// (crossing #6). The bundle echoes `generation`, so a superseded one can be
+/// dropped.
 #[derive(Debug, Clone)]
 pub struct CurveJob {
     pub generation: u64,
     pub input: CurveInput,
 }
 
-/// Everything the UI can ask the Worker to do on the job channel (crossing #6,
-/// UI → Worker) — the mirror of [`WorkerOutput`] on the return path. One input
-/// stream, a sum type of every background job the worker accepts. Curve
-/// recompute is the only kind today; a new kind is a new variant, so the
-/// channel type (and every signature carrying it) never changes to add one.
+/// A job for the Worker (crossing #6).
 #[derive(Debug, Clone)]
 pub enum WorkerJob {
+    /// Recompute the curve bundle.
     Curve(CurveJob),
-    /// Write subsequent capture dumps under this directory, or none at all.
-    ///
-    /// Sent when the open instrument changes, so dumps follow the instrument
-    /// they belong to. The worker drains captures *before* jobs, so a capture
-    /// still in flight when the instrument changes is written under the old
-    /// root — which is the instrument it was actually taken on.
+    /// Write later capture dumps under this directory, or none. Captures already
+    /// queued go under the old one, the instrument they were taken on.
     SetDumpDir(Option<PathBuf>),
 }
 
-/// All tuning-curve engines computed from one [`CurveJob`], echoed back to the
-/// UI. Every engine is computed so the (deferred) comparison UI can switch
-/// between them with no worker round-trip; the manual-mode default view is
-/// [`multi_balanced`](Self::multi_balanced). Derived data — never persisted
-/// (`TuningCurve` has no `Serialize`; design note §9).
+/// Every engine's curve from one [`CurveJob`], so a frontend switches engines
+/// without a recompute. Derived, never persisted.
 #[derive(Debug, Clone)]
 pub struct CurveBundle {
     pub generation: u64,
@@ -108,24 +60,17 @@ pub struct CurveBundle {
     pub per_key_smoothed: TuningCurve,
     /// (c) Giordano sensory-dissonance-calibrated octave type.
     pub giordano: TuningCurve,
-    /// (d) weighted multi-interval least squares, BALANCED preset — the
-    /// manual-mode default.
+    /// (d) weighted multi-interval least squares, BALANCED preset.
     pub multi_balanced: TuningCurve,
     /// (d) weighted multi-interval least squares, PURE_TWELFTHS preset.
     pub multi_pure_twelfths: TuningCurve,
-    /// Per-key displayed strobe partial `n*` (strobe design §6, R5/R8):
-    /// carried in the bundle so it locks with the curve. Filled by the
-    /// amplitude-informed [`curves::select_display_partials`] (CyberTuner
-    /// "Smart Partials", §6.3), which falls back per key to the
-    /// [`curves::default_display_partials`] register table where no
-    /// measurement exists.
+    /// Per-key displayed strobe partial n* ([`curves::select_display_partials`]),
+    /// computed from the same input as the curves, so the two never disagree.
     pub display_partials: [u8; 88],
 }
 
 impl CurveBundle {
-    /// The curve for `choice`. The selection lives on the profile
-    /// ([`models::EngineChoice`]) while the curves live here, so the resolution
-    /// belongs to whichever side owns the bundle — this one.
+    /// The curve for `choice`.
     pub fn curve(&self, choice: models::EngineChoice) -> &TuningCurve {
         match choice {
             models::EngineChoice::RigaudPure => &self.rigaud_pure,
@@ -136,11 +81,8 @@ impl CurveBundle {
         }
     }
 
-    /// Runs every engine at [`CurveParams::default()`] on the job's input.
-    /// Cold path (~1.4 s, dominated by (c)'s Giordano scans) — worker thread
-    /// only, never the DSP hot path. The ρ Low/Mean/High preset variants of
-    /// (c) are deferred with the comparison UI (they need (c)'s calibration
-    /// factored out of the per-preset path to avoid re-running the scan).
+    /// Runs every engine at [`CurveParams::default()`]. A cold path: ≈ 1.4 s,
+    /// most of it (c)'s Giordano scans.
     pub fn compute(job: &CurveJob) -> Self {
         let input = &job.input;
         let params = CurveParams::default();
@@ -161,51 +103,36 @@ impl CurveBundle {
     }
 }
 
-/// Everything the Worker sends back to the UI on the single result channel
-/// (crossing #5, Worker → UI). One output stream, a sum type of every result
-/// the worker produces — the idiomatic actor pattern. The large `Curve`
-/// variant is boxed so the common `Measurement` case stays small.
+/// A Worker result (crossing #5). `Curve` is boxed, so the common `Measurement`
+/// stays small.
 #[derive(Debug, Clone)]
 pub enum WorkerOutput {
     Measurement(KeyMeasurement),
     Curve(Box<CurveBundle>),
 }
 
-/// Directory name for one capture's diagnostic dump:
-/// `key_<idx>_<note>_<epoch>`, relative to the frontend-supplied dump root.
-///
-/// The epoch suffix makes every capture its own directory, so repeat captures
-/// of one key are all retained — the ADR-0009 repeat-noise decomposition
-/// consumes them, and a fixed per-key name silently overwrote earlier dumps.
-/// Offline tools discover dumps by the `key_` prefix and read the key identity
-/// from `analysis.json`, so the suffix is transparent to them.
-///
-/// Public because the frontend deletes the dump of a capture the user undoes,
-/// and both sides must agree on the name.
-///
-/// Takes the identity, not the measurement: a dump must still be nameable once
-/// its profile entry is gone — retention is bounded, the dumps are not.
+/// The directory of one capture's dump under the dump root:
+/// `key_<idx>_<note>_<epoch>`, unique per capture so repeats are all kept. It
+/// takes the identity rather than the measurement, so a dump stays nameable
+/// after its profile entry is gone.
+// Offline tools find dumps by the `key_` prefix and read the key from
+// `analysis.json`, so the suffix is free to change.
 pub fn dump_dir_name(key_index: u8, epoch: &str) -> String {
     let (key_name, _) = models::find_nearest_note_by_index(key_index);
     format!("key_{key_index:03}_{key_name}_{epoch}")
 }
 
-/// Manages the lifecycle of the background worker thread.
-///
-/// The `WorkerManager` owns an `Arc<AudioPool>` so it can return processed buffers
-/// back to the pool after the heavy DSP is complete. Currently a wireframe.
+/// The Worker thread's owner: its channels, the pool it returns buffers to, and
+/// the dump root.
 pub struct WorkerManager {
     audio_pool: Arc<AudioPool>,
     atomics: Arc<PipelineAtomics>,
     capture_rx: Receiver<CapturePayload>,
-    /// UI → Worker background jobs (crossing #6). Serviced only when no
-    /// capture (crossing #5) is pending — measurement latency is
-    /// user-facing mid-session; a background job (curve recompute) is not.
+    /// UI → Worker jobs (crossing #6), serviced only when no capture is pending:
+    /// capture latency is what the operator waits on.
     worker_job_rx: Receiver<WorkerJob>,
     result_tx: Sender<WorkerOutput>,
-    /// Directory capture dumps are written under, or `None` to write none.
-    /// Supplied by the frontend: where files land is a host policy, and an
-    /// embedded host (a plugin) may want no disk writes at all.
+    /// Directory capture dumps are written under; `None` writes none.
     dump_dir: Option<PathBuf>,
 }
 
@@ -230,15 +157,12 @@ impl WorkerManager {
 
     pub fn start_workers(self) {
         std::thread::spawn(move || {
-            // Owned by the loop rather than read from `self`: the frontend
-            // moves it with `WorkerJob::SetDumpDir` when the instrument changes.
+            // The loop's own copy, which `WorkerJob::SetDumpDir` moves.
             let mut dump_dir = self.dump_dir;
             let mut planner = realfft::RealFftPlanner::<f32>::new();
-            // Pre-plan for max size
             let max_fft_size = BASS_WINDOW_SIZE * 8; // 65536
             let mut fft_instance = planner.plan_fft_forward(max_fft_size);
 
-            // Scratch buffers
             let mut time_buffer = vec![0.0f32; max_fft_size];
             let mut frequency_buffer = vec![Complex { re: 0.0, im: 0.0 }; max_fft_size / 2 + 1];
             // Second spectrum of the one-sample-shifted frame, for CSPE phase comparison.
@@ -249,9 +173,7 @@ impl WorkerManager {
             let mut cspe_buffer = vec![0.0f32; max_fft_size / 2];
 
             loop {
-                // Captures first: measurement latency is user-facing mid-session,
-                // a curve recompute is not. Drain every pending capture before
-                // even looking at a curve job.
+                // Every pending capture before any job.
                 let mut capture_disconnected = false;
                 loop {
                     match self.capture_rx.try_recv() {
@@ -281,9 +203,7 @@ impl WorkerManager {
                     break;
                 }
 
-                // Nothing to process right now: block until either channel wakes
-                // us. The capture arm re-loops (drained first above); the job arm
-                // coalesces to the newest job and dispatches it.
+                // Block until either channel has something.
                 select! {
                     recv(self.capture_rx) -> msg => match msg {
                         Ok(payload) => Self::process_payload(
@@ -305,10 +225,8 @@ impl WorkerManager {
                     // A job-channel disconnect (Err) is ignored: captures may
                     // still flow, so keep serving the loop.
                     recv(self.worker_job_rx) -> msg => if let Ok(job) = msg {
-                        // Drain, then coalesce **per kind**. A curve bundle is
-                        // latest-wins — an earlier one is already superseded. A
-                        // dump-directory change is not: dropping one silently
-                        // files an instrument's captures under another's.
+                        // Coalesced per kind: only the newest curve job matters,
+                        // and a directory change is never lost to a curve job.
                         let mut latest_curve = None;
                         let mut latest_dir = None;
                         let mut sort = |job| match job {
@@ -326,9 +244,7 @@ impl WorkerManager {
                         }
                         if let Some(curve_job) = latest_curve {
                             let bundle = CurveBundle::compute(&curve_job);
-                            // Drop on full: a superseded bundle is worthless, and
-                            // the UI re-requests from its dirty flag. Never blocks
-                            // captures.
+                            // Dropped on a full channel rather than blocking captures.
                             let _ = self
                                 .result_tx
                                 .try_send(WorkerOutput::Curve(Box::new(bundle)));
@@ -354,8 +270,8 @@ impl WorkerManager {
         magnitude_buffer: &mut [f32],
         cspe_buffer: &mut [f32],
     ) {
-        // Step 1: Calculate power-of-two size. Bounded at the analysis window,
-        // so a longer record stores more audio without measuring a longer span.
+        // The largest power of two within the analysis window, so a longer record
+        // measures the same span.
         let sample_count = payload
             .stable_sample_count
             .clamp(2048, CAPTURE_ANALYSIS_SAMPLES);
@@ -374,7 +290,6 @@ impl WorkerManager {
             *fft_instance = planner.plan_fft_forward(fft_size);
         }
 
-        // Apply Hann window and copy to scratch
         spectral::fft(
             &payload.stable_buffer[..fft_size],
             &mut time_buffer[..fft_size],
@@ -389,10 +304,9 @@ impl WorkerManager {
             &mut magnitude_buffer[..(fft_size / 2)],
         );
 
-        // CSPE: transform the SAME frame advanced by one sample, then derive the per-bin
-        // super-resolution frequency map from the two spectra (DAFx-09 §2.3). `fft_size`
-        // is the largest power of two inside the analysis window, so `fft_size + 1` is
-        // always within the allocated buffer.
+        // CSPE (DAFx-09 §2.3): the frame advanced by one sample gives every bin's
+        // frequency. `fft_size + 1` stays inside the buffer, which outruns the
+        // analysis window.
         spectral::fft(
             &payload.stable_buffer[1..fft_size + 1],
             &mut time_buffer[..fft_size],
@@ -415,21 +329,7 @@ impl WorkerManager {
         let f0_et = NOTES[measured_key_index as usize].frequency;
         let expected_beta = models::get_expected_beta(measured_key_index);
 
-        // If the real-time Goertzel Engine successfully tracked the note, use its highly
-        // accurate frequency as the seed. Otherwise, fall back to the mathematically
-        // perfect Equal Temperament frequency for this key.
-        //
-        // Plausibility gate (MAT_SEED_TOLERANCE): the tracker seed is trusted
-        // only within ±10 % of the named key's ET. MAT's joint (f0, B)
-        // association is validated to recover B only when the seed lies
-        // within ±10 % of the true fundamental (`examples/mat_b_recovery.rs`),
-        // and a genuine strike of the named key deviates from ET by tuning
-        // error only (a whole semitone is 5.9 %) — so a seed outside the
-        // basin can only be tracker garbage, not a valid reading. Observed
-        // 2026-07-10: the deep-bass tracker walked onto low-frequency rumble
-        // and seeded A0 (27.5 Hz) captures at 5–16 Hz, mis-associating the
-        // entire partial comb; the untrusted-seed case now falls back to ET
-        // exactly as when tracking fails outright.
+        // The tracker's frequency when it is plausible for the named key, else ET.
         let actual_seed = match payload.measured_f0 {
             Some(tracked) if (tracked / f0_et - 1.0).abs() <= MAT_SEED_TOLERANCE => tracked,
             Some(tracked) => {
@@ -442,10 +342,8 @@ impl WorkerManager {
             None => f0_et,
         };
 
-        // Step 3: Run the MAT adjustive trajectory, which jointly refines (f0, B) and
-        // returns a measured B with a reliability score. It only fails (`None`) when the
-        // capture yields fewer than two partials — no pair to solve. Partial frequencies are
-        // read from the CSPE map, so MAT is register-agnostic (no bass/treble split).
+        // MAT's joint (f₀, B) refinement on the CSPE map; `None` only when fewer than
+        // two partials were found.
         let mut partial_freqs_out = [0.0; MAX_PARTIALS];
         let mut partial_ns_out = [0u32; MAX_PARTIALS];
 
@@ -454,18 +352,13 @@ impl WorkerManager {
             &cspe_buffer[..(fft_size / 2)],
             payload.sample_rate,
             actual_seed, // Goertzel seed for the first prediction; MAT refines it
-            // Serial growth (the paper's Fig. 3 order): uses more partials and, by the
-            // goodness-of-fit check in `validate_mat`, explains the clean low partials as well
-            // as Simultaneous while fitting the high partials it discards. Simultaneous remains
-            // the conservative fallback (one flag flip). See `MatOrder`.
+            // The paper's serial order; see `MatOrder`.
             MatOrder::Serial,
             &mut partial_freqs_out,
             &mut partial_ns_out,
         );
 
-        // `calculated_b` carries the measured coefficient; `b_confidence` carries its
-        // reliability. It is `None` only when MAT found no usable partials (a capture
-        // failure). The Rigaud prior is never substituted for a measured value.
+        // The Rigaud prior is never substituted for a measured B.
         let mut partials = Vec::new();
         let mut calculated_b: Option<f32> = None;
         let mut b_confidence = 0.0_f32;
@@ -497,18 +390,16 @@ impl WorkerManager {
             .unwrap_or_default()
             .as_secs();
 
-        // Build Measurement
         let measurement = KeyMeasurement {
             key_index: measured_key_index,
             measured_f0: actual_seed,
             partials,
             calculated_b,
-            last_captured: format!("{}", now), // Basic string timestamp
+            last_captured: format!("{}", now),
             captured_in_auto: payload.captured_in_auto,
             sounding_strings: payload.sounding_strings,
         };
 
-        // Step 4: Write Diagnostic Dump
         Self::write_diagnostics(
             dump_dir,
             &payload,
@@ -520,12 +411,9 @@ impl WorkerManager {
             mat_f0,
         );
 
-        // Step 5: Clean up and send result.
-        //
-        // Strict order. The buffers go home first, so "not in flight" means the
-        // pipeline can borrow them again; the flag drops next, ending the
-        // lifecycle; the result goes last, so a consumer that arms again on
-        // this `Measurement` finds the lifecycle already finished.
+        // In this order: the buffers first, so "not in flight" means the pipeline
+        // can borrow them; then the flag, ending the lifecycle; the result last,
+        // so a consumer that re-arms on it finds the lifecycle finished.
         let _ = audio_pool.push(payload.stable_buffer);
         if let Some(dbuf) = payload.full_event_buffer {
             let _ = audio_pool.push(dbuf);
@@ -563,38 +451,17 @@ impl WorkerManager {
             return;
         }
         {
-            // Write audio.raw
-            let mut file = dir.clone();
-            file.push("audio.raw");
-            if let Ok(mut f) = fs::File::create(file) {
-                // write f32 bytes
-                let slice = &payload.stable_buffer[..payload.stable_sample_count];
-                let byte_slice: &[u8] = unsafe {
-                    std::slice::from_raw_parts(
-                        slice.as_ptr() as *const u8,
-                        std::mem::size_of_val(slice),
-                    )
-                };
-                let _ = f.write_all(byte_slice);
+            Self::write_raw(
+                &dir.join("audio.raw"),
+                &payload.stable_buffer[..payload.stable_sample_count],
+            );
+            if let Some(ref dbuf) = payload.full_event_buffer {
+                Self::write_raw(
+                    &dir.join("audio_full_event.raw"),
+                    &dbuf[..payload.full_event_sample_count],
+                );
             }
 
-            // Write audio_full_event.raw
-            let mut file_full = dir.clone();
-            file_full.push("audio_full_event.raw");
-            if let Some(ref dbuf) = payload.full_event_buffer
-                && let Ok(mut f_full) = fs::File::create(file_full)
-            {
-                let slice = &dbuf[..payload.full_event_sample_count];
-                let byte_slice: &[u8] = unsafe {
-                    std::slice::from_raw_parts(
-                        slice.as_ptr() as *const u8,
-                        std::mem::size_of_val(slice),
-                    )
-                };
-                let _ = f_full.write_all(byte_slice);
-            }
-
-            // Write analysis.json
             let mut file2 = dir.clone();
             file2.push("analysis.json");
             if let Ok(mut f2) = fs::File::create(file2) {
@@ -609,19 +476,19 @@ impl WorkerManager {
                         "f0_et": 27.5 * 2.0_f32.powf(measurement.key_index as f32 / 12.0),
                         "fft_size": fft_size,
                         "hz_per_bin": hz_per_bin,
+                        // The gate's three thresholds as they stood, `noise_floor`
+                        // holding the silence threshold: a replay needs all three.
                         "noise_floor": payload.noise_floor,
+                        "nhwrsf_threshold": payload.nhwrsf_threshold,
+                        "sustain_stability_threshold": payload.sustain_stability_threshold,
                         "calculated_b": measurement.calculated_b,
                         "expected_beta": expected_beta,
                         "b_confidence": b_confidence,
                         "mat_f0": mat_f0,
-                        // Provenance: manual-mode captures are trusted by the
-                        // curve layer (ADR 0006 item 3); auto-mode ones are not.
-                        // Persist it so offline tools that rebuild a profile from
-                        // diagnostics (regenerate_partials → curve_compare) keep
-                        // the trust flag instead of defaulting it to untrusted.
+                        // So a profile rebuilt from dumps keeps the trust flag
+                        // rather than defaulting to untrusted.
                         "captured_in_auto": measurement.captured_in_auto,
-                        // `null` unless the operator declared one; the
-                        // mute-isolation set is read from these dumps.
+                        // `null` unless the operator declared one.
                         "sounding_strings": measurement.sounding_strings,
                         "partials": measurement.partials,
                     }
@@ -632,6 +499,18 @@ impl WorkerManager {
                         .as_bytes(),
                 );
             }
+        }
+    }
+
+    /// Writes `samples` to `path` as raw native-endian `f32`.
+    fn write_raw(path: &Path, samples: &[f32]) {
+        if let Ok(mut f) = fs::File::create(path) {
+            // SAFETY: `f32` has no padding and `u8` no alignment requirement, so
+            // the samples' memory reads as `size_of_val(samples)` valid bytes.
+            let bytes = unsafe {
+                std::slice::from_raw_parts(samples.as_ptr() as *const u8, size_of_val(samples))
+            };
+            let _ = f.write_all(bytes);
         }
     }
 }
@@ -657,7 +536,7 @@ mod tests {
             fft_size <= max_fft_size,
             "fft_size {fft_size} outgrew the {max_fft_size}-sample scratch"
         );
-        // CSPE reads one sample past `fft_size`, from the *allocated* buffer
+        // CSPE reads one sample past `fft_size`, from the allocated buffer
         // rather than the analysed span, so the ceiling has to clear it too.
         assert!(CAPTURE_MAX_SAMPLES > fft_size);
     }
@@ -690,8 +569,8 @@ mod tests {
     }
 
     /// The launch / no-captures state: an empty (prior-only) input must
-    /// produce a full bundle without panicking, so the live curve widget can
-    /// render the prior curve before any key is measured.
+    /// produce a full bundle without panicking, so the prior curve exists before
+    /// any key is measured.
     #[test]
     fn bundle_from_empty_input_is_prior_only_and_anchored() {
         let job = CurveJob {
