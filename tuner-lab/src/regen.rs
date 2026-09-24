@@ -1,18 +1,19 @@
 //! What `mat regen` emits, and the rules for consuming it.
 //!
-//! `docs/internals/06-capture-sets.md` binds two rules for piano #2: its
+//! `capture-sets.md` binds two rules for piano #2: its
 //! captures are consumed through the regenerated dump rather than the cached
 //! `analysis.json`, and entries whose cached fundamental is tracker garbage are
 //! dropped. [`load`] applies the second and returns the count it dropped.
 
 use std::path::Path;
 
+use crate::raw;
 use tuner_core::strobe::MAX_STROBE_REFS;
 
 /// Cents from equal temperament past which a cached measurement is treated as
 /// tracker garbage rather than a reading.
 ///
-/// `06`: piano #2's deep-bass entries predate the `worker::MAT_SEED_TOLERANCE`
+/// `capture-sets.md`: piano #2's deep-bass entries predate the `worker::MAT_SEED_TOLERANCE`
 /// fix and carry rumble-seeded fundamentals — A0 "measured" at 7–14.7 Hz
 /// against an ET 27.5. The audio is genuine; only the cached analysis is wrong.
 pub const ET_PLAUSIBLE_CENTS: f32 = 200.0;
@@ -100,11 +101,11 @@ impl Capture {
 
     /// This capture's raw audio, read from its dump directory.
     pub fn audio(&self, root: &Path) -> Option<Vec<f32>> {
-        crate::raw::stable(&root.join(&self.dir))
+        raw::stable(&root.join(&self.dir))
     }
 }
 
-/// Loads a regenerated-partials dump, **dropping implausible entries** per
+/// Loads a regenerated-partials dump, dropping implausible entries per
 /// [`Capture::plausible`]. Returns the kept captures and how many were dropped.
 pub fn load(path: &Path) -> (Vec<Capture>, usize) {
     let text =

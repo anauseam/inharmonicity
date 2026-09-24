@@ -1,43 +1,18 @@
+//! # Onset-threshold panel
+//!
+//! The live spectral-flux trace against the threshold a strike must clear,
+//! with a slider over it and a freeze for reading one strike.
+
 use iced::widget::{Space, button, column, container, row, slider, text};
 use iced::{Alignment, Element, Fill, Length};
 
+use crate::Message;
 use crate::app::AppDisplayData;
-use crate::widgets::envelope::ENVELOPE_HISTORY_LENGTH;
 use crate::widgets::seismograph::SeismographViewer;
 
-pub fn process_telemetry_tick(
-    settings: &mut crate::app::TransientSettings,
-    flux: f32,
-    current_threshold: f32,
-) {
-    if settings.is_frozen {
-        return;
-    }
-
-    settings.history.push_back(flux);
-    if settings.history.len() > ENVELOPE_HISTORY_LENGTH {
-        settings.history.pop_front();
-    }
-
-    if let Some(mut countdown) = settings.freeze_countdown {
-        if countdown == 0 {
-            settings.is_frozen = true;
-            settings.freeze_countdown = None;
-        } else {
-            countdown -= 1;
-            settings.freeze_countdown = Some(countdown);
-        }
-    } else if flux >= current_threshold {
-        settings.freeze_countdown = Some(90);
-    }
-}
-
-pub fn create_transient_calibration_panel(
-    data: &AppDisplayData,
-) -> Element<'static, crate::Message> {
+pub fn panel(data: &AppDisplayData) -> Element<'static, Message> {
     let current_val = data.settings_data.transient.current_threshold;
 
-    // Draw the active threshold line on the scope
     let hist: Vec<f32> = data
         .settings_data
         .transient
@@ -49,12 +24,12 @@ pub fn create_transient_calibration_panel(
         .width(Fill)
         .height(Fill);
 
-    let mut status_color = iced::Color::from_rgb8(0x2E, 0xCC, 0x71); // Green (Ready)
+    let mut status_color = iced::Color::from_rgb8(0x2E, 0xCC, 0x71);
     let status_text = if data.settings_data.transient.is_frozen {
-        status_color = iced::Color::from_rgb8(0xF3, 0x9C, 0x12); // Orange (Frozen)
+        status_color = iced::Color::from_rgb8(0xF3, 0x9C, 0x12);
         "FROZEN: Tuning mode active. Transient captured."
     } else if data.settings_data.transient.freeze_countdown.is_some() {
-        status_color = iced::Color::from_rgb8(0x34, 0x98, 0xDB); // Blue (Capturing)
+        status_color = iced::Color::from_rgb8(0x34, 0x98, 0xDB);
         "CAPTURING: Please hold..."
     } else {
         "READY: Play your softest note..."
@@ -73,13 +48,9 @@ pub fn create_transient_calibration_panel(
         Space::new().height(20),
         row![
             text("0.0").size(14),
-            slider(
-                0.0..=2.0_f32,
-                current_val,
-                crate::Message::NhwrsfThresholdChanged
-            )
-            .step(0.001_f32)
-            .width(Fill),
+            slider(0.0..=2.0_f32, current_val, Message::NhwrsfThresholdChanged)
+                .step(0.001_f32)
+                .width(Fill),
             text("2.0").size(14),
         ]
         .spacing(10)
@@ -88,10 +59,10 @@ pub fn create_transient_calibration_panel(
         Space::new().height(20),
         row![
             button(text("Reset Scope").size(16))
-                .on_press(crate::Message::ResetTransientScope)
+                .on_press(Message::ResetTransientScope)
                 .padding([8, 16]),
             button(text("Done").size(16))
-                .on_press(crate::Message::ToggleTransientCalibration)
+                .on_press(Message::ToggleTransientCalibration)
                 .padding([8, 16]),
         ]
         .spacing(15)

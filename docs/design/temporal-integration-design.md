@@ -1,8 +1,11 @@
 # Multi-frame temporal integration — design note (exploratory)
 
-**Status:** exploratory, not built. Captured so the one genuinely *information-adding*
-signal-evidence lever isn't lost. Deprioritized behind a second instrument and manual-mode
-finalization. No code committed against this yet.
+**Status:** Draft
+**Tags:** exploratory
+
+Captured so the one genuinely *information-adding*
+signal-evidence lever isn't lost. Unscheduled: the second instrument and the manual-mode
+work it waited behind have both landed. No code committed against this yet.
 
 ## Why this is the lever (and transform swaps are not)
 
@@ -12,7 +15,7 @@ Two ways to "use more time":
   synchrosqueezing). A constant-Q transform genuinely integrates *more time at low
   frequencies* (window length ∝ 1/f), but it is still one linear transform of one stretch
   of signal, bound by the uncertainty principle, and imposes **no model of how partials
-  behave over time**. It spends a fixed budget differently; it adds no information. ADR 0005
+  behave over time**. It spends a fixed budget differently; it adds no information. report 0005
   rejected this family on exactly that basis.
 - **Add** information with a **temporal-continuity model** across many successive frames
   (a partial is born, persists smoothly, dies). This is nonlinear and prior-driven, and it
@@ -39,9 +42,9 @@ Track peaks across hop-advanced frames; feed **persistence-filtered / track-aver
 to TWM instead of the raw single-frame peak list. Upside: rejects transient and
 sympathetic-resonance peaks that don't persist; stabilizes peak frequencies.
 **Costs:** (1) **latency** — a track needs a few frames to be confirmed before discovery can
-trust it; (2) **state** — this re-introduces temporal state into a path ADR 0005
+trust it; (2) **state** — this re-introduces temporal state into a path report 0005
 deliberately kept stateless, and must avoid the **full-sequence Viterbi / path-persistence**
-mechanism ADR 0005 rejected.
+mechanism report 0005 rejected.
 
 ### B. Worker (post-capture)
 
@@ -68,7 +71,7 @@ CSPE = Short & Garcia); our bespoke assemblies underperformed. Apply the same ru
 
 ## Conflicts / constraints (must be respected)
 
-1. **ADR 0005 statelessness + Viterbi rejection.** Use short-horizon, recursive confirmation
+1. **report 0005 statelessness + Viterbi rejection.** Use short-horizon, recursive confirmation
    — never a global path optimization.
 2. **Latency budget.** Confirmation costs frames of delay before a discovery lock; the
    discovery path is latency-sensitive in a way the worker is not.
@@ -94,7 +97,7 @@ Worth doing for **Category-3 signal evidence** — rejecting sympathetic-resonan
 transient confusers, stabilizing peaks — which could lift all registers' auto-detection.
 It is **not** a bass-octave fix (that's Category 2, a structural identity no amount of
 noise rejection resolves). If pursued, start in the **worker** (latency-free, can't regress
-discovery). Gated behind the second instrument and manual-mode work.
+discovery).
 
 ## References
 

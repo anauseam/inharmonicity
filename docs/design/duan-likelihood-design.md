@@ -1,11 +1,14 @@
 # Design Note: Duan Peak/Non-Peak Likelihood for Discovery
 
-Status: **Scoping** (not yet implemented). Feeds ADR 0006. Motivated by the
+**Status:** Draft
+**Tags:** exploratory
+
+Feeds report 0006. Motivated by the
 deadzone n-kernel failure derived there.
 
 ## Why this, why now
 
-The optimization program (ADR 0006) hit a ceiling: constant-tuning tops out at
+The optimization program (report 0006) hit a ceiling: constant-tuning tops out at
 74/87 on the worst-case instrument, and the residuals split into octave/sub-harmonic
 confusion (near the TWM scoring limit) and the **dense-bass attractor / sub-harmonic
 steals**. The 0006 derivation pinned the attractor pathology precisely: candidate
@@ -43,7 +46,7 @@ A candidate's score becomes a per-frame log-likelihood with two terms:
 In log-domain (for the real-time hot path) this is an additive penalty, not a
 product of Gaussians — Duan's full GMM/likelihood is too heavy and not auditable; we
 adopt the *structure* (charge absent-but-expected partials) as a bounded additive
-term, MOBO-weighted.
+term, NSGA-II-weighted.
 
 ## The make-or-break tension: missing fundamentals
 
@@ -71,7 +74,7 @@ absent partial surrounded by strong peaks costs more than one in a sparse region
 ## Integration
 
 - Add a default-off `TwmConfig` field (e.g. `nonpeak_penalty: f32`, default 0.0) so
-  the regression test stays byte-identical and the term is MOBO-tunable. At 0 it is
+  the regression test stays byte-identical and the term is NSGA-II-tunable. At 0 it is
   the current behavior.
 - Slot the non-peak term into `score_candidate`'s forward pass: for each predicted
   partial with no peak within a match tolerance AND inside `[min_obs, max_obs]`, add
@@ -90,7 +93,7 @@ absent partial surrounded by strong peaks costs more than one in a sparse region
    (a) does it suppress the dense-bass/sub-harmonic steals (treble→bass, the
    `N_gap` channel)? AND (b) does it *preserve* bass missing-fundamentals (bass
    register pass-rate must NOT drop)? Both must hold; a one-sided win is a fail.
-2. If promising, **co-tuned MOBO arm** (tune the non-peak weight with q/r/ρ on the
+2. If promising, **co-tuned NSGA-II arm** (tune the non-peak weight with q/r/ρ on the
    tuning-state bench) — because, like every error-landscape change, frozen-constant
    results are only a filter, not a verdict.
 3. **Real-data gate**: beat 74/87 with **no bass regression** (the failure mode of

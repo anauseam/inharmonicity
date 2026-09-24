@@ -1,9 +1,9 @@
 //! Harnesses for the detection thresholds.
 //!
 //! `config.silence_threshold` is calibrated once from ambient silence and
-//! thresholded at three hot-path detectors, two in `engine.rs` and one in
-//! `strobe.rs` (ADR 0015 §Context). The OS-CFAR family that could replace it
-//! is measured against the same reference.
+//! thresholded at three hot-path detectors, two in `Engine::process` and one in
+//! `Strobe::process` (report 0015). The OS-CFAR family that could replace it is
+//! measured against the same reference.
 
 use std::path::PathBuf;
 
@@ -43,18 +43,18 @@ pub struct Cmd {
 #[derive(Subcommand)]
 enum Mode {
     /// The one ambient scalar at all three sites that threshold against it:
-    /// per hop and per partial, signal and the noise beside it in the *same*
-    /// window, scored over a σ sweep (ADR 0015).
+    /// per hop and per partial, signal and the noise beside it in the same
+    /// window, scored over a σ sweep (report 0015).
     Ambient {
         /// A population to score, repeatable: `--set <label> <regen.json> <dump root>`.
         #[arg(long = "set", num_args = 3, value_names = ["LABEL", "REGEN", "ROOT"], required = true)]
         sets: Vec<String>,
         /// The live cut, in SNR. The default is the pre-registered value;
-        /// anything else is exploratory and says so (ADR 0015 §6).
+        /// anything else is exploratory and says so (report 0015 §6).
         #[arg(long)]
         live: Option<f32>,
         /// Candidate C's floor quantile. At 0.5 the Rayleigh median conversion
-        /// applies; above it the quantile is the threshold directly (§12).
+        /// applies; above it the quantile is the threshold directly (report 0015 §12).
         #[arg(long, default_value_t = 0.5)]
         floor_q: f32,
     },

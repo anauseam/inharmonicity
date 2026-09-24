@@ -1,76 +1,42 @@
-//! # Domain Data Models
+//! # Domain models
 //!
-//! Domain types for the tuner: notes and the 88-key lookup tables ([`NOTES`],
-//! [`Note`], [`NOTE_MAP`]), captured measurements ([`Partial`], [`KeyMeasurement`],
-//! [`SoundingStrings`], [`InharmonicityProfile`] with its [`InstrumentIdentity`] and
-//! [`ProfileSettings`]), the two persisted tuning selections ([`EngineChoice`],
-//! [`ReferenceMode`]), and the discovery templates ([`KeyProfile`]).
-//!
-//! It also holds the small body of *domain-specific* math that produces those types —
-//! the Rigaud inharmonicity prior ([`get_expected_beta`]), the Railsback stretch curve
-//! ([`railsback_stretch_curve`]), and the stiff-string partial law in
-//! [`KeyProfile::new`].
+//! The tuner's domain types (the 88-key note table, measurements and the
+//! persisted profile, the tuning curve and the discovery templates) and the
+//! domain math that builds them.
 
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// Highest representable partial frequency — the Nyquist limit.
-///
-/// Derived from [`crate::audio::SAMPLE_RATE`]: the one spot where `models` reaches up
-/// into `audio` (which already depends on `models`), forming a small `models ↔ audio`
-/// cycle. Accepted for now — the crate already has intra-crate cycles. A future refactor
-/// extracts the shared DSP/stream constants into a leaf module (tracked in `TODO.md`).
+/// Highest representable partial frequency: the Nyquist limit.
+// A `models ↔ audio` cycle the module-boundary pass retires; see TODO.md.
 const NYQUIST_HZ: f32 = crate::audio::SAMPLE_RATE as f32 / 2.0;
 
 /// Maximum number of partials modeled per key.
 pub const MAX_PARTIALS: usize = 128;
 
-/// Calculates the deviation from a target frequency in cents.
-///
-/// Cents are a logarithmic unit of pitch measurement where:
-/// - 100 cents = 1 semitone
-/// - 1200 cents = 1 octave
-/// - Positive values indicate sharpness, negative values indicate flatness
-///
-/// # Arguments
-/// * `freq` - Measured frequency in Hz
-/// * `target_freq` - Target frequency in Hz
-///
-/// # Returns
-/// * Cent deviation (positive = sharp, negative = flat)
+/// Cents of `freq` from `target_freq`, both in Hz; positive is sharp.
 pub fn calculate_cents_deviation(freq: f32, target_freq: f32) -> f32 {
     1200.0 * (freq / target_freq).log2()
 }
 
-/// One spectral peak: a local magnitude maximum with a sub-bin-refined
-/// frequency, produced by `algorithms::peaks::extract_peaks` and consumed by
-/// `twm` / `discovery`.
+/// One spectral peak: a local magnitude maximum with a sub-bin-refined frequency.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct SpectralPeak {
-    /// True frequency in Hz (sub-bin interpolated via the Jacobsen estimator
-    /// (Candan 2015)).
+    /// Frequency in Hz, interpolated between bins by the Jacobsen estimator
+    /// (Candan 2015).
     pub frequency: f32,
     /// Linear magnitude at this peak.
     pub magnitude: f32,
 }
 
-/// One spectral line of a note's baseband — in a multi-strung note, one string.
-///
-/// Produced by `algorithms::peaks::resolve_lines` from the strobe's per-reference
-/// complex baseband and consumed by `strobe::unison` and the frontend.
+/// One spectral line of a note's baseband: in a multi-strung note, one string.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct UnisonLine {
-    /// Signed offset from the reference partial, in **Hz** — not cents. The
-    /// reference is `strobe::StrobeRefUpdate::refs[i]` and the frontend owns
-    /// what it displays the offset against (crossing #2's rule).
-    ///
-    /// Bounded by the baseband's own half-rate: `|offset_hz| < 0.5·f_hop`
-    /// ≈ 21.5 Hz, past which a line folds rather than leaving the band.
+    /// Signed offset from the reference partial, in Hz. Its magnitude stays below
+    /// half the hop rate, past which a line folds.
     pub offset_hz: f32,
-    /// Magnitude relative to the strongest line of the same reference, so the
-    /// strongest is always 1.0. Dimensionless — a string's absolute level says
-    /// nothing without the strike.
+    /// Magnitude relative to the strongest line of the same reference, which is 1.0.
     pub relative_amplitude: f32,
 }
 
@@ -83,31 +49,22 @@ pub struct Partial {
     pub number: u32,
     /// The measured frequency of this partial in Hz.
     pub frequency: f32,
-    /// Amplitude of this partial (for spectral envelope analysis).
+    /// Amplitude of this partial.
     pub amplitude: f32,
 }
 
-/// Most strings one key can be strung with. A piano's bass is single- or
-/// double-strung and the rest trichord, but *which* key the breaks fall on is
-/// instrument-specific — hence [`SoundingStrings::on_key`] is declared per
-/// capture rather than derived from the key index.
+/// Most strings one key can be strung with. Where a piano's single-, double- and
+/// triple-strung sections break varies by instrument, so
+/// [`SoundingStrings::on_key`] is declared per capture, not derived from the key.
 pub const MAX_STRINGS_PER_KEY: usize = 3;
 
-/// Which of a key's strings were sounding for one capture — the operator's
-/// declaration made before arming, not something the DSP measures.
+/// Which of a key's strings sounded for one capture: the operator's declaration,
+/// not a measurement. It pairs a note's solo captures, the other strings muted,
+/// with its open one; a solo is the only ground truth for the unison estimator.
 ///
-/// It exists so a capture set can pair a note's **solo** captures (the other
-/// strings damped with a mute) with its **open** one. A solo resolves one
-/// string's (f₀, B) at full resolution, which is the only ground truth the
-/// unison line estimator can be checked against (ADR 0012 §8, ADR 0013 D3).
-///
-/// **Convention:** string 1 is the leftmost string of the note as the tuner
-/// faces the instrument, counting rightwards; `sounding[i]` is string `i + 1`.
-/// Entries at or beyond `on_key` are always `false`.
-///
-/// A capture with no string sounding is not a capture, so that state means
-/// "the operator declared nothing" and the capture records `None` — see
-/// [`SoundingStrings::declared`].
+/// **Convention:** string 1 is the leftmost as the tuner faces the instrument;
+/// `sounding[i]` is string `i + 1`, and entries at or beyond `on_key` are always
+/// `false`. Nothing sounding means nothing was declared ([`Self::declared`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SoundingStrings {
     /// How many strings this key is strung with, in `1..=MAX_STRINGS_PER_KEY`.
@@ -131,7 +88,7 @@ impl SoundingStrings {
     }
 
     /// Every string of the key sounding: the note as it is played, and the
-    /// only state the unison panel's own reading can be compared against.
+    /// only state a unison reading can be compared against.
     ///
     /// Never true of a declaration with nothing sounding — deserialization
     /// does not go through [`Self::declared`], so `on_key: 0` can reach here
@@ -147,16 +104,12 @@ impl SoundingStrings {
         (self.sounding_count() > 0).then_some(self)
     }
 
-    /// Restrings the key, **clearing the sounding set** if the count changed.
+    /// Restrings the key, clearing the sounding set if the count changed: a
+    /// pattern held across the change would declare a solo nobody made.
     ///
-    /// A different count is a different key, so the previous key's mute pattern
-    /// does not carry: a set held across the change would declare a solo nobody
-    /// made, which is a wrong record rather than a missing one.
-    ///
-    /// A single-strung key is the exception in the other direction — it admits
-    /// one declaration, so the count *is* the declaration. **Do not extend that
-    /// to two or three strings**, where a forgotten mute would then be recorded
-    /// as an open capture.
+    /// A single-strung key admits one declaration, so its count is the
+    /// declaration. Do not extend that to two or three strings, where a forgotten
+    /// mute would then be recorded as an open capture.
     pub fn with_on_key(self, on_key: u8) -> Self {
         let on_key = on_key.clamp(1, MAX_STRINGS_PER_KEY as u8);
         if on_key == self.on_key {
@@ -167,9 +120,8 @@ impl SoundingStrings {
         Self { on_key, sounding }
     }
 
-    /// Flips string `index` (0-based). Neither a string the key does not have
-    /// nor a single-strung key's one string can be flipped — the latter's
-    /// declaration is fixed by its count (see [`Self::with_on_key`]).
+    /// Flips string `index` (0-based). A string the key does not have, and a
+    /// single-strung key's one string, stay as they are.
     pub fn toggled(self, index: usize) -> Self {
         let mut out = self;
         if self.on_key > 1 && index < self.on_key as usize {
@@ -207,16 +159,12 @@ impl std::fmt::Display for SoundingStrings {
     }
 }
 
-/// Stores all measured partials for a single piano key, plus the computed
-/// inharmonicity constant (B).
-///
-/// Created by the capture processing pipeline after the Gatekeeper triggers
-/// a successful capture and the Worker runs partial extraction.
+/// One capture's measurement of a key: its partials and inharmonicity B.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeyMeasurement {
     /// The 88-key piano index (0 = A0, 87 = C8).
     pub key_index: u8,
-    /// The fundamental (Hz) MAT was **seeded** from — the live tracker's
+    /// The fundamental (Hz) MAT was seeded from — the live tracker's
     /// reading, or the key's equal-temperament frequency where that reading
     /// was absent or implausible (`worker::MAT_SEED_TOLERANCE`). It is not
     /// MAT's refined f₀, which the profile does not carry; `partials` holds
@@ -232,12 +180,9 @@ pub struct KeyMeasurement {
     /// ([`worker::dump_dir_name`](crate::worker::dump_dir_name)), so the two
     /// must agree.
     pub last_captured: String,
-    /// Capture provenance: `true` when the key identity came from the
-    /// auto-discovery path, `false` when the user named the key (manual
-    /// mode). The tuning curve consumes **manual captures only** (ADR 0006
-    /// Corrections item 3; tuning-curve design note §10.1). Legacy profile
-    /// entries predate this field and deserialize as `true` (auto/untrusted)
-    /// so pre-flag data can never feed the curve.
+    /// The key came from discovery rather than being named. Entries predating the
+    /// field deserialize as `true`, untrusted, so pre-flag data never feeds the
+    /// curve.
     #[serde(default = "default_captured_in_auto")]
     pub captured_in_auto: bool,
     /// Which of the key's strings sounded, when the operator declared it
@@ -248,19 +193,16 @@ pub struct KeyMeasurement {
 }
 
 impl KeyMeasurement {
-    /// Strings were damped, so this measured one string rather than the note.
-    /// False when nothing was declared (`docs/internals/06-capture-sets.md`).
-    /// Named apart from [`Self::is_trusted`] because it is never waived, while
-    /// auto provenance is ([`CurveInput::from_profile_including_auto`]).
+    /// Strings were muted, so this measured one string rather than the note;
+    /// false when nothing was declared. Apart from [`Self::is_trusted`] because
+    /// it is never waived, while auto provenance can be.
     pub(crate) fn is_partial_unison(&self) -> bool {
         self.sounding_strings.is_some_and(|s| !s.is_open())
     }
 
-    /// Whether the tuning curve and the strobe may read this entry. Two
-    /// independent disqualifications, both meaning "this did not measure the
-    /// note as it is played": auto-mode provenance (ADR 0006 Corrections
-    /// item 3) and [`Self::is_partial_unison`]. Untrusted entries are retained
-    /// and never read — see [`InharmonicityProfile::active`].
+    /// Whether a consumer may read this entry: it was captured on a named key and
+    /// measured the whole note. Untrusted entries are retained but never read.
+    // report 0006
     pub fn is_trusted(&self) -> bool {
         !self.captured_in_auto && !self.is_partial_unison()
     }
@@ -273,9 +215,7 @@ fn default_captured_in_auto() -> bool {
 }
 
 /// Filename a pre-library profile was written to, relative to the working
-/// directory. Read-only: the frontend looks here once to import such a file,
-/// and [`AudioPipeline::new`](crate::pipeline::AudioPipeline::new)'s gated
-/// discovery-seeding path still reads it. Nothing writes it.
+/// directory. Nothing writes it any more.
 pub const PROFILE_PATH: &str = "tuning_profile.json";
 
 /// Current [`InharmonicityProfile`] schema version. Version `0` — one
@@ -284,27 +224,22 @@ pub const PROFILE_PATH: &str = "tuning_profile.json";
 pub(crate) const PROFILE_SCHEMA_VERSION: u32 = 1;
 
 /// Trusted measurements retained per key before the oldest is dropped.
-///
-/// Ours. Repeats exist to be compared against each other in the inspector,
-/// which needs only a few per key; the bound keeps a file that is rewritten on
-/// every capture from growing without limit.
+// Ours: comparing repeats needs only a few, and the file is rewritten on every
+// capture.
 pub(crate) const MAX_TRUSTED_MEASUREMENTS_PER_KEY: usize = 8;
 
-/// Untrusted measurements retained per key. Ours, sized to a trichord's three
-/// solos plus one auto-mode entry.
-///
-/// **Do not merge with [`MAX_TRUSTED_MEASUREMENTS_PER_KEY`]** — under one
-/// shared budget an isolation pass's solos evict the note's own captures
-/// (measured; `docs/internals/06-capture-sets.md` and
-/// `docs/design/session-persistence-and-profile-library.md` §1.1).
+/// Untrusted measurements retained per key: a trichord's three solos and one auto
+/// entry.
+// Do not merge the two budgets: under one, an isolation pass's solos evict the
+// note's own captures.
+// asserted: unused_captures_never_displace_trusted_ones
 pub(crate) const MAX_UNUSED_MEASUREMENTS_PER_KEY: usize = 4;
 
-/// Default NHWRSF onset threshold — the flux a transient must exceed to be
-/// declared a new note event.
+/// Default NHWRSF onset threshold: the flux a frame must exceed to be an onset.
 pub(crate) const DEFAULT_NHWRSF_THRESHOLD: f32 = 0.9;
 
-/// Default NINOS² sustain-stability threshold.
-pub(crate) const DEFAULT_NINOS2_STABILITY_THRESHOLD: f32 = 10.0;
+/// Default sustain-stability threshold.
+pub(crate) const DEFAULT_SUSTAIN_STABILITY_THRESHOLD: f32 = 10.0;
 
 /// The family of instrument a profile describes.
 ///
@@ -323,16 +258,6 @@ pub enum InstrumentKind {
     Harp,
 }
 
-impl InstrumentKind {
-    /// What this instrument's measured units are called in the UI.
-    pub fn unit_plural(&self) -> &'static str {
-        match self {
-            InstrumentKind::Piano => "keys",
-            _ => "strings",
-        }
-    }
-}
-
 impl std::fmt::Display for InstrumentKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -344,20 +269,15 @@ impl std::fmt::Display for InstrumentKind {
     }
 }
 
-/// Who and what the profile is a profile *of*.
+/// Who and what the profile is a profile of.
 ///
 /// Every field but `name` is optional: a profile exists from its first capture
 /// and may be identified later, so no field may be required to save one.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct InstrumentIdentity {
-    /// Opaque, stable identity — minted once when the instrument is first
-    /// opened and never changed afterwards.
-    ///
-    /// Everything that must survive a rename keys off this rather than off the
-    /// display name or the filename: capture dumps live in a directory named
-    /// for it, so renaming an instrument moves nothing on disk. Empty on a
-    /// profile written before the field existed; the frontend mints one on
-    /// open, which is also what makes the migration durable.
+    /// Opaque, stable identity, minted once and never changed, so anything keyed
+    /// on it survives a rename. Empty on a profile written before the field
+    /// existed, until a frontend mints one.
     #[serde(default)]
     pub id: String,
     /// Display name. Auto-generated on creation, renameable.
@@ -385,12 +305,8 @@ pub struct InstrumentIdentity {
     pub notes: Option<String>,
 }
 
-/// Which engine of the `CurveBundle` the plot and strobe display — strobe
-/// design note §9/§13. Selection is **display-only** (D7): every engine is
-/// already in the bundle, so switching never triggers a recompute. The (c) ρ
-/// Low/High presets are not variants yet — they are not computed until (c)'s
-/// calibration is factored out of the per-preset path (§14 step 6); the gallery
-/// renders them as deferred placeholders.
+/// One engine of a `CurveBundle`. Every engine is already in the bundle, so
+/// choosing one never recomputes a curve.
 ///
 /// Resolve it against a bundle with `CurveBundle::curve`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -401,97 +317,59 @@ pub enum EngineChoice {
     PerKeySmoothed,
     /// (c) Giordano-calibrated, ρ Mean preset.
     GiordanoMean,
-    /// (d) multi-interval BALANCED — the manual-mode default (D7).
+    /// (d) multi-interval BALANCED, the default.
     #[default]
     MultiBalanced,
     /// (d) multi-interval PURE 12ths preset.
     MultiPureTwelfths,
 }
 
-impl EngineChoice {
-    /// Every selectable engine, in gallery order.
-    pub const ALL: [EngineChoice; 5] = [
-        EngineChoice::RigaudPure,
-        EngineChoice::PerKeySmoothed,
-        EngineChoice::GiordanoMean,
-        EngineChoice::MultiBalanced,
-        EngineChoice::MultiPureTwelfths,
-    ];
-
-    /// Full display name (detail view / panel titles).
-    pub fn label(&self) -> &'static str {
-        match self {
-            EngineChoice::RigaudPure => "(a) Rigaud prior",
-            EngineChoice::PerKeySmoothed => "(b) Per-key + Whittaker",
-            EngineChoice::GiordanoMean => "(c) Giordano · ρ Mean",
-            EngineChoice::MultiBalanced => "(d) Multi-interval · Balanced",
-            EngineChoice::MultiPureTwelfths => "(d) Multi-interval · Pure 12ths",
-        }
-    }
-
-    /// Short name for gallery thumbnails (the section header names the class).
-    pub fn short_label(&self) -> &'static str {
-        match self {
-            EngineChoice::RigaudPure => "Rigaud prior",
-            EngineChoice::PerKeySmoothed => "Per-key smoothed",
-            EngineChoice::GiordanoMean => "ρ Mean",
-            EngineChoice::MultiBalanced => "Balanced",
-            EngineChoice::MultiPureTwelfths => "Pure 12ths",
-        }
-    }
-}
-
-/// Which target function the app measures against — every readout shares it:
-/// the strobe band, its cents readout, and the cent meter.
+/// Which target function a pitch is measured against.
 ///
-/// Orthogonal to reference *pitch* (design §11's A440 / [`TuningCurve::d_g`],
-/// which shifts the whole curve): this selects *which* target function, not
-/// where it is anchored.
+/// Orthogonal to reference pitch (A440, or [`TuningCurve::d_g`], which shifts
+/// the whole curve): this selects which target function, not where it is
+/// anchored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum ReferenceMode {
     /// The instrument's stretched `target_f1` (per-partial targets for the
     /// strobe). The default, and the only mode that uses measured `B`.
     #[default]
     Curve,
-    /// Pure equal temperament, **fundamental only** — the n = 1 target is
-    /// B-immune (design R4), so no per-string inharmonicity is needed and a
-    /// correctly-pitched string shows no false beat. The instrument-agnostic
-    /// mode: it makes the app usable on a non-piano (e.g. a guitar string).
+    /// Pure equal temperament, fundamental only. The n = 1 target holds for any B,
+    /// so it needs no measurement and serves any string.
     Et,
 }
 
 impl ReferenceMode {
-    /// The other mode — the toggle's target.
+    /// The other mode.
     pub fn toggled(self) -> Self {
         match self {
             ReferenceMode::Curve => ReferenceMode::Et,
             ReferenceMode::Et => ReferenceMode::Curve,
         }
     }
-
-    /// Short label for the toggle button.
-    pub fn label(self) -> &'static str {
-        match self {
-            ReferenceMode::Curve => "Ref: Curve",
-            ReferenceMode::Et => "Ref: ET",
-        }
-    }
 }
 
-/// Per-instrument settings that persist with the profile.
-///
-/// The two thresholds are level-independent quantities (NHWRSF is normalized
-/// by Σ|X|; NINOS² is a dimensionless ratio), so they characterise the
-/// instrument rather than the rig — unlike the silence floor, an absolute RMS,
-/// which is measured afresh each session and is deliberately absent here.
+/// Per-instrument settings that persist with the profile. Both thresholds are
+/// level-independent (NHWRSF is normalized by Σ|X|; sustain stability is
+/// dimensionless), so they describe the instrument. The silence threshold, an
+/// absolute RMS, belongs to the room and is not here.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProfileSettings {
     /// NHWRSF onset threshold for this instrument.
     #[serde(default = "default_nhwrsf_threshold")]
     pub nhwrsf_threshold: f32,
-    /// NINOS² sustain-stability threshold for this instrument.
-    #[serde(default = "default_ninos2_threshold")]
-    pub ninos2_stability_threshold: f32,
+    /// Sustain-stability threshold for this instrument, on the gate's
+    /// inverse-participation-ratio metric.
+    // The field has been spelled three ways: `ninos2_stability_threshold`, then
+    // `participation_stability_threshold`, now this. Both aliases stay — dropping
+    // one silently resets that operator's calibration to the default.
+    #[serde(
+        default = "default_sustain_stability_threshold",
+        alias = "ninos2_stability_threshold",
+        alias = "participation_stability_threshold"
+    )]
+    pub sustain_stability_threshold: f32,
     /// Which curve engine this instrument was last tuned with. Consulted only
     /// when `reference_mode` is [`ReferenceMode::Curve`].
     #[serde(default)]
@@ -508,34 +386,29 @@ fn default_nhwrsf_threshold() -> f32 {
     DEFAULT_NHWRSF_THRESHOLD
 }
 
-/// Serde default for [`ProfileSettings::ninos2_stability_threshold`].
-fn default_ninos2_threshold() -> f32 {
-    DEFAULT_NINOS2_STABILITY_THRESHOLD
+/// Serde default for [`ProfileSettings::sustain_stability_threshold`].
+fn default_sustain_stability_threshold() -> f32 {
+    DEFAULT_SUSTAIN_STABILITY_THRESHOLD
 }
 
 impl Default for ProfileSettings {
     fn default() -> Self {
         Self {
             nhwrsf_threshold: DEFAULT_NHWRSF_THRESHOLD,
-            ninos2_stability_threshold: DEFAULT_NINOS2_STABILITY_THRESHOLD,
+            sustain_stability_threshold: DEFAULT_SUSTAIN_STABILITY_THRESHOLD,
             engine: EngineChoice::default(),
             reference_mode: ReferenceMode::default(),
         }
     }
 }
 
-/// The complete inharmonicity profile for one instrument.
-///
-/// The top-level serializable object saved to and loaded from a JSON file: who
-/// the instrument is, its settings, and every measurement taken of it. A key
-/// holds a **list** of measurements, newest last — repeats are retained so a
-/// suspect capture can be compared against the others rather than silently
-/// overwriting the good one, and so an untrusted (auto-mode) capture can be
-/// kept for review without ever displacing a trusted one. [`Self::active`]
-/// resolves the list to the single measurement consumers read.
+/// One instrument's profile, the document saved as JSON: its identity, its
+/// settings and every measurement taken of it. Each key keeps its repeats, so a
+/// suspect capture can be compared with the rest, and [`Self::active`] resolves
+/// them to the one consumers read.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InharmonicityProfile {
-    /// Schema version, for migration. See [`PROFILE_SCHEMA_VERSION`].
+    /// Schema version, for migration. See `PROFILE_SCHEMA_VERSION`.
     #[serde(default)]
     pub version: u32,
     /// The instrument this profile describes.
@@ -550,8 +423,7 @@ pub struct InharmonicityProfile {
     /// Unix seconds of the last write.
     #[serde(default)]
     pub modified: u64,
-    /// Unix seconds at which the profile was last opened — the sort order a
-    /// working tuner reaches for most ("date accessed", strobe design §12).
+    /// Unix seconds at which the profile was last opened.
     #[serde(default)]
     pub last_opened: u64,
     /// Maps a key index (0–87) to every measurement taken of it, oldest first.
@@ -606,13 +478,11 @@ impl InharmonicityProfile {
         }
     }
 
-    /// The one measurement consumers read for `key`: **newest trusted, and
-    /// nothing else** — ADR 0006 item 3 over a list.
+    /// The one measurement consumers read for `key`: the newest trusted one.
     ///
     /// An untrusted entry never presents, even when it is all the key has: a
-    /// discovery false-lock measures the wrong series under the wrong key, and
-    /// a solo measures one string. Such a key reads as unmeasured, whose
-    /// fallback is the prior ([`get_expected_beta`]).
+    /// discovery false-lock measures another key's series, and a solo measures one
+    /// string. Such a key reads as unmeasured, and falls back to the prior.
     pub fn active(&self, key: u8) -> Option<&KeyMeasurement> {
         self.measurements
             .get(&key)?
@@ -621,8 +491,7 @@ impl InharmonicityProfile {
             .find(|m| m.is_trusted())
     }
 
-    /// [`Self::active`] for in-place edits — the inspector's handle on the
-    /// entry a key currently presents.
+    /// [`Self::active`] for in-place edits on the entry a key currently presents.
     pub fn active_mut(&mut self, key: u8) -> Option<&mut KeyMeasurement> {
         let entries = self.measurements.get_mut(&key)?;
         let pos = entries.iter().rposition(|m| m.is_trusted())?;
@@ -638,11 +507,9 @@ impl InharmonicityProfile {
     }
 
     /// The newest entry for `key` that measured the whole note, whatever its
-    /// provenance — [`Self::active`] with only the auto-mode disqualification
-    /// waived, for [`CurveInput::from_profile_including_auto`].
-    ///
-    /// **Do not add a "newest entry, whatever it is" accessor**: a partial
-    /// unison must not be reachable as a stand-in for the note.
+    /// provenance: [`Self::active`] with only the auto-mode rule waived.
+    // Do not add a "newest entry, whatever it is" accessor: a partial unison must
+    // not be reachable as a stand-in for the note.
     pub fn newest_whole_note(&self, key: u8) -> Option<&KeyMeasurement> {
         self.measurements
             .get(&key)?
@@ -651,12 +518,12 @@ impl InharmonicityProfile {
             .find(|m| !m.is_partial_unison())
     }
 
-    /// Appends a measurement, evicting within **its own class** —
-    /// [`MAX_TRUSTED_MEASUREMENTS_PER_KEY`] or
-    /// [`MAX_UNUSED_MEASUREMENTS_PER_KEY`] — so an unread entry never displaces
+    /// Appends a measurement, evicting within its own class —
+    /// `MAX_TRUSTED_MEASUREMENTS_PER_KEY` or
+    /// `MAX_UNUSED_MEASUREMENTS_PER_KEY` — so an unread entry never displaces
     /// one the curve and strobe read.
     ///
-    /// [`Self::active`] needs no guard here: it is the *newest* trusted entry,
+    /// [`Self::active`] needs no guard here: it is the newest trusted entry,
     /// and eviction takes the oldest of a class holding at least two.
     pub fn record(&mut self, measurement: KeyMeasurement) {
         let key = measurement.key_index;
@@ -678,7 +545,7 @@ impl InharmonicityProfile {
     }
 
     /// Which entry loses its place when `trusted`'s budget is full: the oldest
-    /// of that class, except that an untrusted entry whose **configuration** is
+    /// of that class, except that an untrusted entry whose configuration is
     /// already represented goes before one holding the only copy of its own —
     /// so repeats of one solo cannot crowd out another string entirely.
     ///
@@ -709,9 +576,8 @@ impl InharmonicityProfile {
     /// measurement — the shape an undo of a first capture must restore.
     ///
     /// **By identity, never position**: [`Self::record`] evicts from the middle
-    /// of a key's list, so a positional handle held across captures would come
-    /// to name a different capture. `None` means it is no longer retained,
-    /// which is not an error — retention is bounded, the dumps are not.
+    /// of a key's list, so a position held across captures comes to name another
+    /// capture. `None` means it is no longer retained, which is not an error.
     pub fn remove_capture(&mut self, key: u8, epoch: &str) -> Option<KeyMeasurement> {
         let entries = self.measurements.get_mut(&key)?;
         let pos = entries.iter().position(|m| m.last_captured == epoch)?;
@@ -722,14 +588,9 @@ impl InharmonicityProfile {
         Some(removed)
     }
 
-    /// Removes the measurement at `index` in `key`'s list, returning it, or
-    /// `None` if the key or index does not exist.
-    ///
-    /// The reviewing counterpart to [`Self::remove_capture`], which an undo
-    /// reaches by the identity it recorded: a repeat that looks wrong later is
-    /// rarely one the undo stack still names. Holds the same invariant — a key
-    /// left with no measurements disappears entirely, so it reads as unmeasured
-    /// rather than as an empty list.
+    /// Removes the measurement at `index` in `key`'s list, returning it; `None` if
+    /// there is none. A key left with no measurements disappears, as with
+    /// [`Self::remove_capture`].
     pub fn remove(&mut self, key: u8, index: usize) -> Option<KeyMeasurement> {
         let entries = self.measurements.get_mut(&key)?;
         if index >= entries.len() {
@@ -742,7 +603,7 @@ impl InharmonicityProfile {
         Some(removed)
     }
 
-    /// Saves the profile to a JSON file, **atomically**: the bytes go to a
+    /// Saves the profile to a JSON file, atomically: the bytes go to a
     /// temporary file beside the target and are renamed over it, so a crash
     /// mid-write leaves the previous profile intact rather than truncating it.
     /// The temp file is a sibling deliberately — `rename` is only atomic within
@@ -799,26 +660,22 @@ impl InharmonicityProfile {
 /// (0.01 ¢ targets), unlike the `f32` DSP hot path.
 #[derive(Debug, Clone)]
 pub struct CurveKeyData {
-    /// Measured inharmonicity coefficient B (raw — smoothing/fallback
-    /// decisions belong to the engines; strobe targets use this value
-    /// always, per the design note's strobe/curve B split, §5 D3).
+    /// Measured B, raw: smoothing and fallback are the engines' decisions.
     pub b: f64,
     /// Flexible-string fundamental F_0 (Hz), derived from the partial list
     /// and B via Rigaud Eq. 20 (`algorithms::rigaud::f0_from_partials`)
-    /// — **not** `measured_f0`, which is the Goertzel seed. The audible first
-    /// partial is f_1 = F_0√(1+B) (design note §1 convention rule).
+    /// — not `measured_f0`, which is the Goertzel seed. The audible first
+    /// partial is f_1 = F_0√(1+B).
     pub f0: f64,
     /// Measured partials as `(n, frequency_hz, amplitude)` — the Giordano
     /// layer's input.
     pub partials: Vec<(u32, f64, f64)>,
 }
 
-/// Trust-filtered, engine-ready view of an [`InharmonicityProfile`]:
-/// one optional [`CurveKeyData`] per key of the 88-key compass.
-///
-/// [`CurveInput::from_profile`] enforces the provenance rule — the curve
-/// consumes **manual-mode captures only** (ADR 0006 item 3) — plus basic
-/// validity (B finite and positive, ≥ 2 partials, Eq.-20 F₀ solvable).
+/// The trust-filtered, engine-ready view of an [`InharmonicityProfile`]: one
+/// optional [`CurveKeyData`] per key. [`CurveInput::from_profile`] admits trusted
+/// entries with a finite positive B, at least two partials and a solvable
+/// Eq.-20 F₀.
 #[derive(Debug, Clone)]
 pub struct CurveInput {
     /// Index 0 = A0 … 87 = C8; `None` where no trusted measurement exists.
@@ -850,31 +707,28 @@ pub struct CurveKeyFlags {
     /// A trusted measurement fed the curve at this key.
     pub measured: bool,
     /// Curve-side B is prior-dominated: the precision-weighted blend of
-    /// measured B toward the B_ξ fit (ADR 0009; design note §8, defaults
-    /// #13.3) gave the measurement less than half the weight — the treble
+    /// measured B toward the B_ξ fit gave the measurement less than half the weight — the treble
     /// information floor — or the key carries no measurement at all.
     /// Strobe targets still use the raw measured B.
+    // report 0009
     pub curve_b_fallback: bool,
     /// This key's measured B was excluded by the negative-stretch validity
-    /// detector (design note §2): its octave pair implied d(m+12) < d(m)
+    /// detector: its octave pair implied d(m+12) < d(m)
     /// and this key was the larger prior-deviator. Recapture recommended.
     pub excluded: bool,
     /// Engine (c) only: this key's octave pair failed the Giordano
     /// sufficiency gate (edge-hit or < 8 strong cross pairs) and did not
     /// contribute a ρ point.
     pub giordano_excluded: bool,
-    /// The **final** curve still violates d(m+12) ≥ d(m) at a pair
-    /// involving this key (flagged, never clamped — design note §2).
+    /// The final curve still violates d(m+12) ≥ d(m) at a pair
+    /// involving this key (flagged, never clamped).
     pub negative_stretch: bool,
 }
 
-/// A computed tuning curve: the target deviation from equal temperament,
-/// in cents, for each of the 88 keys, defined on the **audible first
-/// partial** f_1 (Rigaud Eq. 4; design note §1).
-///
-/// **Derived data — never persisted.** The curve is recomputed from the
-/// profile on load (design note §9; the stale-`analysis.json` incident is
-/// the standing proof). Deliberately does not implement `Serialize`.
+/// A computed tuning curve: each key's target deviation from equal temperament,
+/// in cents, on the audible first partial f_1 (Rigaud Eq. 4). Derived, and
+/// recomputed from the profile rather than persisted.
+// Do not implement `Serialize`: a stored curve goes stale against its profile.
 #[derive(Debug, Clone)]
 pub struct TuningCurve {
     /// d(m): cents deviation of the target f_1 from ET, per key,
@@ -897,15 +751,14 @@ impl TuningCurve {
         et * ((self.cents[key_index as usize] + self.d_g) / 1200.0).exp2()
     }
 
-    /// Per-partial strobe reference frequencies (design note §7):
+    /// Per-partial strobe reference frequencies:
     /// f_n^*(m) = n f_0^*(m)√(1 + B_{raw} n²) with
     /// f_0^* = f_1^*/√(1 + B_{raw}).
     ///
-    /// `b_raw` **must be the key's own measured B** — targets must match
-    /// the physical string, or a correctly tuned partial shows a false beat
-    /// (design note §5, D3). Any smoothed/fitted B is curve-input only.
-    /// Fills `out` with partials n = 1, 2, … until Nyquist or capacity;
-    /// returns the count.
+    /// `b_raw` must be the key's own measured B: a target off the physical
+    /// string's series shows a correctly tuned partial as a false beat. Fills
+    /// `out` with partials n = 1, 2, … up to Nyquist or capacity, returning the
+    /// count.
     pub fn strobe_partials(&self, key_index: u8, b_raw: f32, out: &mut [f32]) -> usize {
         let f1 = self.target_f1(key_index);
         let f0 = f1 / (1.0 + b_raw).sqrt();
@@ -926,17 +779,13 @@ impl TuningCurve {
 /// Represents a single musical note with its name and frequency.
 #[derive(Debug, Clone)]
 pub struct Note {
-    /// Note name (e.g., "A4", "C#3", "Bb2")
+    /// Note name, such as "A4" or "C#3".
     pub name: String,
     /// Frequency in Hz
     pub frequency: f32,
 }
 
-/// Statically computed notes for a standard 88-key piano (A0 to C8).
-///
-/// This lazy static contains all 88 piano keys with their corresponding
-/// frequencies calculated using equal temperament tuning with A4 = 440 Hz.
-/// The notes are computed once at startup for optimal performance.
+/// The 88 keys, A0 to C8, at equal temperament with A4 = 440 Hz.
 pub static NOTES: Lazy<Vec<Note>> = Lazy::new(|| {
     const NOTE_NAMES: [&str; 12] = [
         "A", "A#", "B", "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#",
@@ -956,104 +805,17 @@ pub static NOTES: Lazy<Vec<Note>> = Lazy::new(|| {
     notes
 });
 
-/// Static map for quick note name to key index lookups.
-///
-/// This provides O(log n) lookup time for converting note names
-/// (like "A4", "C#3") to their corresponding piano key indices.
-pub static NOTE_MAP: Lazy<BTreeMap<String, u8>> = Lazy::new(|| {
-    NOTES
-        .iter()
-        .enumerate()
-        .map(|(i, note)| (note.name.clone(), i as u8))
-        .collect()
-});
-
-/// Finds the closest musical note to a given frequency.
-///
-/// This function searches through all 88 piano keys to find the one
-/// with the frequency closest to the input frequency. It's used for
-/// automatic note detection in the tuner.
-///
-/// # Arguments
-/// * `freq` - Input frequency in Hz
-///
-/// # Returns
-/// * `(note_name, target_frequency)` - Closest note name and its target frequency
-pub fn find_nearest_note(freq: f32) -> (String, f32) {
-    let closest = NOTES
-        .iter()
-        .min_by(|a, b| {
-            let diff_a = (a.frequency - freq).abs();
-            let diff_b = (b.frequency - freq).abs();
-            diff_a.partial_cmp(&diff_b).unwrap()
-        })
-        .unwrap(); // This is safe as NOTES is never empty.
-
-    (closest.name.clone(), closest.frequency)
-}
-
-/// Finds a note's name and frequency by its 88-key piano index.
-///
-/// This function provides direct access to note information using
-/// the piano key index (0-87, where 0 is A0 and 87 is C8).
-///
-/// # Arguments
-/// * `key_index` - Piano key index (0-87)
-///
-/// # Returns
-/// * `(note_name, frequency)` - Note name and frequency
+/// Returns the note name and frequency of the key at `key_index` (0 = A0, 87 = C8).
 pub fn find_nearest_note_by_index(key_index: u8) -> (String, f32) {
     let note = &NOTES[key_index as usize];
     (note.name.clone(), note.frequency)
 }
 
-/// Returns the 88-key piano index (0–87) of the note closest to `freq`.
-///
-/// Unlike [`find_nearest_note()`], this avoids a `String` allocation and is
-/// suitable for use on the DSP hot path or in pipeline output types.
-///
-/// # Arguments
-/// * `freq` - Input frequency in Hz
-///
-/// # Returns
-/// * Piano key index (0 = A0, 87 = C8)
-pub fn find_nearest_note_index(freq: f32) -> u8 {
-    NOTES
-        .iter()
-        .enumerate()
-        .min_by(|(_, a), (_, b)| {
-            let diff_a = (a.frequency - freq).abs();
-            let diff_b = (b.frequency - freq).abs();
-            diff_a.partial_cmp(&diff_b).unwrap()
-        })
-        .map(|(i, _)| i as u8)
-        .unwrap() // Safe: NOTES is never empty.
-}
-
-/// Gets the 88-key piano index from a note name.
-///
-/// This function converts note names like "A4" or "C#3" to their
-/// corresponding piano key indices for use in the GUI.
-///
-/// # Arguments
-/// * `name` - Note name (e.g., "A4", "C#3", "Bb2")
-///
-/// # Returns
-/// * Piano key index (0-87), defaults to 0 if note not found
-pub fn get_key_index_from_name(name: &str) -> u8 {
-    *NOTE_MAP.get(name).unwrap_or(&0)
-}
-
-/// MIDI note number of piano key 0 (A0). The 88-key compass spans MIDI
-/// 21 (A0) … 108 (C8); key 48 (A4) is MIDI 69 = 440 Hz.
+/// MIDI note number of piano key 0 (A0): the compass spans MIDI 21 to 108.
 pub const MIDI_KEY_0: u8 = 21;
 
-/// MIDI note number for an 88-key piano index (`key + 21`; A0 → 21, C8 → 108).
-///
-/// The single canonical key↔MIDI converter (MIDI Tuning Standard: A4 = 69 =
-/// 440 Hz). External note sources — a MIDI keyboard, a DAW — map through here
-/// so the whole codebase agrees on the numbering; the synth and curve layers
-/// stay in native key-index units. Inverse of [`key_from_midi`].
+/// MIDI note number of a key, `key + 21`, so A4 is 69 (MIDI Tuning Standard).
+/// Inverse of [`key_from_midi`].
 pub fn midi_from_key(key_index: u8) -> u8 {
     key_index + MIDI_KEY_0
 }
@@ -1065,33 +827,22 @@ pub fn key_from_midi(note: u8) -> Option<u8> {
     note.checked_sub(MIDI_KEY_0).filter(|&k| k < 88)
 }
 
-/// Returns the expected physical inharmonicity coefficient (beta) for a given piano key.
+/// The Rigaud prior: a key's expected inharmonicity B, from the dual-exponential
+/// whole-compass model `B(m) = e^(s_B·m + y_B) + e^(s_T·m + y_T)` (the bass and
+/// treble bridges' log-linear asymptotes, m the MIDI note), re-indexed to n = 1
+/// at A0: `B(n) = exp(−0.066n − 9.211) + exp(0.0926n − 11.788)`.
 ///
-/// Implements Rigaud's dual-exponential whole-compass model (Eqs. 7–8):
-/// B(m) = e^(s_B·m + y_B) + e^(s_T·m + y_T), the sum of the bass- and
-/// treble-bridge log-linear asymptotes, with m the MIDI note number. Here,
-/// re-indexed to 1-indexed keys via m = n + 20 (A0: n = 1 ↔ m = 21):
-///
-///   B(n) = exp(-0.066n - 9.211) + exp(0.0926n - 11.788)
-///
-/// Constant provenance (faithfulness-audit-06):
-/// * **Treble pair = the paper's universal fit**, verified exact:
-///   (s_T, y_T) = (9.26e-2, −13.64) ⇒ 0.0926·(n+20) − 13.64 = 0.0926n − 11.788.
-///   The paper fixes these across all pianos (after Young 1952).
-/// * **Bass pair = OURS** — the paper defines (s_B, y_B) as *piano-specific*
-///   free parameters (no universal value exists); ours (−6.6e-2, −7.891 in
-///   MIDI domain) is a typical medium-piano default. Known domain limit: the
-///   real upright's measured bass B runs 7–25× this default (ADR 0006) —
-///   inherent to any fixed bass choice, which is why measured-B seeding
-///   exists (gated off pending validation on a second instrument).
-///
-/// # Reference
-/// 1. Rigaud, F., David, B., & Daudet, L. (2013). "A parametric model and estimation techniques
-///    for the inharmonicity and tuning of the piano". JASA 133(5), pp. 3107-3118.
-///    DOI: 10.1121/1.4802644 (Eqs. 7-8; treble universality §IV.)
+/// # References
+/// Rigaud, F., David, B., & Daudet, L. (2013). "A parametric model and estimation
+/// techniques for the inharmonicity and tuning of the piano". JASA 133(5),
+/// 3107–3118. DOI: 10.1121/1.4799806 (Eqs. 7–8; treble universality §IV).
+// The treble pair is the paper's universal fit (s_T, y_T) = (9.26e-2, −13.64),
+// after Young 1952, re-indexed exactly. The bass pair is ours: the paper leaves it
+// per-piano, and (−6.6e-2, −7.891) is a medium-piano default that measured bass B
+// has run 7–25× above.
+// audit 06
 pub fn get_expected_beta(key_index: u8) -> f32 {
-    // Rigaud model uses a 1-indexed key number (A0 = 1).
-    // key_index is 0-indexed (A0 = 0), so we offset by 1.
+    // n = 1 at A0.
     let n = key_index as f32 + 1.0;
     (-0.066 * n - 9.211).exp() + (0.0926 * n - 11.788).exp()
 }
@@ -1144,13 +895,10 @@ impl KeyProfile {
         )
     }
 
-    /// Builds a template from a measured key, using its measured inharmonicity B in
-    /// place of the prior. Returns `None` when B is absent or non-physical (so the
-    /// caller keeps the prior).
-    ///
-    /// The template is centered on equal temperament, not the measured `f0`: B is the
-    /// tuning-invariant string-shape parameter, whereas a stored `f0` goes stale as the
-    /// string is tuned. Stage-B refinement absorbs the live pitch offset.
+    /// A template from a measured key's B in place of the prior; `None` when B is
+    /// absent or non-physical. Centred on equal temperament, not the measured f₀:
+    /// B describes the string whatever its tuning, while a stored f₀ goes stale as
+    /// the string is tuned.
     pub fn from_measurement(m: &KeyMeasurement) -> Option<Self> {
         let beta = m.calculated_b?;
         if !beta.is_finite() || beta <= 0.0 {
@@ -1168,11 +916,8 @@ pub fn build_default_profiles() -> Box<[KeyProfile; 88]> {
 }
 
 /// Abramowitz & Stegun 7.1.26 error-function approximation (|err| < 1.5e-7).
-///
-/// `f32` twin of `algorithms::rigaud::erf`, kept separate on purpose:
-/// this one feeds the discovery-side Railsback curve, which stays
-/// bit-identical against the pre-tuning-curve baselines; the curve layer
-/// needs the `f64` precision.
+// Not merged with the f64 `rigaud::erf`: the Railsback curve here must stay
+// bit-identical.
 fn erf(x: f32) -> f32 {
     let sign = if x < 0.0 { -1.0 } else { 1.0 };
     let x = x.abs();
@@ -1183,18 +928,11 @@ fn erf(x: f32) -> f32 {
     sign * (1.0 - poly * (-x * x).exp())
 }
 
-/// Canonical Railsback stretch (cents vs equal temperament) for each of the 88
-/// keys, from the Rigaud (2011/2013) inharmonicity-coupled octave-stretch model
-/// with mean parameters (type-octave K≈4.51, m0≈64, α≈24; A4 anchored at 440).
+/// The Railsback stretch (cents from equal temperament) per key, from Rigaud's
+/// inharmonicity-coupled octave-stretch model with mean parameters (type-octave
+/// K ≈ 4.51, m0 ≈ 64, α ≈ 24; A4 anchored at 440 Hz).
 ///
-/// Discovery currently scores templates at raw ET, which handicaps every note by
-/// its stretch (worst in the extreme treble). Centering the per-key template on
-/// this expected tuned pitch removes that systematic handicap; Stage-B refinement
-/// then absorbs the residual per-instrument / pitch-raise offset. This is the same
-/// model the synthetic generator uses, so the engine reference and the synthetic
-/// dataset stay consistent.
-///
-/// # Reference
+/// # References
 /// Rigaud, F., David, B., & Daudet, L. (2011). "A parametric model of piano
 /// tuning". Proc. DAFx-11. (Eqs. 8, 12–14.)
 pub fn railsback_stretch_curve() -> [f32; 88] {
@@ -1311,8 +1049,7 @@ mod tests {
         assert!(!malformed.is_open());
     }
 
-    /// The inspector and the sidebar read the same label, so it has to name
-    /// the three states the protocol distinguishes.
+    /// The label names the three states the protocol distinguishes.
     #[test]
     fn sounding_strings_label_names_the_state() {
         let tri = SoundingStrings::UNDECLARED;
@@ -1366,9 +1103,8 @@ mod tests {
         );
     }
 
-    /// The active-entry rule (ADR 0006 item 3 over a list): an auto-mode
-    /// capture is retained for review but never displaces a manual one,
-    /// however recent it is.
+    // The active-entry rule (report 0006): an auto-mode capture is retained for
+    // review but never displaces a manual one, however recent it is.
     #[test]
     fn untrusted_never_displaces_trusted() {
         let mut p = InharmonicityProfile::default();
@@ -1377,11 +1113,11 @@ mod tests {
         assert_eq!(p.active(5).unwrap().measured_f0, 100.0);
         assert_eq!(p.measurements[&5].len(), 2, "the auto entry is retained");
 
-        // A newer *manual* capture does take over.
+        // A newer manual capture does take over.
         p.record(m(5, 300.0, false));
         assert_eq!(p.active(5).unwrap().measured_f0, 300.0);
 
-        // With no manual entry at all the key presents *nothing*: an auto
+        // With no manual entry at all the key presents nothing: an auto
         // capture is retained for review and read by no one, so the key reads
         // as unmeasured and its consumers fall back to the prior. A discovery
         // false-lock would otherwise place the strobe's partials off a
@@ -1464,9 +1200,8 @@ mod tests {
     }
 
     /// The budgets are separate, so an entry no consumer reads can never take a
-    /// trusted one's place. The measured failure this prevents: a mute-isolation
-    /// pass on A#3 left the key one of its thirteen open captures
-    /// (`docs/internals/06-capture-sets.md`).
+    /// trusted one's place: under one budget, a mute-isolation pass on A#3 left
+    /// the key one of its thirteen open captures.
     #[test]
     fn unused_captures_never_displace_trusted_ones() {
         let solo = |f0: f32| {
@@ -1553,8 +1288,8 @@ mod tests {
         );
     }
 
-    /// `remove` reaches any entry by position — the inspector's handle — and
-    /// holds `remove_capture`'s invariant: emptying a key removes the key.
+    /// `remove` reaches any entry by position and holds `remove_capture`'s
+    /// invariant: emptying a key removes the key.
     #[test]
     fn remove_reaches_any_entry_and_empties_the_key() {
         let mut p = InharmonicityProfile::default();

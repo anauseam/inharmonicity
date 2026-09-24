@@ -1,8 +1,7 @@
-//! # Engine (Thread 2) — Fundamental Frequency Detection
+//! # Engine — fundamental-frequency detection
 //!
-//! The "Brains" of the pipeline. The Engine is orchestrated by the `AudioPipeline`
-//! after the signal has been validated by the Gatekeeper. Its sole responsibility
-//! is to process the signal and extract the exact fundamental frequency.
+//! Names the key a validated signal belongs to, locks onto it, and tracks the
+//! frequencies of its partials.
 
 use crate::algorithms::{
     discovery,
@@ -13,28 +12,21 @@ use crate::audio::{BASS_WINDOW_SIZE, HOP_SIZE};
 use crate::models::{KeyProfile, MAX_PARTIALS, SpectralPeak};
 use crate::pipeline::ProcessingFrame;
 
-// ── M-of-N Acquisition Lock (Binary Integration) ──
-// Discovery locks the first key to win ≥ M of the last N Stable-frame scans —
-// the binary-integration / coincidence procedure (Schwartz 1956, IRE Trans. IT
-// 2(4); Shnidman 1998, IEEE Trans. AES 34(3)). M > N/2 guarantees at most one
-// key can hold ≥ M votes, so only the frame's own winner is ever tested.
-// (M, N) = (7, 8) is the refined-path production pick; provenance and the full
-// (M, N) latency/accuracy tradeoff (e.g. the cheaper (5, 6) ≈ 46 ms vs ≈ 93 ms)
-// are in docs/adr/0010-m-of-n-lock-rule-replay.md.
+// Binary integration (Schwartz 1956, IRE Trans. IT 2(4); Shnidman 1998, IEEE
+// Trans. AES 34(3)): lock the first key to win ≥ M of the last N Stable-frame
+// scans. M > N/2, so at most one key can hold M votes. (7, 8) costs ≈ 93 ms of
+// latency against (5, 6)'s ≈ 46 ms, for its accuracy.
+// report 0010
 const LOCK_VOTES_M: usize = 7;
 const LOCK_WINDOW_N: usize = 8;
 
-// ── Adaptive Tracking Seed (Phase Vocoder Feedback) ──
-// Rate at which each partial's Goertzel evaluation centre drifts toward its
-// measured instantaneous frequency (Dolson 1986, Computer Music Journal), so the
-// tracker follows a detuned string without losing coherent integration energy.
-//
-// The value is ours and unswept — no experiment has compared it against a
-// neighbouring one. What is on record (ADR 0011) bounds it rather than confirms
-// it: this EMA is also the lobe-centering loop, and α = 1 at N = 4096 makes that
-// loop unstable (|z| = √2); the τ ≈ 0.46 s this value gives is outrun by a
-// turning peg (152–387 ¢ of tracker aliasing at 200–400 ¢/s), which is why the
-// coarse readout exists rather than a faster tracker.
+/// Rate at which each partial's Goertzel centre follows its measured
+/// instantaneous frequency (Dolson 1986, Computer Music Journal), so the tracker
+/// stays on a detuned string.
+// Ours and unswept, and bounded rather than confirmed: α = 1 at N = 4096 makes the
+// loop unstable (|z| = √2), and the τ ≈ 0.46 s this gives is outrun by a turning
+// peg (152–387 ¢ of aliasing at 200–400 ¢/s), which the coarse readout covers.
+// report 0011
 const TRACKER_SEED_ALPHA: f32 = 0.05;
 
 /// Result of a successful pitch detection frame.
@@ -42,18 +34,17 @@ const TRACKER_SEED_ALPHA: f32 = 0.05;
 pub struct PitchResult {
     /// 0–87 key index of the identified note.
     pub key_index: u8,
-    /// Physical fundamental frequency (Partial 1), tracked via Goertzel phase vocoder. Returns None if Partial 1 is dead.
-    /// Absolute physical fundamental frequency (Partial 1) in Hz. Returns None if Partial 1 is dead.
+    /// Partial 1's frequency in Hz; `None` when partial 1 is dead.
     pub measured_f0: Option<f32>,
-    /// Per-partial instantaneous frequency (Hz). Valid entries: [0..partial_count].
+    /// Per-partial instantaneous frequency (Hz). Valid entries: `[0..partial_count]`.
     pub partial_freqs: [f32; MAX_PARTIALS],
-    /// Per-partial cents deviation relative to tuning curve target.
+    /// Per-partial cents from the key's discovery template.
     pub partial_cents: [f32; MAX_PARTIALS],
     /// Harmonic index (n) for each live partial.
     pub partial_ns: [u32; MAX_PARTIALS],
-    /// Per-partial amplitude from Goertzel (used as weight by consumer if desired).
+    /// Per-partial Goertzel amplitude.
     pub partial_amplitudes: [f32; MAX_PARTIALS],
-    /// Number of live (non-ghost) partials contributing to this frame.
+    /// Live partials this frame.
     pub partial_count: usize,
     #[cfg(feature = "telemetry")]
     pub telemetry_count: usize,
@@ -97,34 +88,28 @@ struct PartialTracker {
     prev_phase: f32,
 }
 
-/// The Fundamental Frequency ($f_0$) Engine.
+/// The fundamental-frequency engine: discovery, the M-of-N lock, and partial
+/// tracking.
 pub struct Engine {
     pub sample_rate: u32,
-
-    // Discovery State
     pub identified_key: Option<u8>,
-    /// Ring buffer of the last `LOCK_WINDOW_N` Stable-frame discovery winners
-    /// (key indices), with its fill length and write cursor — the M-of-N lock
-    /// window (see [`Engine::record_stable_winner`]).
+    /// Ring buffer of the last `LOCK_WINDOW_N` Stable-frame discovery winners,
+    /// with its fill length and write cursor.
     lock_window: [u8; LOCK_WINDOW_N],
     lock_window_len: usize,
     lock_window_head: usize,
-
-    // Tracking state
     tracking_targets: [f32; MAX_PARTIALS],
     partial_trackers: [PartialTracker; MAX_PARTIALS],
     warmup_hops: u8,
     /// Winning Stage B scale (s_win) of the current lock; 1.0 when unlocked.
     locked_scale: f32,
-    /// R3 for the tracker: `true` while the locked key's partial spacing
-    /// (≈ f₀, proxied by the f₁ seed) sits inside the 1024-sample Hann main
-    /// lobe (half-width 2·fs/1024 ≈ 86 Hz), selecting the 4096-sample
-    /// Goertzel window for every partial of the key. Same derivation and
-    /// boundary as [`crate::strobe::Strobe`]'s long-window rule; window
-    /// length ≠ hop, so the ±21.5 Hz phase-unwrap range is unchanged.
+    /// The locked key's partial spacing (≈ f₀, proxied by the f₁ seed) is inside
+    /// the 1024-sample Hann main lobe (half-width 2·fs/1024 ≈ 86 Hz), so every
+    /// partial uses the 4096-sample Goertzel window. The hop, and with it the
+    /// unwrap range, is unchanged. The strobe bank applies the same rule.
     long_window: bool,
-
-    // Shared
+    /// The silence threshold, standing in for the noise σ of the peak floor and
+    /// the partial gate.
     pub noise_floor: f32,
     peak_scratch: Box<[SpectralPeak]>,
 }
@@ -134,7 +119,7 @@ fn hz_to_cents(freq: f32, reference: f32) -> f32 {
 }
 
 impl Engine {
-    /// Creates a new Engine with default algorithms.
+    /// An unlocked engine.
     pub fn new(sample_rate: u32) -> Self {
         Engine {
             sample_rate,
@@ -147,32 +132,23 @@ impl Engine {
             warmup_hops: 0,
             locked_scale: 1.0,
             long_window: false,
-            noise_floor: 0.0, // updated by pipeline
+            noise_floor: 0.0,
             peak_scratch: vec![SpectralPeak::default(); 64].into_boxed_slice(),
         }
     }
 
-    /// Records a Stable-frame discovery winner into the M-of-N window and
-    /// returns whether `key` has reached the lock threshold.
-    ///
-    /// Binary integration (Schwartz 1956; Shnidman 1998; ADR 0010): lock the
-    /// first key to win ≥ `LOCK_VOTES_M` of the last `LOCK_WINDOW_N` Stable
-    /// frames. The window is a fixed ring buffer — the oldest vote is
-    /// overwritten once it is full — so a partially-filled window lets clean
-    /// evidence lock after `M` straight frames. Only Stable frames call this: a
-    /// non-Stable interruption casts no vote and leaves the window intact
-    /// ([`reset_lock_window`](Self::reset_lock_window) clears it on a new
-    /// onset). `M > N/2` guarantees at most one key can hold ≥ `M` votes, so
-    /// testing the just-recorded key alone is exact.
+    /// Records a Stable-frame discovery winner and returns whether `key` now holds
+    /// `LOCK_VOTES_M` of the last `LOCK_WINDOW_N` votes. A partly filled window
+    /// locks after M straight votes, and M > N/2 makes testing the recorded key
+    /// alone exact.
     fn record_stable_winner(&mut self, key: u8) -> bool {
         self.lock_window[self.lock_window_head] = key;
         self.lock_window_head = (self.lock_window_head + 1) % LOCK_WINDOW_N;
         if self.lock_window_len < LOCK_WINDOW_N {
             self.lock_window_len += 1;
         }
-        // Until the buffer is full the head advances in lockstep with the fill
-        // length, so the valid votes are always the first `len` slots. N ≤ 8 ⇒
-        // this linear count is trivially cheap and allocation-free.
+        // Until the buffer is full the head moves with the fill length, so the
+        // valid votes are the first `len` slots.
         let votes = self.lock_window[..self.lock_window_len]
             .iter()
             .filter(|&&k| k == key)
@@ -180,20 +156,18 @@ impl Engine {
         votes >= LOCK_VOTES_M
     }
 
-    /// Clears the M-of-N lock window (new onset / silence / transient bypass).
-    /// Only the fill length and cursor are reset; slots past `len` are never
-    /// read.
+    /// Clears the M-of-N lock window. Only the fill length and cursor are reset;
+    /// slots past `len` are never read.
     #[inline]
     fn reset_lock_window(&mut self) {
         self.lock_window_len = 0;
         self.lock_window_head = 0;
     }
 
-    /// Executes the primary DSP detection loop for a single frame.
-    ///
-    /// `profiles` is the read-only per-key template table to score against.
-    // Gate state is passed as decomposed booleans (not the gatekeeper's
-    // `GateResult`) to keep the engine decoupled from `crate::gatekeeper`.
+    /// Runs one frame: discovery until a key locks, then partial tracking.
+    /// `profiles` is the per-key template table discovery scores against.
+    // Gate state arrives as booleans rather than a `GateResult`, so the engine
+    // does not depend on the gatekeeper.
     #[allow(clippy::too_many_arguments)]
     pub fn process(
         &mut self,
@@ -224,7 +198,7 @@ impl Engine {
             self.identified_key = None;
         }
 
-        // Force re-evaluation for instant UI response
+        // A new manual target drops the current lock.
         if let Some(target_idx) = target_note
             && self.identified_key.is_some()
             && self.identified_key != Some(target_idx)
@@ -237,30 +211,16 @@ impl Engine {
 
         // ── Discovery State ──
         if self.identified_key.is_none() {
-            // Auto-mode M-of-N votes accrue on Stable frames only (ADR 0010
-            // window semantics): a non-Stable frame casts no vote and — crucially
-            // — must not clear the accumulated window, so skip the Stage-A scan
-            // entirely until the gatekeeper is Stable again. Manual mode (an
-            // explicit target) is acquisition-immediate and unaffected.
+            // Auto mode votes on Stable frames only, and a non-Stable frame leaves
+            // the window intact. A manual target locks at once.
             if target_note.is_none() && !is_stable {
                 return None;
             }
 
-            // ── Gaussian Noise Filter (Detection Theory) ─────────────────────
-            // Computes a Neyman-Pearson threshold for Additive White Gaussian Noise.
-            // Foundation: Kay, S. M. (1998) Fundamentals of Statistical Signal Processing.
-            //
-            // Kay defines the false-alarm rate for a power threshold (gamma') as:
-            // P_fa = exp(-gamma' / sigma^2) (eq. 7.26, ISBN: 0-13-504135-X)
-            //
-            // For efficiency, we target a magnitude threshold (T) where gamma' = T^2.
-            // The total bin power variance (sigma^2) is pre-calculated here as `p_bin`
-            // using the unnormalized FFT Hann window energy (sum_w2 = 0.375 * N).
-            //
-            // Substituting these yields: P_fa = exp(-T^2 / p_bin)
-            // Solving for T gives:       T = sqrt(-p_bin * ln(P_fa))
-            //
-            // Here we target a 0.1% false-alarm rate (P_fa = 0.001).
+            // Neyman–Pearson peak floor for white Gaussian noise (Kay 1998,
+            // Fundamentals of Statistical Signal Processing, eq. 7.26):
+            // P_fa = exp(−T²/p_bin), so T = √(−p_bin·ln P_fa), with p_bin = σ²·Σw² for
+            // the unnormalised Hann window (Σw² = 0.375·N), at P_fa = 0.001.
             let sum_w2 = 0.375 * BASS_WINDOW_SIZE as f32;
             let p_bin = self.noise_floor * self.noise_floor * sum_w2;
             let min_magnitude = if p_bin > 0.0 {
@@ -285,29 +245,22 @@ impl Engine {
             let valid_count = peaks::mask_peaks(active_peaks);
             let active_peaks = &mut active_peaks[..valid_count];
 
-            // 2. Safe Bypass Gate
+            // 2. Discovery
             let cfg = twm::TwmConfig::default();
             // `min_error` feeds only the debug_assertions diagnostic below.
             #[cfg_attr(not(debug_assertions), allow(unused_variables))]
             let (winning_key, lock_acquired, s_win, min_error) =
                 if let Some(target_idx) = target_note {
-                    // Manual Mode: bypass the 88-key scan, but still run Stage B scale
-                    // refinement on the single target profile — otherwise this is the
-                    // worst-seeded path (pure ET), and it is the critical one for
-                    // Pitch Raise on heavily mistuned strings.
+                    // Manual: no 88-key scan, but the scale is still refined, or a
+                    // mistuned string would be seeded at pure ET.
                     let (s, err) =
                         discovery::refine_scale(active_peaks, &profiles[target_idx as usize], &cfg);
                     (target_idx, true, s, err)
                 } else {
-                    // Auto Mode: split discovery (ADR 0005) — Stage A discrete 88-key
-                    // scan, Stage B basin-clamped scale refinement of the top-3.
                     let res = discovery::discover(active_peaks, profiles, &cfg, true);
 
-                    // M-of-N binary-integration lock (ADR 0010): count this
-                    // Stable-frame winner into the N-window; lock the first key
-                    // to reach M votes. `s_win`/`error` come from the winning
-                    // frame's own scan — because M > N/2, the key that crosses
-                    // the threshold is always this frame's `res.key_index`.
+                    // A key that locks is this frame's winner (M > N/2), so the
+                    // scale and error are this scan's.
                     let locked = self.record_stable_winner(res.key_index);
 
                     (res.key_index, locked, res.scale, res.error)
@@ -322,7 +275,6 @@ impl Engine {
             );
 
             if lock_acquired {
-                // Lock
                 #[cfg(debug_assertions)]
                 eprintln!(
                     "[ENGINE] *** LOCK ACQUIRED *** -> key_idx={}, s_win={:+.1}c",
@@ -332,21 +284,16 @@ impl Engine {
                 self.identified_key = Some(winning_key);
                 self.warmup_hops = 0;
                 self.locked_scale = s_win;
-                // Long window iff the 1024-sample main-lobe half-width
-                // (2·fs/1024) exceeds the partial spacing, proxied by the
-                // refined f₁ seed (spacing ≈ f₀ ≤ f₁ for every partial pair
-                // of the key) — the strobe bank's R3 rule applied to the
-                // tracker (its absence was Prompt N Defect 1: guitar E2's
-                // 2nd partial inside the lobe read ±47 ¢ of jitter).
+                // Inside the main lobe, the neighbouring partial beats against
+                // the tracked one.
                 self.long_window =
                     profile.predicted_partials[0] * s_win * 1024.0 < 2.0 * self.sample_rate as f32;
 
                 let limit = profile.valid_partial_count.min(MAX_PARTIALS);
                 for i in 0..limit {
-                    // Seed the Goertzel trackers from the REFINED series, not ET:
-                    // an ET seed for partial n of a mistuned note is off by
-                    // δ·n·f0, which exceeds the ±21.5 Hz phase-unwrap range at
-                    // the 1024-sample hop for high partials.
+                    // Seeded from the refined series, not ET: an ET seed for
+                    // partial n of a mistuned note is off by δ·n·f₀, past the
+                    // unwrap range for high partials.
                     self.tracking_targets[i] = profile.predicted_partials[i] * s_win;
 
                     self.partial_trackers[i].prev_phase = 0.0;
@@ -359,9 +306,8 @@ impl Engine {
         // ── Tracking State ──
         let key = self.identified_key?;
         let profile = &profiles[key as usize];
-        // The evaluator reads the freshest `window` samples of the full COLA
-        // buffer; the hop cadence (and hence the ±21.5 Hz unwrap range) is
-        // set by the caller, not the window length.
+        // The evaluator reads the freshest window of the buffer; the unwrap
+        // range follows the hop, not the window.
         let audio_slice = &frame.audio_buffer[..BASS_WINDOW_SIZE];
         let (eval, np_k): (spectral::GoertzelFn, f32) = if self.long_window {
             (spectral::goertzel_bass, spectral::neyman_pearson_k(4096))
@@ -386,13 +332,9 @@ impl Engine {
                 continue;
             }
 
-            // ── Phase Vocoder / Sinusoidal Tracking ──
-            // Foundation: McAulay, R. J., & Quatieri, T. F. (1986). Speech analysis/synthesis based
-            // on a sinusoidal representation. IEEE Transactions on Acoustics, Speech, and Signal Processing.
-            //
-            // Computes instantaneous frequency by unwrapping the phase derivative relative to the static f_target:
-            // Δφ = (φ_n - φ_{n-1} - 2π f_target t_hop) mod 2π
-            // f_inst = f_target + Δφ / (2π t_hop)
+            // Instantaneous frequency from the unwrapped phase advance (McAulay &
+            // Quatieri 1986, IEEE Trans. ASSP 34(4)):
+            // Δφ = (φₙ − φₙ₋₁ − 2π·f_target·t_hop) mod 2π, f_inst = f_target + Δφ/(2π·t_hop).
             let expected_advance = 2.0 * core::f32::consts::PI * f_target * t_hop;
             let phase_diff = phase_current - tracker.prev_phase - expected_advance;
             let delta_phi = (phase_diff + core::f32::consts::PI)
@@ -402,18 +344,13 @@ impl Engine {
             let f_inst = f_target + delta_phi / (2.0 * core::f32::consts::PI * t_hop);
             tracker.prev_phase = phase_current;
 
-            // Kay 1998 Neyman–Pearson amplitude gate at the active window
-            // length (see `spectral::neyman_pearson_k` for the derivation).
+            // Kay 1998 Neyman–Pearson amplitude gate at the active window length.
             let t_amp = self.noise_floor * np_k;
 
-            // A physical partial has a positive, finite frequency. On a
-            // spurious deep-bass lock the tracker free-runs on noise and the
-            // adaptive target can walk toward DC until f_target − 21.5 Hz
-            // (the unwrap half-range) crosses zero; such an f_inst is not a
-            // partial reading. Gating it to weight 0 both keeps it out of
-            // the result (a negative f_inst reached hz_to_cents as NaN and
-            // panicked the GUI canvas, observed 2026-07-10) and stops the
-            // target adaptation that lets the walk continue.
+            // A partial has a positive, finite frequency. On a spurious deep-bass
+            // lock the adaptive target can walk toward DC until f_inst goes
+            // negative, which `hz_to_cents` would publish as NaN; weight 0 drops it
+            // and stops the walk.
             let weight = if amplitude < t_amp || !(f_inst.is_finite() && f_inst > 0.0) {
                 0.0
             } else {
@@ -429,8 +366,8 @@ impl Engine {
                 result.partial_freqs[live_partials] = f_inst;
                 result.partial_amplitudes[live_partials] = amplitude;
 
-                let tuning_curve_target = profile.predicted_partials[i];
-                let cents_i = hz_to_cents(f_inst, tuning_curve_target);
+                let template_hz = profile.predicted_partials[i];
+                let cents_i = hz_to_cents(f_inst, template_hz);
                 result.partial_cents[live_partials] = cents_i;
                 result.partial_ns[live_partials] = (i + 1) as u32;
 
@@ -461,13 +398,8 @@ impl Engine {
             return None;
         }
 
-        // ── Global Pitch Reconstruction (Partial 1 Only) ──
-        // We deliberately use Partial 1 exclusively to drive the Cent Meter.
-        // If the stored inharmonicity profile (B_profile) doesn't perfectly match the physical string
-        // (B_true) due to uncalibrated models or string aging, higher partials will carry an n^2
-        // systematic cents error. Partial 1 carries no B correction (n=1) and is immune to this inaccuracy.
-        // For extreme bass notes where Partial 1 has no acoustic energy, this correctly returns None,
-        // and the tuner naturally falls back to the strobe display.
+        // The pitch is partial 1's alone: a template B that misses the string's
+        // biases higher partials in proportion to n², while n = 1 carries no B.
         for i in 0..live_partials {
             if result.partial_ns[i] == 1 {
                 result.measured_f0 = Some(result.partial_freqs[i]);
@@ -486,9 +418,9 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
 
-    /// Reference M-of-N rule — a direct port of `eval_rule` in
-    /// `scripts/replay_lock_rules.py`, the harness the ADR 0010 numbers were
-    /// measured with. Returns `(key, index)` of the first lock, or `None`.
+    // The reference M-of-N rule: a port of `eval_rule` in `replay_lock_rules.py`,
+    // the harness report 0010 was measured with. Returns `(key, index)` of the
+    // first lock, or `None`.
     fn ref_eval(seq: &[u8], m: usize, n: usize) -> Option<(u8, usize)> {
         let mut win: VecDeque<u8> = VecDeque::with_capacity(n);
         for (t, &w) in seq.iter().enumerate() {

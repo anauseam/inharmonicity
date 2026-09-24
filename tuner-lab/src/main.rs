@@ -8,13 +8,11 @@
 //! cargo lab strobe replay diagnostics
 //! cargo lab --help
 //! ```
-//!
-//! What belongs here rather than in `tuner-core/tests/` or `benches/`, and the
-//! crate boundary the lab observes: `tuner-lab/README.md` and ADR 0016.
 
 mod capture;
 mod curve;
 mod engine;
+mod figure;
 mod gatekeeper;
 mod gates;
 mod mat;
@@ -44,7 +42,7 @@ struct Cli {
 enum Subsystem {
     /// Discovery: the TWM scorer, the auto lock, and its parameter sweeps.
     Engine(engine::Cmd),
-    /// The 5-state signal validator.
+    /// The signal validator.
     Gatekeeper(gatekeeper::Cmd),
     /// The Worker's (f₀, B) estimator and the dumps it consumes.
     Mat(mat::Cmd),

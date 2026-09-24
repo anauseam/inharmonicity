@@ -1,22 +1,23 @@
 //! # The one ambient scalar, at all three sites that threshold against it
 //!
 //! `config.silence_threshold` is calibrated once from ambient silence and then
-//! thresholded at three hot-path detectors — `engine.rs`'s FFT-magnitude peak
-//! gate and Goertzel tracker gate, and `strobe.rs`'s fixed-reference gate. Per
+//! thresholded at three hot-path detectors: `Engine::process`'s FFT-magnitude peak
+//! gate and Goertzel tracker gate, and `Strobe::process`'s fixed-reference gate. Per
 //! hop and per partial this measures the signal and the noise present beside it
-//! in the *same* window, classifies the partial live or dead against that, and
+//! in the same window, classifies the partial live or dead against that, and
 //! scores all three gates over a σ sweep.
 //!
 //! Several populations run together so their columns are directly comparable.
-//! Reproduces [ADR 0015](../../../docs/adr/0015-ambient-sigma-gates-measured.md).
+//! Reproduces report 0015.
 
 use std::path::{Path, PathBuf};
 
+use anyhow::Result;
 use realfft::RealFftPlanner;
 
-use crate::capture::strobe_register as register;
 use crate::regen::{Capture, ET_PLAUSIBLE_CENTS, load as load_regen};
 use crate::truth::*;
+use crate::{capture, raw};
 use tuner_core::algorithms::spectral::{goertzel_windowed, neyman_pearson_k};
 use tuner_core::audio::{BASS_WINDOW_SIZE, HOP_SIZE};
 use tuner_core::strobe::{MAX_STROBE_REFS, Strobe, StrobeRefUpdate};
@@ -35,7 +36,7 @@ const NOISE_WIN: usize = BASS_WINDOW_SIZE;
 const NOISE_PAD: usize = 4;
 
 /// Minimum zero-padded bins an inter-partial gap must hold before it may
-/// contribute a noise sample (ADR 0015 §1, pre-registered). Below it the row is
+/// contribute a noise sample (report 0015 §1, pre-registered). Below it the row is
 /// unmeasurable and is reported as such rather than defaulted.
 const MIN_GAP_BINS: usize = 3;
 
@@ -44,26 +45,27 @@ const MIN_GAP_BINS: usize = 3;
 /// median quantile — the same conversion the coarse read's OS-CFAR gate uses, so
 /// the two are calibrated alike rather than merely similar.
 ///
-/// Without it a threshold compared against `N_local` is being compared against
-/// the noise's *median*, which a correctly-specified detector must sit 3.157×
-/// above. An earlier revision of ADR 0015 omitted it and so read the bass
-/// threshold as "0.77× — nearly right" when it is ≈ 4× too **low**.
+/// Without it a threshold compared against `N_local` is compared against the
+/// noise's median, which a correctly specified detector must sit 3.157× above;
+/// omitting it reads the bass threshold as 0.77×, nearly right, when it is ≈ 4×
+/// too low.
 fn threshold_for_median(n_local: f32) -> f32 {
     n_local * cfar_multiplier(0.5)
 }
 
-/// `SNR_gate` below which a partial counts as **dead** — indistinguishable from
+/// `SNR_gate` below which a partial counts as dead — indistinguishable from
 /// its own neighbourhood in the window the gate actually uses.
 const SNR_DEAD: f32 = 1.0;
 
-/// `SNR_gate` at or above which a partial counts as **live**. Anchored to
-/// ADR 0014 §8a, which measured the strobe gate closing while partials were
+/// `SNR_gate` at or above which a partial counts as live. Anchored to
+/// report 0014 §8a, which measured the strobe gate closing while partials were
 /// still 3–15× above the noise beside them: 3 is the bottom of a range already
-/// measured on this project's data, not a chosen bar (`07` §2).
+/// measured on this project's data, not a chosen bar (CONTRIBUTING.md,
+/// "anchor a threshold").
 const SNR_LIVE: f32 = 3.0;
 
 /// Onset reference: the first hop reaching −20 dB of the record's loudest
-/// 1024-sample RMS. Dimensionless by construction (`07` §7), so it survives a
+/// 1024-sample RMS. Dimensionless by construction, so it survives a
 /// gain change and needs no calibrated floor — the quantity under scrutiny here.
 const ONSET_REL_DB: f32 = -20.0;
 
@@ -83,13 +85,13 @@ fn stiff_partial(f0: f32, b: f32, n: usize) -> f32 {
 /// so they differ only in what they evaluate and over how long.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum GateSite {
-    /// `engine.rs:252` — discovery's FFT peak floor, always 8192. The only one
-    /// of the three that *scans*, so ADR 0011 §5's search loss applies to it
+    /// `Engine::process`'s discovery FFT peak floor, always 8192. The only one
+    /// of the three that scans, so report 0011 §5's search loss applies to it
     /// and to neither of the others.
     Peaks,
-    /// `engine.rs:394` — the tracker's Goertzel gate at an adaptive centre.
+    /// `Engine::process`'s tracker Goertzel gate, at an adaptive centre.
     Tracker,
-    /// `strobe.rs:253` — the bank's D3 gate at a fixed reference.
+    /// `Strobe::process`'s amplitude gate, at a fixed reference.
     Strobe,
 }
 
@@ -108,8 +110,8 @@ const GATES: [GateSite; 3] = [GateSite::Peaks, GateSite::Tracker, GateSite::Stro
 /// One hop's probe spectrum in the `4/N` physical-amplitude units the Goertzel
 /// evaluators return, so a sinusoid of amplitude A peaks at A whatever the
 /// window length. Noise carries no such invariance — it falls as 1/√N — and
-/// that asymmetry *is* the processing gain, corrected explicitly wherever a
-/// gate's own window differs from this one (ADR 0015 §1).
+/// that asymmetry is the processing gain, corrected explicitly wherever a
+/// gate's own window differs from this one (report 0015 §1).
 struct ProbeSpectrum {
     mag: Vec<f32>,
     hz_per_bin: f32,
@@ -126,7 +128,7 @@ impl ProbeSpectrum {
         self.mag[lo..=hi].iter().copied().fold(0.0, f32::max)
     }
 
-    /// Largest magnitude in `[lo_hz, hi_hz]` over the **unpadded** 8192 bins
+    /// Largest magnitude in `[lo_hz, hi_hz]` over the unpadded 8192 bins
     /// only — what discovery's peak extractor sees, scalloping loss included.
     fn peak_coarse(&self, lo_hz: f32, hi_hz: f32) -> f32 {
         let lo = (lo_hz / self.hz_per_bin).floor().max(1.0) as usize;
@@ -194,14 +196,14 @@ fn probe_spectrum(
     probe_spectrum_at(signal, end, NOISE_WIN, hann, planner, scratch)
 }
 
-/// **S and N_local for one partial**, both read from the same window.
+/// S and N_local for one partial, both read from the same window.
 ///
 /// `f_n` is the partial's measured frequency; `f_lo`/`f_hi` its neighbours'
 /// predicted positions, which bound the two gaps the noise is read from. Each
 /// gap is inset by one main-lobe half-width at both ends, excluding the
 /// target's lobe and the neighbours'. What leaks past that is Hann sidelobe at
 /// −31 dB, which inflates N_local and so understates every SNR below — the
-/// conservative direction for the claim under test (ADR 0014 §8a made the same
+/// conservative direction for the claim under test (report 0014 §8a made the same
 /// argument).
 ///
 /// `None` where neither gap reaches [`MIN_GAP_BINS`].
@@ -221,8 +223,8 @@ fn partial_probe_at(
     scratch.clear();
     let mut bins = 0;
     // Below f₁ there is no partial, only rumble — still local noise, but
-    // clamped away from DC where the blocker's own 35 Hz corner shapes it
-    // (`audio.rs`, and the Prompt P finding that raising α hurt the coarse read).
+    // clamped away from DC, where `DC_BLOCK_ALPHA`'s 35 Hz corner shapes it
+    // (report 0019).
     let lo_start = (f_lo + l).max(20.0);
     if f_n - l > lo_start {
         bins += spec.collect_band(lo_start, f_n - l, scratch);
@@ -280,9 +282,10 @@ fn onset_sample(signal: &[f32]) -> usize {
 
 /// σ sweep grid — eight points per decade from 1e−5 to 1e−1, spanning the
 /// values the sets actually recorded (2.8e−3 … 7.8e−3) by two decades either
-/// way. ADR 0015 §2 sweeps σ rather than choosing one: it is a user-movable
-/// slider (`Message::SilenceThresholdChanged`), so no single value is the
-/// honest one, and `07` §7 requires the family rather than a crossing.
+/// way. report 0015 §2 sweeps σ rather than choosing one: it is a user-movable
+/// slider (the GUI's `Message::SilenceThresholdChanged`), so no single value
+/// represents it, and a threshold-dependent question needs the family rather
+/// than a single crossing (CONTRIBUTING.md).
 fn sigma_grid() -> Vec<f32> {
     (0..=32)
         .map(|i| 10f32.powf(-5.0 + i as f32 / 8.0))
@@ -315,7 +318,7 @@ const REGISTERS: [&str; 4] = ["bass", "tenor", "treble", "high 76–87"];
 fn register_index(key: u8) -> usize {
     REGISTERS
         .iter()
-        .position(|&r| r == register(key))
+        .position(|&r| r == capture::strobe_register(key))
         .unwrap_or(0)
 }
 
@@ -324,7 +327,7 @@ fn register_index(key: u8) -> usize {
 /// only one a false-alarm rate may be quoted against.
 #[derive(Default, Clone, Copy)]
 struct Tally {
-    /// Dead **and** absent at the probe window — H₀ proper.
+    /// Dead and absent at the probe window — H₀ proper.
     h0: u64,
     h0_pass: u64,
     /// Dead at the gate's window but present at the probe's: admitting one is
@@ -363,15 +366,15 @@ struct GateStudy {
     /// `[gate][register][σ]` — the pre-registered rates.
     tally: Vec<Vec<Vec<Tally>>>,
     /// `[gate][register][t_bucket]` — the shipped threshold ÷ the correctly
-    /// specified one at the same P_fa, `σ_rec·K(N) / (3.157·N_local)`. **1.0 is
-    /// correct**; > 1 over-rejects, < 1 over-admits. Verified against AWGN of
+    /// specified one at the same P_fa, `σ_rec·K(N) / (3.157·N_local)`. 1.0 is
+    /// correct; > 1 over-rejects, < 1 over-admits. Verified against AWGN of
     /// known σ, where it reads 0.97–0.99.
     ratio: Vec<Vec<Vec<Vec<f32>>>>,
     /// `[gate][register][t_bucket]` — SNR_gate over the same rows, so a
     /// stranded threshold can be told from a partial that simply died.
     snr: Vec<Vec<Vec<Vec<f32>>>>,
     /// The shipped gate's verdict on each of those rows. Paired with `snr`, it
-    /// lets the **live cut be swept after the fact** — necessary because the
+    /// lets the live cut be swept after the fact — necessary because the
     /// pre-registered cut of 3 turns out to sit at a correctly-specified gate's
     /// own threshold (3.157× the noise median), so it cannot separate a
     /// stranded partial from one at the detection limit.
@@ -380,13 +383,13 @@ struct GateStudy {
     /// the noise present, so the registers can be compared without the
     /// calibration each session happened to hold.
     sigma_local: Vec<Vec<Vec<f32>>>,
-    /// `[register][t_bucket]` — σ_local read at the **gate's own** window
+    /// `[register][t_bucket]` — σ_local read at the gate's own window
     /// instead of the 8192 probe's. Only defined where the partial spacing
     /// clears 2.5 main-lobe half-widths at that window, which excludes the bass
     /// entirely; where it is defined it resolves the attack the 186 ms probe
     /// window cannot see, and cross-checks the √(N_T/N) scaling.
     sigma_local_win: Vec<Vec<Vec<f32>>>,
-    /// **Candidate C** (ADR 0015 §12): the per-bin startup floor, built once per
+    /// Candidate C (report 0015 §12): the per-bin startup floor, built once per
     /// set from the odd-indexed silence-screened pre-roll hops of every capture.
     /// Empty when the set kept no usable pre-roll.
     floor_bins: Vec<f32>,
@@ -398,7 +401,7 @@ struct GateStudy {
     /// stops a floor built from silence being scored on the silence it saw.
     c_holdout_rows: u64,
     c_holdout_pass: u64,
-    /// `[register]` — σ_local measured by the *same* probe on pre-onset silence.
+    /// `[register]` — σ_local measured by the same probe on pre-onset silence.
     /// The control that decides whether the in-note figure is the room's own
     /// floor or an artifact of the probe: if the note's tail agrees with this,
     /// the noise has already reached the room and cannot fall further.
@@ -417,7 +420,7 @@ struct GateStudy {
     sigmas: Vec<f32>,
     rows: u64,
     unmeasurable: u64,
-    /// Pre-onset room noise — the honest H₀, and the true-silence rejection the
+    /// Pre-onset room noise: H₀ proper, and the true-silence rejection the
     /// entry credits these gates with.
     silence_rows: Vec<u64>,
     silence_pass: Vec<Vec<u64>>,
@@ -428,10 +431,10 @@ struct GateStudy {
     /// dead partials during a bass-dominated sustain".
     bass_hi_dead: Vec<u64>,
     bass_hi_dead_pass: Vec<u64>,
-    /// Gate #3 fidelity: hops where the **shipped** `Strobe::process` and this
+    /// Gate #3 fidelity: hops where the shipped `Strobe::process` and this
     /// harness's replica of its amplitude test agree / disagree on `gated`, at
     /// the recorded σ with `is_silence = false`. The replica has no standing
-    /// unless this is ~100 % — the check ADR 0011 ran as `--verify-shipped`.
+    /// unless this is ~100 % — the check report 0011 ran as `--verify-shipped`.
     strobe_agree: u64,
     strobe_disagree: u64,
     /// Tracker rows the non-physical-`f_inst` guard rejected while the
@@ -480,8 +483,8 @@ impl GateStudy {
 
 /// The σ the app actually held when this capture was taken.
 ///
-/// `metadata.noise_floor` is session *config*, not a MAT output, so reading it
-/// from `analysis.json` does not touch what `06` requires `regenerate_partials`
+/// `metadata.noise_floor` is session config, not a MAT output, so reading it
+/// from `analysis.json` does not touch what `capture-sets.md` requires `cargo lab mat regen`
 /// for — the stale fields there are `measured_f0`, `calculated_b` and the
 /// partial list, none of which this uses.
 fn recorded_sigma(root: &Path, dir: &str) -> Option<f32> {
@@ -492,11 +495,11 @@ fn recorded_sigma(root: &Path, dir: &str) -> Option<f32> {
 
 /// Pre-onset audio, where the capture kept any: `audio_full_event.raw` leads
 /// `audio.raw` by whatever the pipeline held in its pre-roll ring, so the kept
-/// segment is the file's **tail**. Verified rather than assumed — a capture
+/// segment is the file's tail. Verified rather than assumed — a capture
 /// whose tail does not reproduce `audio.raw` is skipped, because a misaligned
 /// slice would score the note as if it were the room.
 fn preroll(root: &Path, dir: &str, kept: &[f32]) -> Option<Vec<f32>> {
-    let full = crate::raw::read(&root.join(dir).join("audio_full_event.raw"))?;
+    let full = raw::read(&root.join(dir).join("audio_full_event.raw"))?;
     if full.len() <= kept.len() {
         return None;
     }
@@ -510,7 +513,7 @@ fn preroll(root: &Path, dir: &str, kept: &[f32]) -> Option<Vec<f32>> {
 /// **Candidate C's floor.** Per-bin median of the probe spectrum over the
 /// odd-indexed silence-screened pre-roll hops of every capture in the set —
 /// the offline stand-in for the calibration recording the app already takes and
-/// currently reduces to a single scalar (ADR 0015 §12).
+/// currently reduces to a single scalar (report 0015 §12).
 ///
 /// Parity split rather than a random one so the build and holdout halves are
 /// interleaved in time and neither gets a quieter stretch of the session.
@@ -575,7 +578,7 @@ fn build_startup_floor(
             let i = ((v.len() - 1) as f32 * quantile).round() as usize;
             let q = v[i.min(v.len() - 1)];
             // At the median the Rayleigh conversion applies. Above it the
-            // quantile IS the threshold: a q-quantile of the silence admits
+            // quantile is the threshold: a q-quantile of the silence admits
             // (1 − q) of it by construction, so the budget is set empirically
             // rather than by assuming a tail shape the room does not have.
             if quantile <= 0.5 {
@@ -626,7 +629,7 @@ fn study_capture(
     }
 
     // The register rule both gates share, keyed on the first reference exactly
-    // as `engine.rs` and `strobe.rs` key it.
+    // as `Engine` and `Strobe` key it.
     let win = register_window(f_meas[0]);
     let hann_gate = hann_vec(win);
     let k_gate = neyman_pearson_k(win);
@@ -829,7 +832,7 @@ fn study_capture(
     // The tracker has not re-centred yet at this point, so its target is still
     // the fixed reference and gates #2 and #3 coincide here by construction.
     if let Some(pre) = preroll(root, &cap.dir, &audio) {
-        // The capture arms on the strike, so the pre-roll's *last* samples
+        // The capture arms on the strike, so the pre-roll's last samples
         // already contain the attack. Stay four hops clear of its end, or the
         // "silence" being scored is the note.
         let usable = pre.len().saturating_sub(4 * HOP_SIZE);
@@ -843,7 +846,7 @@ fn study_capture(
             // says silence — engine-side it resets first, strobe-side
             // `is_silence` gates every reference. The pre-roll ring also holds
             // whatever was played before, so without this screen a set captured
-            // key-by-key scores the *previous* note's decay as room noise.
+            // key-by-key scores the previous note's decay as room noise.
             let rms = (sl[NOISE_WIN - HOP_SIZE..]
                 .iter()
                 .map(|x| x * x)
@@ -1022,7 +1025,7 @@ fn report(st: &GateStudy) {
     // also falls as `1/√N`, so the two scalings cancel —
     // `σ·K(N) / (N_local·√(N_T/N)) = σ·K(N_T) / N_local`. The measured columns
     // agreed to the printed precision across all three gates, which is the
-    // empirical check. **No choice of window rescues this gate**; only the
+    // empirical check. No choice of window rescues this gate; only the
     // reference σ can.
     println!("\n  ── Per register at three fixed σ, so the register gradient is separable ──");
     println!(
@@ -1186,7 +1189,7 @@ fn report(st: &GateStudy) {
     }
 
     if !st.ratio_c[0].iter().all(|v| v.is_empty()) || !st.ratio_c[3].iter().all(|v| v.is_empty()) {
-        println!("\n  ── Candidate C: the per-bin startup floor (ADR 0015 §12) ──");
+        println!("\n  ── Candidate C: the per-bin startup floor (report 0015 §12) ──");
         println!(
             "     T_C ÷ T_ideal = floor(f_n) ÷ N_local. **1.0 is correct.** Compared against the\n     \
              shipped gate's own T ÷ T_ideal on the identical rows."
@@ -1301,7 +1304,7 @@ fn report(st: &GateStudy) {
     );
 }
 
-/// **Task 1 — the three ambient-σ gates, measured as they ship** (ADR 0015).
+/// Task 1 — the three ambient-σ gates, measured as they ship (report 0015).
 fn np_gate_study(sets: &[(String, PathBuf, PathBuf)], snr_live: f32, floor_q: f32) {
     let mut planner = RealFftPlanner::<f32>::new();
     let hann_probe = hann_vec(NOISE_WIN);
@@ -1310,11 +1313,11 @@ fn np_gate_study(sets: &[(String, PathBuf, PathBuf)], snr_live: f32, floor_q: f3
     }
 
     println!(
-        "Ambient-σ gate measurement (ADR 0015, pre-registered).\n\
+        "Ambient-σ gate measurement (report 0015, pre-registered).\n\
          Probe window {NOISE_WIN} ×{NOISE_PAD} zero-pad; S = peak in the target's main lobe, \
          N_local = median of the flanking inter-partial gaps, both in 4/N physical units.\n\
          SNR_gate = S / (N_local·√({NOISE_WIN}/N_win)) — dead < {SNR_DEAD}, live ≥ {SNR_LIVE} \
-         (ADR 0014 §8a); 'blind' = dead at the gate's window but present at the probe's.\n\
+         (report 0014 §8a); 'blind' = dead at the gate's window but present at the probe's.\n\
          P_fa is quoted on the H₀ subset only (dead AND absent at the probe window). \
          Gates #2/#3 take no argmax, so no search-loss correction applies to them; #1 scans.\n"
     );
@@ -1344,8 +1347,6 @@ fn np_gate_study(sets: &[(String, PathBuf, PathBuf)], snr_live: f32, floor_q: f3
 }
 
 // ── Mode entry point ─────────────────────────────────────────────────────────
-
-use anyhow::Result;
 
 /// `--set <label> <regen.json> <dump root>`, repeatable: several populations in
 /// one run so their columns are directly comparable.

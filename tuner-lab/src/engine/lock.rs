@@ -1,38 +1,34 @@
-//! End-to-end validation of the SHIPPED engine auto-lock path.
+//! End-to-end validation of the shipped engine auto-lock path.
 //!
-//! `diagnose_engine` drives the engine in *manual* mode (`Some(winning_key)`),
-//! so `Engine::process`'s auto M-of-N acquisition lock (ADR 0010) is never
-//! exercised by the Python replicas — those validate the *rule*, not the
-//! *integration*. This harness closes that gap: it drives the real
-//! `Engine::process` in **auto mode** (`target_note = None`) frame-by-frame over
-//! each capture, feeding the gatekeeper's `is_silence/is_stable/is_new_onset/
-//! is_transient_bypass` exactly as the live pipeline does, and records the first
-//! key the engine latches (`identified_key` None→Some). The engine's auto path
-//! always refines (`discover(refine=true)`), so with the shipped
-//! `LOCK_VOTES_M = 7 / LOCK_WINDOW_N = 8` this MUST reproduce the refined
-//! (7,8) number the Python replica reports — piano-1 **81/87**. Any deviation is
-//! an integration bug between the engine and the replayed semantics.
+//! The Python replicas validate the M-of-N rule (report 0010), not its
+//! integration, since `cargo lab engine dump` drives the engine in manual mode.
+//! This drives the real `Engine::process` in auto mode (`target_note = None`)
+//! frame by frame over each capture, feeding the gatekeeper's verdicts exactly as
+//! the live pipeline does, and records the first key the engine latches. The auto
+//! path always refines, so with the shipped `LOCK_VOTES_M = 7 / LOCK_WINDOW_N = 8`
+//! this must reproduce the replica's refined (7,8) figure, piano-1 81/87; any
+//! deviation is an integration bug.
 //!
-//! The `from-onset` mode runs the counterfactual instead: the gatekeeper withholds the
-//! engine's vote until `Stable`, a fixed five hops (116 ms) after the NHWRSF
-//! onset, on the stated ground that the attack is broadband. Nothing here scored
-//! what that wait buys, because both this harness and `diagnose_gatekeeper` only
-//! ever observe the *gated* path. In this mode the Stage-A scan — the same
-//! `discovery::discover` call `Engine::process` makes, on the same 8192-point bass
-//! spectrum — runs on **every** hop from the onset hop onward regardless of gate
-//! state, and each hop's winner is scored against the capture's key, bucketed by
-//! hops since onset. The gate's own verdict is carried per hop, so the shipped
-//! policy sits inside the table rather than bounding it.
+//! The `from-onset` mode runs the counterfactual: the gatekeeper withholds the
+//! engine's vote until `Stable`, five hops (116 ms) after the NHWRSF onset, on the
+//! ground that the attack is broadband. Here the Stage-A scan, the same
+//! `discovery::discover` call `Engine::process` makes on the same 8192-point bass
+//! spectrum, runs on every hop from the onset whatever the gate says, and each
+//! hop's winner is scored against the capture's key, bucketed by hops since
+//! onset. The gate's own verdict is carried per hop, so the shipped policy sits
+//! inside the table rather than bounding it.
 //!
 //! Usage: `cargo lab engine lock [BASE_DIR]`
 //!        `cargo lab engine from-onset diagnostics_piano2`
 
-use anyhow::{Context, Result, anyhow};
-use realfft::{RealFftPlanner, RealToComplex};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
+use anyhow::{Context, Result, anyhow};
+use realfft::{RealFftPlanner, RealToComplex};
+
+use crate::{capture, raw};
 use tuner_core::algorithms::spectral::{fft, magnitude_spectrum};
 use tuner_core::algorithms::{discovery, peaks, twm};
 use tuner_core::audio::{BASS_WINDOW_SIZE, HOP_SIZE, SAMPLE_RATE, WINDOW_SIZE};
@@ -64,8 +60,8 @@ const ONSET_REGISTERS: [(&str, u8, u8); 4] = [
 /// Hops after the onset hop that get their own bucket; later hops pool.
 const MAX_HOP: usize = 24;
 
-/// The capture's calibrated ambient RMS, or the 0.001 fallback where the dump
-/// carries none.
+/// The capture's logged silence threshold (`metadata.noise_floor`), or 0.001
+/// where the dump carries none.
 fn capture_noise_floor(dir: &Path) -> f32 {
     fs::read_to_string(dir.join("analysis.json"))
         .ok()
@@ -131,7 +127,7 @@ fn score_from_onset(
     profiles: &[KeyProfile; 88],
 ) -> Vec<Hop> {
     let mut out = Vec::new();
-    let Some(audio) = crate::raw::full_event(dir) else {
+    let Some(audio) = raw::full_event(dir) else {
         return out;
     };
     if audio.len() < BASS_WINDOW_SIZE {
@@ -143,7 +139,7 @@ fn score_from_onset(
     gk.config.silence_threshold = nf;
     let mut scratch = vec![SpectralPeak::default(); 64];
     let cfg = twm::TwmConfig::default();
-    // The engine's Neyman-Pearson magnitude gate (engine.rs, P_fa = 0.001).
+    // `Engine::process`'s Neyman–Pearson magnitude gate, P_fa = 0.001.
     let p_bin = nf * nf * 0.375 * BASS_WINDOW_SIZE as f32;
     let min_magnitude = if p_bin > 0.0 {
         (-p_bin * 0.001_f32.ln()).sqrt()
@@ -237,8 +233,7 @@ fn first_lock(
     fft_gate: &Arc<dyn RealToComplex<f32>>,
     profiles: &[KeyProfile; 88],
 ) -> Result<Option<Option<u8>>> {
-    let Some(audio) = crate::raw::full_event(key_dir).or_else(|| crate::raw::stable(key_dir))
-    else {
+    let Some(audio) = raw::full_event(key_dir).or_else(|| raw::stable(key_dir)) else {
         return Ok(None);
     };
     let noise_floor = capture_noise_floor(key_dir);
@@ -295,13 +290,12 @@ pub fn run(base: &Path, from_onset: bool) -> Result<()> {
     }
     let profiles: [KeyProfile; 88] = profiles_vec.try_into().unwrap();
 
-    let dirs =
-        crate::capture::find(base).with_context(|| format!("read dir {}", base.display()))?;
+    let dirs = capture::find(base).with_context(|| format!("read dir {}", base.display()))?;
 
     if from_onset {
         let mut hops = Vec::new();
         for d in &dirs {
-            let Some(key) = crate::capture::key_of(d) else {
+            let Some(key) = capture::key_of(d) else {
                 continue;
             };
             hops.extend(score_from_onset(d, key, &fft_bass, &fft_gate, &profiles));
@@ -322,7 +316,7 @@ pub fn run(base: &Path, from_onset: bool) -> Result<()> {
     let mut fails = Vec::new();
 
     for d in &dirs {
-        let expected = crate::capture::key_of(d).ok_or_else(|| anyhow!("bad dir name"))? as usize;
+        let expected = capture::key_of(d).ok_or_else(|| anyhow!("bad dir name"))? as usize;
         let Some(lock) = first_lock(d, &fft_bass, &fft_gate, &profiles)? else {
             continue;
         };

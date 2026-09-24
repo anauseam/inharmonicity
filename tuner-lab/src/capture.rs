@@ -60,7 +60,7 @@ pub fn key_from_dirname(name: &str) -> Option<u8> {
     digits.parse().ok()
 }
 
-/// Register label on the **four-band** split the unison and strobe summaries
+/// Register label on the four-band split the unison and strobe summaries
 /// report against (`strobe replay`, `strobe isolation`).
 pub fn strobe_register(key: u8) -> &'static str {
     match key {
@@ -71,7 +71,7 @@ pub fn strobe_register(key: u8) -> &'static str {
     }
 }
 
-/// Register label on the **three-band** split the curve tooling reports
+/// Register label on the three-band split the curve tooling reports
 /// against: bass = A0–C#3, the wound-string region; treble = C6 up, where
 /// partial counts thin. Same idea as [`strobe_register`], different
 /// boundaries — a figure read against curve-side tables uses this one.
@@ -86,7 +86,7 @@ pub fn curve_register(key: u8) -> &'static str {
 /// The three bands [`curve_register`] can return, in compass order.
 pub const CURVE_REGISTERS: [&str; 3] = ["bass", "mid", "treble"];
 
-/// Captures under `root`, or `root` itself when it *is* one capture (it holds
+/// Captures under `root`, or `root` itself when it is one capture (it holds
 /// an `audio.raw`). Membership is the presence of that file rather than the
 /// `key_` prefix, so a single-capture path can be passed directly.
 pub fn find_or_single(root: &Path) -> Vec<PathBuf> {

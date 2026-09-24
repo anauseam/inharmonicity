@@ -3,7 +3,7 @@
 //! A capture writes headerless little-endian mono `f32`: `audio.raw` (the
 //! strictly causal buffer the Worker analysed) and `audio_full_event.raw` (the
 //! non-causal record — pre-roll, strike, decay). See
-//! `docs/internals/06-capture-sets.md`.
+//! `capture-sets.md`.
 
 use std::path::Path;
 

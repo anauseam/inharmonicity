@@ -1,12 +1,7 @@
 //! # Median-Adjustive Trajectories (MAT)
 //!
-//! Estimates the fundamental frequency ($f_0$) and inharmonicity coefficient ($B$) of a
-//! struck string from its magnitude spectrum, using the Median-Adjustive Trajectories
-//! method.
-//!
-//! Implements the estimator of:
-//!   Hodgkinson, M., Wang, J., Timoney, J. & Lazzarini, V. (2009). "Handling Inharmonic
-//!   Series with Median-Adjustive Trajectories." Proc. DAFx-09, Como, Italy, pp. 1–7.
+//! Estimates a struck string's fundamental ($f_0$) and inharmonicity coefficient ($B$)
+//! from its magnitude spectrum by the Median-Adjustive Trajectories method \[1\].
 //!
 //! ## Equations (DAFx-09)
 //!
@@ -20,109 +15,68 @@
 //!   Eq. (9)   E   = (K² − K) / 2                               [pairwise B-estimates for K partials]
 //! ```
 //!
-//! Eq. (8) (Galembo's two-partial relation, cited by the paper) lets any pair of correctly
-//! numbered partials yield a $B$ estimate; Eq. (6) then back-calculates an $f_0$. The
-//! method's robustness is the **median** over the resulting B- and Fo-arrays (§2.2).
+//! Eq. (8), Galembo's two-partial relation \[2\], gives a $B$ estimate from any pair of
+//! correctly numbered partials, and Eq. (6) back-calculates $f_0$; the method's
+//! robustness is the median over both arrays (§2.2).
 //!
 //! ## Method (§2.2–§2.4)
 //!
 //! 1. **Predict** each partial position from the running $(f_0, B)$ via Eq. (1).
-//! 2. **Locate** the strongest peak in a *narrow* band around the prediction (§2.4), sub-bin
-//!    refined (§2.3), keeping it only if it rises above the magnitude-spectrum average — the
-//!    paper's significance gate, which also terminates the series when partials fade (§2.2).
-//! 3. **Re-estimate** $(f_0, B)$: build the B-array (Eq. 8) and Fo-array (Eq. 6) over the
-//!    located partials (up to Eq. 9 of them) and take their **medians** — the resilience
-//!    filter that nullifies anomalous readings (missing harmonics, parallel-string and
-//!    longitudinal peaks, beating). The medians become the running $(f_0, B)$.
+//! 2. **Locate** the strongest peak in a narrow band around the prediction (§2.4), sub-bin
+//!    refined (§2.3), keeping it only above the magnitude-spectrum average, the §2.2
+//!    significance gate that also ends the series as partials fade.
+//! 3. **Re-estimate** $(f_0, B)$ as the medians of the B-array (Eq. 8) and the Fo-array
+//!    (Eq. 6) over the located partials, which discounts missing harmonics, parallel-string
+//!    and longitudinal peaks, and beating.
 //! 4. **Repeat** until $(f_0, B)$ converges.
 //!
-//! The low partials are nearly independent of $B$ and anchor the estimate; the running
-//! median $B$ then re-centres the high-partial bands onto the genuinely stretched peaks
-//! (Eq. 1). A single non-adjustive pass would seed those high bands from a prior that is
-//! ~an order of magnitude too low in the bass, mis-numbering partials and yielding
-//! impossible (negative) $B$.
+//! The low partials barely depend on $B$ and anchor the estimate; the running median $B$
+//! then re-centres the high-partial bands on the stretched peaks. A single pass from the
+//! prior, an order of magnitude low in the bass, mis-numbers partials and yields negative
+//! $B$.
 //!
-//! ## Relationship to the paper, and deliberate adaptations
+//! ## Adaptations
 //!
-//! The estimator is faithful — Eqs. 1/6/8/9, the median combiner, the §2.2 significance
-//! gate, and §2.4 bands sized to the fundamental are all as published. Two points adapt to a
-//! real out-of-tune upright (a harder regime than the paper's clean Steinway / bass-guitar
-//! tones):
+//! The equations, the median combiner, the §2.2 gate and the §2.4 bands sized to the
+//! fundamental are as published. For an out-of-tune piano:
 //!
-//! * **Convergence order — selectable via [`MatOrder`].** The paper grows the trajectory
-//!   *serially*: locate one partial, re-median, predict the next (Fig. 3). Both orders are
-//!   implemented and share the same equations; the iteration *style* is the textbook
-//!   Gauss-Seidel (serial) vs Jacobi (simultaneous) pair. They are **not** equivalent in
-//!   outcome, though: because simultaneous is partial-count-capped and serial is not, they
-//!   fit *different* partial sets and so reach different estimates — serial is the full
-//!   method, simultaneous a limited variant:
-//!     - [`MatOrder::Serial`] (**the shipped default**) grows one partial at a time, refining
-//!       $(f_0, B)$ before each next prediction, so correct numbering is established
-//!       incrementally and the series reaches many partials (toward [`MAX_PARTIALS`]),
-//!       exploiting the high-$n$ $B$ leverage. On the real captures it tracks 30+ bass
-//!       partials, agrees with `Simultaneous` in the clean mid register, and — by the
-//!       goodness-of-fit check in `validate_mat` — its $(f_0, B)$ explains the clean low
-//!       partials as well as `Simultaneous`'s (≈6.6 vs ≈6.6 kppm residual) while also fitting
-//!       the high partials `Simultaneous` cannot (≈9.9 kppm). That refutes the concern that
-//!       its high partials might follow one parallel string (the paper's Conclusion, §4)
-//!       and bias $B$. Final accuracy
-//!       still awaits a second, in-tune instrument.
-//!     - [`MatOrder::Simultaneous`] (the conservative fallback) predicts **all** partials each
-//!       pass and iterates. A single mis-associated partial cannot cascade, but it is capped
-//!       at `SIM_MAX_PARTIALS` (12): predicting all partials from one shared estimate
-//!       mis-numbers the high ones, whose $O(n^2)$ self-consistent wrong pairs then out-vote
-//!       the median (24 collapses bass $B$ to ~0), so the high-$n$ information is left unused.
-//! * **Seeding.** The paper seeds partials 1 and 2 at $f_{0,ET}$ and $2 f_{0,ET}$, presuming
-//!   prominent low partials (§2.2). This project seeds from the Goertzel-tracked $f_0$ (more
-//!   accurate on a detuned piano) and — because the deep-bass fundamental is often absent
-//!   (ADR 0005: A0 carries no energy at partial 1, a case the paper does not treat) — the
-//!   §2.2 gate lets the estimate anchor on whichever low partials actually clear the floor.
+//! * **Order.** [`MatOrder::Serial`] is the paper's growth (Fig. 3);
+//!   [`MatOrder::Simultaneous`] is a capped variant kept as the fallback. They fit
+//!   different partial sets and reach different estimates.
+//! * **Seeding.** From the tracked $f_0$ rather than $f_{0,ET}$. The deep-bass fundamental
+//!   is often absent, a case the paper does not treat, so the §2.2 gate lets the estimate
+//!   anchor on whichever low partials clear it.
+//! * **Bands.** $f_0/4$, four times the paper's tightest $f_0/16$: on a detuned piano
+//!   a tight band misses the true partial and locks onto a self-consistent wrong series.
 //!
-//! Sub-bin refinement is the paper's preferred **CSPE** (§2.3): the per-bin super-resolution
-//! frequency map ([`crate::algorithms::spectral::cspe`]) is computed once by the
-//! Worker and the located partial's frequency is read straight from it, bin-independently.
-//! Parallel-string courses are handled as in the paper — the narrow band (§2.4) keeps
-//! the trajectory on a single series; full multi-series separation remains future work there
-//! (Conclusion, §4) as here. The band is held a little wider than the paper's tightest
-//! $f_0/16$ so one
-//! pass can bootstrap $B$ from the low/mid partials, and the $B$ ceiling is generous enough
-//! not to clip the steep treble inharmonicity rise the paper measures (Fig. 10).
+//! Sub-bin frequencies are read from a CSPE map (§2.3, \[3\]). Parallel-string courses are
+//! handled as in the paper, by the narrow band; full multi-series separation is future
+//! work there (§4) as here.
 //!
-//! ## Measurement vs. assumption
+//! ## Output
 //!
-//! The estimator always reports the *measured* median $B$ over the located partials, with
-//! a confidence reflecting pairwise agreement and the amount of supporting evidence. It
-//! never substitutes the Rigaud prior. The only failure mode is `None` from
-//! [`detect_pitch_mat`], returned when fewer than two partials clear the gate (no pair to
-//! solve) — a capture failure to surface, not a value to fabricate.
-//!
-//! The `confidence` field on [`MatEstimate`] is **ours, not part of DAFx-09** (the paper
-//! outputs only $(f_0, B)$; the median is its robustness mechanism). It measures pairwise
-//! *self-consistency* × supporting evidence — **not accuracy**: a coherent-but-wrong series
-//! (e.g. an octave-mis-seeded fit yielding 4×B) scores high. It is a diagnostic signal only
-//! — never persisted, never gates a decision (demoted by decision, ADR 0006 Corrections
-//! item 4). Used by the `validate_mat` / `mat_b_recovery` harnesses, not the live pipeline.
+//! The estimate is always the measured median $B$, never the Rigaud prior; `None` when
+//! fewer than two partials clear the gate. `confidence` is ours: pairwise
+//! self-consistency times supporting evidence, not accuracy, since a coherent but wrong
+//! series (an octave mis-seed giving 4×B) scores high. Nothing gates on it.
 //!
 //! ## References
 //!
-//! [1] Hodgkinson, M., Wang, J., Timoney, J. & Lazzarini, V. (2009). "Handling Inharmonic
+//! \[1\] Hodgkinson, M., Wang, J., Timoney, J. & Lazzarini, V. (2009). "Handling Inharmonic
 //!     Series with Median-Adjustive Trajectories." Proc. DAFx-09, Como, Italy. (Eqs. 1, 6,
 //!     8, 9; method §2.2; sub-bin refinement §2.3; narrow bands §2.4; multi-series
-//!     limitation: Conclusion, §4 — the paper has no §7; a pre-audit reference said
-//!     otherwise, see faithfulness-audit-07.)
-//! [2] Galembo, A. S. & Askenfelt, A. (1999). "Signal Representation and Estimation of
+//!     limitation: Conclusion, §4.)
+//! \[2\] Galembo, A. S. & Askenfelt, A. (1999). "Signal Representation and Estimation of
 //!     Spectral Parameters by Inharmonic Comb Filters…" IEEE Trans. Speech Audio Process.
 //!     7(2), pp. 197–203. (Origin of Eq. 8's two-partial $B$ relation.)
-//! [3] Short, K. M. & Garcia, R. A. (2006). "Signal Analysis Using the Complex Spectral
+//! \[3\] Short, K. M. & Garcia, R. A. (2006). "Signal Analysis Using the Complex Spectral
 //!     Phase Evolution (CSPE) Method." AES 120th Convention, Paris. Paper 6645. (The sub-bin
 //!     refinement, DAFx-09 §2.3; see [`crate::algorithms::spectral::cspe`].)
 
 // ─── Tuning constants ───────────────────────────────────────────────────────────
 
-/// Maximum predict→extract→re-estimate passes. The trajectory typically converges in 2–4
-/// passes; the cap bounds worst-case cost on incoherent captures. This runs on the async
-/// Worker (Gatekeeper State-4 RELEASE), not the audio hot path, so a few passes of ≤12
-/// narrow sub-bin searches is negligible against the capture budget.
+/// Maximum predict–extract–re-estimate passes. A trajectory typically converges in 2–4;
+/// the cap bounds the cost of an incoherent capture.
 const MAX_ITERATIONS: u32 = 6;
 
 /// Relative change in $f_0$ below which the trajectory is considered converged.
@@ -134,26 +88,23 @@ const B_REL_TOL: f32 = 1e-2;
 /// Lowest physically plausible $B$ (a little negative is allowed for sub-bin jitter).
 const B_MIN: f32 = -1e-3;
 
-/// Highest physically plausible $B$. The Rigaud prior alone reaches ~0.026 at C8 (DAFx-09
-/// Fig. 10 shows the steep treble rise, ~2.8e-3 already by C#7), so the ceiling is generous
-/// — its only job is to drop nonsensical pairs (e.g. from mis-numbering) before the median.
+/// Highest physically plausible $B$: generous, since the Rigaud prior reaches ~0.026 at C8
+/// (DAFx-09 Fig. 10's treble rise), and there only to drop nonsensical pairs before the
+/// median.
 const B_MAX: f32 = 5e-2;
 
-/// Partial-buffer capacity — the most partials any order can track. The paper grows the
-/// series "as far as it features sufficient energy" (its examples reach ~22–27 partials),
-/// and the [`MatOrder::Serial`] growth realises that: it predicts each high partial from an
-/// already-converged estimate, so the prediction stays accurate and a fixed band keeps
-/// associating correctly out to high $n$ (where $B$ leverage $\propto n^2$ is greatest).
-/// Public so the Worker and harness size their partial buffers to match.
+/// Partial-buffer capacity: the most partials any order can track. The paper grows the
+/// series "as far as it features sufficient energy" (its examples reach ~22–27), which
+/// [`MatOrder::Serial`] realises out to high $n$, where $B$ leverage ($\propto n^2$) is
+/// greatest.
 pub const MAX_PARTIALS: usize = 32;
 
-/// Partial cap for the [`MatOrder::Simultaneous`] order. It predicts *all* partials from one
-/// running $(f_0, B)$, so the predicted position of partial $n$ moves $\propto n^3 f_0$ per
-/// unit of $B$ error; beyond $n\approx 12$ a realistic $B$ uncertainty shifts the prediction
-/// past the fixed §2.4 band, the high partials mis-*number*, and their $O(n^2)$
-/// self-consistent wrong pairs out-vote the correct ones — dragging the median to ~0
-/// (empirically: 24 collapses bass $B$). So the simultaneous order is capped where it stays
-/// reliable; only the serial order may exceed it.
+/// Partial cap for the [`MatOrder::Simultaneous`] order. Predicting every partial from one
+/// $(f_0, B)$ moves partial $n$ by $\propto n^3 f_0$ per unit of $B$ error, so past
+/// $n \approx 12$ the predictions leave the §2.4 band, the high partials mis-number, and
+/// their $O(n^2)$ self-consistent wrong pairs drag the median to ~0.
+// Do not raise: a cap of 24 collapses bass B.
+// audit 07
 const SIM_MAX_PARTIALS: usize = 12;
 
 /// Stop the serial growth after this many consecutive sub-significant predictions (the series
@@ -171,39 +122,23 @@ const MAX_PAIRS: usize = MAX_PARTIALS * (MAX_PARTIALS - 1) / 2;
 /// peaks, so the band must reach them on the bootstrap pass.
 const BAND_HALFWIDTH_F0_FRAC_SIM: f32 = 0.25;
 
-/// Peak-detection band half-width as a fraction of $f_0$ for the [`MatOrder::Serial`] order.
-///
-/// The paper's §2.4 band is *tight* (~$f_0/16$ full) — its whole point is rejecting
-/// parallel-string / longitudinal peaks — and serial's accurate incremental predictions make
-/// a tight band feasible in principle. But it was **tested empirically** (`validate_mat`,
-/// $f_0/16$ and $f_0/8$ half-widths) and is *fragile on this out-of-tune upright*: where the
-/// deep-bass fundamental is missing or the seed is a little off, a tight band misses the true
-/// partial and the trajectory locks onto a self-consistent *wrong* series — e.g. A#0 jumped
-/// to 279× the prior. The tight band lowered the *self*-fit residual (it fits its own,
-/// sometimes-wrong, partial set very cleanly) but *raised* the cross-residual against the
-/// clean low-mid partials (6.6 → 17.6 kppm), the metric that actually tracks correctness.
-/// So serial uses the same forgiving $f_0/4$ band as simultaneous here. **Revisit on a clean,
-/// in-tune instrument**, where the paper's tight band should become both faithful and safe.
+/// Peak-detection band half-width as a fraction of $f_0$ for the [`MatOrder::Serial`] order:
+/// the same forgiving $f_0/4$ as the simultaneous order, not the paper's tight §2.4 band. On
+/// an out-of-tune piano, with the fundamental missing or the seed a little off, a tight band
+/// misses the true partial and locks onto a self-consistent wrong series.
+// Do not tighten on detuned data. At f0/16 and f0/8 half-widths (`cargo lab mat validate`)
+// A#0 jumped to 279× the prior, and the cross-residual against the clean low-mid partials
+// rose 6.6 → 17.6 kppm while the self-fit residual fell.
+// audit 07
 const BAND_HALFWIDTH_F0_FRAC_SERIAL: f32 = 0.25;
 
-/// Floor on the band half-width in bins, so the window stays resolvable for sub-bin
-/// interpolation even when $f_0/4$ is sub-bin (deep bass at large FFT sizes).
-///
-/// Ours — the paper states no floor — though the value is not arbitrary: §2.4's
-/// own worked example band is exactly 4 bins (faithfulness-audit-07).
-///
-/// When it engages depends on the capture, because the Worker sizes its FFT to
-/// the captured sample count (largest power of two, capped at 2¹⁶). At a full
-/// 1.5 s capture that is 65536 — a 0.67 Hz bin, where `f_0/4` is already 10 bins
-/// at A0 and the floor is inert. A capture cut short by early silence drops the
-/// FFT an octave at a time, and by 2¹⁴ (2.7 Hz bins) the 4-bin floor is 10.8 Hz
-/// against an `f_0/4` of 6.9 Hz at A0 — so in the deep bass it **is** the term
-/// that sets the band on short captures. That is the case it exists for.
-///
-/// It is **not** the same constant as `peaks::COARSE_SPAN_MIN_BINS` despite the
-/// shared value and shape: that one lives at 8192/2048 where a bin is 5.4/21.5 Hz,
-/// and it is only safe there because of a neighbour cap this band has no
-/// equivalent of (ADR 0011 §6). Do not factor them together.
+/// Floor on the band half-width, in bins, so the band stays resolvable where $f_0/4$ is
+/// under a few bins: in the deep bass on a capture short enough to shrink the FFT (at 2¹⁴,
+/// 4 bins is 10.8 Hz against A0's 6.9 Hz $f_0/4$). Inert on a full-length capture.
+// Ours: the paper states no floor, though §2.4's worked example band is 4 bins. Not
+// `peaks::COARSE_SPAN_MIN_BINS` despite the shared value: that one is safe only because
+// of a neighbour cap this band lacks. Do not factor them together.
+// audit 07
 const BAND_HALFWIDTH_MIN_BINS: f32 = 4.0;
 
 /// Pair count at which the confidence's evidence term saturates. Below it, confidence is
@@ -212,22 +147,18 @@ const CONFIDENCE_EVIDENCE_PAIRS: f32 = 10.0;
 
 // ─── Public API ─────────────────────────────────────────────────────────────────
 
-/// Joint $(f_0, B)$ estimate produced by the MAT trajectory.
-///
-/// The Worker is the heavy async stage and is expected to commit a measurement for every
-/// captured key, so `b` is always the measured median (never the Rigaud prior). Its
-/// reliability is carried by `confidence` rather than by withholding the value — a low
-/// confidence in the information-limited treble is reported, not nulled.
+/// The joint $(f_0, B)$ estimate of a MAT trajectory. A weak reading is reported with low
+/// `confidence`, not withheld.
 #[derive(Debug, Clone, Copy)]
 pub struct MatEstimate {
     /// Refined fundamental frequency (Hz).
     pub f0: f32,
-    /// Measured inharmonicity coefficient: the median of the pairwise algebraic solutions
-    /// over the located partials. **Never the Rigaud prior** — when fewer than two partials
-    /// clear the gate, `detect_pitch_mat` returns `None` rather than fabricating it.
+    /// Measured inharmonicity coefficient: the median of the pairwise solutions over the
+    /// located partials.
     pub b: f32,
-    /// Reliability of `b` in `[0, 1]`: pairwise-median agreement scaled by how many
-    /// pairwise estimates backed the median (so a single-pair reading cannot read as 1.0).
+    /// Self-consistency of `b` in `[0, 1]`, not its accuracy: the fraction of pairwise
+    /// estimates agreeing with the median, scaled down when few backed it, so a
+    /// single-pair reading cannot read as 1.0.
     pub confidence: f32,
     /// Number of partials located on the final pass.
     pub partial_count: usize,
@@ -235,52 +166,34 @@ pub struct MatEstimate {
     pub iterations: u32,
 }
 
-/// Order in which the trajectory estimates its partials. Both use the same equations (§2.2),
-/// but they are *not* interchangeable: serial is the paper's full method and reaches many
-/// partials, while simultaneous is a partial-count-capped variant that lands on a different,
-/// lower-information estimate (and cannot exceed the cap without collapsing).
+/// Order in which the trajectory estimates its partials. Both use the same equations (§2.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MatOrder {
-    /// Grow the trajectory **one partial at a time**, re-estimating $(f_0, B)$ before
-    /// predicting the next — the paper's serial procedure (Fig. 3, Gauss-Seidel-like). Each
-    /// high partial is predicted from an already-converged estimate, so correct numbering is
-    /// established incrementally and the series extends toward [`MAX_PARTIALS`], realising the
-    /// high-$n$ $B$ leverage the simultaneous order cannot. **The shipped default** (the
-    /// faithful method): on the real captures its $(f_0, B)$ explains the clean low partials
-    /// as well as `Simultaneous` while also fitting the high partials `Simultaneous` discards
-    /// (goodness-of-fit check in `validate_mat`). Still being confirmed on a second, in-tune
-    /// instrument; revert to `Simultaneous` if a regression appears.
+    /// Grow the trajectory one partial at a time, re-estimating $(f_0, B)$ before predicting
+    /// the next: the paper's serial procedure (Fig. 3, Gauss–Seidel-like). Each high partial
+    /// is predicted from a converged estimate, so the series extends toward
+    /// [`MAX_PARTIALS`].
+    // Measured with `cargo lab mat validate` on detuned captures: serial tracks 30+ bass
+    // partials, agrees with simultaneous in the clean mid register, and fits the clean low
+    // partials as well (≈6.6 kppm residual each) while also fitting the high partials
+    // simultaneous drops (≈9.9 kppm).
     #[default]
     Serial,
-    /// Predict **all** partials from one running $(f_0, B)$ and iterate to convergence
-    /// (Jacobi-like). The conservative fallback: a single mis-associated partial cannot
-    /// cascade into the next prediction, but it is capped at 12 partials, beyond which the
-    /// high partials mis-number under one shared estimate (see `SIM_MAX_PARTIALS`) and the
-    /// median collapses — so it leaves the high-$n$ $B$ information unused.
-    ///
-    /// Retained only as the A/B baseline / fallback until a second, in-tune instrument
-    /// confirms `Serial` generalises; **remove this variant once it does** (it originated as a
-    /// workaround for an earlier broken serial implementation, now superseded).
+    /// Predict every partial from one running $(f_0, B)$ and iterate (Jacobi-like). A
+    /// mis-associated partial cannot cascade, but it stops at 12 partials, beyond which the
+    /// median collapses, so the high-$n$ information goes unused. The fallback.
     Simultaneous,
 }
 
 /// Estimates the fundamental frequency and inharmonicity from a magnitude spectrum and its
 /// CSPE-refined per-bin frequency map, using the MAT adjustive trajectory procedure.
 ///
-/// # Arguments
-/// * `magnitudes` — Linear magnitude spectrum (`magnitude_spectrum` output), used to
-///   locate the strongest peak in each band.
-/// * `cspe_freqs` — Per-bin super-resolution frequency (`cspe` output), parallel
-///   to `magnitudes`; supplies each located partial's sub-bin-accurate frequency (§2.3).
-/// * `sample_rate` — Audio sample rate in Hz.
-/// * `f0_seed` — Coarse fundamental seed (the Goertzel-tracked $f_0$, or ET if untracked).
-/// * `order` — Estimation order ([`MatOrder`]); `Serial` is the shipped default (the
-///   Worker passes it), with `Simultaneous` kept as the labeled fallback.
-/// * `partial_freqs_out` — Storage buffer; on success holds the located partial frequencies.
-/// * `partial_ns_out` — Storage buffer; on success holds the matching partial indices.
-///
-/// # Returns
-/// `Some(MatEstimate)` on success, `None` if fewer than two partials clear the gate.
+/// `magnitudes` is the linear spectrum (`magnitude_spectrum` output) that locates the strongest
+/// peak in each band, and `cspe_freqs` the parallel per-bin frequency map (`cspe` output) that
+/// gives each located partial its sub-bin frequency (§2.3). `f0_seed` is the coarse fundamental
+/// in Hz — the Goertzel-tracked $f_0$, or ET if untracked. The located partials' frequencies and
+/// indices are written to `partial_freqs_out` and `partial_ns_out`, and the result is `None` if
+/// fewer than two partials clear the gate.
 pub fn detect_pitch_mat(
     magnitudes: &[f32],
     cspe_freqs: &[f32],
@@ -294,9 +207,6 @@ pub fn detect_pitch_mat(
         return None;
     }
 
-    // The paper's significance threshold: the average of the magnitude spectrum (§2.2). A
-    // located peak must rise above this to count as a partial; this skips missing/weak
-    // partials and rejects noise instead of admitting it.
     let ctx = SpectrumCtx {
         magnitudes,
         cspe_freqs,
@@ -311,15 +221,11 @@ pub fn detect_pitch_mat(
         MatOrder::Serial => run_serial(&ctx, f0_seed, partial_freqs_out, partial_ns_out),
     }?;
 
-    // Confidence folds pairwise-median agreement together with how much evidence backed
-    // the median, so an under-evidenced reading (few in-band partials, as in the treble)
-    // reports low confidence instead of being withheld.
     let evidence = (outcome.solved.b_count as f32 / CONFIDENCE_EVIDENCE_PAIRS).min(1.0);
     let confidence = outcome.solved.coherence * evidence;
 
-    // Physical floor: string stiffness only ever raises partials, so B ≥ 0. A negative
-    // median is measurement noise on an information-starved key (too few low-n partials to
-    // constrain B); it is reported as ~0 with its low confidence, never sign-flipped.
+    // Stiffness only raises partials, so B ≥ 0: a negative median is noise on a key with
+    // too few low partials, reported as 0 with its low confidence, never sign-flipped.
     let b = outcome.solved.b.max(0.0);
 
     Some(MatEstimate {
@@ -399,8 +305,8 @@ fn run_simultaneous(
     let solved = best?;
 
     // Re-extract at the converged estimate so the caller's buffers and the reported
-    // `partial_count` describe the SAME trajectory we return (the last pass extracted at the
-    // *previous* prediction before refining the median).
+    // `partial_count` describe the same trajectory we return (the last pass extracted at the
+    // previous prediction before refining the median).
     let partial_count = extract_all(ctx, solved.f0, solved.b, SIM_MAX_PARTIALS, freqs, ns);
 
     Some(Outcome {
@@ -472,9 +378,7 @@ fn predicted_position(f0: f32, b: f32, n: u32) -> f32 {
 
 /// Locates the strongest peak in the §2.4 band (half-width `band_frac · f0`) around
 /// `center_hz`, returning its `(CSPE frequency, magnitude)` only if it clears the §2.2
-/// significance gate. `band_frac` is the per-order band (currently both $f_0/4$ — the
-/// paper's tight serial band was tested and reverted on this instrument; see
-/// `BAND_HALFWIDTH_F0_FRAC_SERIAL`).
+/// significance gate.
 fn extract_significant(
     ctx: &SpectrumCtx,
     center_hz: f32,
@@ -553,7 +457,7 @@ fn solve_estimate(
         return None;
     }
 
-    // Fo-array (Eq. 6): exactly ONE f0 per located partial, back-calculated with the median
+    // Fo-array (Eq. 6): exactly one f0 per located partial, back-calculated with the median
     // B (the paper's K-entry construction, page 3 — not one entry per pair).
     let mut f0_estimates = [0.0_f32; MAX_PARTIALS];
     for i in 0..k {
@@ -794,8 +698,8 @@ mod tests {
 
     #[test]
     fn recovers_high_treble_inharmonicity() {
-        // A high-B treble series must NOT be filtered out by the pairwise B ceiling — the
-        // bug the old B_MAX = 0.01 introduced (it rejected every genuine high-B pair).
+        // A high-B treble series must not be filtered out by the pairwise B ceiling:
+        // a ceiling of 0.01 rejects every genuine high-B pair.
         let f0 = 1760.0; // A6
         let b = 8.0e-3;
         let (mags, cspe) = synth_inharmonic(f0, b, 1, 8);

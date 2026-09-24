@@ -1,39 +1,15 @@
-//! # Strobe — fixed-reference phase comparator (strobe Path A)
+//! # Strobe — fixed-reference phase comparator
 //!
-//! The DSP half of the absolute-partial strobe (strobe design note §5.2,
-//! R1/R2/R3): a bank of Goertzel evaluations pinned to the *curve target*
-//! frequencies of the key being tuned — unlike the engine's tracker, whose
-//! adaptive seeds follow the physical string. Each hop the bank reads the
-//! phase of the live signal at every reference and accumulates the wrapped
-//! hop-to-hop drift into a per-reference **beat phase** (cycles, mod 1):
-//! exactly `f_live − f_ref` cycles per second, the rotation a strobe
-//! displays. Hop-to-hop phase differences at non-integer bins are exact
-//! (the audit-08 property of [`spectral::goertzel`]'s finalization — the D1
-//! basis), so the accumulated angle is a true beat count, not an estimate.
+//! A bank of Goertzel evaluations pinned to the target frequencies of the key
+//! being tuned, where the engine's tracker follows the string instead. Each hop
+//! the bank accumulates every reference's wrapped phase drift into a beat phase
+//! that turns at exactly `f_live − f_ref`. Hop-to-hop phase differences at
+//! non-integer bins are exact (a property of [`spectral::goertzel`]), so the
+//! angle is a true beat count. From it come the band's rate ([`band_slope`]) and
+//! the resolved strings ([`unison`]).
 //!
-//! Angle-as-state (R2): accumulation happens here, on the DSP thread, so the
-//! lossy `FrameOutput` triple buffer cannot corrupt it — a dropped frame
-//! skips one visual update instead of losing beat cycles.
-//!
-//! The bank ships that rotation twice: the accumulated angle, and its **rate** —
-//! a least-squares fit of the unwrapped angle against hop index over
-//! [`band_slope::BAND_SLOPE_WINDOW_SECS`], in Hz. Rotation is exactly
-//! `f_live − f_ref` (design §3), so that slope is the detuning.
-//!
-//! Keeping the Goertzel's amplitude *with* its phase gives a third readout: the
-//! per-reference complex baseband, whose spectrum resolves the note's individual
-//! strings ([`unison`]).
-//!
-//! Deep-bass references evaluate a 4096-sample window (R3): partial spacing
-//! ≈ f₀ falls inside the 1024-sample Hann main lobe below ≈ 86 Hz, and no
-//! choice of displayed partial changes the spacing. Window length ≠ hop —
-//! the bank still updates every hop.
-//!
-//! The bank runs in `process_cola_hop` whenever references are set,
-//! independent of the engine's note lock — an early strike, or a note the
-//! discovery mistracked, still spins the band. Gatekeeper `Silence` is the one
-//! state that stops it: there is no note by definition, so any phase advance
-//! would be room noise (see [`Strobe::process`]).
+//! It runs whenever references are set, whatever the engine's lock, so an early
+//! strike or a mistracked note still turns the band.
 
 pub mod band_slope;
 pub mod unison;
@@ -48,69 +24,52 @@ use crate::pipeline::ProcessingFrame;
 use crate::strobe::band_slope::BandSlope;
 use crate::strobe::unison::{Unison, UnisonVerdict};
 
-/// Capacity of the reference bank — mirrors the tracker's partial ceiling
-/// and `FrameOutput`'s strobe arrays.
+/// Capacity of the reference bank, matching the tracker's partial ceiling and
+/// `FrameOutput`'s strobe arrays.
 pub const MAX_STROBE_REFS: usize = 12;
 
-/// One key's strobe reference set, in transit UI → DSP (crossing #4 charter:
-/// grouped parameters that must apply atomically on a frame boundary).
-/// Heap-free and `Copy` — legal across the real-time boundary.
-///
-/// Carries both the phase-comparison references and the coarse-read target
-/// for the [`Strobe`]: one message atomically updates both readouts.
+/// One key's strobe reference set, UI → DSP (crossing #4): the references and
+/// the coarse-read target together, so both readouts retarget on the same hop.
+/// Heap-free and `Copy`.
 #[derive(Debug, Clone, Copy)]
 pub struct StrobeRefUpdate {
-    /// Number of valid entries in `refs`; 0 clears the bank (no key selected).
+    /// Number of valid entries in `refs`; 0 clears the bank.
     pub count: usize,
-    /// Per-partial reference frequencies f_n* in Hz, index = partial n − 1
-    /// (the `TuningCurve::strobe_partials` order).
+    /// Per-partial reference frequencies f_n* in Hz, at index partial n − 1 (the
+    /// `TuningCurve::strobe_partials` order).
     pub refs: [f32; MAX_STROBE_REFS],
-    /// Partial the coarse read centres on, as `n` (1-based, so `refs[n − 1]`).
-    /// The frontend's policy call — `curves::coarse_read_partial` is the
-    /// derived rule — and independent of the *displayed* partial, which the
-    /// register table picks for the band. `0`, or any index past `count`,
-    /// disables the coarse read.
+    /// Partial the coarse read centres on, 1-based (`refs[n − 1]`); `0`, or past
+    /// `count`, disables the coarse read.
     pub coarse_index: u8,
-    /// The key's partial spacing f₀\* in Hz — the neighbour cap and the
-    /// CFAR reference width both scale with it, and neither may use the
-    /// centre frequency in its place (`peaks::coarse_read`).
+    /// The key's partial spacing f₀\* in Hz. The coarse read's neighbour cap and
+    /// CFAR reference width both scale with it, never with the centre frequency.
     pub spacing_hz: f32,
 }
 
-/// Per-hop strobe telemetry, returned by value (the component convention:
-/// the pipeline copies it into `FrameOutput`).
+/// Per-hop strobe telemetry.
 #[derive(Debug, Clone, Copy)]
 pub struct StrobeResult {
     /// Number of live references.
     pub count: usize,
     /// Accumulated beat phase per reference, cycles in [0, 1).
     pub angle: [f32; MAX_STROBE_REFS],
-    /// D3 amplitude gate: `true` = this reference was below the noise floor
-    /// this hop (its angle was held, not advanced).
+    /// This reference was gated this hop, its angle held.
     pub gated: [bool; MAX_STROBE_REFS],
-    /// Beat rate per reference, `f_live − f_ref` in Hz — the slope of the
-    /// accumulated angle over [`band_slope::BAND_SLOPE_WINDOW_SECS`]. `None`
-    /// until the fit spans [`band_slope::BAND_SLOPE_MIN_SPAN_SECS`]; held at its
-    /// last value while the reference is gated, and dropped again when a
-    /// re-strike restarts the fit.
-    ///
-    /// Hz, not cents: the reference is `refs[i]` and the frontend owns what it
-    /// displays the offset against (crossing #2's rule for `coarse_hz`).
+    /// Beat rate per reference, `f_live − f_ref` in Hz: the accumulated angle's
+    /// slope over [`band_slope::BAND_SLOPE_WINDOW_SECS`]. `None` until the fit
+    /// spans [`band_slope::BAND_SLOPE_MIN_SPAN_SECS`]; held while gated, and
+    /// dropped when a re-strike restarts the fit.
     pub beat_hz: [Option<f32>; MAX_STROBE_REFS],
-    /// Goertzel amplitude per reference, in the time signal's own units — the
-    /// per-reference magnitude the strobe design's R2 specifies alongside the
-    /// angle. What the D3 gate thresholds, so it is also why a band froze.
+    /// Goertzel amplitude per reference, in the time signal's units: the quantity
+    /// the amplitude gate thresholds.
     pub amplitude: [f32; MAX_STROBE_REFS],
-    /// Per-reference resolved lines, strongest first — the note's individual
-    /// strings ([`unison`]). Valid entries: `[0..line_count[i]]`. Held while a
-    /// reference is gated, dropped once the Gatekeeper reports silence
-    /// ([`Strobe::process`]).
+    /// Per-reference resolved lines, strongest first ([`unison`]). Valid entries:
+    /// `[0..line_count[i]]`. Held while gated, dropped on silence.
     pub lines: [[UnisonLine; MAX_UNISON_LINES]; MAX_STROBE_REFS],
     /// Valid entries of [`Self::lines`] per reference.
     pub line_count: [u8; MAX_STROBE_REFS],
-    /// `2/T` per reference (Hz) — what this reference's current baseband record
-    /// is worth, and the number the display must carry beside the lines. `0.0`
-    /// while the record is too short to resolve anything.
+    /// `2/T` per reference (Hz): the smallest split the current record resolves;
+    /// `0.0` while it resolves nothing.
     pub line_resolution_hz: [f32; MAX_STROBE_REFS],
     /// Whether the resolved lines are a unison or one partial splitting against
     /// itself — decided across the whole bank, not per reference.
@@ -141,7 +100,7 @@ pub struct Strobe {
     sample_rate: u32,
     count: usize,
     refs: [f32; MAX_STROBE_REFS],
-    /// R3: `true` while the reference spacing (≈ f₁*) sits inside the
+    /// `true` while the reference spacing (≈ f₁*) sits inside the
     /// 1024-sample Hann main lobe, selecting the 4096-sample window.
     long_window: bool,
     prev_phase: [f32; MAX_STROBE_REFS],
@@ -199,9 +158,8 @@ impl Strobe {
         self.refs = update.refs;
         self.coarse_index = update.coarse_index;
         self.spacing_hz = update.spacing_hz;
-        // Long window iff the 1024-sample main-lobe half-width (2·fs/1024)
-        // exceeds the partial spacing, proxied by f₁* = refs[0] (spacing is
-        // ≈ f₀ ≤ f₁* for every partial pair of the key).
+        // The long window when the partial spacing, proxied by f₁* = refs[0], is
+        // inside the 1024-sample main lobe (half-width 2·fs/1024).
         self.long_window =
             self.count > 0 && update.refs[0] * 1024.0 < 2.0 * self.sample_rate as f32;
         self.prev_phase = [0.0; MAX_STROBE_REFS];
@@ -213,24 +171,17 @@ impl Strobe {
         self.warmup = true;
     }
 
-    /// One hop: evaluate every reference over the freshest window of
-    /// `audio` (the pipeline's full 8192-sample buffer) and advance the
-    /// accumulated angles. `noise_floor` is the calibrated silence
-    /// threshold from the config atomics.
+    /// One hop: evaluates every reference over the freshest window and advances
+    /// the angles. `noise_floor` is the silence threshold.
     ///
-    /// `is_silence` gates every reference for the hop. It is not redundant with
-    /// the per-reference amplitude test: that test admits a *single bin* above
-    /// `noise_floor · K(n)`, and `K ∝ 1/√n` puts it at 10 % of the silence
-    /// threshold at the 4096-sample window. Low-frequency room rumble clears
-    /// that comfortably while the broadband RMS is still below the silence
-    /// floor, so without this the band accumulates rumble phase and rotates
-    /// with no note playing. Angles are held, not reset (R2).
-    ///
-    /// Silence holds the angle and the band's rate — a frozen band is the last
-    /// verdict on a string's pitch, which the note ending does not revise — but
-    /// drops the resolved lines, which assert what the note's strings are doing
-    /// now. The amplitude gate alone drops neither: a dip below it mid-note must
-    /// not blank the panel.
+    /// `is_silence` gates every reference, holding its angle and rate but dropping
+    /// its lines: a frozen band is still the string's last verdict, while the
+    /// lines describe strings that have stopped. The amplitude gate alone drops
+    /// neither, since a dip below it mid-note is not the note ending.
+    // `is_silence` is not redundant with the amplitude gate, which one bin clears
+    // at `noise_floor · K(n)`: at 4096 samples that is 10 % of the silence
+    // threshold, so room rumble would turn the band with no note playing.
+    // asserted: test_silence_state_overrides_the_amplitude_test
     pub fn process(
         &mut self,
         frame: &ProcessingFrame,
@@ -269,7 +220,7 @@ impl Strobe {
             }
 
             // Wrapped drift against the expected advance at exactly f_ref —
-            // the engine's phase-vocoder step with a *fixed* target.
+            // the engine's phase-vocoder step with a fixed target.
             let expected = 2.0 * core::f32::consts::PI * f_ref * t_hop;
             let raw = phase - self.prev_phase[i] - expected;
             let delta = (raw + core::f32::consts::PI).rem_euclid(2.0 * core::f32::consts::PI)
@@ -352,7 +303,7 @@ mod tests {
     use crate::strobe::band_slope::BAND_SLOPE_MIN_POINTS;
 
     /// The generalized K(n) must reproduce the engine's pinned constant at
-    /// its window length — same gate, no second constant (D3).
+    /// its window length — same gate, no second constant.
     #[test]
     fn test_neyman_pearson_k_matches_engine() {
         assert!((spectral::neyman_pearson_k(1024) - 0.201184).abs() < 1e-4);
@@ -416,12 +367,12 @@ mod tests {
             frame_buf.audio_buffer[..BASS_WINDOW_SIZE].copy_from_slice(w);
             let f = bank.process(&frame_buf, noise_floor, true);
             assert!(f.gated[0], "silence must gate every reference");
-            assert_eq!(f.angle[0], held, "gated angle must hold, not reset (R2)");
+            assert_eq!(f.angle[0], held, "gated angle must hold, not reset");
         }
     }
 
     /// The coarse partial resolves 1-based against `refs`, and every way of
-    /// *not* selecting one yields `None` — the pipeline reads that as "skip the
+    /// not selecting one yields `None` — the pipeline reads that as "skip the
     /// coarse read this hop" rather than reading `refs[0]` by accident.
     #[test]
     fn test_coarse_target_resolution() {
@@ -528,7 +479,7 @@ mod tests {
     }
 
     /// The published rate is the detuning itself, signed — the readout contract
-    /// (design §3: rotation = f_live − f_ref).
+    /// (rotation = f_live − f_ref).
     #[test]
     fn test_beat_rate_recovers_the_detuning() {
         for delta in [1.0f32, -1.0, 0.5] {
@@ -560,8 +511,8 @@ mod tests {
         );
     }
 
-    /// D3: silence gates every reference and holds the angle (R2 — the
-    /// frozen band is state, not decay).
+    /// Silence gates every reference and holds the angle — the frozen band is
+    /// state, not decay.
     #[test]
     fn test_silence_gates_and_holds_angle() {
         let fs = 44_100u32;
@@ -597,7 +548,7 @@ mod tests {
     }
 
     /// A dead note keeps its band but loses its strings: `is_silence` drops the
-    /// published lines, while the angle and the band's rate hold (R2).
+    /// published lines, while the angle and the band's rate hold.
     #[test]
     fn test_silence_drops_the_unison_lines() {
         use crate::algorithms::peaks::UNISON_MIN_BINS;
@@ -634,12 +585,12 @@ mod tests {
             assert_eq!(frame.line_count[0], 0, "silence must drop the lines");
             assert_eq!(frame.line_resolution_hz[0], 0.0);
             assert_eq!(frame.verdict, UnisonVerdict::Undetermined);
-            assert_eq!(frame.angle[0], last.angle[0], "the angle holds (R2)");
+            assert_eq!(frame.angle[0], last.angle[0], "the angle holds");
             assert_eq!(frame.beat_hz[0], last.beat_hz[0], "the rate holds");
         }
     }
 
-    /// R3: a deep-bass reference set selects the long window; a treble set
+    /// A deep-bass reference set selects the long window; a treble set
     /// does not. (Boundary: spacing < 2·fs/1024 ≈ 86 Hz at 44.1 kHz.)
     #[test]
     fn test_long_window_selection() {

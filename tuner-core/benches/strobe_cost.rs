@@ -1,16 +1,11 @@
 //! Per-hop cost of the strobe bank against the audio callback's budget.
 //!
-//! `docs/internals/03-dsp-pipeline.md` makes hot-path latency a hard rule, and
-//! nothing enforced it: the figures the ADRs quote came from ad-hoc `Instant`
-//! timing inside a harness, which reports a number once and cannot notice it
-//! moving. These are that regression check.
-//!
-//! Both cases are the **worst** case a real capture does not reach — every
+//! Both cases are the worst case a real capture does not reach — every
 //! reference live and every ring at the cap, where a capture's upper partials
 //! gate out and stop transforming. The budget to compare against is one hop:
 //! `HOP_SIZE / SAMPLE_RATE` = 23.2 ms.
 //!
-//! Run with `cargo bench -p tuner-core`. Reproduces ADR 0012's E9.
+//! Run with `cargo bench -p tuner-core`. Reproduces report 0012's E9.
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use rustfft::num_complex::Complex;

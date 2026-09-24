@@ -1,4 +1,4 @@
-//! Replays a capture through the engine in *manual* mode and dumps what the
+//! Replays a capture through the engine in manual mode and dumps what the
 //! STFT, peak extractor and TWM scorer saw at every frame into `spectrum.csv`
 //! and `peaks.csv` beside the audio. With `--features telemetry` it also writes
 //! `goertzel.csv` (per-partial amplitude and Neyman–Pearson threshold per
@@ -31,10 +31,10 @@ pub struct DumpArgs {
     /// Run Stage-B refinement on the winner.
     #[arg(long)]
     pub refine: bool,
-    /// Sum the forward error instead of averaging it (M&B test #1).
+    /// Sum the forward error instead of averaging it over N, as Maher & Beauchamp do.
     #[arg(long)]
     pub sum_forward: bool,
-    /// Stretched (Railsback) template reference (test #2a).
+    /// Stretched (Railsback) template reference.
     #[arg(long)]
     pub stretch: bool,
     /// Forward-error B-deadzone scaling c (n-kernel).
@@ -46,7 +46,7 @@ pub struct DumpArgs {
     /// Matched-partial amplitude-incoherence penalty (Emiya smoothness).
     #[arg(long, value_name = "W")]
     pub smoothness: Option<f32>,
-    /// Five space-separated floats, `"p q r rho lambda"` — scores a MOBO
+    /// Five space-separated floats, `"p q r rho lambda"` — scores a NSGA-II
     /// candidate without recompiling the default. `lambda` may be `inf`.
     #[arg(long, value_name = "P Q R RHO LAMBDA")]
     pub config: Option<String>,
@@ -178,9 +178,8 @@ pub fn run(args: DumpArgs) -> Result<()> {
     let mut engine = Engine::new(44100);
     engine.noise_floor = noise_floor;
 
-    // Reconstruct KeyProfiles directly since they are private in Engine.
-    // EXPERIMENT (test #2a): with --stretch, center each template on the expected
-    // Railsback-stretched pitch instead of raw ET (discovery scoring only).
+    // The discovery templates. With --stretch each centres on the
+    // Railsback-stretched pitch instead of ET (discovery scoring only).
     let stretch = tuner_core::models::railsback_stretch_curve();
     let mut profiles_vec = Vec::with_capacity(88);
     for i in 0..88 {
@@ -196,9 +195,9 @@ pub fn run(args: DumpArgs) -> Result<()> {
 
     let mut profiles_array: [KeyProfile; 88] = profiles_vec.try_into().unwrap();
 
-    // VALIDATION (--profile): overwrite each measured key's template with its
-    // measured-B template (the live pipeline's exact ET-centered, β-only mapping).
-    // This drives BOTH the per-frame `discover()` CSV and `engine.process` below,
+    // Validation (--profile): overwrite each measured key's template with its
+    // measured-B template, through `KeyProfile::from_measurement`.
+    // This drives both the per-frame `discover()` CSV and `engine.process` below,
     // so bass false-locks can be compared against the prior-only baseline.
     if let Some(p) = &profile_path {
         match tuner_core::models::InharmonicityProfile::from_file(p) {
@@ -234,7 +233,7 @@ pub fn run(args: DumpArgs) -> Result<()> {
         "frame,key_idx,partial_n,target_hz,measured_hz,amplitude,t_amp,is_alive"
     )?;
 
-    // Calculate noise threshold formula just like engine.rs line 189
+    // `Engine::process`'s Neyman–Pearson peak threshold.
     let sum_w2 = 0.375 * BASS_WINDOW_SIZE as f32;
     let p_bin = noise_floor * noise_floor * sum_w2;
     let min_magnitude = if p_bin > 0.0 {
@@ -247,7 +246,6 @@ pub fn run(args: DumpArgs) -> Result<()> {
         min_magnitude
     );
 
-    // Loop through frame-by-frame- Sliding Window Loop ---
     let mut frame_idx = 0;
     let mut cursor = 0;
 

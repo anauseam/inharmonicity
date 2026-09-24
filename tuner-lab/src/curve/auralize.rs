@@ -1,20 +1,14 @@
-//! # Auralize the tuning curves — offline additive-resynthesis A/B/C/D (Prompt J)
+//! # Auralize the tuning curves: offline additive resynthesis, A/B/C/D
 //!
-//! There is **no ground-truth-free "optimal" curve**. With inharmonicity the
-//! octave, fifth, and twelfth beats are mutually incompatible objectives, so
-//! engines (a)–(d) each minimize a *different* functional and "best" is a
-//! listening judgment (ADR 0009). The objective screens `curve_compare` prints
-//! (beat-rate smoothness — the Verituner criterion) can *reject* a bad curve
-//! but cannot crown a winner. This harness produces the missing selection
-//! evidence in the only form that can decide it: a **human perceptual A/B**.
+//! With inharmonicity the octave, fifth and twelfth beats are mutually
+//! incompatible objectives, so engines (a)–(d) each minimize a different
+//! functional and "best" is a listening judgment (report 0009). The screens
+//! `cargo lab curve compare` prints can reject a bad curve but cannot pick a
+//! winner; this renders the evidence that can, for a person to compare.
 //!
-//! It is a **thin driver over [`tuner_core::synth`]** (the reusable, headless
-//! additive-resynthesis engine). Its own job is the *comparison*: render the
-//! same musical material under every engine's curve, loudness-matched, so the
-//! audible differences between the WAVs are literally the different
-//! coincident-partial beat rates each curve prescribes. This does not break
-//! n = 1 discipline — the output is audio for a person to compare, not a
-//! statistic — and nothing touches the hot path.
+//! A driver over [`tuner_core::synth`]: the same musical material under every
+//! engine's curve, loudness-matched, so the audible differences between the WAVs
+//! are the coincident-partial beat rates each curve prescribes.
 //!
 //! ## Test material (where coincident-partial beats are audible)
 //!
@@ -33,8 +27,8 @@
 //! Writes `auralize_out/<engine>.wav` (a, b, c×{Low,Mean,High ρ}, d, d-pure-12ths)
 //! and prints a short material-specific beat-rate screen. Consumes the piano-2
 //! regenerated partials (the timbres) + each engine's curve (the targets);
-//! **repeat captures are averaged per key** to denoise the timbre (see
-//! [`load_profile`]). Validation-only data (n = 1); commit only when asked.
+//! repeat captures are averaged per key to denoise the timbre (see
+//! [`load_profile`]). Validation-only data.
 
 use std::collections::BTreeMap;
 
@@ -56,24 +50,23 @@ const NYQUIST_HZ: f64 = SAMPLE_RATE as f64 / 2.0;
 
 // ─── Partials loader (averages repeat captures per key to denoise timbre) ────
 
-/// One parsed capture entry from a `regenerate_partials` dump.
+/// One parsed capture entry from a `cargo lab mat regen` dump.
 struct RawEntry {
     measured_f0: f64,
     calculated_b: Option<f64>,
     partials: Vec<(u32, f64, f64)>, // (n, frequency, amplitude)
 }
 
-/// Load a `regenerate_partials` JSON dump into a profile, **averaging repeat
-/// captures per key** to denoise the timbre (unlike `curve_compare`, which
-/// keeps the last capture). A single strike is a noisy sample of the string;
-/// repeats shrink that noise ~√N (the reason the repeat set was captured —
-/// ADR 0009). Aggregation per key:
+/// Load a `cargo lab mat regen` JSON dump into a profile, averaging repeat
+/// captures per key to denoise the timbre (unlike `cargo lab curve compare`, which
+/// keeps the last capture): repeats shrink a strike's noise ≈ √N (report 0009).
+/// Aggregation per key:
 ///
 ///   * **B**: log-space median of the finite positive per-capture B (repeat
-///     noise of B is multiplicative — ADR 0009 A1);
+///     noise of B is multiplicative — report 0009 A1);
 ///   * **partials**: grouped by number n, a partial is kept only if it appears
-///     in a **majority** of the key's captures (drops one-off spurious lines),
-///     and its frequency/amplitude are the **medians** across the captures
+///     in a majority of the key's captures (drops one-off spurious lines),
+///     and its frequency/amplitude are the medians across the captures
 ///     that carry it;
 ///   * `measured_f0`: median (unused by the curve — `CurveInput` derives F₀
 ///     from the partials via Eq. 20 — but kept sensible).
@@ -183,7 +176,7 @@ fn aggregate_key(key_index: u8, entries: &[RawEntry]) -> KeyMeasurement {
         partials,
         calculated_b,
         last_captured: String::new(),
-        captured_in_auto: true, // honest provenance: auto-mode validation data
+        captured_in_auto: true, // auto-mode validation data
         // The regen this consumes is a median over repeats, not one capture,
         // so no single string declaration describes it.
         sounding_strings: None,

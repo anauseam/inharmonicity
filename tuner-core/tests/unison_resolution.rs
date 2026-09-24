@@ -1,13 +1,10 @@
 //! The unison line estimator against synthetic truth.
 //!
-//! [ADR 0012](../../docs/adr/0012-unison-line-estimator.md) §4 states the law
-//! this asserts: a pair resolves when its separation clears `2/T` **and not
-//! before**, the transition is sharp rather than gradual, and above ~1.6 × that
-//! floor the reported split is exact to a systematic −0.085 Hz. That is the
-//! whole argument for publishing `2/T` on screen, so it is asserted rather than
-//! assumed.
+//! Report 0012 states the law this asserts: a pair resolves when its separation
+//! clears `2/T` and not before, the transition is sharp rather than gradual, and
+//! above ≈ 1.6 × that floor the reported split is exact to a systematic −0.085 Hz.
 //!
-//! The trials are driven as **audio** through the shipped Goertzel front end —
+//! The trials are driven as audio through the shipped Goertzel front end —
 //! analysis window, decay and noise all in the loop — not through a model of
 //! it. The full E6 sweep this is drawn from is `cargo lab strobe replay`.
 
@@ -69,7 +66,7 @@ fn synth_audio(sources: &[Source], hops: usize, snr_db: f32, seed: u32) -> Vec<f
         .collect()
 }
 
-/// Drives the **shipped** bank over one trial and returns the split it reported
+/// Drives the shipped bank over one trial and returns the split it reported
 /// at the longest record it reached, or `None` where it published one line.
 fn reported_split(split_hz: f32, hops: usize, seed: u32) -> Option<f32> {
     let sources = [
@@ -103,7 +100,7 @@ fn reported_split(split_hz: f32, hops: usize, seed: u32) -> Option<f32> {
         frame.audio_buffer[..BASS_WINDOW_SIZE]
             .copy_from_slice(&audio[h * HOP_SIZE..h * HOP_SIZE + BASS_WINDOW_SIZE]);
         let out = strobe.process(&frame, 1e-6, false);
-        // The published resolution is 2·f_hop/L, so it *is* the record length.
+        // The published resolution is 2·f_hop/L, so it is the record length.
         let record = if out.line_resolution_hz[0] > 0.0 {
             (2.0 * HOP_RATE_HZ / out.line_resolution_hz[0]).round() as usize
         } else {
@@ -136,7 +133,7 @@ fn two_over_t(hops: usize) -> f32 {
     2.0 * HOP_RATE_HZ / hops as f32
 }
 
-/// ADR 0012 §4: the transition is **sharp**, not gradual — at 40 dB the outcome
+/// report 0012: the transition is sharp, not gradual — at 40 dB the outcome
 /// is essentially deterministic in the split. Below the floor nothing resolves;
 /// clear of it everything does.
 #[test]
@@ -144,14 +141,14 @@ fn a_pair_resolves_when_it_clears_two_over_t_and_not_before() {
     let floor = two_over_t(FULL_RECORD_HOPS);
     assert!(
         (floor - 1.54).abs() < 0.01,
-        "the ring cap's floor moved: 2/T = {floor:.2} Hz, ADR 0012 §4 states 1.54"
+        "the ring cap's floor moved: 2/T = {floor:.2} Hz, report 0012 §4 states 1.54"
     );
 
     let (below, _) = resolve_rate(0.65 * floor, FULL_RECORD_HOPS);
     assert_eq!(
         below,
         0.0,
-        "a pair at 0.65 × 2/T resolved on {:.0} % of trials; ADR 0012 §4 has it at 0 %",
+        "a pair at 0.65 × 2/T resolved on {:.0} % of trials; report 0012 §4 has it at 0 %",
         100.0 * below
     );
 
@@ -159,12 +156,12 @@ fn a_pair_resolves_when_it_clears_two_over_t_and_not_before() {
     assert_eq!(
         above,
         1.0,
-        "a pair at 1.95 × 2/T resolved on only {:.0} % of trials; ADR 0012 §4 has it at 100 %",
+        "a pair at 1.95 × 2/T resolved on only {:.0} % of trials; report 0012 §4 has it at 100 %",
         100.0 * above
     );
 }
 
-/// ADR 0012 §4: above ~1.6 × the floor the reported split is exact, to the
+/// report 0012: above ~1.6 × the floor the reported split is exact, to the
 /// systematic −0.085 Hz below. "Two lines" and "the right two lines" are
 /// different claims, and this is the second one.
 #[test]
@@ -178,15 +175,15 @@ fn a_clearly_separated_split_is_reported_exactly() {
         assert!(
             (-0.15..=0.05).contains(&err),
             "reported {reported:.3} Hz for a true {split:.3} Hz ({err:+.3} Hz); \
-             ADR 0012 §4 states a systematic −0.085 Hz and nothing larger"
+             report 0012 §4 states a systematic −0.085 Hz and nothing larger"
         );
     }
 }
 
-/// ADR 0012 §4: at or below the floor the reported split **collapses onto the
-/// limit itself**, whatever the truth was — survivorship, not measurement. A
-/// 0.7 Hz pair is reported at 3.48 Hz there. This is why the panel publishes
-/// `2/T` instead of calling a reading clean.
+/// report 0012: at or below the floor the reported split collapses onto the
+/// limit itself, whatever the truth was — survivorship, not measurement. A
+/// 0.7 Hz pair is reported at 3.48 Hz there, so `2/T` must be published with the
+/// lines.
 #[test]
 fn an_unresolvable_split_that_survives_is_reported_at_the_limit_not_the_truth() {
     // A short record, where the floor is high enough that a true 0.7 Hz pair is
@@ -201,12 +198,12 @@ fn an_unresolvable_split_that_survives_is_reported_at_the_limit_not_the_truth() 
         assert!(
             reported > floor,
             "a survivor at {reported:.2} Hz sits below the {floor:.2} Hz floor it \
-             cleared to be seen — the collapse ADR 0012 §4 describes is absent"
+             cleared to be seen — the collapse report 0012 §4 describes is absent"
         );
         assert!(
             reported > 2.0 * truth,
             "reported {reported:.2} Hz for a true {truth:.2} Hz is close enough to \
-             the truth to be a measurement; ADR 0012 §4 has it collapsing onto the limit"
+             the truth to be a measurement; report 0012 §4 has it collapsing onto the limit"
         );
     }
 }

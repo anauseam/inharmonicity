@@ -4,30 +4,13 @@ version.workspace = true
 edition = "2024"
 
 [dependencies]
+tuner-core = { path = "../tuner-core" }
+
+directories = "6"
+iced = { version = "0.14.0", features = ["canvas", "tokio", "advanced"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+triple_buffer = { workspace = true }
 # Instrument identity (UUIDv7 — time-ordered, so dump directories sort by
 # creation). Already in the tree via iced; the v7 feature is what we add.
 uuid = { version = "1.24.1", features = ["v7"] }
-# Dependency on the local core logic crate
-tuner-core = { path = "../tuner-core" }
-
-# Iced is a popular choice for GUIs in Rust
-iced = { version = "0.14.0", features = ["canvas", "tokio", "advanced"] }
-
-
-
-# For running audio on a separate thread and communicating
-cpal = { workspace = true }
-ringbuf = { workspace = true }
-triple_buffer = { workspace = true }
-
-
-# For profile saving and loading
-serde = { workspace = true }
-serde_json = { workspace = true }
-
-anyhow = { workspace = true }
-rustfft.workspace = true
-realfft.workspace = true
-crossbeam-queue = { workspace = true }
-directories = "6"
-

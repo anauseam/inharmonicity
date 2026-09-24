@@ -1,13 +1,8 @@
-//! # Per-key measurement inspector
+//! # Measurement inspector
 //!
-//! Every retained measurement of one key — epoch, provenance, partial count and
-//! B — with the curve's verdict on that key and the two remedies: drop one
-//! entry, or re-measure. The review surface autosave assumes, since no
-//! automatic acceptance gate exists
-//! (`docs/design/session-persistence-and-profile-library.md` §4, §5.2).
-//!
-//! Renders `AppDisplayData`'s mirrored rows; every action is a `Message`
-//! handled in `app.rs`, so this file holds no policy.
+//! Every retained measurement of one key, the curve's verdict on it, and the two
+//! remedies: drop an entry, or re-measure. Autosave keeps every capture and
+//! nothing accepts one automatically, so this is where a bad one is caught.
 
 use iced::widget::{Space, button, column, container, row, scrollable, text};
 use iced::{Alignment, Element, Fill, Length};
@@ -16,9 +11,27 @@ use tuner_core::worker::CurveBundle;
 
 use crate::Message;
 use crate::advisory::{self, Severity};
-use crate::app::{AppDisplayData, InspectorRow};
+use crate::app::AppDisplayData;
 use crate::views::curve_select;
 use crate::widgets::curve_plot::{CurvePlot, INK_SECONDARY, PlotMode, SUSPECT};
+
+/// One retained measurement of one key, as the inspector renders it.
+#[derive(Debug, Clone)]
+pub struct InspectorRow {
+    /// Position in the key's measurement list.
+    pub index: usize,
+    /// The capture's timestamp, [`models::KeyMeasurement::last_captured`].
+    pub epoch: String,
+    pub manual: bool,
+    /// How many partials the measurement kept.
+    pub partials: usize,
+    pub b: Option<f32>,
+    pub sounding_strings: Option<models::SoundingStrings>,
+    /// The entry [`models::InharmonicityProfile::active`] resolves to.
+    pub in_use: bool,
+    /// [`models::KeyMeasurement::is_trusted`]: a consumer may read the entry.
+    pub trusted: bool,
+}
 
 /// One measurement row: when, how, and what it measured, plus its drop button.
 fn entry_row(key: u8, e: &InspectorRow) -> Element<'static, Message> {
@@ -27,9 +40,8 @@ fn entry_row(key: u8, e: &InspectorRow) -> Element<'static, Message> {
     } else {
         e.epoch.clone()
     };
-    // Provenance is the load-bearing column: an auto-mode entry is retained but
-    // never feeds the curve, so "why did dropping it change nothing?" has to be
-    // answerable from the row itself.
+    // On every row: an auto entry never feeds the curve, so dropping it changes
+    // nothing, and the row must say why.
     let provenance = if e.manual { "manual" } else { "auto" };
     let b = match e.b {
         Some(b) => format!("B = {b:.3e}"),
@@ -44,8 +56,7 @@ fn entry_row(key: u8, e: &InspectorRow) -> Element<'static, Message> {
     ]
     .spacing(2)
     .width(Fill);
-    // Only the isolation set declares this, and there it is the whole point of
-    // the entry: a solo capture measured one string, not the note.
+    // A solo capture measured one string, not the note.
     if let Some(strings) = e.sounding_strings {
         label = label.push(text(strings.to_string()).size(11).color(INK_SECONDARY));
     }
@@ -96,7 +107,7 @@ fn advisory_lines(flags: &CurveKeyFlags) -> Element<'static, Message> {
 }
 
 /// The full inspector panel.
-pub fn create_inspector_panel(
+pub fn panel(
     data: &AppDisplayData,
     curve_bundle: Option<&CurveBundle>,
 ) -> Element<'static, Message> {
@@ -109,11 +120,8 @@ pub fn create_inspector_panel(
     ]
     .align_y(Alignment::Center);
 
-    // The curve itself is the key picker: it shows at a glance which keys are
-    // measured (dots), which are doubted (✗) and which are gaps, so choosing
-    // one to review is the same act as reading the curve. Selecting a key on
-    // the main-view keyboard moves it too, so the panel follows the key being
-    // tuned.
+    // The curve is the key picker: it shows which keys are measured, doubted or
+    // missing.
     let picker: Element<'static, Message> = match curve_bundle {
         Some(bundle) => {
             let (cents, measured, suspect) = curve_select::plot_inputs(bundle.curve(engine));
@@ -141,9 +149,8 @@ pub fn create_inspector_panel(
                 Some(f) => advisory_lines(&f),
                 None => Space::new().into(),
             };
-            // Collapsed to the entry in use: the app already resolves which
-            // measurement a key presents, so the history is an override, not a
-            // question the user is asked on arrival.
+            // Collapsed to the entry in use: the app already resolves which entry a
+            // key presents, so the history is an override, not a question.
             let (used, unused): (Vec<_>, Vec<_>) =
                 data.inspector_rows.iter().partition(|e| e.trusted);
             let mut rows = column![].spacing(4);
@@ -175,8 +182,8 @@ pub fn create_inspector_panel(
                         .on_press(Message::ToggleInspectorHistory),
                 );
             }
-            // Retained but read by nothing. Filed apart and closed by
-            // default: evidence to go looking for, not part of the review.
+            // Retained but read by nothing: filed apart and closed, evidence to go
+            // looking for rather than part of the review.
             if !unused.is_empty() {
                 let label = if data.inspector_unused_expanded {
                     "Hide captures not in use".to_string()
@@ -219,9 +226,12 @@ pub fn create_inspector_panel(
     container(
         column![
             header,
-            text(format!("{} · click a key to review it", engine.label()))
-                .size(12)
-                .color(INK_SECONDARY),
+            text(format!(
+                "{} · click a key to review it",
+                curve_select::engine_label(engine)
+            ))
+            .size(12)
+            .color(INK_SECONDARY),
             picker,
             Space::new().height(12),
             body,
@@ -231,8 +241,7 @@ pub fn create_inspector_panel(
         .padding(15),
     )
     .width(Fill)
-    // Bounded, like every other settings panel: the parent column is Shrink,
-    // so a `Fill` height here collapses the panel to nothing.
+    // Bounded: the parent column is Shrink, so a `Fill` height collapses it.
     .height(Length::Fixed(620.0))
     .into()
 }

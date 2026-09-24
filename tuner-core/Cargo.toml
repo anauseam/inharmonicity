@@ -6,7 +6,7 @@ edition = "2024"
 [features]
 telemetry = []
 
-# Hot-path cost, measured. `03` makes latency a hard rule; these are its
+# Hot-path cost, measured. `hot-path.md` makes latency a hard rule; these are its
 # regression check. Criterion is a dev-dependency: it ships in nothing.
 [dev-dependencies]
 criterion = { version = "0.7", features = ["html_reports"] }
@@ -15,22 +15,19 @@ criterion = { version = "0.7", features = ["html_reports"] }
 name = "strobe_cost"
 harness = false
 
+[[bench]]
+name = "discovery_cost"
+harness = false
+
 [dependencies]
-# Use the workspace-defined versions
 anyhow = { workspace = true }
-
-# For running audio on a separate thread and communicating
-ringbuf = { workspace = true }
-triple_buffer = { workspace = true }
 cpal = { workspace = true }
-
-# Add other dependencies for math, etc.
-rustfft = { workspace = true }
-realfft = { workspace = true }
-once_cell = "1.21.4"
-
-# For profile saving and loading
-serde =  { workspace = true }
-crossbeam-queue = { workspace = true }
 crossbeam-channel = "0.5.16"
-serde_json.workspace = true
+crossbeam-queue = { workspace = true }
+once_cell = "1.21.4"
+realfft = { workspace = true }
+ringbuf = { workspace = true }
+rustfft = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+triple_buffer = { workspace = true }

@@ -1,113 +1,75 @@
-//! Replays a capture through the 5-state signal validator and dumps its
+//! Replays a capture through the signal validator and dumps its
 //! per-frame metrics to `gatekeeper.csv` beside the audio.
 
-use anyhow::{Context, Result, anyhow};
-use realfft::RealFftPlanner;
-use std::fs::{self, File};
+use anyhow::{Result, anyhow};
+use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
-use tuner_core::algorithms::spectral::fft;
-use tuner_core::audio::{BASS_WINDOW_SIZE, HOP_SIZE, WINDOW_SIZE};
-use tuner_core::gatekeeper::{Gatekeeper, SignalState};
-use tuner_core::pipeline::ProcessingFrame;
+use tuner_core::audio::{BASS_WINDOW_SIZE, SAMPLE_RATE};
+use tuner_core::gatekeeper::SignalState;
+
+use super::replay::{self, Overrides, Source, Thresholds};
+use crate::raw;
 
 pub fn run(file_path: &Path) -> Result<()> {
-    let path = file_path;
-    let parent_dir = path.parent().unwrap_or(Path::new(""));
-    let json_path = parent_dir.join("analysis.json");
+    let parent_dir = file_path.parent().unwrap_or(Path::new(""));
+    let thresholds = Thresholds::resolve(parent_dir, &Overrides::default());
 
-    let mut noise_floor = 0.0;
-    if let Ok(json_str) = fs::read_to_string(&json_path)
-        && let Ok(json) = serde_json::from_str::<serde_json::Value>(&json_str)
-        && let Some(nf) = json["metadata"]["noise_floor"].as_f64()
-    {
-        noise_floor = nf as f32;
-    }
-
-    if noise_floor <= 0.0 {
+    if thresholds.silence == Source::GateDefault {
         println!(
             "Warning: Failed to read 'noise_floor' from analysis.json. Defaulting to 0.005 (-46 dBFS)."
         );
-        noise_floor = 0.005;
     }
 
     println!("Loading file: {}", file_path.display());
-    println!("Using noise floor: {:.6} (from analysis.json)", noise_floor);
-
-    let audio_bytes = fs::read(file_path).context("Failed to read audio.raw")?;
-    if audio_bytes.len() % 4 != 0 {
-        return Err(anyhow!(
-            "File size not divisible by 4, might not be an f32 array"
-        ));
+    println!(
+        "Using noise floor: {:.6} (from analysis.json)",
+        thresholds.config.silence_threshold
+    );
+    if thresholds.nhwrsf == Source::Logged {
+        println!(
+            "Using NHWRSF threshold: {:.3} (from analysis.json)",
+            thresholds.config.nhwrsf_threshold
+        );
     }
-    let num_samples = audio_bytes.len() / 4;
-    let mut audio_f32 = vec![0.0f32; num_samples];
-
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            audio_bytes.as_ptr(),
-            audio_f32.as_mut_ptr() as *mut u8,
-            audio_bytes.len(),
+    if thresholds.sustain == Source::Logged {
+        println!(
+            "Using sustain-stability threshold: {:.1} (from analysis.json)",
+            thresholds.config.sustain_stability_threshold
         );
     }
 
+    let audio = raw::read(file_path)
+        .ok_or_else(|| anyhow!("{} is not a readable f32 dump", file_path.display()))?;
+    let num_samples = audio.len();
+
     println!(
-        "Loaded {} samples ({:.2} seconds at 44100Hz)",
+        "Loaded {} samples ({:.2} seconds at {}Hz)",
         num_samples,
-        num_samples as f32 / 44100.0
+        num_samples as f32 / SAMPLE_RATE as f32,
+        SAMPLE_RATE
     );
 
     if num_samples < BASS_WINDOW_SIZE {
         return Err(anyhow!("File too short for one frame"));
     }
 
-    // --- Setup DSP ---
-    let mut planner = RealFftPlanner::<f32>::new();
-    let fft_instance = planner.plan_fft_forward(WINDOW_SIZE);
-
-    let mut processing_frame = ProcessingFrame::new();
-
-    let mut gatekeeper = Gatekeeper::new();
-    // Explicitly set the silence threshold from the JSON
-    gatekeeper.config.silence_threshold = noise_floor;
-
     // Setup output files
     let mut gatekeeper_csv = File::create(parent_dir.join("gatekeeper.csv"))?;
     writeln!(
         gatekeeper_csv,
-        "frame_idx,time_ms,rms_ema,nhwrsf,ninos2_ema,ninos2_raw,state_enum,is_new_onset,state_name"
+        "frame_idx,time_ms,rms_ema,nhwrsf,sustain_stability_ema,sustain_stability_raw,state_enum,is_new_onset,state_name"
     )?;
-
-    // Loop through frame-by-frame- Sliding Window Loop ---
-    let mut frame_idx = 0;
-    let mut cursor = 0;
 
     println!("==================================================");
     println!("Gatekeeper Execution Timeline");
     println!("==================================================");
 
-    while cursor + BASS_WINDOW_SIZE <= num_samples {
-        let frame_audio = &audio_f32[cursor..cursor + BASS_WINDOW_SIZE];
-
-        // Copy audio into processing frame
-        processing_frame.audio_buffer[..BASS_WINDOW_SIZE].copy_from_slice(frame_audio);
-
-        // Perform WINDOW_SIZE FFT for Gatekeeper
-        let newest_start = BASS_WINDOW_SIZE - WINDOW_SIZE;
-        fft(
-            &processing_frame.audio_buffer[newest_start..BASS_WINDOW_SIZE],
-            &mut processing_frame.time_buffer[..WINDOW_SIZE],
-            &mut processing_frame.frequency_buffer[..],
-            &fft_instance,
-            WINDOW_SIZE,
-        );
-
-        let gate_result = gatekeeper.process_frame(&processing_frame);
-
-        // The Gatekeeper analyzes the newest WINDOW_SIZE samples of the BASS_WINDOW_SIZE buffer.
-        let gatekeeper_cursor = cursor + BASS_WINDOW_SIZE - WINDOW_SIZE;
-        let time_ms = (gatekeeper_cursor as f32 / 44100.0) * 1000.0;
+    for (frame_idx, hop) in replay::run(&audio, thresholds.config).iter().enumerate() {
+        let gate_result = hop.result;
+        // Stamped at the start of the window the gate analysed.
+        let time_ms = (hop.window_start as f32 / SAMPLE_RATE as f32) * 1000.0;
 
         let state_enum = match gate_result.state {
             SignalState::Silence => 0,
@@ -131,8 +93,12 @@ pub fn run(file_path: &Path) -> Result<()> {
         // Only print interesting frames to terminal to avoid spam
         if gate_result.state != SignalState::Silence || gate_result.is_new_onset {
             println!(
-                "Frame {:4} | {:6.1} ms | {:8} | RMS EMA: {:.5} | NINOS2 EMA: {:.1}",
-                frame_idx, time_ms, state_name, gate_result.rms_ema, gate_result.ninos2_ema
+                "Frame {:4} | {:6.1} ms | {:8} | RMS EMA: {:.5} | Sustain EMA: {:.1}",
+                frame_idx,
+                time_ms,
+                state_name,
+                gate_result.rms_ema,
+                gate_result.sustain_stability_ema
             );
         }
 
@@ -143,15 +109,12 @@ pub fn run(file_path: &Path) -> Result<()> {
             time_ms,
             gate_result.rms_ema,
             gate_result.nhwrsf,
-            gate_result.ninos2_ema,
-            gate_result.ninos2_raw,
+            gate_result.sustain_stability_ema,
+            gate_result.sustain_stability_raw,
             state_enum,
             gate_result.is_new_onset,
             state_name
         )?;
-
-        cursor += HOP_SIZE;
-        frame_idx += 1;
     }
 
     println!("\nDiagnostics complete.");

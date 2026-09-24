@@ -1,26 +1,15 @@
-//! # Whittaker — the Whittaker smoother and the shared banded LS solver
+//! # Whittaker — the Whittaker smoother and a banded least-squares solver
 //!
-//! [`BandedSystem`], the banded SPD solver, is the smoother's numerical kernel and is
-//! exported: engine (d)'s penalized least squares reuses it directly.
-//!
-//! The Whittaker smoother (Whittaker 1923 [1]; Eilers 2003 [2]): penalized
+//! The Whittaker smoother (Whittaker 1923 \[1\]; Eilers 2003 \[2\]): penalized
 //! least squares on an equally spaced grid,
 //!
 //! ẑ = argmin_z ∑_i w_i (y_i - z_i)² + λ ∑_i (Δ² z_i)²,
 //!
-//! solved as the banded SPD system (W + λ Dᵀ D) z = W y with D
-//! the second-difference matrix. The second-difference (curvature) penalty is
-//! the design note's definition of smoothness (§5): any straight trend passes
-//! free, only bending is charged. λ is selected by Eilers' fast
-//! leave-one-out cross-validation (his Eq. 11: the LOO residual is
-//! (y_i - ẑ_i)/(1 - h_{ii}), with h_{ii} the diagonal of the Eq.-10
-//! hat matrix), which is statistical model selection — categorically distinct
-//! from tuning on the validation captures (design note §5, defaults #4).
-//!
-//! [`BandedSystem`] is a general symmetric positive-definite banded normal-equation
-//! accumulator + Cholesky solver, shared with the multi-interval engine (d)
-//! in [`super::curves`] (bandwidth ≤ 24 there; 2 here). Cold-path only:
-//! these functions allocate and are not for the DSP hot loop.
+//! solved as the banded SPD system (W + λ Dᵀ D) z = W y with D the
+//! second-difference matrix, so a straight trend passes free and only bending is
+//! charged. λ is chosen by Eilers' fast leave-one-out cross-validation (his Eq. 11:
+//! the LOO residual is (y_i − ẑ_i)/(1 − h_{ii}), h_{ii} the Eq.-10 hat diagonal).
+//! [`BandedSystem`], the solver underneath, is general. Cold path: these allocate.
 //!
 //! # References
 //! 1. E. T. Whittaker, "On a new method of graduation", Proc. Edinburgh
@@ -51,9 +40,11 @@ impl BandedSystem {
         }
     }
 
-    /// Adds `v` to A_{rc} (and by symmetry A_{cr}; only the lower
-    /// triangle is stored). Panics if `|r - c|` exceeds the half-bandwidth —
-    /// a caller bug per the assert-vs-Result rule.
+    /// Adds `v` to A_{rc}, and by symmetry A_{cr}; only the lower triangle is
+    /// stored.
+    ///
+    /// # Panics
+    /// If `|r − c|` exceeds the half-bandwidth.
     pub fn add(&mut self, r: usize, c: usize, v: f64) {
         let (i, j) = if r >= c { (r, c) } else { (c, r) };
         let k = i - j;
@@ -128,8 +119,8 @@ impl BandedSystem {
 }
 
 /// BandedSystem Cholesky factor L (see [`BandedSystem::cholesky`]). Reusable across
-/// multiple right-hand sides — the LOO-CV hat diagonal and the GCV effective
-/// DOF both solve many systems against one factorization.
+/// multiple right-hand sides — the LOO-CV hat diagonal solves many systems
+/// against one factorization.
 #[derive(Debug, Clone)]
 pub struct BandedCholesky {
     n: usize,
@@ -160,8 +151,8 @@ impl BandedCholesky {
         }
     }
 
-    /// Diagonal of A⁻¹, by solving against each unit vector. O(n² p)
-    /// — trivial at the 88-key scale; used for the CV hat diagonal.
+    /// Diagonal of A⁻¹, by solving against each unit vector: O(n² p), trivial at
+    /// the 88-key scale.
     pub fn inverse_diag(&self) -> Vec<f64> {
         let mut diag = vec![0.0; self.n];
         let mut e = vec![0.0; self.n];
@@ -194,14 +185,11 @@ fn system(y: &[f64], w: &[f64], lambda: f64) -> BandedSystem {
 /// The Whittaker smoother (module doc): returns ẑ minimizing
 /// ∑ w_i (y_i - z_i)² + λ ∑ (Δ² z_i)².
 ///
-/// `w` are non-negative observation weights (0 = missing: the smoother
-/// interpolates there). Returns `None` when the system is singular — fewer
-/// than 2 strictly-positive weights leaves the affine null space of Dᵀ D
-/// unconstrained. Limits: λ → 0 reproduces the weighted data;
-/// λ → ∞ tends to the weighted least-squares *straight line*
-/// (the penalty's null space), which is why the curve engines smooth the
-/// *residual from the prior mean* — the prior carries the curve shape, the
-/// residual's line component is the data's to keep (design note §5).
+/// `w` are non-negative observation weights; at 0 the point is missing and the
+/// smoother interpolates. Returns `None` when the system is singular: fewer than two
+/// positive weights leave the affine null space of Dᵀ D unconstrained. As λ → 0 the
+/// result reproduces the weighted data; as λ → ∞ it tends to the weighted
+/// least-squares straight line, the penalty's null space.
 pub fn smooth(y: &[f64], w: &[f64], lambda: f64) -> Option<Vec<f64>> {
     assert_eq!(y.len(), w.len());
     system(y, w, lambda).solve()
@@ -211,30 +199,20 @@ pub fn smooth(y: &[f64], w: &[f64], lambda: f64) -> Option<Vec<f64>> {
 /// CV = ∑_{w_i > 0} w_i · ((y_i − ẑ_i)/(1 − h_ii))²,
 /// where h_{ii} = [(W + λ Dᵀ D)⁻¹]_{ii} w_i is the diagonal of the hat
 /// matrix H = (W + λ Dᵀ D)⁻¹ W (Eilers 2003 Eq. 10) and the fast LOO
-/// residual (y_i − ẑ_i)/(1 − h_ii) is his Eq. 11. The identity is exact
-/// for a general diagonal W, not only Eilers' 0/1 missing-data weights
-/// (leaving point i out is the rank-one update M − w_i·e_i·e_iᵀ;
-/// Sherman–Morrison gives the same 1/(1 − h_ii) inflation — pinned by the
-/// brute-force test including heterogeneous weights). Weighting the
-/// *score* by w_i is **ours** (Eilers' Eq. 9 scores unweighted): LOO
-/// residuals are scored in the same weighted metric the smoother
-/// minimizes. Returns `None` on a singular system or when some h_{ii} = 1
-/// (a point the smoother reproduces exactly cannot be cross-validated).
+/// residual (y_i − ẑ_i)/(1 − h_ii) is his Eq. 11. The identity is exact for any
+/// diagonal W, not only Eilers' 0/1 weights: leaving point i out is the rank-one
+/// update M − w_i·e_i·e_iᵀ, and Sherman–Morrison gives the same inflation. Weighting
+/// the score by w_i is ours (Eilers' Eq. 9 is unweighted), scoring the residuals in
+/// the metric the smoother minimizes. Returns `None` on a singular system or when
+/// some h_{ii} = 1, a point reproduced exactly and so impossible to cross-validate.
 pub fn cv(y: &[f64], w: &[f64], lambda: f64) -> Option<f64> {
     let all: Vec<bool> = w.iter().map(|&x| x > 0.0).collect();
     cv_masked(y, w, lambda, &all)
 }
 
-/// [`cv`] restricted to a validation subset: the CV sum runs only
-/// over indices where `cv_mask` is true (and w_i > 0).
-///
-/// Needed when the weight vector carries **prior pseudo-observations** —
-/// the tuning-curve engines' boundary-reversion term (ADR 0007) observes
-/// the prior mean at unmeasured keys with a small weight. Pseudo-points
-/// encode the prior, not data, so cross-validating them would reward
-/// λ-choices for predicting the prior back to itself; they are masked out
-/// of the score while still shaping the smoother (they enter W and hence
-/// h_{ii} and ẑ).
+/// [`cv`] summed only where `cv_mask` is true (and w_i > 0). For prior
+/// pseudo-observations: they shape the smoother through W, but scoring them would
+/// reward a λ for predicting the prior back to itself.
 pub fn cv_masked(y: &[f64], w: &[f64], lambda: f64, cv_mask: &[bool]) -> Option<f64> {
     assert_eq!(y.len(), cv_mask.len());
     let sys = system(y, w, lambda);
@@ -258,13 +236,10 @@ pub fn cv_masked(y: &[f64], w: &[f64], lambda: f64, cv_mask: &[bool]) -> Option<
     Some(cv)
 }
 
-/// The λ grid for automatic selection: half-decade steps over
-/// 10^(-2) … 10^(8) — Eilers' own search practice ("the logarithm of λ was
-/// varied in steps of 0.5 on a linear grid"; his Fig. 10 profile spans the
-/// same 10⁻²…10⁸). In cents²-per-curvature² units on an 88-key grid this
-/// spans "follow every point" to "affine residual"; the endpoints are
-/// deliberately beyond both useful extremes so the CV minimum is interior in
-/// practice.
+/// The λ grid for automatic selection: half-decade steps over 10⁻² … 10⁸, Eilers'
+/// own practice (log λ in steps of 0.5; his Fig. 10 spans the same range). On the
+/// 88-key grid that runs from following every point to an affine residual, both
+/// beyond the useful extremes, so the CV minimum falls inside.
 pub const LAMBDA_GRID_DECADES: (f64, f64, usize) = (-2.0, 8.0, 21);
 
 /// Whittaker smoothing with λ selected by LOO-CV over
@@ -303,7 +278,7 @@ mod tests {
         ((*seed >> 33) as f64 / (1u64 << 31) as f64) - 1.0
     }
 
-    /// §11 test: banded Cholesky against a dense reference solve.
+    /// Banded Cholesky against a dense reference solve.
     #[test]
     #[allow(clippy::needless_range_loop)] // the dense reference reads clearest in index form
     fn test_banded_vs_dense() {
@@ -366,7 +341,7 @@ mod tests {
         }
     }
 
-    /// §11 test: λ → 0 reproduces the input at observed points.
+    /// λ → 0 reproduces the input at observed points.
     #[test]
     fn test_whittaker_lambda_zero_limit() {
         let y: Vec<f64> = (0..20).map(|i| (i as f64 * 0.7).sin() * 5.0).collect();
@@ -382,7 +357,7 @@ mod tests {
         }
     }
 
-    /// §11 test: λ → ∞ tends to the weighted LS straight line (the penalty
+    /// λ → ∞ tends to the weighted LS straight line (the penalty
     /// null space) — second differences vanish, and a pure line is
     /// reproduced exactly.
     #[test]
@@ -418,7 +393,7 @@ mod tests {
         assert!(z[3] > z[2], "gap not monotone between neighbors");
     }
 
-    /// §11 test: Eilers' fast LOO-CV identity against brute force — the fast
+    /// Eilers' fast LOO-CV identity against brute force — the fast
     /// residual (y_i − z_i)/(1 − h_ii) equals the true leave-one-out
     /// prediction error y_i − z^{(−i)}_i.
     #[test]

@@ -29,7 +29,7 @@ pub struct Resolved {
     pub record: usize,
 }
 
-/// Drives the **shipped** bank over `audio` and returns, per reference, the
+/// Drives the shipped bank over `audio` and returns, per reference, the
 /// best record it reached — the hop with the longest unbroken record, which is
 /// what the panel would be showing when the tuner looks at it.
 pub fn run_unison(
@@ -57,7 +57,7 @@ pub fn run_unison(
             .copy_from_slice(&audio[h * HOP_SIZE..h * HOP_SIZE + BASS_WINDOW_SIZE]);
         let out = strobe.process(&frame, noise_floor, false);
         for i in 0..count {
-            // The published resolution is 2·f_hop/L, so it *is* the record length.
+            // The published resolution is 2·f_hop/L, so it is the record length.
             record[i] = if out.line_resolution_hz[i] > 0.0 {
                 (2.0 * HOP_RATE_HZ / out.line_resolution_hz[i]).round() as usize
             } else {
@@ -107,7 +107,7 @@ enum Mode {
     /// window A/B (E2), per-hop delta noise (E3), fit-window jitter versus
     /// motion lag (E4) and the shipped rate against an independent refit (E5);
     /// the unison experiments (E6–E8) and the bass attribution (E10–E12).
-    /// E1–E5 are ADR 0011's and must not move.
+    /// E1–E5 are report 0011's and must not move.
     Replay {
         /// Capture-set root.
         #[arg(default_value = "diagnostics")]
@@ -115,19 +115,19 @@ enum Mode {
     },
     /// The unison panel against isolation truth on the mute-isolation set:
     /// the false-beat positive control, availability per register, and a JSON
-    /// dump of per-capture line positions (ADR 0014 §§3–5).
+    /// dump of per-capture line positions (report 0014 §§3–5).
     Isolation {
         /// A `mat regen` dump of the isolation set.
         regen: PathBuf,
         /// That set's dump directory.
         root: PathBuf,
-        /// Write per-capture line positions here, for `scripts/isolation_truth.py`.
+        /// Write per-capture line positions here, for `isolation_truth.py`.
         #[arg(long)]
         json: Option<PathBuf>,
         /// Admit captures carrying no `sounding_strings` declaration.
         #[arg(long)]
         all: bool,
-        /// Override the D3 gate's ambient-silence RMS.
+        /// Override the amplitude gate's ambient-silence RMS.
         #[arg(long, default_value_t = 3e-3)]
         noise_floor: f32,
     },
@@ -150,7 +150,7 @@ enum Mode {
     Alias(ReadOpts),
     /// Longest ungated run and the band read, per fit-window length.
     Window(ReadOpts),
-    /// Tracker as-is / tracker + Defect-1 window / bounded spectral peak.
+    /// Tracker as-is / tracker + long window / bounded spectral peak.
     Readout(ReadOpts),
     /// Whether the band/coarse regime switch chatters near its boundary.
     Chatter(ReadOpts),

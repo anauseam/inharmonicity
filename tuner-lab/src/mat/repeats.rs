@@ -1,11 +1,11 @@
-//! # Repeat-capture noise decomposition harness (handoff Prompt H)
+//! # Repeat-capture noise decomposition harness (report 0009)
 //!
-//! Consumes a **per-capture** regenerated-partials JSON (the output of
-//! `examples/regenerate_partials` on a diagnostics tree holding repeat
+//! Consumes a per-capture regenerated-partials JSON (the output of
+//! `cargo lab mat regen` on a diagnostics tree holding repeat
 //! captures — multiple timestamped dumps per key) and measures the
 //! capture-to-capture variance of every quantity the curve layer consumes:
 //!
-//! 1. **ρ-point reproducibility** (Prompt H analysis 2): for each octave
+//! 1. **ρ-point reproducibility** (report 0009 analysis 2): for each octave
 //!    pair, every (lower-capture × upper-capture) combination is pushed
 //!    through the exact engine-(c) calibration path — §VI.C gate →
 //!    coincidence-bracket scan → Eq.-30 inversion — giving per-pair σ of
@@ -15,19 +15,18 @@
 //!    against the observed σ_ρ.
 //! 2. **Strike-strength sensitivity** (analysis 3): per pair, the optimal
 //!    width is regressed on the combo's summed partial power (dB) — the
-//!    slope is the Giordano optimum's amplitude-condition dependence the
-//!    design note §3.2 left unquantified.
+//!    slope is the Giordano optimum's amplitude-condition dependence.
 //! 3. **Resampled curve draws** (analysis 4): R deterministic pseudo-random
 //!    draws of one capture per key; per draw the raw octave chain, the
 //!    per-draw ρ-fit φ, and engines (b), (c), (d)-BALANCED and
 //!    (d)-octaves-only are computed. The per-draw outputs let the offline
 //!    post-processor measure chain-noise correlation across keys (the
-//!    LOO-CV independence question deferred from Prompt G) and per-engine
+//!    LOO-CV independence question, report 0009 analysis 4) and per-engine
 //!    curve variance.
 //!
-//! Output: one machine-readable JSON on stdout (post-processed by the
-//! Prompt-H analysis scripts). Diagnostics, not selection — the repeat set
-//! is validation data (n = 1 instrument at a time).
+//! Output: one machine-readable JSON on stdout, post-processed offline.
+//! Diagnostics, not selection: the repeat set is validation data, one instrument
+//! at a time.
 //!
 //! Usage:
 //!   cargo lab mat regen diagnostics > p2.json
@@ -40,10 +39,10 @@ use tuner_core::algorithms::curves::{self, BALANCED_INTERVALS, CurveParams, Inte
 use tuner_core::algorithms::{giordano, rigaud};
 use tuner_core::models::{CurveInput, CurveKeyData};
 
-/// Engine (d) restricted to the octave family — the Prompt-G deferred
-/// "chain-noise vs LOO independence" comparison line: same interval
-/// evidence as engine (b)'s chains, different estimator (joint LS vs
-/// chain + smoother).
+/// Engine (d) restricted to the octave family, for report 0009 analysis 4's
+/// chain-noise against LOO-independence comparison: the interval evidence of
+/// engine (b)'s chains under a different estimator (joint LS, not chain and
+/// smoother).
 const OCTAVES_ONLY: &[IntervalSpec] = &[
     IntervalSpec {
         k: 12,
@@ -74,7 +73,7 @@ struct Capture {
     /// Summed squared partial amplitude, dB (arbitrary reference) — the
     /// strike-strength proxy. Equal-power normalization inside the
     /// dissonance engine removes the absolute level; what varies with
-    /// strike strength is the spectral *balance*, and this scalar tags the
+    /// strike strength is the spectral balance, and this scalar tags the
     /// combos so the regression can see it.
     power_db: f64,
     source_dir: String,
@@ -127,7 +126,7 @@ fn load_captures(path: &Path) -> BTreeMap<usize, Vec<Capture>> {
     keys
 }
 
-/// Optimal octave *width* (audible-f₁ deviation from the pure ET octave,
+/// Optimal octave width (audible-f₁ deviation from the pure ET octave,
 /// cents) for one capture combo, via the engine-(c) path. Returns the
 /// width, the implied ρ (`None` when Eq. 30 has no real root), and the
 /// scan's interior flag.

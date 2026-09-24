@@ -1,23 +1,30 @@
 //! # Profile library browser
 //!
-//! The instrument picker: the list of saved profiles, plus the identity of the
-//! one currently open. Renders `AppDisplayData`'s library state; every action
-//! is a `Message` handled in `app.rs`, so this file holds no policy.
-//!
-//! Search covers the serial number because that is the only field that
-//! identifies an instrument unambiguously. The shape — a browsable list rather
-//! than an OS file picker — is argued in
-//! `docs/design/session-persistence-and-profile-library.md` §5.
+//! The saved profiles, and the identity form of the one open.
 
 use iced::widget::{
     Space, button, column, container, pick_list, row, scrollable, text, text_input,
 };
 use iced::{Alignment, Border, Element, Fill, Length};
 
-use crate::app::{AppDisplayData, IdentityField};
+use crate::Message;
+use crate::app::AppDisplayData;
 use crate::library::{ProfileEntry, ProfileSort};
 use crate::widgets::curve_plot;
 use tuner_core::models::InstrumentKind;
+
+/// Which text field of [`InstrumentIdentity`](tuner_core::models::InstrumentIdentity)
+/// an edit targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityField {
+    Name,
+    Make,
+    Model,
+    Serial,
+    Form,
+    Owner,
+    Notes,
+}
 
 /// Instrument families offered in the picker.
 const KINDS: [InstrumentKind; 4] = [
@@ -33,11 +40,11 @@ fn identity_row(
     field: IdentityField,
     value: String,
     placeholder: &'static str,
-) -> Element<'static, crate::Message> {
+) -> Element<'static, Message> {
     row![
         text(label).size(13).width(Length::Fixed(90.0)),
         text_input(placeholder, &value)
-            .on_input(move |v| crate::Message::IdentityFieldChanged(field, v))
+            .on_input(move |v| Message::IdentityFieldChanged(field, v))
             .size(13)
             .width(Fill),
     ]
@@ -46,19 +53,12 @@ fn identity_row(
     .into()
 }
 
-/// The identity form for the open instrument — the detail half of the panel's
-/// list–detail pair, following what is *open* rather than what is selected.
-///
-/// Editable after the fact and never required: a profile exists and auto-saves
-/// from its first capture, and is named later. Its whole job is to make "is
-/// this the instrument in front of me?" answerable before autosave writes
-/// another instrument's measurements into this file.
-fn identity_panel(data: &AppDisplayData) -> Element<'static, crate::Message> {
+/// The identity form of the open instrument, not of a selected row. Never
+/// required: a profile autosaves from its first capture and is named later.
+fn identity_panel(data: &AppDisplayData) -> Element<'static, Message> {
     let id = &data.open_identity;
     let form = column![
-        // Not "Open instrument": every row of the list below carries an *Open*
-        // button, so the word reads as the action there rather than as the
-        // state here.
+        // Not "Open instrument": every row below has an Open button.
         text("Instrument details").size(16),
         Space::new().height(6),
         identity_row(
@@ -70,7 +70,7 @@ fn identity_panel(data: &AppDisplayData) -> Element<'static, crate::Message> {
         row![
             text("Family").size(13).width(Length::Fixed(90.0)),
             pick_list(KINDS, Some(id.kind.clone()), |k| {
-                crate::Message::InstrumentKindChanged(k)
+                Message::InstrumentKindChanged(k)
             })
             .text_size(13)
             .width(Fill),
@@ -113,8 +113,7 @@ fn identity_panel(data: &AppDisplayData) -> Element<'static, crate::Message> {
             id.notes.clone().unwrap_or_default(),
             "Anything worth remembering"
         ),
-        // Not editable: it is what the capture dumps are filed under, so it
-        // outlives every field above it.
+        // Not editable: the capture dumps are filed under it.
         row![
             text("Identity").size(13).width(Length::Fixed(90.0)),
             text(if id.id.is_empty() {
@@ -131,8 +130,7 @@ fn identity_panel(data: &AppDisplayData) -> Element<'static, crate::Message> {
     ]
     .spacing(6);
 
-    // Boxed, because this panel is two subjects rather than one: the record
-    // being written to, and the collection it belongs to.
+    // Boxed: the record being written to is a separate subject from the list.
     container(form)
         .padding(12)
         .width(Fill)
@@ -148,7 +146,7 @@ fn identity_panel(data: &AppDisplayData) -> Element<'static, crate::Message> {
 }
 
 /// One row of the saved-profile list.
-fn entry_row(entry: &ProfileEntry, is_open: bool) -> Element<'static, crate::Message> {
+fn entry_row(entry: &ProfileEntry, is_open: bool) -> Element<'static, Message> {
     let mut subtitle = Vec::new();
     if let Some(make) = &entry.make {
         subtitle.push(make.clone());
@@ -159,26 +157,24 @@ fn entry_row(entry: &ProfileEntry, is_open: bool) -> Element<'static, crate::Mes
     if let Some(serial) = &entry.serial {
         subtitle.push(format!("#{serial}"));
     }
-    subtitle.push(format!(
-        "{} {}",
-        entry.measured_count,
-        entry.kind.unit_plural()
-    ));
+    let units = match entry.kind {
+        InstrumentKind::Piano => "keys",
+        _ => "strings",
+    };
+    subtitle.push(format!("{} {units}", entry.measured_count));
 
     let path = entry.path.clone();
     let open = button(text(if is_open { "Open ✓" } else { "Open" }).size(13))
         .padding([4, 10])
-        .on_press_maybe((!is_open).then(|| crate::Message::OpenProfile(path.clone())));
+        .on_press_maybe((!is_open).then(|| Message::OpenProfile(path.clone())));
 
     let duplicate = button(text("Duplicate").size(13))
         .padding([4, 10])
-        .on_press(crate::Message::DuplicateProfile(path.clone()));
+        .on_press(Message::DuplicateProfile(path.clone()));
 
-    // Deleting the instrument being tuned would leave autosave writing to a
-    // file that no longer exists, so the open row cannot offer it.
     let delete = button(text("Delete").size(13))
         .padding([4, 10])
-        .on_press_maybe((!is_open).then_some(crate::Message::DeleteProfile(path)));
+        .on_press_maybe((!is_open).then_some(Message::DeleteProfile(path)));
 
     container(
         row![
@@ -202,22 +198,22 @@ fn entry_row(entry: &ProfileEntry, is_open: bool) -> Element<'static, crate::Mes
 
 /// The full library panel: identity of the open instrument above, the saved
 /// list below.
-pub fn create_library_panel(data: &AppDisplayData) -> Element<'static, crate::Message> {
+pub fn panel(data: &AppDisplayData) -> Element<'static, Message> {
     let controls = row![
         text_input("Search name, make, model, serial…", &data.library_search)
-            .on_input(crate::Message::LibrarySearchChanged)
+            .on_input(Message::LibrarySearchChanged)
             .size(13)
             .width(Fill),
         pick_list(ProfileSort::ALL, Some(data.library_sort), |s| {
-            crate::Message::LibrarySortChanged(s)
+            Message::LibrarySortChanged(s)
         })
         .text_size(13),
         button(text("New instrument").size(13))
             .padding([4, 10])
-            .on_press(crate::Message::NewProfile),
+            .on_press(Message::NewProfile),
         button(text("Close").size(13))
             .padding([4, 10])
-            .on_press(crate::Message::ToggleLibrary),
+            .on_press(Message::ToggleLibrary),
     ]
     .spacing(8)
     .align_y(Alignment::Center);
@@ -243,8 +239,7 @@ pub fn create_library_panel(data: &AppDisplayData) -> Element<'static, crate::Me
         );
     }
 
-    // "All", not "Saved": everything is saved, always, so the word no longer
-    // distinguishes one instrument from another.
+    // "All", not "Saved": every instrument is saved.
     let total = data.library_entries.len();
     let heading = if shown == total {
         format!("All instruments · {total}")
@@ -267,8 +262,7 @@ pub fn create_library_panel(data: &AppDisplayData) -> Element<'static, crate::Me
         .padding(15),
     )
     .width(Fill)
-    // Bounded, like every other settings panel: the parent column is Shrink,
-    // so a `Fill` height here collapses the panel to nothing.
+    // Bounded: the parent column is Shrink, so a `Fill` height collapses it.
     .height(Length::Fixed(620.0))
     .into()
 }

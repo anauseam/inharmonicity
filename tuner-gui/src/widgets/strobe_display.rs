@@ -1,40 +1,29 @@
-//! # Strobe Display Widget
+//! # Strobe display
 //!
-//! The absolute-partial strobe band (strobe design note §5): a rotating
-//! segmented ring whose angular position is the accumulated beat phase
-//! between the live partial and its locked curve target. In tune ⇒
-//! stationary; off by Δf ⇒ the pattern travels at Δf pattern-periods per
-//! second (§5.5/R12 calibration — one pattern period of travel per beat
-//! cycle, so the display literally shows the beat a tuner counts).
-//!
-//! The widget is a stateless renderer: it receives the beat phase and the
-//! gate flag and draws. The phase is accumulated on the DSP thread by
-//! `tuner_core::strobe::Strobe` (Path A, R2) and arrives via
-//! `FrameOutput.strobe_angle`. The amplitude gate (D3) reaches the widget
-//! as `gated` — the band freezes at its last angle and dims rather than
-//! spinning on noise; a frozen band is the re-strike signal.
+//! The strobe band: a segmented ring turned by the accumulated beat phase, one
+//! pattern period per beat, so a string in tune stands still. While gated it
+//! freezes and dims.
 
 use iced::widget::canvas::{self, Canvas, Path, Stroke, path::Arc};
 use iced::{Color, Element, Fill, Point, Radians, Rectangle, Renderer, Theme, mouse};
 
 use crate::widgets::curve_plot::{GRID, SERIES, SURFACE};
 
-/// Dark/light pattern periods around the ring. R12: an S-fold pattern
-/// sampled at the 43 Hz hop rate aliases at S·Δf > 21.5 Hz, so S stays
-/// small (4–6); final value by eye during the prototype.
+/// Dark/light pattern periods around the ring.
+// Kept small: an S-fold pattern aliases once S·Δf passes half the hop rate.
+// Ours, set by eye.
 const PATTERN_PERIODS: usize = 4;
 
-/// Wedge fill while gated: muted grey — clearly *visible* (the frozen band
-/// is the honest re-strike signal, not an empty panel) but unmistakably
-/// not the live series color.
+/// Wedge fill while gated: visible, since a frozen band is the re-strike
+/// signal, but not the live series colour.
 const GATED_FILL: Color = Color::from_rgb8(0x6e, 0x6d, 0x66);
 
 /// Canvas program drawing one strobe band.
 pub struct StrobeDisplay {
     /// Accumulated beat phase in cycles, [0, 1).
     beat_phase: f32,
-    /// D3 amplitude gate: `true` freezes and dims the band (the caller
-    /// holds the phase, so the last angle persists).
+    /// Amplitude gate: `true` dims the band, which the caller freezes by holding
+    /// the phase.
     gated: bool,
     cache: canvas::Cache,
 }
@@ -73,7 +62,7 @@ impl<Message> canvas::Program<Message> for StrobeDisplay {
             let outer = (bounds.width.min(bounds.height) / 2.0 - 6.0).max(1.0);
             let inner = outer * 0.55;
 
-            // One pattern period of rotation per beat cycle (R12), so the
+            // One pattern period of rotation per beat cycle, so the
             // phase wrap at 1.0 lands exactly on the pattern's symmetry.
             let period = std::f32::consts::TAU / PATTERN_PERIODS as f32;
             let theta = self.beat_phase.rem_euclid(1.0) * period;

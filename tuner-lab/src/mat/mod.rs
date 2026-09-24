@@ -27,7 +27,7 @@ enum Mode {
     },
     /// Each capture re-measured on same-length windows cut at offsets from the
     /// physical onset — what the gatekeeper's `Stable` start costs the B fit
-    /// (ADR 0009 analysis 9). Needs `audio_full_event.raw`.
+    /// (report 0009 analysis 9). Needs `audio_full_event.raw`.
     Offset {
         /// Capture-set root.
         #[arg(default_value = "diagnostics")]
@@ -37,22 +37,22 @@ enum Mode {
         offsets: Vec<u32>,
     },
     /// The repeat-capture noise decomposition — σ_lnB, ρ reproducibility and
-    /// strike strength (ADR 0009).
+    /// strike strength (report 0009).
     Repeats {
         /// A `mat regen` dump.
         partials: PathBuf,
     },
     /// Re-derives per-key partials from the kept audio with the current
-    /// estimator, one JSON dump on stdout. **The required entry point for
-    /// piano #2 data** (`06`).
+    /// estimator, one JSON dump on stdout. The required entry point for
+    /// piano #2 data (`capture-sets.md`).
     Regen {
         /// Capture-set root.
         #[arg(default_value = "diagnostics")]
         root: PathBuf,
     },
-    /// MAT against *known* synthetic B, swept 1×–25× the prior with and
+    /// MAT against known synthetic B, swept 1×–25× the prior with and
     /// without a fundamental — the characterisation behind the deep-bass
-    /// measurement argument (ADR 0006). Its assertion is
+    /// measurement argument (report 0006). Its assertion is
     /// `tuner-core/tests/mat_b_recovery.rs`.
     Recovery,
 }

@@ -1,26 +1,27 @@
-//! # Regenerate persisted partials from kept audio with the CURRENT Serial MAT
+//! # Regenerate persisted partials from kept audio with the current Serial MAT
 //!
 //! The `diagnostics/key_*/analysis.json` files were written 2026-05-30 under the
-//! **Simultaneous** MAT default (capped at `SIM_MAX_PARTIALS = 12`) and an earlier
-//! `(f0, B)` estimator. Both their partial *count* (12) and their `calculated_b` are
+//! Simultaneous MAT default (capped at `SIM_MAX_PARTIALS = 12`) and an earlier
+//! `(f0, B)` estimator. Both their partial count (12) and their `calculated_b` are
 //! therefore stale. Every key kept its `audio.raw`, so we can re-derive the partials
 //! offline with today's shipped worker path (Serial MAT, up to `MAX_PARTIALS = 32`)
-//! **without re-capturing on the instrument**.
+//! without re-capturing on the instrument.
 //!
 //! This harness reproduces the Worker's exact offline path (FFT sizing, Hann window,
 //! CSPE one-sample shift, `detect_pitch_mat(Serial)`, amplitude-at-rounded-bin) and
-//! emits one JSON array over all keys to **stdout** — it writes no repo files, so it
-//! cannot clobber the validation captures. Redirect it where you like.
+//! emits one JSON array over all keys to stdout. It writes no files, so it cannot
+//! clobber the validation captures.
 //!
 //! Usage: `cargo lab mat regen [diagnostics_dir] > out.json`
 
-use anyhow::Result;
 use std::path::Path;
 use std::sync::Arc;
 
+use anyhow::Result;
 use realfft::{RealFftPlanner, RealToComplex};
 use rustfft::num_complex::Complex;
 
+use crate::capture;
 use tuner_core::algorithms::mat::{MAX_PARTIALS, MatOrder, detect_pitch_mat};
 use tuner_core::algorithms::spectral::{cspe, fft, magnitude_spectrum};
 use tuner_core::models::{NOTES, get_expected_beta};
@@ -147,7 +148,7 @@ fn process(dir: &Path) -> Option<serde_json::Value> {
 }
 
 pub fn run(root: &Path) -> Result<()> {
-    let dirs = crate::capture::find(root)?;
+    let dirs = capture::find(root)?;
     let out: Vec<_> = dirs.iter().filter_map(|d| process(d)).collect();
     println!("{}", serde_json::to_string_pretty(&out).unwrap());
     eprintln!("regenerated {} keys", out.len());
