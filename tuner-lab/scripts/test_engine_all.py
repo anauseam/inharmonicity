@@ -8,7 +8,7 @@ from collections import Counter, deque
 def mofn_lock(winners, m, n):
     """First key to win >= m of the last n winners (deque(maxlen=n)); identical
     to validate_config.py / replay_lock_rules.py and the engine's
-    record_stable_winner. m = n = 3 reproduces the old 3-consecutive rule."""
+    record_winner. m = n = 3 reproduces the old 3-consecutive rule."""
     win = deque(maxlen=n)
     counts = Counter()
     for w in winners:
@@ -118,7 +118,8 @@ def main():
             continue
             
         # M-of-N binary-integration lock (report 0010) over the stable-frame
-        # winner sequence — same rule as validate_config.py and the engine.
+        # winner sequence — same rule as validate_config.py; the engine's window
+        # also fills on Unstable frames (report 0020).
         stable_winners = [int(row['key_idx']) for _, row in stable_df.iterrows()]
         locked = mofn_lock(stable_winners, args.lock_m, args.lock_n)
         locked_key = -1 if locked is None else locked

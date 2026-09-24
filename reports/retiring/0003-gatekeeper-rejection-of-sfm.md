@@ -140,6 +140,9 @@ the vote the gate releases is what the (7, 8) rule accumulates — and re-sizing
 the wait per register is gated on the same second-instrument bar as everything
 else touching discovery. No code changed.
 
+**Amended 2026-09-23 by [report 0020](../0020-vote-from-onset.md).** The wait
+priced above is now measured at lock level, and the vote no longer waits for it.
+
 ## Consequences
 
 - The Gatekeeper architecture is radically simplified and relies purely on:

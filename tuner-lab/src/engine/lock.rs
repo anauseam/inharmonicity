@@ -1,22 +1,22 @@
 //! End-to-end validation of the shipped engine auto-lock path.
 //!
-//! The Python replicas validate the M-of-N rule (report 0010), not its
-//! integration, since `cargo lab engine dump` drives the engine in manual mode.
-//! This drives the real `Engine::process` in auto mode (`target_note = None`)
-//! frame by frame over each capture, feeding the gatekeeper's verdicts exactly as
-//! the live pipeline does, and records the first key the engine latches. The auto
-//! path always refines, so with the shipped `LOCK_VOTES_M = 7 / LOCK_WINDOW_N = 8`
-//! this must reproduce the replica's refined (7,8) figure, piano-1 81/87; any
-//! deviation is an integration bug.
+//! The Python replicas validate the M-of-N rule over report 0010's Stable-frame
+//! winners, not its integration, since `cargo lab engine dump` drives the engine
+//! in manual mode. This drives the real `Engine::process` in auto mode
+//! (`target_note = None`) frame by frame over each capture, feeding the
+//! gatekeeper's verdicts exactly as the live pipeline does, and records the first
+//! key the engine latches. The auto path always refines and votes from the onset,
+//! so the shipped `LOCK_VOTES_M = 7 / LOCK_WINDOW_N = 8` gives piano-1 82/87
+//! (report 0020), one more than the replicas' Stable-frame 81/87; any deviation is
+//! an integration bug.
 //!
-//! The `from-onset` mode runs the counterfactual: the gatekeeper withholds the
-//! engine's vote until `Stable`, five hops (116 ms) after the NHWRSF onset, on the
-//! ground that the attack is broadband. Here the Stage-A scan, the same
-//! `discovery::discover` call `Engine::process` makes on the same 8192-point bass
-//! spectrum, runs on every hop from the onset whatever the gate says, and each
-//! hop's winner is scored against the capture's key, bucketed by hops since
-//! onset. The gate's own verdict is carried per hop, so the shipped policy sits
-//! inside the table rather than bounding it.
+//! The `from-onset` mode scores each vote rather than the lock: the Stage-A scan,
+//! the same `discovery::discover` call `Engine::process` makes on the same
+//! 8192-point bass spectrum, runs on every hop from the NHWRSF onset whatever the
+//! gate says, and each hop's winner is scored against the capture's key, bucketed
+//! by hops since onset. It is per-hop identification by register, with no window
+//! and no reset; the gate's own verdict is carried per hop, so where `Stable`
+//! lands sits inside the table.
 //!
 //! Usage: `cargo lab engine lock [BASE_DIR]`
 //!        `cargo lab engine from-onset diagnostics_piano2`
@@ -257,12 +257,10 @@ fn first_lock(
         bass_spectrum(&mut frame, fft_bass);
 
         let is_silence = gate.state == SignalState::Silence;
-        let is_stable = gate.state == SignalState::Stable;
         engine.process(
             &frame,
             profiles,
             is_silence,
-            is_stable,
             gate.is_new_onset,
             gate.is_transient_bypass,
             None, // AUTO mode — the path under test

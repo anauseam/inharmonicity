@@ -40,6 +40,11 @@ REFUTED: it never beats winner-voting and
 fixes none of the B-limited residuals. Score-level fusion is closed; see
 `report 0010` appendix.)**
 
+**Amended 2026-09-23 by [report 0020](0020-vote-from-onset.md).** The window now
+fills on every hop after the onset that is neither silent nor a bypass, not on
+`Stable` hops only, and `record_stable_winner` is `record_winner`; the rule's
+(7, 8) is unchanged, and the tables below stay as measured.
+
 ## Context
 
 The production Discovery lock rule is *first key to win 3 consecutive stable

@@ -368,21 +368,20 @@ move, so it runs after the step as its own change.
   the threshold must not be able to report a strike. Moving any of this moves
   every lock baseline, so it needs a `gatekeeper dump` replay over all three
   capture sets first.
-- **The transient is not the wait** — `Investigating`, unreported. In a
-  `gatekeeper dump` over all three capture sets, stability lands exactly four
-  hops after the last onset hop in 1,055 of 1,067 captures — that is the
-  `stable_counter` requirement and nothing else. Exploratory work separately
-  found the onset line-dominated from its first frame, the broadband component
-  40–55 dB under the tone. If both hold, the gate's transient handling is not
-  what delays a measurement; the analysis window filling is. Whether the
-  four-hop wait buys anything is then a replay question, and both numbers need a
-  report before anything moves on them.
+- **The transient is not the wait** — resolved by measurement. The gate's
+  four-hop stable run was the wait, and the lock's vote no longer sits it out:
+  the window fills from the onset, every measured commit still lands on a
+  `Stable` frame, and the lock arrives a median 42–48 ms sooner on piano #2,
+  never later, non-inferior on every instrument read. The capture still starts
+  its record on `Stable`.
+  → [report 0020](reports/0020-vote-from-onset.md)
 - **The gate's onset and bypass flags are one signal** — `Investigating`.
   `Gatekeeper::process_transient_detection` raises `is_new_onset` on exactly the
   frames it returns as the bypass, so `GateResult`'s two flags are always equal,
   and `Engine::process`'s `is_new_onset` branch never runs, because the bypass
   returns first. Either they were meant to differ or one goes; removing one
-  changes `Engine::process`'s signature and the lab harnesses that pass both.
+  changes `Engine::process`'s signature, which no longer takes `is_stable`
+  (report 0020), and the lab harnesses that pass both.
 - **No noise floor; the silence threshold stands in for one** — `Planned`.
   Nothing measures the room's noise. RMS calibration sets the
   silence threshold to the loudest ambient RMS it reads × 1.5, and three

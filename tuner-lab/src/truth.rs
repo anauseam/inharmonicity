@@ -242,7 +242,6 @@ pub(crate) fn run_engine(
             &frame,
             &profiles,
             gr.state == SignalState::Silence,
-            gr.state == SignalState::Stable,
             gr.is_new_onset,
             gr.is_transient_bypass,
             Some(key),

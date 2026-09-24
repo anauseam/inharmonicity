@@ -46,8 +46,8 @@ belongs here.
 
 | Mode | What it reports | Reproduces | Input |
 | --- | --- | --- | --- |
-| `lock [ROOT]` | end-to-end auto-lock validation, M-of-N included | report 0010; piano-1 **81/87** | a capture set |
-| `from-onset [ROOT]` | Stage-A's winner on every hop from the onset, gate ignored — what the `Stable` wait buys, per register | report 0003 (2026-09-02 amendment) | a capture set (needs `audio_full_event.raw`) |
+| `lock [ROOT]` | end-to-end auto-lock validation, M-of-N included | report 0020; piano-1 **82/87** | a capture set |
+| `from-onset [ROOT]` | Stage-A's winner on every hop from the onset, gate ignored — per-hop identification by register, with the hops the gate calls `Stable` marked | report 0003 (2026-09-02 amendment) | a capture set (needs `audio_full_event.raw`) |
 | `dump <AUDIO>` | per-frame STFT, peaks and TWM scores to `spectrum.csv` / `peaks.csv`; `goertzel.csv` under `cargo lab-telemetry` | report 0002 | one `.raw` |
 | `reach [NAME Q R RHO]…` | 1 ¢-resolution detuning reach of the lock | report 0006 pitch-raise reach (canonical 78 ¢, conservative 69 ¢) — re-run after the jacobsen fix reproduced both exactly, so the harness is peak-estimator-independent | none (synthetic) |
 | `nsga2 [--serve]` | the synthetic dataset generator and discovery fitness harness | report 0001; `--serve` is `tuner-lab/scripts/optimize_twm.py`'s protocol | none (synthetic) |
@@ -96,8 +96,9 @@ The evaluator can also be driven directly (one trial per stdin line):
 | `plot <PATH>` | the gate's verdict drawn per capture to `gatekeeper.png` — the waveform shaded by state; NHWRSF, RMS and sustain stability against their thresholds — and the wait from onset to `Stable` per register | — | one capture or a set; `--profile`, `--silence`, `--nhwrsf`, `--sustain` and `--out` |
 | `sparsity [ROOT]` | our sustain-stability gate against faithful Mounir NINOS² variants | faithfulness audit 05 | a capture set |
 
-The third gatekeeper measurement — what the `Stable` wait actually buys — is
-`engine from-onset`, which needs the engine's own Stage-A scan.
+The third gatekeeper measurement — how well Stage-A names the key on each hop
+before and after `Stable` — is `engine from-onset`, which needs the engine's
+own Stage-A scan.
 
 ## `mat` — the Worker's (f₀, B) estimator
 

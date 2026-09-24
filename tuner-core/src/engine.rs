@@ -13,9 +13,9 @@ use crate::models::{KeyProfile, MAX_PARTIALS, SpectralPeak};
 use crate::pipeline::ProcessingFrame;
 
 // Binary integration (Schwartz 1956, IRE Trans. IT 2(4); Shnidman 1998, IEEE
-// Trans. AES 34(3)): lock the first key to win ≥ M of the last N Stable-frame
-// scans. M > N/2, so at most one key can hold M votes. (7, 8) costs ≈ 93 ms of
-// latency against (5, 6)'s ≈ 46 ms, for its accuracy.
+// Trans. AES 34(3)): lock the first key to win ≥ M of the last N scans. M > N/2,
+// so at most one key can hold M votes. (7, 8) costs ≈ 93 ms of latency against
+// (5, 6)'s ≈ 46 ms, for its accuracy.
 // report 0010
 const LOCK_VOTES_M: usize = 7;
 const LOCK_WINDOW_N: usize = 8;
@@ -93,8 +93,8 @@ struct PartialTracker {
 pub struct Engine {
     pub sample_rate: u32,
     pub identified_key: Option<u8>,
-    /// Ring buffer of the last `LOCK_WINDOW_N` Stable-frame discovery winners,
-    /// with its fill length and write cursor.
+    /// Ring buffer of the last `LOCK_WINDOW_N` discovery winners, with its fill
+    /// length and write cursor.
     lock_window: [u8; LOCK_WINDOW_N],
     lock_window_len: usize,
     lock_window_head: usize,
@@ -137,11 +137,11 @@ impl Engine {
         }
     }
 
-    /// Records a Stable-frame discovery winner and returns whether `key` now holds
+    /// Records a frame's discovery winner and returns whether `key` now holds
     /// `LOCK_VOTES_M` of the last `LOCK_WINDOW_N` votes. A partly filled window
     /// locks after M straight votes, and M > N/2 makes testing the recorded key
     /// alone exact.
-    fn record_stable_winner(&mut self, key: u8) -> bool {
+    fn record_winner(&mut self, key: u8) -> bool {
         self.lock_window[self.lock_window_head] = key;
         self.lock_window_head = (self.lock_window_head + 1) % LOCK_WINDOW_N;
         if self.lock_window_len < LOCK_WINDOW_N {
@@ -168,13 +168,11 @@ impl Engine {
     /// `profiles` is the per-key template table discovery scores against.
     // Gate state arrives as booleans rather than a `GateResult`, so the engine
     // does not depend on the gatekeeper.
-    #[allow(clippy::too_many_arguments)]
     pub fn process(
         &mut self,
         frame: &ProcessingFrame,
         profiles: &[KeyProfile; 88],
         is_silence: bool,
-        is_stable: bool,
         is_new_onset: bool,
         is_transient_bypass: bool,
         target_note: Option<u8>,
@@ -210,13 +208,9 @@ impl Engine {
         let bass_magnitudes = &frame.bass_magnitude_buffer[..mag_count_bass];
 
         // ── Discovery State ──
+        // The window fills on Unstable frames too, and a commit still needs 7 of 8.
+        // report 0020
         if self.identified_key.is_none() {
-            // Auto mode votes on Stable frames only, and a non-Stable frame leaves
-            // the window intact. A manual target locks at once.
-            if target_note.is_none() && !is_stable {
-                return None;
-            }
-
             // Neyman–Pearson peak floor for white Gaussian noise (Kay 1998,
             // Fundamentals of Statistical Signal Processing, eq. 7.26):
             // P_fa = exp(−T²/p_bin), so T = √(−p_bin·ln P_fa), with p_bin = σ²·Σw² for
@@ -261,7 +255,7 @@ impl Engine {
 
                     // A key that locks is this frame's winner (M > N/2), so the
                     // scale and error are this scan's.
-                    let locked = self.record_stable_winner(res.key_index);
+                    let locked = self.record_winner(res.key_index);
 
                     (res.key_index, locked, res.scale, res.error)
                 };
@@ -416,6 +410,9 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::SAMPLE_RATE;
+    use crate::gatekeeper::SignalState::{self, Silence, Stable, Unstable};
+    use crate::models::{NOTES, get_expected_beta};
     use std::collections::VecDeque;
 
     // The reference M-of-N rule: a port of `eval_rule` in `replay_lock_rules.py`,
@@ -435,12 +432,12 @@ mod tests {
         None
     }
 
-    /// Feed a winner sequence through the engine's ring-buffer voter as if every
-    /// frame were Stable, returning where it first locks.
+    /// Feed a winner sequence through the engine's ring-buffer voter, one vote per
+    /// frame, returning where it first locks.
     fn engine_lock(seq: &[u8]) -> Option<(u8, usize)> {
         let mut e = Engine::new(44100);
         for (t, &w) in seq.iter().enumerate() {
-            if e.record_stable_winner(w) {
+            if e.record_winner(w) {
                 return Some((w, t));
             }
         }
@@ -481,29 +478,92 @@ mod tests {
         // lock — the six pre-eviction fives no longer contribute.
         let mut e = Engine::new(44100);
         for _ in 0..(LOCK_VOTES_M - 1) {
-            assert!(!e.record_stable_winner(5));
+            assert!(!e.record_winner(5));
         }
         for i in 0..LOCK_WINDOW_N {
             let filler = if i % 2 == 0 { 9 } else { 8 };
-            assert!(!e.record_stable_winner(filler));
+            assert!(!e.record_winner(filler));
         }
         for _ in 0..(LOCK_VOTES_M - 1) {
-            assert!(!e.record_stable_winner(5));
+            assert!(!e.record_winner(5));
         }
-        assert!(e.record_stable_winner(5)); // Mth five of the fresh run → lock
+        assert!(e.record_winner(5)); // Mth five of the fresh run → lock
     }
 
     #[test]
     fn reset_clears_accumulated_votes() {
         let mut e = Engine::new(44100);
         for _ in 0..(LOCK_VOTES_M - 1) {
-            assert!(!e.record_stable_winner(5));
+            assert!(!e.record_winner(5));
         }
         e.reset_lock_window();
         // Post-reset, the full M straight frames are required again.
         for _ in 0..(LOCK_VOTES_M - 1) {
-            assert!(!e.record_stable_winner(5));
+            assert!(!e.record_winner(5));
         }
-        assert!(e.record_stable_winner(5));
+        assert!(e.record_winner(5));
+    }
+
+    /// One bass window of `profile`'s first twelve template partials at 1/n
+    /// amplitude, transformed as the pipeline transforms it.
+    fn note_frame(profile: &KeyProfile) -> ProcessingFrame {
+        let mut frame = ProcessingFrame::new();
+        for (t, s) in frame.audio_buffer[..BASS_WINDOW_SIZE]
+            .iter_mut()
+            .enumerate()
+        {
+            let seconds = t as f32 / SAMPLE_RATE as f32;
+            *s = (0..profile.valid_partial_count.min(12))
+                .map(|i| {
+                    let f = profile.predicted_partials[i];
+                    (2.0 * core::f32::consts::PI * f * seconds).sin() / (i as f32 + 1.0)
+                })
+                .sum();
+        }
+        let plan = realfft::RealFftPlanner::<f32>::new().plan_fft_forward(BASS_WINDOW_SIZE);
+        spectral::fft(
+            &frame.audio_buffer[..BASS_WINDOW_SIZE],
+            &mut frame.time_buffer[..BASS_WINDOW_SIZE],
+            &mut frame.bass_frequency_buffer[..],
+            &plan,
+            BASS_WINDOW_SIZE,
+        );
+        spectral::magnitude_spectrum(
+            &frame.bass_frequency_buffer[..],
+            BASS_WINDOW_SIZE,
+            &mut frame.bass_magnitude_buffer[..BASS_WINDOW_SIZE / 2],
+        );
+        frame
+    }
+
+    #[test]
+    fn unstable_frames_vote_and_silence_clears() {
+        let profiles: [KeyProfile; 88] = core::array::from_fn(|k| {
+            KeyProfile::new(NOTES[k].frequency, get_expected_beta(k as u8))
+        });
+        let key = 39; // C4
+        let frame = note_frame(&profiles[key]);
+
+        // The frame on which the engine locks, fed each verdict as the pipeline
+        // reduces it; every frame is the same note, so every vote agrees.
+        let lock_frame = |states: &[SignalState]| {
+            let mut e = Engine::new(SAMPLE_RATE);
+            e.noise_floor = 0.001;
+            states.iter().position(|&s| {
+                e.process(&frame, &profiles, s == Silence, false, false, None);
+                e.identified_key
+                    .inspect(|&k| assert_eq!(k as usize, key))
+                    .is_some()
+            })
+        };
+
+        // Four Unstable frames, then Stable: the seventh vote commits.
+        let mut states = vec![Unstable; 4];
+        states.extend([Stable; 6]);
+        assert_eq!(lock_frame(&states), Some(LOCK_VOTES_M - 1));
+
+        // Silence after the fourth clears the window, and six votes do not commit.
+        states.insert(4, Silence);
+        assert_eq!(lock_frame(&states), None);
     }
 }

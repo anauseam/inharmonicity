@@ -374,12 +374,10 @@ pub fn run(args: DumpArgs) -> Result<()> {
         // writes to peaks.csv is the raw `discover()` output, and the lock rule
         // is replayed offline by validate_config.py / replay_lock_rules.py.
         let is_silence = gate_result.state == tuner_core::gatekeeper::SignalState::Silence;
-        let is_stable = gate_result.state == tuner_core::gatekeeper::SignalState::Stable;
         let pitch_result = engine.process(
             &processing_frame,
             &profiles_array,
             is_silence,
-            is_stable,
             gate_result.is_new_onset,
             gate_result.is_transient_bypass,
             Some(winning_key),

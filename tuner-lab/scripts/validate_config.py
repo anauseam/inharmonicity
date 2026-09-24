@@ -2,14 +2,16 @@
 """Score a TWM constant set against the real diagnostic captures — pass/fail per
 key, dependency-free (stdlib csv only; no pandas/matplotlib).
 
-Replicates the engine's lock logic exactly: merge gatekeeper + engine per frame,
+Replays the lock logic report 0010 measured: merge gatekeeper + engine per frame,
 keep only 'Stable' frames, then apply the M-of-N (binary-integration) lock rule
 — lock the first key to win >= M of the last N stable-frame winners (`key_idx`),
 Schwartz 1956 / Shnidman 1998 — and compare to the folder-name ground truth.
 This is the Phase 5 real-data gate. The shipped rule is (M, N) = (7, 8) for the
 refined path (report 0010); `--lock-m 3 --lock-n 3` reproduces the old
 3-consecutive rule. The rule here is identical to `replay_lock_rules.py`'s
-`eval_rule` and `Engine::record_stable_winner`.
+`eval_rule` and `Engine::record_winner`, but the engine's window also fills on
+'Unstable' frames (report 0020), so `cargo lab engine lock` is the engine's
+figure and this is report 0010's.
 
 Usage:
   python3 tuner-lab/scripts/validate_config.py [--refine] [--config "p q r rho lambda"]
@@ -28,7 +30,7 @@ GATE = [LAB, "gatekeeper", "dump"]
 
 def mofn_lock(winners, m, n):
     """First key to win >= m of the last n winners (deque(maxlen=n)); identical
-    to replay_lock_rules.py eval_rule and the engine's record_stable_winner.
+    to replay_lock_rules.py eval_rule and the engine's record_winner.
     m > n/2 => at most one key can hold >= m votes. Returns the key or None."""
     win = deque(maxlen=n)
     counts = Counter()

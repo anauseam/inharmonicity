@@ -169,22 +169,22 @@ each hop:
 ┌─ 3 Gatekeeper ───────────────┐ GateResult   ┌─ 5 Engine ─────────────────────┐
 │ Silence   RMS EMA under the  ├─ reset all ─►│ [A] Discovery                  │
 │           silence threshold  │              │     TWM over the bass peaks;   │
-│ onset     flux (NHWRSF) over ├─ drop lock ─►│     one vote per Stable hop,   │
+│ onset     flux (NHWRSF) over ├─ drop lock ─►│     one vote per hop,          │
 │           its threshold      │              │     locks at 7 of the last 8   │
-│ Stable    stability over its ├─ vote ──────►│                                │
-│           threshold, 4 hops  ├──────────┐   ├──────────── ▼ lock ────────────┤
-│ Unstable  not yet settled    ├─ track ──┴──►│ [B] Tracking                   │
+│ Stable    stability over its ├─┬─ vote ────►│                                │
+│           threshold, 4 hops  │ │            ├──────────── ▼ lock ────────────┤
+│ Unstable  not yet settled    ├─┴─ track ───►│ [B] Tracking                   │
 │ An onset is a per-hop flag,  │              │     a Goertzel phase vocoder   │
 │ not a state.                 │              │     on each tracked partial    │
 └──────────────────────────────┘              └────────────────────────────────┘
 ```
 
-The pipeline hands the Engine each hop's `GateResult`, its state and onset flag.
-Silence sends the Engine back to discovery with its trackers cleared; an onset
-drops the lock and skips its hop. Only Stable hops vote, and once the lock lands
-every hop that is neither silent nor an onset is tracked. A key the user selects
-skips the vote and locks at once. The full state rules are in `gatekeeper.rs`'s
-module doc.
+The pipeline hands the Engine two things from each hop's `GateResult`: whether it
+is Silence, and its onset flag. Silence sends the Engine back to discovery with
+its trackers cleared; an onset drops the lock and skips its hop. Unstable and
+Stable hops both vote, and once the lock lands every hop that is neither silent
+nor an onset is tracked. A key the user selects skips the vote and locks at
+once. The full state rules are in `gatekeeper.rs`'s module doc.
 
 **The Gatekeeper and capture.** What the same verdicts do to the capture
 lifecycle:
@@ -366,7 +366,7 @@ The major DSP components and their foundations:
 - **Note Discovery**: Maher & Beauchamp (1994) Two-Way Mismatch, scored on spectral peaks and searched coarse to fine; its amplitude terms ($q$, $r$) are ours, tuned by an NSGA-II sweep (report 0006). A stiff string's f₀ is a parameter of its partial series, not the frequency of any one line, and in the bass only the series separates neighbouring keys: at A0 a semitone is 1.6 Hz against a 5.4 Hz bin, and the gap grows with partial number. TWM is a published series scorer that has worked here so far, not one shown to be best; MAT stays on the Worker. Reopens on a labelled in-scope corpus with trustworthy truth, on polyphony, or on systematic *B*-mismatch in the discovery residuals (report 0005)
 - **Detection thresholds**: Kay (1998) Neyman–Pearson amplitude threshold, with σ taken to be the silence threshold — discovery's peak gate, the tracker's per-partial gate and the strobe bank's per-reference gate. Nothing measures the room's noise; that threshold is 1.5 × the loudest ambient RMS seen at calibration, or whatever the operator sets
 - **Sympathetic Noise Rejection**: `mask_peaks` — our own critical-band masking heuristic (empirically validated in report 0002; the global magnitude gate adapts Cano 1998), with a Duan et al. (2010) topological ceiling on the reverse TWM error term
-- **Temporal lock**: M-of-N binary integration at (7, 8), a published nonparametric rule — Schwartz (1956) / Shnidman (1998), validated on two instruments in report 0010. The attack transient wins a first-to-3 race; a window that outlasts it recovers the note body's plurality, the largest single lever measured on the discovery side. Reopens on the post-tuning re-replay; release and re-lock hysteresis are deliberately unspecified
+- **Temporal lock**: M-of-N binary integration at (7, 8), a published nonparametric rule — Schwartz (1956) / Shnidman (1998), validated on two instruments in report 0010; its window fills from the onset, and every commit measured still lands on a `Stable` frame (report 0020). The attack transient wins a first-to-3 race; a window that outlasts it recovers the note body's plurality, the largest single lever measured on the discovery side. Reopens on the post-tuning re-replay; release and re-lock hysteresis are deliberately unspecified
 - **Partial tracking** (Locked): Goertzel phase vocoder — McAulay & Quatieri (1986) instantaneous frequency, with an adaptive re-centring of each partial's evaluation frequency that is ours, after Dolson (1986)
 - **Inharmonicity**: Hodgkinson (2009) Median-Adjustive Trajectories (MAT) — serial trajectory growth, with Short & Garcia (2006) Complex Spectral Phase Evolution (CSPE) sub-bin refinement
 - **Tuning curve** (cold path): Rigaud, David & Daudet (2013) parametric inharmonicity-and-tuning model — the $B_\xi$ fit and the $\rho_\varphi$ octave-type curve; Giordano (2015) sensory-dissonance octave-width recipe (Plomp–Levelt roughness in the Sethares parametrization) as the perceptual layer; Whittaker (1923) / Eilers (2003) smoother for the per-key residual

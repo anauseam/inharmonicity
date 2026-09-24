@@ -19,14 +19,14 @@ pub struct Cmd {
 #[derive(Subcommand)]
 enum Mode {
     /// End-to-end auto-lock validation, M-of-N rule included. Piano #1
-    /// reproduces 81/87 (report 0010); a change there is an integration bug.
+    /// gives 82/87 (report 0020); a change there is an integration bug.
     Lock {
         /// Capture-set root.
         #[arg(default_value = "diagnostics_piano_1")]
         root: PathBuf,
     },
     /// Stage-A's winner scored on every hop from the onset, gate ignored —
-    /// what the gatekeeper's `Stable` wait buys, per register (report 0003).
+    /// per-hop identification by register, `Stable` hops marked (report 0003).
     FromOnset {
         /// Capture-set root.
         #[arg(default_value = "diagnostics_piano_1")]

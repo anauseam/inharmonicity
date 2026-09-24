@@ -734,7 +734,6 @@ impl AudioPipeline {
 
         let gate_result = self.gatekeeper.process_frame(&self.processing_frame);
         let is_silence = gate_result.state == SignalState::Silence;
-        let is_stable = gate_result.state == SignalState::Stable;
 
         store_f32(&self.atomics.runtime.current_rms_ema, gate_result.rms_ema);
         store_f32(&self.atomics.runtime.current_nhwrsf, gate_result.nhwrsf);
@@ -765,7 +764,6 @@ impl AudioPipeline {
             &self.processing_frame,
             &self.live_profiles,
             is_silence,
-            is_stable,
             gate_result.is_new_onset,
             gate_result.is_transient_bypass,
             target_note,

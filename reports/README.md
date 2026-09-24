@@ -166,7 +166,7 @@ number is never reused.
 | 0007 | [`0007-tuning-curve-regularization-geometry.md`](0007-tuning-curve-regularization-geometry.md) | prior-mean reversion, ℓ = 12 keys; minimum-norm chain gauge | `curves.rs` `REVERSION_LENGTH_KEYS`, `per_key_smoothed` |
 | 0008 | [`0008-giordano-layer-fidelity-derived-weights.md`](0008-giordano-layer-fidelity-derived-weights.md) | coincidence-bracket scan, the §VI.C gate, LOO-CV + 1-SE, derived interval weights | `curves.rs` `GIORDANO_MIN_COINCIDENT_PAIRS`, `select_rho_reg_weight`; `giordano.rs` `SCAN_MARGIN_CENTS` |
 | 0009 | [`0009-repeat-capture-noise-decomposition.md`](0009-repeat-capture-noise-decomposition.md) | inverse-variance ln-*B* shrinkage replaces the hard partial-count switch | `curves.rs` `SIGMA_LNB_COEFF`, `sigma_ln_b` |
-| 0010 | [`0010-m-of-n-lock-rule-replay.md`](0010-m-of-n-lock-rule-replay.md) | the acquisition lock is M-of-N binary integration at (7, 8) | `ARCHITECTURE.md` § DSP foundations; `engine.rs` `record_stable_winner` |
+| 0010 | [`0010-m-of-n-lock-rule-replay.md`](0010-m-of-n-lock-rule-replay.md) | the acquisition lock is M-of-N binary integration at (7, 8) | `ARCHITECTURE.md` § DSP foundations; `engine.rs` `record_winner` |
 | 0011 | [`0011-coarse-spectral-readout.md`](0011-coarse-spectral-readout.md) | a bounded OS-CFAR readout replaces the tracker fallback; *n\** = 4 below key 16; an 8-hop debounce | `peaks.rs` coarse block; `curves.rs` `COARSE_READ_FUNDAMENTAL_KEY`; `app/strobe.rs` `BAND_UNWRAP_MARGIN_HZ` |
 | 0012 | [`0012-unison-line-estimator.md`](0012-unison-line-estimator.md) | strings resolve as spectral lines: zoom DFT, OS-CFAR, a Rohling-derived record floor, 1024 window; the χ² test is not shipped | `strobe/unison.rs`; `peaks.rs` `UNISON_*` |
 | 0013 | [`0013-bass-extra-lines-attribution.md`](0013-bass-extra-lines-attribution.md) | the bass stays in unison assist; the discriminator withholds the claim per key | `strobe/unison.rs` module doc |
@@ -176,6 +176,7 @@ number is never reused.
 | 0017 | — | two FFTs per hop | `ARCHITECTURE.md` § Decisions |
 | 0018 | — | one owner for `CaptureState` | `ARCHITECTURE.md` § Decisions |
 | 0019 | [`0019-dc-blocker-corner.md`](retiring/0019-dc-blocker-corner.md) | the DC blocker's 35 Hz corner stays; change the order, not α | `audio.rs` `DC_BLOCK_ALPHA` |
+| 0020 | [`0020-vote-from-onset.md`](0020-vote-from-onset.md) | the lock's window fills from the onset, not from `Stable`; a commit still lands on a `Stable` frame | `ARCHITECTURE.md` § DSP foundations; `engine.rs` `Engine::process` |
 
 Standalone, with no number: [`tuning-curve-grounding.md`](tuning-curve-grounding.md),
 [`nsga2/`](nsga2/README.md) (the sweep's method and its runs), and
