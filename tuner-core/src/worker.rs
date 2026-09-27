@@ -50,7 +50,8 @@ pub enum WorkerJob {
 }
 
 /// Every engine's curve from one [`CurveJob`], so a frontend switches engines
-/// without a recompute. Derived, never persisted.
+/// without a recompute, and discovery's templates from the same input. Derived,
+/// never persisted.
 #[derive(Debug, Clone)]
 pub struct CurveBundle {
     pub generation: u64,
@@ -67,6 +68,9 @@ pub struct CurveBundle {
     /// Per-key displayed strobe partial n* ([`curves::select_display_partials`]),
     /// computed from the same input as the curves, so the two never disagree.
     pub display_partials: [u8; 88],
+    /// Discovery's template B per key: [`curves::template_b_fit`]'s curve at each
+    /// key, one curve over the whole compass whatever subset of keys is measured.
+    pub template_b: [f32; 88],
 }
 
 impl CurveBundle {
@@ -81,11 +85,12 @@ impl CurveBundle {
         }
     }
 
-    /// Runs every engine at [`CurveParams::default()`]. A cold path: ≈ 1.4 s,
+    /// Runs every engine at [`CurveParams::default()`]. A cold path: ≈ 1.1 s,
     /// most of it (c)'s Giordano scans.
     pub fn compute(job: &CurveJob) -> Self {
         let input = &job.input;
         let params = CurveParams::default();
+        let template_bxi = curves::template_b_fit(input);
         Self {
             generation: job.generation,
             rigaud_pure: curves::rigaud_pure(input, &params),
@@ -99,6 +104,7 @@ impl CurveBundle {
                 None,
             ),
             display_partials: curves::select_display_partials(input),
+            template_b: core::array::from_fn(|k| template_bxi.b_at_key(k) as f32),
         }
     }
 }

@@ -399,7 +399,79 @@ pub fn instrument_b_fit(input: &CurveInput) -> BXi {
         .enumerate()
         .filter_map(|(k, d)| d.as_ref().map(|d| (midi_from_key(k), d.b)))
         .collect();
-    rigaud::fit_b_xi(&points).unwrap_or(BXi::DEFAULT_MEDIUM)
+    rigaud::fit_b_xi(&points, None).unwrap_or(BXi::DEFAULT_MEDIUM)
+}
+
+// ─── Discovery templates ─────────────────────────────────────────────────────
+
+/// Fewest partials a measurement carries to enter the discovery templates' fit.
+// Repeat captures of one key scatter in ln B by 27 % at 4–5 partials, 8 % at 6–7
+// and 2.2 % from 8 up; templates stretched by top-octave values under the floor
+// lost locks.
+// report 0021
+pub const TEMPLATE_MIN_PARTIALS: usize = 8;
+
+/// A measured key is a point of the templates' fit only if its B is at least this
+/// many times the treble term e^(S_T m + Y_T) of the Rigaud B_ξ(m) model (Eqs. 7–8).
+/// The model is a bass term plus a treble term, and the treble term is the same for
+/// every piano, so the fit sets only the bass term, and only from keys where it is
+/// at least half of B.
+// If a key's B comes mostly from the treble term, the part above that term says
+// little about the bass term, and matching it anyway throws the bass term far off
+// at A0: on mid or treble keys alone, A0 landed at 0.08× to 224× the default. This
+// filter is the project's. 2 is not tuned: at 2 a point's bass and treble terms
+// are equal.
+// report 0021
+pub const TEMPLATE_MIN_B_OVER_TREBLE: f64 = 2.0;
+
+/// Fewest keys the fit's points must cover, lowest to highest inclusive, for the
+/// fit to estimate the slope s_B as well as the intercept y_B.
+// Points close together fix the bass term's level but not its slope: two adjacent
+// keys fitted s_B four times too shallow and lost locks. Twelve keeps both
+// parameters on every complete profile read.
+// report 0021
+pub const TEMPLATE_SLOPE_SPAN_KEYS: usize = 12;
+
+/// The bass pair of discovery's templates ([`KeyProfile`](crate::models::KeyProfile)),
+/// fitted to the instrument. Every template's B is Rigaud's whole-compass model
+/// B_ξ̂(m) (Eqs. 7–8) at its key, so every template follows one curve whatever
+/// subset of keys is measured, and no template is a key's own measurement.
+///
+/// A key enters the fit through the one measurement [`CurveInput::keys`] holds for
+/// it (from [`CurveInput::from_profile`], its newest trusted capture) when that
+/// carries at least [`TEMPLATE_MIN_PARTIALS`] partials, and is a point of the fit
+/// when its B reaches [`TEMPLATE_MIN_B_OVER_TREBLE`] times the treble term. Fewer
+/// than two points keep [`BXi::DEFAULT_MEDIUM`]; points covering fewer than
+/// [`TEMPLATE_SLOPE_SPAN_KEYS`] keys fit the intercept alone at the default slope,
+/// since two points close together fix the bass term's level and not its slope.
+///
+/// # References
+/// Rigaud, F., David, B., & Daudet, L. (2013). "A parametric model and estimation
+/// techniques for the inharmonicity and tuning of the piano". JASA 133(5),
+/// 3107–3118. DOI: 10.1121/1.4799806 (Eqs. 7–8, 29).
+pub fn template_b_fit(input: &CurveInput) -> BXi {
+    // The fit's points (m, B): admitted keys whose B reaches
+    // TEMPLATE_MIN_B_OVER_TREBLE times the treble term of Eq. 8.
+    let points: Vec<(f64, f64)> = input
+        .keys
+        .iter()
+        .enumerate()
+        .filter_map(|(k, d)| {
+            let d = d
+                .as_ref()
+                .filter(|d| d.partials.len() >= TEMPLATE_MIN_PARTIALS)?;
+            let m = midi_from_key(k);
+            let treble = (rigaud::S_T * m + rigaud::Y_T).exp();
+            (d.b >= TEMPLATE_MIN_B_OVER_TREBLE * treble).then_some((m, d.b))
+        })
+        .collect();
+    let covered = match (points.first(), points.last()) {
+        (Some(&(lo, _)), Some(&(hi, _))) => (hi - lo) as usize + 1,
+        _ => 0,
+    };
+    // Eq. 29 over both parameters, or over y_B alone at the default slope.
+    let held_slope = (covered < TEMPLATE_SLOPE_SPAN_KEYS).then_some(BXi::DEFAULT_MEDIUM.s_b);
+    rigaud::fit_b_xi(&points, held_slope).unwrap_or(BXi::DEFAULT_MEDIUM)
 }
 
 /// What every engine starts from: the instrument's curve-side B, after the
@@ -1202,7 +1274,9 @@ pub fn coarse_read_partial(key_index: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{InharmonicityProfile, KeyMeasurement, Partial};
+    use crate::models::{
+        InharmonicityProfile, KeyMeasurement, Partial, SoundingStrings, get_expected_beta,
+    };
 
     /// Fallback display-partial table: values from the TuneLab default
     /// set, monotone non-increasing across the compass, fundamental from A4
@@ -1467,7 +1541,7 @@ mod tests {
         let mut profile = synth_profile(0..88);
         for entries in profile.measurements.values_mut() {
             for m in entries {
-                m.sounding_strings = Some(crate::models::SoundingStrings::UNDECLARED.toggled(1));
+                m.sounding_strings = Some(SoundingStrings::UNDECLARED.toggled(1));
             }
         }
         assert_eq!(CurveInput::from_profile(&profile).measured_count(), 0);
@@ -1664,5 +1738,321 @@ mod tests {
                 b.cents[k]
             );
         }
+    }
+
+    // ─── Discovery templates ─────────────────────────────────────────────────
+
+    /// One trusted capture of `key` with measured B `b` and `partials` partials.
+    fn capture(key: u8, b: f32, partials: u32) -> KeyMeasurement {
+        let f0 = NOTES[key as usize].frequency;
+        KeyMeasurement {
+            key_index: key,
+            measured_f0: f0,
+            partials: (1..=partials)
+                .map(|n| Partial {
+                    number: n,
+                    frequency: n as f32 * f0,
+                    amplitude: 1.0,
+                })
+                .collect(),
+            calculated_b: Some(b),
+            last_captured: String::new(),
+            captured_in_auto: false,
+            sounding_strings: None,
+        }
+    }
+
+    /// A recorded fit: its points, as (key, B's f64 bits), and the fitted pair's
+    /// bits.
+    // The fits report 0021 records, at full precision.
+    struct RecordedFit {
+        points: &'static [(usize, u64)],
+        pair: (u64, u64),
+    }
+
+    impl RecordedFit {
+        /// An input measuring exactly these points, one capture each at 32
+        /// partials.
+        fn input(&self) -> CurveInput {
+            let mut input = CurveInput::default();
+            for &(k, b) in self.points {
+                let f0 = f64::from(NOTES[k].frequency);
+                input.keys[k] = Some(CurveKeyData {
+                    b: f64::from_bits(b),
+                    f0,
+                    partials: (1..=32).map(|n| (n, f64::from(n) * f0, 1.0)).collect(),
+                });
+            }
+            input
+        }
+
+        fn midi_b(&self) -> Vec<(f64, f64)> {
+            self.points
+                .iter()
+                .map(|&(k, b)| (midi_from_key(k), f64::from_bits(b)))
+                .collect()
+        }
+    }
+
+    /// Piano #2, every bass-bridge key: 25 points, fitted pair (-0.0608, -6.373).
+    const PIANO2: RecordedFit = RecordedFit {
+        points: &[
+            (0, 0x3f3ed26460000000),
+            (1, 0x3f3e404920000000),
+            (2, 0x3f3b751920000000),
+            (3, 0x3f3943ab60000000),
+            (4, 0x3f39435580000000),
+            (5, 0x3f37bc5360000000),
+            (6, 0x3f369bdac0000000),
+            (7, 0x3f35f0ebc0000000),
+            (8, 0x3f34110120000000),
+            (9, 0x3f34cf7480000000),
+            (10, 0x3f33a84660000000),
+            (11, 0x3f338da820000000),
+            (12, 0x3f33f9c5a0000000),
+            (13, 0x3f33a99980000000),
+            (14, 0x3f2e1a1ba0000000),
+            (15, 0x3f2d01dc00000000),
+            (16, 0x3f2d6c12c0000000),
+            (17, 0x3f2ca18c80000000),
+            (18, 0x3f29d27e60000000),
+            (19, 0x3f2a350c20000000),
+            (20, 0x3f279fc840000000),
+            (21, 0x3f2509e5a0000000),
+            (22, 0x3f2524c720000000),
+            (23, 0x3f264d2930000000),
+            (24, 0x3f28a44660000000),
+        ],
+        pair: (0xbfaf22be0589acbc, 0xc0197e0f3cb3e574),
+    };
+    /// Piano #2, two adjacent bass keys (C1, C#1): 2 points, fitted pair (-0.0141, -7.551).
+    const PIANO2_ADJACENT: RecordedFit = RecordedFit {
+        points: &[(3, 0x3f3943ab60000000), (4, 0x3f39435580000000)],
+        pair: (0xbf8ceb463497b73b, 0xc01e3434c1a8ac5c),
+    };
+    /// Piano #2, two bass keys four apart (A1, C#2): 2 points, fitted pair (-0.0994, -4.903).
+    const PIANO2_FOUR_APART: RecordedFit = RecordedFit {
+        points: &[(12, 0x3f33f9c5a0000000), (16, 0x3f2d6c12c0000000)],
+        pair: (0xbfb971d4a0477a5a, 0xc0139c30d306a2b1),
+    };
+    /// The RWC Yamaha: 21 points, fitted pair (-0.0814, -6.670).
+    const RWC_YAMAHA: RecordedFit = RecordedFit {
+        points: &[
+            (0, 0x3f2f37b732210680),
+            (1, 0x3f2e7b24d64f8ab3),
+            (2, 0x3f2dca3fe792191e),
+            (3, 0x3f27d8b21ade3f73),
+            (4, 0x3f284295e07f41b7),
+            (5, 0x3f27fc8082930b14),
+            (6, 0x3f23febd455267ff),
+            (7, 0x3f240ac59f0fb400),
+            (8, 0x3f21b6441ee6be9c),
+            (9, 0x3f21f1c8426e2084),
+            (10, 0x3f1aa2c1ab1785ad),
+            (11, 0x3f1b6b377bd840b1),
+            (12, 0x3f1aa42207069c8c),
+            (13, 0x3f1964cb9eb3e6a0),
+            (14, 0x3f1a54e7a54b9799),
+            (15, 0x3f1a8b29ffd9c5a9),
+            (16, 0x3f19206bbd08d0b1),
+            (17, 0x3f1b404a096ed7ba),
+            (18, 0x3f1ae34c944ded58),
+            (19, 0x3f19df14f3092609),
+            (20, 0x3f1caa4eab5b4e5f),
+        ],
+        pair: (0xbfb4d3b1e726a391, 0xc01aadad96a6a012),
+    };
+    /// The RWC Bösendorfer: 15 points, fitted pair (-0.0095, -9.903).
+    const RWC_BOSENDORFER: RecordedFit = RecordedFit {
+        points: &[
+            (0, 0x3f10491910aca767),
+            (1, 0x3f0c0ad441a5afaf),
+            (2, 0x3f0b4912e1b8a5fc),
+            (3, 0x3f0aa65aae5d872b),
+            (4, 0x3f0acf327ca8081c),
+            (5, 0x3f090cbb2a3025c8),
+            (6, 0x3f06dd446fc2c4da),
+            (7, 0x3f0d1a7de9bf93ab),
+            (8, 0x3f0d0f51e08eaf6f),
+            (9, 0x3f0c7a6e236c2ab7),
+            (10, 0x3f0ae7848182123e),
+            (11, 0x3f08c4417d7d5ab9),
+            (17, 0x3f1de615415c760b),
+            (18, 0x3f1c023318d8aa56),
+            (19, 0x3f1a0bf29e9f77c5),
+        ],
+        pair: (0xbf836e4aa80b93fb, 0xc023ce6f3f52fc27),
+    };
+    /// The RWC Steinway: 11 points, fitted pair (-0.1397, -5.982).
+    const RWC_STEINWAY: RecordedFit = RecordedFit {
+        points: &[
+            (0, 0x3f22c117b5c7d938),
+            (1, 0x3f21ee1839c63efb),
+            (2, 0x3f1c92d0413e6b4d),
+            (3, 0x3f175edcc1bf4571),
+            (4, 0x3f16d060def2a927),
+            (6, 0x3f1207571ee4337e),
+            (7, 0x3f1189f88c4d3bac),
+            (8, 0x3f1068f5613c6d30),
+            (9, 0x3f1084191739c0b4),
+            (10, 0x3f0c2edf0c7ca77c),
+            (11, 0x3f0b405720be925a),
+        ],
+        pair: (0xbfc1e0a17b0f6ad8, 0xc017edbda5119ce1),
+    };
+
+    /// Eq. 29's fit reproduces the recorded pairs bit for bit on their point
+    /// sets, and so does the templates' fit on inputs holding exactly those
+    /// points: the complete profiles, the RWC Steinway's bass bridge (A0–G♯1,
+    /// twelve keys) included, while two points closer than twelve keys keep the
+    /// default slope and fit the intercept alone.
+    // report 0021
+    #[test]
+    fn template_b_fit_reproduces_the_recorded_fits() {
+        let pair = |bxi: BXi| (bxi.s_b.to_bits(), bxi.y_b.to_bits());
+        for set in [&PIANO2, &RWC_YAMAHA, &RWC_BOSENDORFER, &RWC_STEINWAY] {
+            assert_eq!(
+                pair(rigaud::fit_b_xi(&set.midi_b(), None).unwrap()),
+                set.pair
+            );
+            assert_eq!(pair(template_b_fit(&set.input())), set.pair);
+        }
+        for set in [&PIANO2_ADJACENT, &PIANO2_FOUR_APART] {
+            assert_eq!(
+                pair(rigaud::fit_b_xi(&set.midi_b(), None).unwrap()),
+                set.pair
+            );
+            let fit = template_b_fit(&set.input());
+            assert_eq!(fit.s_b, BXi::DEFAULT_MEDIUM.s_b);
+            assert_eq!(
+                Some(fit),
+                rigaud::fit_b_xi(&set.midi_b(), Some(BXi::DEFAULT_MEDIUM.s_b))
+            );
+        }
+    }
+
+    /// The slope guard counts the keys its points cover: eleven apart is twelve
+    /// keys and fits the slope, ten apart holds it at the default.
+    // report 0021
+    #[test]
+    fn the_slope_guard_counts_covered_keys() {
+        // The upper point sits at half the lower one's multiple of the prior, so
+        // a fitted slope moves off the default and a held one cannot.
+        let slope = |lo: u8, hi: u8| {
+            let mut profile = InharmonicityProfile::default();
+            profile.record(capture(lo, 4.0 * get_expected_beta(lo), 32));
+            profile.record(capture(hi, 2.0 * get_expected_beta(hi), 32));
+            template_b_fit(&CurveInput::from_profile(&profile)).s_b
+        };
+        assert_ne!(slope(0, 11), BXi::DEFAULT_MEDIUM.s_b);
+        assert_eq!(slope(0, 10), BXi::DEFAULT_MEDIUM.s_b);
+        assert_ne!(slope(3, 15), BXi::DEFAULT_MEDIUM.s_b);
+    }
+
+    /// Below two points every template is the prior, to f32: with nothing
+    /// measured, with one bass key measured, and with mid keys too close to the
+    /// treble term to be points.
+    #[test]
+    fn fewer_than_two_bass_bridge_keys_is_the_prior() {
+        let mut one_bass_and_mids = InharmonicityProfile::default();
+        one_bass_and_mids.record(capture(3, 4.0 * get_expected_beta(3), 32));
+        for k in [30u8, 40, 50] {
+            one_bass_and_mids.record(capture(k, get_expected_beta(k), 16));
+        }
+        for input in [
+            CurveInput::default(),
+            CurveInput::from_profile(&one_bass_and_mids),
+        ] {
+            let bxi = template_b_fit(&input);
+            assert_eq!(bxi, BXi::DEFAULT_MEDIUM);
+            for k in 0..88 {
+                let (t, prior) = (bxi.b_at_key(k) as f32, get_expected_beta(k as u8));
+                assert!(
+                    ((t - prior) / prior).abs() < 1e-6,
+                    "key {k}: {t} against the prior {prior}"
+                );
+            }
+        }
+    }
+
+    /// A key is a point from [`TEMPLATE_MIN_B_OVER_TREBLE`] times the treble term
+    /// up, and not below: just above it a second point makes a fit, just below it
+    /// the one bass point left keeps the default pair.
+    // report 0021
+    #[test]
+    fn a_template_point_needs_the_minimum_b_over_treble() {
+        let fit_with = |multiple: f64| {
+            let treble = (rigaud::S_T * midi_from_key(30) + rigaud::Y_T).exp();
+            let mut profile = InharmonicityProfile::default();
+            profile.record(capture(0, 4.0 * get_expected_beta(0), 32));
+            profile.record(capture(30, (multiple * treble) as f32, 32));
+            template_b_fit(&CurveInput::from_profile(&profile))
+        };
+        assert_ne!(
+            fit_with(1.01 * TEMPLATE_MIN_B_OVER_TREBLE),
+            BXi::DEFAULT_MEDIUM
+        );
+        assert_eq!(
+            fit_with(0.99 * TEMPLATE_MIN_B_OVER_TREBLE),
+            BXi::DEFAULT_MEDIUM
+        );
+    }
+
+    /// One measured bass key leaves no hole: the pair stays the default, so its
+    /// template is not its measured B, four times the prior, beside neighbours on
+    /// the prior. Two measured keys an octave and more apart move the whole bass
+    /// with them, unmeasured keys between included.
+    // report 0021
+    #[test]
+    fn one_measured_bass_key_leaves_no_hole() {
+        let mut profile = InharmonicityProfile::default();
+        profile.record(capture(3, 4.0 * get_expected_beta(3), 32));
+        assert_eq!(
+            template_b_fit(&CurveInput::from_profile(&profile)),
+            BXi::DEFAULT_MEDIUM
+        );
+
+        profile.record(capture(15, 4.0 * get_expected_beta(15), 32));
+        let bxi = template_b_fit(&CurveInput::from_profile(&profile));
+        for k in 0..16 {
+            let ratio = bxi.b_at_key(k) as f32 / get_expected_beta(k as u8);
+            assert!((3.5..4.5).contains(&ratio), "key {k} at {ratio}× the prior");
+        }
+    }
+
+    /// The fit reads each key's newest trusted capture: an older trusted capture
+    /// with another B does not move the pair, and neither does an auto-mode
+    /// capture or a solo recorded after it.
+    // report 0021
+    #[test]
+    fn the_fit_reads_each_keys_newest_trusted_capture() {
+        let b = |k: u8| 4.0 * get_expected_beta(k);
+        let fit_of =
+            |profile: &InharmonicityProfile| template_b_fit(&CurveInput::from_profile(profile));
+        let mut newest = InharmonicityProfile::default();
+        let mut older = InharmonicityProfile::default();
+        let mut all = InharmonicityProfile::default();
+        for k in [0u8, 12, 24] {
+            newest.record(capture(k, b(k), 32));
+            older.record(capture(k, 0.5 * b(k), 32));
+            all.record(capture(k, 0.5 * b(k), 32));
+            all.record(capture(k, b(k), 32));
+            let mut auto = capture(k, 2.0 * b(k), 32);
+            auto.captured_in_auto = true;
+            all.record(auto);
+            let mut solo = capture(k, 3.0 * b(k), 32);
+            solo.sounding_strings = Some(SoundingStrings::UNDECLARED.toggled(1));
+            all.record(solo);
+        }
+        assert_ne!(fit_of(&newest), BXi::DEFAULT_MEDIUM);
+        assert_ne!(fit_of(&older), fit_of(&newest));
+        assert_eq!(fit_of(&all), fit_of(&newest));
+        // A newest capture under the partial floor leaves its key out.
+        all.record(capture(12, 0.5 * b(12), TEMPLATE_MIN_PARTIALS as u32 - 1));
+        let mut ends = InharmonicityProfile::default();
+        for k in [0u8, 24] {
+            ends.record(capture(k, b(k), 32));
+        }
+        assert_eq!(fit_of(&all), fit_of(&ends));
     }
 }

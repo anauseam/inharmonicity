@@ -214,10 +214,6 @@ fn default_captured_in_auto() -> bool {
     true
 }
 
-/// Filename a pre-library profile was written to, relative to the working
-/// directory. Nothing writes it any more.
-pub const PROFILE_PATH: &str = "tuning_profile.json";
-
 /// Current [`InharmonicityProfile`] schema version. Version `0` — one
 /// measurement per key, no identity or settings — still deserializes; see
 /// [`InharmonicityProfile::from_file`].
@@ -838,8 +834,10 @@ pub fn key_from_midi(note: u8) -> Option<u8> {
 /// 3107–3118. DOI: 10.1121/1.4799806 (Eqs. 7–8; treble universality §IV).
 // The treble pair is the paper's universal fit (s_T, y_T) = (9.26e-2, −13.64),
 // after Young 1952, re-indexed exactly. The bass pair is ours: the paper leaves it
-// per-piano, and (−6.6e-2, −7.891) is a medium-piano default that measured bass B
-// has run 7–25× above.
+// per-piano, and (−6.6e-2, −7.891) is a medium-piano default. Do not re-fit it to
+// one instrument: six put their bass between 0.58× and 4.8× it at the bottom of
+// the compass.
+// report 0021
 // audit 06
 pub fn get_expected_beta(key_index: u8) -> f32 {
     // n = 1 at A0.
@@ -893,19 +891,6 @@ impl KeyProfile {
             NOTES[key_index as usize].frequency,
             get_expected_beta(key_index),
         )
-    }
-
-    /// A template from a measured key's B in place of the prior; `None` when B is
-    /// absent or non-physical. Centred on equal temperament, not the measured f₀:
-    /// B describes the string whatever its tuning, while a stored f₀ goes stale as
-    /// the string is tuned.
-    pub fn from_measurement(m: &KeyMeasurement) -> Option<Self> {
-        let beta = m.calculated_b?;
-        if !beta.is_finite() || beta <= 0.0 {
-            return None;
-        }
-        let f0_et = NOTES.get(m.key_index as usize)?.frequency;
-        Some(Self::new(f0_et, beta))
     }
 }
 

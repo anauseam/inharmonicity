@@ -303,6 +303,12 @@ upside and gated with everything else on the second instrument.
 
 ### Closed: measured B fed back into discovery (built, shipped gated off)
 
+**Amended 2026-09-24 by [report 0021](0021-curve-seeded-templates.md).** The
+gated pathway is removed. Every template now takes the instrument's fitted *B*
+curve, not a key's own measured *B*: a per-key table leaves holes, where a
+measured neighbour outbids the true key left on the prior. Six instruments
+since put their bass between 0.58× and 4.8× the prior, not the 7–25× below.
+
 The pathway is implemented and gated off behind
 `APPLY_MEASURED_B_TO_DISCOVERY`. Sharpening a template with the key's own
 measured B also sharpens the **sub-harmonic impostor** templates, because the

@@ -18,7 +18,11 @@
 //! and no reset; the gate's own verdict is carried per hop, so where `Stable`
 //! lands sits inside the table.
 //!
-//! Usage: `cargo lab engine lock [BASE_DIR]`
+//! With `--regen` the templates are the instrument's fitted curve, built from a
+//! `mat regen` dump's profile through the source the app ships, in place of the
+//! prior.
+//!
+//! Usage: `cargo lab engine lock [BASE_DIR] [--regen REGEN]`
 //!        `cargo lab engine from-onset diagnostics_piano2`
 
 use std::fs;
@@ -34,7 +38,7 @@ use tuner_core::algorithms::{discovery, peaks, twm};
 use tuner_core::audio::{BASS_WINDOW_SIZE, HOP_SIZE, SAMPLE_RATE, WINDOW_SIZE};
 use tuner_core::engine::Engine;
 use tuner_core::gatekeeper::{GateResult, Gatekeeper, SignalState};
-use tuner_core::models::{KeyProfile, NOTES, SpectralPeak, get_expected_beta};
+use tuner_core::models::{KeyProfile, NOTES, SpectralPeak};
 use tuner_core::pipeline::ProcessingFrame;
 
 fn register(key: usize) -> usize {
@@ -274,19 +278,14 @@ fn first_lock(
     Ok(Some(None)) // never locked
 }
 
-pub fn run(base: &Path, from_onset: bool) -> Result<()> {
+pub fn run(base: &Path, from_onset: bool, regen: Option<&Path>) -> Result<()> {
     let mut planner = RealFftPlanner::<f32>::new();
     let fft_bass = planner.plan_fft_forward(BASS_WINDOW_SIZE);
     let fft_gate = planner.plan_fft_forward(WINDOW_SIZE);
 
-    let mut profiles_vec = Vec::with_capacity(88);
-    for i in 0..88 {
-        profiles_vec.push(KeyProfile::new(
-            NOTES[i].frequency,
-            get_expected_beta(i as u8),
-        ));
-    }
-    let profiles: [KeyProfile; 88] = profiles_vec.try_into().unwrap();
+    let betas = super::template_b(regen);
+    let profiles: [KeyProfile; 88] =
+        core::array::from_fn(|i| KeyProfile::new(NOTES[i].frequency, betas[i]));
 
     let dirs = capture::find(base).with_context(|| format!("read dir {}", base.display()))?;
 

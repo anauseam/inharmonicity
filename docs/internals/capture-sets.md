@@ -79,9 +79,9 @@ targets the out-of-tune and pitch-raise regime, and captures of a freshly tuned
 instrument would test the easy case only. It does constrain what the sets can
 prove:
 
-- There is **no trusted `B` reference** on either instrument — the standing
-  gate behind `APPLY_MEASURED_B_TO_DISCOVERY` and the report 0006 measured-B
-  pathway (report 0006, `pipeline.rs`).
+- There is **no trusted `B` reference** on either instrument — why report 0006
+  kept measured B out of discovery's templates, and why report 0021 confirmed
+  the fitted curve that now seeds them on other instruments.
 - Lock-accuracy scores are *relative*: a config scoring 77/87 beats one
   scoring 74/87 **on this instrument**, and neither is an accuracy claim about
   pianos.

@@ -17,7 +17,7 @@ use tuner_core::audio::{BASS_WINDOW_SIZE, HOP_SIZE, WINDOW_SIZE};
 use tuner_core::engine::Engine;
 use tuner_core::gatekeeper::Gatekeeper;
 use tuner_core::models::SpectralPeak;
-use tuner_core::models::{KeyProfile, NOTES, get_expected_beta};
+use tuner_core::models::{InharmonicityProfile, KeyProfile, NOTES};
 use tuner_core::pipeline::ProcessingFrame;
 
 use clap::Args;
@@ -50,11 +50,14 @@ pub struct DumpArgs {
     /// candidate without recompiling the default. `lambda` may be `inf`.
     #[arg(long, value_name = "P Q R RHO LAMBDA")]
     pub config: Option<String>,
-    /// Seed each measured key's discovery template with its measured B from a
-    /// persisted `InharmonicityProfile`, through the same
-    /// `KeyProfile::from_measurement` the live pipeline uses.
-    #[arg(long, value_name = "PATH")]
+    /// Build the discovery templates the app would push for a persisted
+    /// `InharmonicityProfile`, through the source it ships, in place of the
+    /// prior.
+    #[arg(long, value_name = "PATH", conflicts_with = "regen")]
     pub profile: Option<PathBuf>,
+    /// The same, for the profile a `mat regen` dump describes (report 0021).
+    #[arg(long, value_name = "REGEN")]
+    pub regen: Option<PathBuf>,
 }
 
 pub fn run(args: DumpArgs) -> Result<()> {
@@ -68,6 +71,7 @@ pub fn run(args: DumpArgs) -> Result<()> {
         smoothness,
         config,
         profile: profile_path,
+        regen,
     } = args;
     let file_path = audio.to_string_lossy().into_owned();
     let mut cfg = tuner_core::algorithms::twm::TwmConfig {
@@ -95,7 +99,6 @@ pub fn run(args: DumpArgs) -> Result<()> {
             return Err(anyhow!("--config needs 5 floats: \"p q r rho lambda\""));
         }
     }
-    let profile_path = profile_path.map(|p| p.to_string_lossy().into_owned());
     eprintln!(
         "[CONFIG] p={} q={} r={} rho={} lambda={} b_deadzone={} nonpeak={} sum_forward={} stretch={} refine={}",
         cfg.p,
@@ -178,44 +181,28 @@ pub fn run(args: DumpArgs) -> Result<()> {
     let mut engine = Engine::new(44100);
     engine.noise_floor = noise_floor;
 
-    // The discovery templates. With --stretch each centres on the
+    // The discovery templates: the prior, or with --profile or --regen the
+    // instrument's fitted curve, which drives both the per-frame `discover()` CSV
+    // and `engine.process` below. With --stretch each centres on the
     // Railsback-stretched pitch instead of ET (discovery scoring only).
+    let betas = match &profile_path {
+        Some(p) => {
+            let profile = InharmonicityProfile::from_file(p)
+                .map_err(|e| anyhow!("--profile: cannot read {}: {e}", p.display()))?;
+            super::fitted_template_b(&profile, p)
+        }
+        None => super::template_b(regen.as_deref()),
+    };
     let stretch = tuner_core::models::railsback_stretch_curve();
-    let mut profiles_vec = Vec::with_capacity(88);
-    for i in 0..88 {
+    let profiles_array: [KeyProfile; 88] = core::array::from_fn(|i| {
         let note = &NOTES[i];
-        let beta = get_expected_beta(i as u8);
         let f0 = if use_stretch {
             note.frequency * 2.0_f32.powf(stretch[i] / 1200.0)
         } else {
             note.frequency
         };
-        profiles_vec.push(KeyProfile::new(f0, beta));
-    }
-
-    let mut profiles_array: [KeyProfile; 88] = profiles_vec.try_into().unwrap();
-
-    // Validation (--profile): overwrite each measured key's template with its
-    // measured-B template, through `KeyProfile::from_measurement`.
-    // This drives both the per-frame `discover()` CSV and `engine.process` below,
-    // so bass false-locks can be compared against the prior-only baseline.
-    if let Some(p) = &profile_path {
-        match tuner_core::models::InharmonicityProfile::from_file(p) {
-            Ok(profile) => {
-                let mut applied = 0usize;
-                for (key, m) in profile.active_entries() {
-                    if let Some(kp) = KeyProfile::from_measurement(m)
-                        && let Some(slot) = profiles_array.get_mut(key as usize)
-                    {
-                        *slot = kp;
-                        applied += 1;
-                    }
-                }
-                eprintln!("[PROFILE] Applied measured B for {applied} key(s) from {p}");
-            }
-            Err(e) => return Err(anyhow!("--profile: cannot read {p}: {e}")),
-        }
-    }
+        KeyProfile::new(f0, betas[i])
+    });
 
     // Setup output files
     let path = Path::new(&file_path);

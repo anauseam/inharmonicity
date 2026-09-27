@@ -19,7 +19,7 @@ fallback); the crossing-by-crossing contract is the body of this file.
 | **1** | Hardware Capture | `ringbuf` SPSC | Stream (1) → DSP (2) | Lossless elastic buffer for incoming raw audio. |
 | **2** | Structural Output | `triple_buffer` | DSP (2) → UI (4) | `FrameOutput` — lossy per-hop viz and telemetry, plus anything the DSP integrates across hops. |
 | **3** | DSP Parameters | `Arc<Atomic*>` | UI (4) ↔ DSP (2) | Wait-free configuration and metric reads/writes. |
-| **4** | Template Update | `ringbuf` SPSC | UI (4) → DSP (2) | Recompiled `KeyProfile` (measured $B$) into the engine's templates. |
+| **4** | Template Update | `ringbuf` SPSC | UI (4) → DSP (2) | All 88 recompiled `KeyProfile`s, from each curve bundle's fitted $B$, into the engine's templates. |
 | **4** | Strobe References | `ringbuf` SPSC | UI (4) → DSP (2) | `StrobeRefUpdate` — curve targets + coarse partial — into the `Strobe`. |
 | **4** | Capture Commands | `ringbuf` SPSC | UI (4) → DSP (2) | `CaptureCommand`: `Arm(ArmRequest)` — fill target + string declaration — and `Cancel`. |
 | **5** | Capture Dispatch | crossbeam SPSC (bounded) | DSP (2) → Worker (3) | `CapturePayload` containing pooled audio buffer + metadata. |
@@ -121,9 +121,14 @@ GUI retries next tick — and `AudioPipeline` drains each ring at the top of
   `{f32, f32, [f32; MAX_PARTIALS], usize}`), so swapping it drops no heap data
   on the audio thread. `KeyProfile` and its constructors live in `models`;
   `pipeline` holds only the transport.
-- **Producer:** `pipeline::ProfileSender`.
+- **Producer:** `pipeline::ProfileSender`, which pushes a whole refresh per
+  curve bundle: all 88 keys from the bundle's `template_b`, committed to the
+  ring at once. Capacity `PROFILE_QUEUE_CAPACITY = 88`, so a refresh goes only
+  into an empty ring; until the pipeline has drained the last one the push
+  returns `false` and the GUI retries next tick.
 - **Consumer:** every queued update is applied, swapped into the live
-  `[KeyProfile; 88]` array (allocated once at startup) that the engine reads.
+  `[KeyProfile; 88]` array (allocated once at startup) that the engine reads,
+  so a refresh lands whole on one hop.
 
 ### Strobe reference updates
 
@@ -222,7 +227,7 @@ is a design smell, so reconsider the design first.
   side.
 - **Purpose:** let the UI hand the worker heavy, non-realtime **background
   jobs** — today a tuning-curve recompute; the Giordano-calibrated engine (c)
-  alone takes ~1.3 s, far too slow for the GUI thread, which is why the curve
+  alone takes ~1 s, far too slow for the GUI thread, which is why the curve
   is computed off-thread rather than inline on load.
 - **UI → Worker** — `WorkerJob`, an enum of the jobs the UI can request:
   `Curve(CurveJob)`, a trust-filtered `CurveInput` snapshot plus a generation
@@ -242,7 +247,7 @@ over #5, and captures must be serviced ahead of curve jobs.
 **Captures first, latest-wins jobs.** The worker drains every pending
 `CapturePayload` before looking at a `WorkerJob` — measurement latency is
 user-facing mid-session, a curve recompute is not — then blocks on a `select!`
-over both. A capture arriving while a bundle computes waits out the ~1.3 s:
+over both. A capture arriving while a bundle computes waits out the ~1.1 s:
 `Processing` lasts that much longer, once. The UI sends a curve job on every
 trusted-set edit (a capture merged, an undo, a profile load), because the curve
 is derived state, recomputed from the profile rather than stored. Jobs are

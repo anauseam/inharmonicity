@@ -162,7 +162,7 @@ number is never reused.
 | 0003 | [`0003-gatekeeper-rejection-of-sfm.md`](retiring/0003-gatekeeper-rejection-of-sfm.md) | spectral flatness is removed from the Gatekeeper | report only |
 | 0004 | [`0004-instrument-scope.md`](retiring/0004-instrument-scope.md) | scope is struck and plucked stiff-string instruments | `ARCHITECTURE.md` § Decisions |
 | 0005 | [`0005-discovery-algorithm-class.md`](0005-discovery-algorithm-class.md) | discovery is peak-domain TWM scoring, coarse-to-fine; MAT stays Worker-side | `ARCHITECTURE.md` § DSP foundations |
-| 0006 | [`0006-discovery-refinement-validation.md`](0006-discovery-refinement-validation.md) | the conservative TWM constants ship; the measured-*B* pathway is gated off | `twm.rs` `TwmConfig::default`, `pipeline.rs` `APPLY_MEASURED_B_TO_DISCOVERY` |
+| 0006 | [`0006-discovery-refinement-validation.md`](0006-discovery-refinement-validation.md) | the conservative TWM constants ship; the measured-*B* pathway is gated off | `twm.rs` `TwmConfig::default`; the gate, superseded by report 0021 |
 | 0007 | [`0007-tuning-curve-regularization-geometry.md`](0007-tuning-curve-regularization-geometry.md) | prior-mean reversion, ℓ = 12 keys; minimum-norm chain gauge | `curves.rs` `REVERSION_LENGTH_KEYS`, `per_key_smoothed` |
 | 0008 | [`0008-giordano-layer-fidelity-derived-weights.md`](0008-giordano-layer-fidelity-derived-weights.md) | coincidence-bracket scan, the §VI.C gate, LOO-CV + 1-SE, derived interval weights | `curves.rs` `GIORDANO_MIN_COINCIDENT_PAIRS`, `select_rho_reg_weight`; `giordano.rs` `SCAN_MARGIN_CENTS` |
 | 0009 | [`0009-repeat-capture-noise-decomposition.md`](0009-repeat-capture-noise-decomposition.md) | inverse-variance ln-*B* shrinkage replaces the hard partial-count switch | `curves.rs` `SIGMA_LNB_COEFF`, `sigma_ln_b` |
@@ -177,6 +177,7 @@ number is never reused.
 | 0018 | — | one owner for `CaptureState` | `ARCHITECTURE.md` § Decisions |
 | 0019 | [`0019-dc-blocker-corner.md`](retiring/0019-dc-blocker-corner.md) | the DC blocker's 35 Hz corner stays; change the order, not α | `audio.rs` `DC_BLOCK_ALPHA` |
 | 0020 | [`0020-vote-from-onset.md`](0020-vote-from-onset.md) | the lock's window fills from the onset, not from `Stable`; a commit still lands on a `Stable` frame | `ARCHITECTURE.md` § DSP foundations; `engine.rs` `Engine::process` |
+| 0021 | [`0021-curve-seeded-templates.md`](0021-curve-seeded-templates.md) | every discovery template takes the instrument's fitted *B* curve: Rigaud's bass pair on the measured bass-bridge keys, the slope held under twelve keys, no per-key table | `ARCHITECTURE.md` § Decisions; `curves.rs` `template_b_fit` |
 
 Standalone, with no number: [`tuning-curve-grounding.md`](tuning-curve-grounding.md),
 [`nsga2/`](nsga2/README.md) (the sweep's method and its runs), and

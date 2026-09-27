@@ -90,39 +90,45 @@ impl BXi {
 ///
 /// ξ̂ = argmin_ξ ∑_{m ∈ M} |log B(m) - log B_ξ(m)|.
 ///
-/// `points` are `(m_midi, b)` pairs from every trusted key: the L1 norm is the
-/// paper's outlier guard, and the fixed treble asymptote gives treble points little
-/// pull on the bass pair. `None` with fewer than two points or a non-positive `b`.
+/// `points` are `(m_midi, b)` pairs: the L1 norm is the paper's outlier guard,
+/// and the fixed treble asymptote gives treble points little pull on the bass
+/// pair. `None` with fewer than two points or a non-positive `b`.
+///
+/// With `held_slope`, s_B stays at that value and only y_B is fitted, for points
+/// too close together to fix the slope. The paper always fits both.
 ///
 /// The objective is the paper's; the optimizer, a coarse-to-fine grid search over
 /// s_B ∈ [−0.20, 0] and y_B ∈ [−14, −2], is ours. The paper initializes s_B at
 /// −8.9e-2: §III.A.3.b prints +8.9e-2, a sign typo, as Fig. 1(a)'s bass asymptote
 /// falls with m.
 // The domain brackets the paper's pianos and the measured upright's (−0.050, −6.3).
-pub fn fit_b_xi(points: &[(f64, f64)]) -> Option<BXi> {
+pub fn fit_b_xi(points: &[(f64, f64)], held_slope: Option<f64>) -> Option<BXi> {
     if points.len() < 2 || points.iter().any(|&(_, b)| b <= 0.0 || !b.is_finite()) {
         return None;
     }
-    let objective = |s_b: f64, y_b: f64| -> f64 {
-        let xi = BXi { s_b, y_b };
-        points
-            .iter()
-            .map(|&(m, b)| (b.ln() - xi.b_at_midi(m).ln()).abs())
-            .sum()
-    };
 
-    // Coarse pass over the full domain, then four zoom rounds.
-    let (mut s0, mut s1, mut y0, mut y1) = (-0.20, 0.0, -14.0, -2.0);
+    // Coarse pass over the full domain, then four zoom rounds; a held slope is a
+    // single column of the grid.
+    let (mut s0, mut s1) = held_slope.map_or((-0.20, 0.0), |s| (s, s));
+    let (mut y0, mut y1) = (-14.0, -2.0);
     let mut best = (BXi::DEFAULT_MEDIUM, f64::INFINITY);
     for round in 0..5 {
         let steps = if round == 0 { 60 } else { 20 };
+        let s_steps = if held_slope.is_some() { 0 } else { steps };
         let (ds, dy) = ((s1 - s0) / steps as f64, (y1 - y0) / steps as f64);
-        for i in 0..=steps {
+        for i in 0..=s_steps {
             for j in 0..=steps {
-                let (s, y) = (s0 + ds * i as f64, y0 + dy * j as f64);
-                let e = objective(s, y);
+                let xi = BXi {
+                    s_b: s0 + ds * i as f64,
+                    y_b: y0 + dy * j as f64,
+                };
+                // Eq. 29's objective.
+                let e: f64 = points
+                    .iter()
+                    .map(|&(m, b)| (b.ln() - xi.b_at_midi(m).ln()).abs())
+                    .sum();
                 if e < best.1 {
-                    best = (BXi { s_b: s, y_b: y }, e);
+                    best = (xi, e);
                 }
             }
         }
@@ -364,7 +370,7 @@ mod tests {
             .step_by(3)
             .map(|m| (m as f64, truth.b_at_midi(m as f64)))
             .collect();
-        let fit = fit_b_xi(&points).expect("fit succeeds");
+        let fit = fit_b_xi(&points, None).expect("fit succeeds");
         assert!(
             (fit.s_b - truth.s_b).abs() < 1e-3,
             "s_b {} want {}",
@@ -382,6 +388,25 @@ mod tests {
             let (a, b) = (fit.b_at_midi(m as f64), truth.b_at_midi(m as f64));
             assert!((a.ln() - b.ln()).abs() < 0.01, "B mismatch at m={m}");
         }
+    }
+
+    /// With the slope held at the truth's, two close bass points recover the
+    /// intercept, and the slope comes back exactly as held.
+    #[test]
+    fn test_fit_b_xi_held_slope_recovers_the_intercept() {
+        let truth = BXi {
+            s_b: -0.066,
+            y_b: -6.4,
+        };
+        let points = [(24.0, truth.b_at_midi(24.0)), (25.0, truth.b_at_midi(25.0))];
+        let fit = fit_b_xi(&points, Some(truth.s_b)).expect("fit succeeds");
+        assert_eq!(fit.s_b, truth.s_b);
+        assert!(
+            (fit.y_b - truth.y_b).abs() < 1e-3,
+            "y_b {} want {}",
+            fit.y_b,
+            truth.y_b
+        );
     }
 
     /// Eq. 31 fit recovers known φ from clean ρ points (no regularization).

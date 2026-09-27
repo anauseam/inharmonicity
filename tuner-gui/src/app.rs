@@ -274,6 +274,9 @@ pub struct TunerApp {
     curve_bundle: Option<CurveBundle>,
     /// A trusted-set edit awaits a recompute the job channel has not accepted.
     curve_dirty: bool,
+    /// `curve_bundle`'s discovery templates await a DSP ring that still holds
+    /// the previous refresh.
+    templates_pending: bool,
     /// Held until the Worker accepts it.
     pending_dump_dir: Option<PathBuf>,
     /// Held until the DSP ring accepts it. A newer command replaces it, as the
@@ -315,6 +318,7 @@ impl Default for TunerApp {
             app_settings: AppSettings::default(),
             curve_bundle: None,
             curve_dirty: false,
+            templates_pending: false,
             pending_dump_dir: None,
             pending_capture_command: None,
             curve_generation: 0,
@@ -410,9 +414,6 @@ impl TunerApp {
         self.apply_profile_settings(&settings);
         self.sync_identity_mirror();
         self.sync_dump_dir();
-        if let Some(host) = self.host_handle.as_mut() {
-            host.profiles.update_all(self.session.profile());
-        }
         self.mark_curve_dirty();
         self.strobe_lock.on_trusted_set_edit(TrustedSetEdit::Loaded);
         self.refresh_undo_label();
@@ -664,6 +665,19 @@ impl TunerApp {
         }
     }
 
+    /// Pushes the adopted bundle's discovery templates to the DSP (crossing #4);
+    /// they stay pending while the ring still holds the previous refresh.
+    fn pump_templates(&mut self) {
+        if !self.templates_pending {
+            return;
+        }
+        if let (Some(host), Some(bundle)) = (self.host_handle.as_mut(), self.curve_bundle.as_ref())
+            && host.profiles.push_templates(&bundle.template_b)
+        {
+            self.templates_pending = false;
+        }
+    }
+
     /// Turns unison assist on or off, and both panels with it: a panel left on
     /// screen with the mode off would have no toggle to dismiss it.
     fn set_unison_assist(&mut self, on: bool) {
@@ -809,10 +823,6 @@ impl TunerApp {
                     // An undo declares the capture bad, so its audio goes too.
                     let root = library::diagnostics_dir_for(&self.session.profile().identity.id);
                     Self::remove_dump(&root, &undone);
-                    if let Some(host) = self.host_handle.as_mut() {
-                        host.profiles
-                            .update_key_profile(idx, self.session.profile().active(idx));
-                    }
                     eprintln!("[MAIN] Undoing profile change at index {}", idx);
                     // Undoing an untrusted entry recomputes an identical curve:
                     // harmless, and undo is rare.
@@ -864,11 +874,6 @@ impl TunerApp {
                             .join(worker::dump_dir_name(key, &dropped.last_captured))
                             .display()
                     );
-                    // The key may now resolve to a different entry, or to none.
-                    if let Some(host) = self.host_handle.as_mut() {
-                        host.profiles
-                            .update_key_profile(key, self.session.profile().active(key));
-                    }
                     eprintln!("[MAIN] Dropped measurement {index} of key {key}");
                     self.mark_curve_dirty();
                     // The lock takes a drop as it takes an undo.
@@ -1291,13 +1296,6 @@ impl TunerApp {
                     // work, and nothing else guarantees a write.
                     self.session.record(measurement);
 
-                    if let Some(host) = self.host_handle.as_mut() {
-                        host.profiles.update_key_profile(
-                            target_idx,
-                            self.session.profile().active(target_idx),
-                        );
-                    }
-
                     eprintln!(
                         "[MAIN] Successfully slotted new capture data into Inharmonicity Profile at index {}",
                         target_idx
@@ -1321,6 +1319,7 @@ impl TunerApp {
                     self.display_data.curve_recomputing = false;
                     if bundle.generation == self.curve_generation {
                         self.curve_bundle = Some(*bundle);
+                        self.templates_pending = true;
                     }
                 }
             }
@@ -1328,6 +1327,7 @@ impl TunerApp {
 
         self.pump_dump_dir();
         self.pump_curve_job();
+        self.pump_templates();
         self.pump_capture_command();
 
         self.update_strobe(frame_pushed);

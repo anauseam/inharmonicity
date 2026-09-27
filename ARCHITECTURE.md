@@ -69,7 +69,7 @@ audio::spawn_analysis_thread(source, dump_dir)  →  HostHandle
     │  Stable, +onset │       │  .worker_rx         ← recv     │ (WorkerOutput: measurements + curves)
     │       ↓         │       │  .send_curve_job()  → send     │ (WorkerJob: curve recompute)
     │ Engine (F0 DSP) │       │  .send_dump_dir()   → send     │ (WorkerJob: dump directory)
-    │       ↓         │       │  .profiles          → send     │ (template updates → DSP; gated off)
+    │       ↓         │       │  .profiles          → send     │ (templates per curve bundle → DSP)
     │ Strobe (tap)    │       │  .strobe_refs       → send     │ (strobe references → DSP)
     │       ↓         │       │  .capture_commands  → send     │ (Arm / Cancel → DSP)
     │ Capture Accum.  │       └────────────────────────────────┘
@@ -83,7 +83,7 @@ audio::spawn_analysis_thread(source, dump_dir)  →  HostHandle
       ┌───────────────────┐
       │ High-res FFT+CSPE │ ← 65536-pt + shifted frame   (captures serviced first;
       │ MAT (f₀,B solver) │ ← partials + inharmonicity     curve recompute when idle)
-      │ Curve engines a–d │ ← CurveBundle (cold, ≈ 1.4 s)
+      │ Curve engines a–d │ ← CurveBundle (cold, ≈ 1.1 s)
       │ Diagnostics I/O   │ ← analysis.json + audio.raw
       └────────┬──────────┘
                │ crossbeam SPSC (WorkerOutput: measurements + curves) → Frontend
@@ -349,6 +349,14 @@ runs on no pipeline thread and owns no stream; when playback is built, the
 output stream lives in `audio`, not the GUI. →
 [`thread-crossings.md`](docs/internals/thread-crossings.md), *Cold-path
 modules*.
+
+**Every discovery template takes the instrument's fitted B curve.** The Worker
+fits Rigaud's bass pair to the measured bass-bridge keys with each curve bundle,
+and the frontend pushes all 88 templates whole over crossing 4. No template is
+a key's own measurement: a per-key table leaves holes, where a measured
+neighbour outbids a true key left on the prior. Reopens if a bass the
+two-asymptote form misfits loses locks under the fit.
+→ [report 0021](reports/0021-curve-seeded-templates.md)
 
 ### DSP foundations
 

@@ -117,9 +117,9 @@ for the statistics, not for the curve.
 - **The GUI owns the profile, so the GUI owns where it goes.** The *schema* is
   a domain type (`models::InharmonicityProfile`, shared with the Worker and
   the offline harnesses), but every file-location policy — the per-user
-  directories, the app-settings document, the listing the browser renders, the
-  one-time import of a pre-move profile — lives in `library.rs`; `tuner-core`
-  stays headless and knows nothing about `directories` or XDG. Persistence
+  directories, the app-settings document, the listing the browser renders —
+  lives in `library.rs`; `tuner-core` stays headless and knows nothing about
+  `directories` or XDG. Persistence
   *timing* (autosave on capture and undo, the session `.bak`) is likewise
   `app.rs` policy, not core's.
 - **File locations are injected, never assumed.** The frontend hands the

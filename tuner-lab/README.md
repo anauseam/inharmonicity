@@ -46,9 +46,9 @@ belongs here.
 
 | Mode | What it reports | Reproduces | Input |
 | --- | --- | --- | --- |
-| `lock [ROOT]` | end-to-end auto-lock validation, M-of-N included | report 0020; piano-1 **82/87** | a capture set |
+| `lock [ROOT] [--regen REGEN]` | end-to-end auto-lock validation, M-of-N included; with `--regen`, on the templates the app would push for the regen dump's profile, named on stderr by a `[TEMPLATES]` line | report 0020; piano-1 **82/87**; with `--regen`, report 0021 | a capture set; a `mat regen` dump of it |
 | `from-onset [ROOT]` | Stage-A's winner on every hop from the onset, gate ignored — per-hop identification by register, with the hops the gate calls `Stable` marked | report 0003 (2026-09-02 amendment) | a capture set (needs `audio_full_event.raw`) |
-| `dump <AUDIO>` | per-frame STFT, peaks and TWM scores to `spectrum.csv` / `peaks.csv`; `goertzel.csv` under `cargo lab-telemetry` | report 0002 | one `.raw` |
+| `dump <AUDIO>` | per-frame STFT, peaks and TWM scores to `spectrum.csv` / `peaks.csv`; `goertzel.csv` under `cargo lab-telemetry`; `--profile` or `--regen` put the templates the app would push for that profile in place of the prior | report 0002 | one `.raw`; a saved profile or a `mat regen` dump |
 | `reach [NAME Q R RHO]…` | 1 ¢-resolution detuning reach of the lock | report 0006 pitch-raise reach (canonical 78 ¢, conservative 69 ¢) — re-run after the jacobsen fix reproduced both exactly, so the harness is peak-estimator-independent | none (synthetic) |
 | `nsga2 [--serve]` | the synthetic dataset generator and discovery fitness harness | report 0001; `--serve` is `tuner-lab/scripts/optimize_twm.py`'s protocol | none (synthetic) |
 

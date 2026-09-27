@@ -370,32 +370,6 @@ pub(crate) fn default_profile_name() -> String {
     format!("Untitled instrument ({})", secs / 86_400)
 }
 
-/// Imports a pre-library `tuning_profile.json` from the working directory, once:
-/// only into an empty library, and as a copy, since `cargo lab engine dump
-/// --profile` reads the original. Returns the imported path, if any.
-pub(crate) fn import_legacy_profile() -> Option<PathBuf> {
-    let legacy = Path::new(models::PROFILE_PATH);
-    if !legacy.is_file() || !list_profiles(ProfileSort::default()).is_empty() {
-        return None;
-    }
-    // `from_file` migrates the v0 shape (one measurement per key, no identity)
-    // in memory; writing it here is what makes the migration durable, and it
-    // lands on the copy, never on the original.
-    let mut profile = InharmonicityProfile::from_file(legacy).ok()?;
-    if profile.identity.name.is_empty() {
-        profile.identity.name = "Imported profile".to_string();
-    }
-    let path = unique_path_for(&profile.identity.name);
-    profile.to_file(&path).ok()?;
-    eprintln!(
-        "[LIBRARY] Imported legacy {} → {} ({} keys). The original is untouched.",
-        models::PROFILE_PATH,
-        path.display(),
-        profile.measurements.len()
-    );
-    Some(path)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

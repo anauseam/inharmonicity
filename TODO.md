@@ -67,8 +67,6 @@ They open together, so plan one session for them rather than one each.
 - **MAT's serial order**, and with it the `Simultaneous` fallback and the
   paper's tighter §2.4 peak band (`mat.rs`). The deletion rides with the
   `(f₀, B)` seam work, which injects `MatOrder` as a parameter.
-- **Measured-`B` discovery seeding** (`pipeline::APPLY_MEASURED_B_TO_DISCOVERY`),
-  and behind it the TWM bass-lock bias, which is a wrong-template problem.
 - **Report 0014 §7's prediction**, which needs solo captures on the tuned
   instrument: in the plain-wire treble a unison's per-string `B` spread is
   mostly tension and should largely vanish once the unison is tuned; in the
@@ -247,6 +245,26 @@ move, so it runs after the step as its own change.
   one they sent, needs a native file dialog (`rfd`), which is a real system
   dependency on Linux. The field's answer is cloud sync or share-sheet export
   — decide when the need is real.
+- **Drop the v0 profile reader** — `Planned`, as its own change after the
+  curve-seeding commit (report 0021). `InharmonicityProfile::from_file` still
+  falls back to the pre-versioning shape (`ProfileV0`: one measurement per key,
+  no identity, no settings). The GUI's one-time legacy import was its reason, and
+  it is gone; the fallback now serves only a v0 file put in the library by hand
+  or given to `cargo lab engine dump --profile` or `cargo lab gatekeeper plot
+  --profile`. The one v0 file known is the owner's `tuning_profile.json` in the
+  repository root (gitignored), already imported into the library as
+  `tuning_profile.json` ("Piano2"). Every library profile is v1, and every entry
+  in them carries `captured_in_auto` (checked 2026-09-26).
+  - **What goes:** `ProfileV0`, the fallback in `from_file`, the test
+    `v0_profiles_migrate_on_load`, and the v0 sentences in the docs of
+    `PROFILE_SCHEMA_VERSION` and `from_file`. A v0 file then fails to load,
+    which the open path already reports.
+  - **First:** search for any other v0 file still read (a profile JSON with no
+    `version`). Then delete the root file and its `.gitignore` line, or keep the
+    file as a record outside the tree.
+  - **Open:** whether `captured_in_auto`'s serde default (`true`, so an entry
+    without the flag reads as untrusted) goes too. It guards entries older than
+    the flag; nothing in the library needs it now.
 - **Capture-dump retention, and a user-settable dump location** — `Planned`.
   *(Half done 2026-08-15: dumps now follow the open instrument —
   `diagnostics/<identity.id>/` via `WorkerJob::SetDumpDir`, with an
@@ -313,7 +331,7 @@ move, so it runs after the step as its own change.
   whether it flickers at the threshold, and so needs hysteresis, was left to be
   judged by eye once the strobe was in use.
 - **Engine (c) ρ Low/High presets** — `Deferred`. Computing three (c) presets
-  naively re-runs the ~1.3 s Giordano scan three times; the calibration has to be
+  naively re-runs the ~1 s Giordano scan three times; the calibration has to be
   factored out of the per-preset path first. Rendered as greyed placeholders.
 - **"Advanced" mode** — `Deferred`. Curve selection, comparison metrics, and the
   offline diagnostics are all currently visible to every user with no separation
@@ -335,22 +353,22 @@ move, so it runs after the step as its own change.
 
 ## Engine and discovery
 
-- **TWM bass-lock bias (deep-bass stable-wrong core)** — `Gated on` an
-  in-tune instrument, behind measured-$B$ seeding (see *When an in-tune
-  instrument is captured*). The decision-level half is solved (M-of-N acquisition lock,
-  validated on two instruments); the residual is a wrong-$B$-template problem in
-  the bass that scoring constants cannot fix.
+- **TWM bass-lock bias (deep-bass stable-wrong core)** — `Investigating`. The
+  decision-level half is solved (M-of-N acquisition lock, validated on two
+  instruments), and the template half landed: every template now takes the
+  instrument's fitted $B$ curve, which fixed bass locks wherever the bass sits
+  off the prior. What remains commits an octave high where the fundamental is
+  weak (a grand read close over the bass strings, an upright at a distance, the
+  mid on two grands); measured $B$ removed few of those and none in the mid, so
+  it is the estimator on a weak fundamental, not the template.
   → [report 0006](reports/0006-discovery-refinement-validation.md),
-  [report 0010](reports/0010-m-of-n-lock-rule-replay.md)
-- **Measured-$B$ discovery seeding** — `Built, gated off`
-  (`pipeline::APPLY_MEASURED_B_TO_DISCOVERY`). Flip the flag once an in-tune
-  instrument validates the measured values. Before flipping it, delete
-  `AudioPipeline::new`'s read of `models::PROFILE_PATH`: it loads the pre-library
-  `tuning_profile.json` from the working directory, a file location `layering.md`
-  keeps out of `tuner-core`, and startup's `ProfileSender::update_all` already
-  seeds the open instrument. The constant then belongs in `library.rs`, whose
-  legacy import is its one other user.
-  → [report 0006](reports/0006-discovery-refinement-validation.md)
+  [report 0010](reports/0010-m-of-n-lock-rule-replay.md),
+  [report 0021](reports/0021-curve-seeded-templates.md)
+- **Measured-$B$ discovery seeding** — landed as one fitted curve in every
+  template, not the gated per-key pathway: Rigaud's bass pair fitted to the
+  measured keys on the bass bridge, recomputed with each curve bundle and pushed
+  whole. The pre-library `PROFILE_PATH` read left `tuner-core` with it.
+  → [report 0021](reports/0021-curve-seeded-templates.md)
 - **Lock-release / re-lock hysteresis** — `Deferred`. The M-of-N rule covers
   acquisition only. → [report 0010](reports/0010-m-of-n-lock-rule-replay.md)
 - **Silence closes the gate's own senses** — `Investigating`. Under
@@ -422,15 +440,42 @@ move, so it runs after the step as its own change.
   gains ~0.05 ¢ of target movement in the bass and cannot beat shrinkage in the
   treble, whereas a mis-weighted key is a systematic error. Needs a shrinkage
   estimator for small k (k = 2–3 gives a very noisy sample SD — pooled or
-  hierarchical, not the raw SD) and validation on both instruments.
-  → [report 0009](reports/0009-repeat-capture-noise-decomposition.md)
+  hierarchical, not the raw SD) and validation on both instruments. With the
+  bass-model question below, it decides whether discovery's templates move from
+  the fit to the precision blend.
+  → [report 0009](reports/0009-repeat-capture-noise-decomposition.md),
+  [report 0021](reports/0021-curve-seeded-templates.md)
+- **Does a bass model with more freedom than two asymptotes describe every
+  piano?** — `Investigating`. Rigaud's bass asymptote fits the bass keys of the
+  upright, the Disklavier and the RWC Yamaha and Steinway within 0.3 in ln B,
+  but misses the RWC Bösendorfer's, whose bass is nearly flat, by up to 0.45,
+  about a factor of 1.5 either way. A break at the wound-string boundary, a third
+  parameter or a smoothed per-key residual may describe it; it matters for the
+  tuning curve, where cents count, more than for discovery, where the fit was
+  non-inferior.
+  → [report 0021](reports/0021-curve-seeded-templates.md)
+- **`instrument_b_fit` is not identifiable from keys off the bass bridge** —
+  `Planned`, as its own change after the curve-seeding commit. The curve engines
+  fit Rigaud's bass pair on every measured key and hand it to every unmeasured
+  one; fitted on mid keys alone it puts A0 at 25× the default, on treble keys
+  alone at 224× or 0.08×. Discovery's templates are guarded
+  (`curves::template_b_fit`: points at twice the treble term or more, the slope
+  held under twelve keys of them); the engines are not, so a profile measured
+  only above the bass carries a wild bass into the curve. The agreed fix is one
+  fit for both: the engines take `template_b_fit`'s pair and `instrument_b_fit`
+  goes. That moves every curve number (engine (a) uses the fit at every key, the
+  others where a key is unmeasured), so the change carries a before-and-after
+  comparison of the engines' curves on the capture sets, a treble-only profile
+  included.
+  → [report 0021](reports/0021-curve-seeded-templates.md)
 - **What replaces an excluded measurement, and the exclusion on partial
   coverage** — `Investigating`. When the curve's negative-stretch check excludes
   a key's measured B, three things follow that nobody has examined:
   - **The curve falls back to the model's `B_ξ`, not to the key's earlier
     trusted capture.** An earlier capture is better evidence: B moves little with
     tuning (B ∝ 1/tension). But `CurveInput` carries only the newest trusted
-    capture per key, so the curve cannot see older ones.
+    capture per key, so the curve cannot see older ones, and the discovery
+    templates' fit reads the same one.
   - **The strobe still builds that key's partial targets from the excluded B.**
     `strobe_partials` reads the active entry, so an excluded key's displayed
     partial follows the measurement the curve rejected. The key carries the
@@ -503,6 +548,32 @@ move, so it runs after the step as its own change.
   crate, spells 134 items `pub`; `#![warn(unreachable_pub)]` finds them, with
   machine-applicable fixes. Keep that sweep out of the item-order pass, whose
   check needs pure moves.
+- **Two style sweeps the 2026-09 pass left** — `Deferred`. Neither rule has a lint
+  either. A guard states provenance as a sentence saying precisely which part is
+  ours, but 22 comments in `tuner-core` and `tuner-gui` still open with the older
+  tag (`// Ours, measured.`, `// Ours, set by eye.`, `(ours, not in the paper)`),
+  `SIGMA_LNB_COEFF`, the rule's own example, among them. And a function is
+  reached through its module, yet `tuner-lab` imports `get_expected_beta` bare in
+  eight files, `curves.rs` imports `rigaud::midi_from_key`, the discovery bench
+  `discover`, and several test modules their helpers.
+- **One type for a key's predicted partial series, `PartialTemplate`** —
+  `Planned`, as its own change after the curve-seeding commit (report 0021).
+  Discovery's templates (`KeyProfile`: up to 128 partials from the
+  equal-temperament frequency and the templates' B) and the strobe's references
+  (`StrobeRefUpdate::refs`: up to 12 from the curve's target pitch and the key's
+  measured B, filled by `TuningCurve::strobe_partials`) hold the same thing, a
+  stiff-string partial series, built by two copies of the law
+  f_n = n·F₀·√(1 + B·n²). MAT's `predicted_position`, `synth::partial_freq` and
+  `cargo lab curve compare` write the law out again. One type, with the law in
+  its constructor, serves both consumers, and the law as a function serves the
+  rest; the measured side stays `KeyMeasurement`. The rename rides with it so
+  that "profile" means only `InharmonicityProfile`: `KeyProfile` →
+  `PartialTemplate`, `KeyProfileUpdate` → `TemplateUpdate`, `ProfileSender` →
+  `TemplateSender`, `PROFILE_QUEUE_CAPACITY` → `TEMPLATE_QUEUE_CAPACITY`, and
+  `live_profiles` and `build_default_profiles` with them. To decide in the
+  change: the two capacities (a const generic, or one size), and each consumer
+  keeping its anchor and precision (f32 on the DSP paths, f64 in `synth`), so the
+  lab's lock outputs and the strobe replay stay byte-identical.
 - **Four algorithm seams become traits, and audits become differential tests** —
   `Planned`, after the structural step. The signal gate (`Gatekeeper`), discovery,
   the `(f₀, B)` estimator (MAT) and the curve engines each get a trait, matching

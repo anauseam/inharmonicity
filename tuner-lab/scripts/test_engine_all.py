@@ -27,9 +27,9 @@ def main():
     parser.add_argument("--config", default=None,
                         help='Override TWM constants: "p q r rho lambda" (lambda may be inf)')
     parser.add_argument("--profile", default=None,
-                        help="Path to a persisted InharmonicityProfile JSON; seeds each "
-                             "measured key's template with its measured B (ET-centered, "
-                             "validation only).")
+                        help="Path to a persisted InharmonicityProfile JSON; the templates "
+                             "are the ones the app would push for it, the instrument's fitted "
+                             "B curve (validation only).")
     parser.add_argument("--no-plot", action="store_true",
                         help="Skip per-key plotting (faster; not needed for pass/fail)")
     parser.add_argument("--base", default="./diagnostics",

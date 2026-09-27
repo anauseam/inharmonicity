@@ -70,17 +70,10 @@ impl ProfileSession {
     }
 
     /// Opens the instrument the session starts on, recording it in `settings`:
-    /// the profile open when the app last closed, else a one-time import of a
-    /// pre-library `tuning_profile.json`, else a fresh instrument, so autosave
-    /// always has somewhere to write.
+    /// the profile open when the app last closed, else a fresh instrument, so
+    /// autosave always has somewhere to write.
     pub fn open_at_startup(&mut self, settings: &mut AppSettings) {
         if let Some(path) = settings.last_profile.clone()
-            && let Ok(profile) = InharmonicityProfile::from_file(&path)
-        {
-            self.adopt(profile, path, settings);
-            return;
-        }
-        if let Some(path) = library::import_legacy_profile()
             && let Ok(profile) = InharmonicityProfile::from_file(&path)
         {
             self.adopt(profile, path, settings);

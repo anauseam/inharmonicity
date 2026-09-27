@@ -429,9 +429,7 @@ pub fn run(partials: &Path, json_out: Option<&Path>) -> Result<()> {
     let curve_a = curves::rigaud_pure(&input, &params);
     let measured: Vec<usize> = (0..88).filter(|&k| input.keys[k].is_some()).collect();
     for n in [4usize, 8, 16, 32, measured.len()] {
-        let mut subset = CurveInput {
-            keys: (0..88).map(|_| None).collect(),
-        };
+        let mut subset = CurveInput::default();
         for i in 0..n.min(measured.len()) {
             let k = measured[i * (measured.len() - 1) / (n.max(2) - 1).max(1)];
             subset.keys[k] = input.keys[k].clone();
