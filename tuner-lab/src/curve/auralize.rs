@@ -299,7 +299,7 @@ pub fn run(partials: &Path, out_dir: &Path) -> Result<()> {
 
     let profile = load_profile(partials);
     let input = CurveInput::from_profile_including_auto(&profile);
-    let bxi = curves::instrument_b_fit(&input);
+    let bxi = curves::bass_bridge_fit(&input);
     println!(
         "auralize — additive resynthesis A/B/C/D on {path}\n\
          measured keys: {} of 88 (auto-mode provenance, validation only)\n",

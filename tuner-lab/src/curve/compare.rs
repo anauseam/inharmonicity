@@ -151,7 +151,7 @@ pub fn run(partials: &Path, json_out: Option<&Path>) -> Result<()> {
     let path = partials.display();
     let profile = load_profile(partials);
     let input = CurveInput::from_profile_including_auto(&profile);
-    let bxi = curves::instrument_b_fit(&input);
+    let bxi = curves::bass_bridge_fit(&input);
 
     println!("curve_compare — §11 diagnostics on {path}");
     println!(

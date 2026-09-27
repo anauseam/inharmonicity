@@ -68,7 +68,7 @@ pub struct CurveBundle {
     /// Per-key displayed strobe partial n* ([`curves::select_display_partials`]),
     /// computed from the same input as the curves, so the two never disagree.
     pub display_partials: [u8; 88],
-    /// Discovery's template B per key: [`curves::template_b_fit`]'s curve at each
+    /// Discovery's template B per key: [`curves::bass_bridge_fit`]'s curve at each
     /// key, one curve over the whole compass whatever subset of keys is measured.
     pub template_b: [f32; 88],
 }
@@ -90,7 +90,7 @@ impl CurveBundle {
     pub fn compute(job: &CurveJob) -> Self {
         let input = &job.input;
         let params = CurveParams::default();
-        let template_bxi = curves::template_b_fit(input);
+        let template_bxi = curves::bass_bridge_fit(input);
         Self {
             generation: job.generation,
             rigaud_pure: curves::rigaud_pure(input, &params),

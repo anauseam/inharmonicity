@@ -585,6 +585,10 @@ point of every read, piano #2's A0 the farthest at 1.025 times.
    **Displaced: one fit for both**, the engines taking the template source's points, which
    moves every curve number; planned as its own change after this one.
 
+   **Amended 2026-09-27 by [report 0022](0022-curve-bass-bridge-fit.md).** The engines now
+   take the template source's fit and `instrument_b_fit` is gone; its pairs above, the tree
+   fit's rows, stay as measured.
+
 **Also considered.** The fit on every measured key, `instrument_b_fit` as it stands: within
 7.5 % of the bass-bridge fit on piano #2's complete profiles, but not identifiable from keys
 off the bass bridge (*Method*). A register cap on where measured B applies: blunter than the

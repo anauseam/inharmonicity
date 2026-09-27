@@ -6,7 +6,7 @@ use anyhow::Result;
 use clap::{Args, Subcommand};
 
 use crate::regen;
-use tuner_core::algorithms::curves;
+use tuner_core::algorithms::curves::{self, BASS_BRIDGE_MIN_PARTIALS};
 use tuner_core::models::{self, CurveInput, InharmonicityProfile};
 
 mod dump;
@@ -95,9 +95,9 @@ fn fitted_template_b(profile: &InharmonicityProfile, source: &Path) -> [f32; 88]
         .keys
         .iter()
         .flatten()
-        .filter(|d| d.partials.len() >= curves::TEMPLATE_MIN_PARTIALS)
+        .filter(|d| d.partials.len() >= BASS_BRIDGE_MIN_PARTIALS)
         .count();
-    let bxi = curves::template_b_fit(&input);
+    let bxi = curves::bass_bridge_fit(&input);
     eprintln!(
         "[TEMPLATES] {measured} of 88 keys measured from {}: s_B {:?}, y_B {:?}",
         source.display(),

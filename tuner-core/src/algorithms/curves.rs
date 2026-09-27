@@ -390,28 +390,16 @@ fn lagrange_eval(xs: &[f64], ys: &[f64], x: f64) -> f64 {
     sum
 }
 
-/// The per-instrument B_ξ fit (Eq. 29) over the input's keys, degrading to the
-/// medium-piano default when fewer than 2 keys are measured.
-pub fn instrument_b_fit(input: &CurveInput) -> BXi {
-    let points: Vec<(f64, f64)> = input
-        .keys
-        .iter()
-        .enumerate()
-        .filter_map(|(k, d)| d.as_ref().map(|d| (midi_from_key(k), d.b)))
-        .collect();
-    rigaud::fit_b_xi(&points, None).unwrap_or(BXi::DEFAULT_MEDIUM)
-}
+// ─── The instrument's B curve ────────────────────────────────────────────────
 
-// ─── Discovery templates ─────────────────────────────────────────────────────
-
-/// Fewest partials a measurement carries to enter the discovery templates' fit.
+/// Fewest partials a measurement carries to enter [`bass_bridge_fit`].
 // Repeat captures of one key scatter in ln B by 27 % at 4–5 partials, 8 % at 6–7
 // and 2.2 % from 8 up; templates stretched by top-octave values under the floor
 // lost locks.
 // report 0021
-pub const TEMPLATE_MIN_PARTIALS: usize = 8;
+pub const BASS_BRIDGE_MIN_PARTIALS: usize = 8;
 
-/// A measured key is a point of the templates' fit only if its B is at least this
+/// A measured key is a point of [`bass_bridge_fit`] only if its B is at least this
 /// many times the treble term e^(S_T m + Y_T) of the Rigaud B_ξ(m) model (Eqs. 7–8).
 /// The model is a bass term plus a treble term, and the treble term is the same for
 /// every piano, so the fit sets only the bass term, and only from keys where it is
@@ -422,36 +410,38 @@ pub const TEMPLATE_MIN_PARTIALS: usize = 8;
 // filter is the project's. 2 is not tuned: at 2 a point's bass and treble terms
 // are equal.
 // report 0021
-pub const TEMPLATE_MIN_B_OVER_TREBLE: f64 = 2.0;
+pub const BASS_BRIDGE_MIN_B_OVER_TREBLE: f64 = 2.0;
 
-/// Fewest keys the fit's points must cover, lowest to highest inclusive, for the
-/// fit to estimate the slope s_B as well as the intercept y_B.
+/// Fewest keys the points of [`bass_bridge_fit`] must cover, lowest to highest
+/// inclusive, for the fit to estimate the slope s_B as well as the intercept y_B.
 // Points close together fix the bass term's level but not its slope: two adjacent
 // keys fitted s_B four times too shallow and lost locks. Twelve keeps both
 // parameters on every complete profile read.
 // report 0021
-pub const TEMPLATE_SLOPE_SPAN_KEYS: usize = 12;
+pub const BASS_BRIDGE_SLOPE_SPAN_KEYS: usize = 12;
 
-/// The bass pair of discovery's templates ([`KeyProfile`](crate::models::KeyProfile)),
-/// fitted to the instrument. Every template's B is Rigaud's whole-compass model
-/// B_ξ̂(m) (Eqs. 7–8) at its key, so every template follows one curve whatever
-/// subset of keys is measured, and no template is a key's own measurement.
+/// The instrument's B curve: Rigaud's whole-compass model B_ξ̂(m) (Eqs. 7–8) with the
+/// bass pair ξ̂ = (s_B, y_B) fitted by Eq. 29 to the measured keys on the bass bridge.
+/// It is one curve over the compass whatever subset of keys is measured: the B the
+/// tuning curve weighs a measured key against and gives an unmeasured one, and every
+/// discovery template's B ([`KeyProfile`](crate::models::KeyProfile)), so no template is
+/// a key's own measurement.
 ///
 /// A key enters the fit through the one measurement [`CurveInput::keys`] holds for
 /// it (from [`CurveInput::from_profile`], its newest trusted capture) when that
-/// carries at least [`TEMPLATE_MIN_PARTIALS`] partials, and is a point of the fit
-/// when its B reaches [`TEMPLATE_MIN_B_OVER_TREBLE`] times the treble term. Fewer
+/// carries at least [`BASS_BRIDGE_MIN_PARTIALS`] partials, and is a point of the fit
+/// when its B reaches [`BASS_BRIDGE_MIN_B_OVER_TREBLE`] times the treble term. Fewer
 /// than two points keep [`BXi::DEFAULT_MEDIUM`]; points covering fewer than
-/// [`TEMPLATE_SLOPE_SPAN_KEYS`] keys fit the intercept alone at the default slope,
+/// [`BASS_BRIDGE_SLOPE_SPAN_KEYS`] keys fit the intercept alone at the default slope,
 /// since two points close together fix the bass term's level and not its slope.
 ///
 /// # References
 /// Rigaud, F., David, B., & Daudet, L. (2013). "A parametric model and estimation
 /// techniques for the inharmonicity and tuning of the piano". JASA 133(5),
 /// 3107–3118. DOI: 10.1121/1.4799806 (Eqs. 7–8, 29).
-pub fn template_b_fit(input: &CurveInput) -> BXi {
+pub fn bass_bridge_fit(input: &CurveInput) -> BXi {
     // The fit's points (m, B): admitted keys whose B reaches
-    // TEMPLATE_MIN_B_OVER_TREBLE times the treble term of Eq. 8.
+    // BASS_BRIDGE_MIN_B_OVER_TREBLE times the treble term of Eq. 8.
     let points: Vec<(f64, f64)> = input
         .keys
         .iter()
@@ -459,10 +449,10 @@ pub fn template_b_fit(input: &CurveInput) -> BXi {
         .filter_map(|(k, d)| {
             let d = d
                 .as_ref()
-                .filter(|d| d.partials.len() >= TEMPLATE_MIN_PARTIALS)?;
+                .filter(|d| d.partials.len() >= BASS_BRIDGE_MIN_PARTIALS)?;
             let m = midi_from_key(k);
             let treble = (rigaud::S_T * m + rigaud::Y_T).exp();
-            (d.b >= TEMPLATE_MIN_B_OVER_TREBLE * treble).then_some((m, d.b))
+            (d.b >= BASS_BRIDGE_MIN_B_OVER_TREBLE * treble).then_some((m, d.b))
         })
         .collect();
     let covered = match (points.first(), points.last()) {
@@ -470,7 +460,7 @@ pub fn template_b_fit(input: &CurveInput) -> BXi {
         _ => 0,
     };
     // Eq. 29 over both parameters, or over y_B alone at the default slope.
-    let held_slope = (covered < TEMPLATE_SLOPE_SPAN_KEYS).then_some(BXi::DEFAULT_MEDIUM.s_b);
+    let held_slope = (covered < BASS_BRIDGE_SLOPE_SPAN_KEYS).then_some(BXi::DEFAULT_MEDIUM.s_b);
     rigaud::fit_b_xi(&points, held_slope).unwrap_or(BXi::DEFAULT_MEDIUM)
 }
 
@@ -486,15 +476,18 @@ struct CurveBasis {
     /// Engine (a)'s curve — the prior every other engine corrects.
     prior: [f64; 88],
     flags: [CurveKeyFlags; 88],
-    /// The Eq.-29 fit the blend shrinks toward.
+    /// The instrument's B curve ([`bass_bridge_fit`]), which the blend shrinks toward.
     bxi: BXi,
 }
 
 fn curve_basis(input: &CurveInput, params: &CurveParams) -> CurveBasis {
     let mut flags = [CurveKeyFlags::default(); 88];
 
-    // Eq. 29 fit over all trusted measured keys (L1 is the outlier guard).
-    let bxi = instrument_b_fit(input);
+    // Do not fit every measured key: a profile with no key on the bass bridge then
+    // puts A0 anywhere from 0.27× to 160× the default, and every unmeasured key
+    // takes the fit.
+    // report 0022
+    let bxi = bass_bridge_fit(input);
 
     // `b_is_measured` grades a key as data at the point of equal information,
     // w ≥ 1/2 ⇔ σ_m ≤ σ_p; the blended B itself is continuous across it.
@@ -622,8 +615,8 @@ fn finish(mut cents: [f64; 88], mut flags: [CurveKeyFlags; 88], d_g: f64) -> Tun
 /// the §IV.C.2 presets) drive an Eq.-6 chain of A notes from A4, Lagrange
 /// interpolation (§II.B.4) spreads it over the compass, and d_g carries the global
 /// deviation (Eq. 32's role). About 3 effective degrees of freedom: heavy on bias,
-/// light on variance. With no trusted measurements the fit degrades to the
-/// medium-piano default, a generic starting curve.
+/// light on variance. With fewer than two measured keys on the bass bridge the fit
+/// is the medium-piano default, a generic starting curve.
 pub fn rigaud_pure(input: &CurveInput, params: &CurveParams) -> TuningCurve {
     let basis = curve_basis(input, params);
     finish(basis.prior, basis.flags, params.d_g)
@@ -1277,6 +1270,7 @@ mod tests {
     use crate::models::{
         InharmonicityProfile, KeyMeasurement, Partial, SoundingStrings, get_expected_beta,
     };
+    use crate::worker::{CurveBundle, CurveJob};
 
     /// Fallback display-partial table: values from the TuneLab default
     /// set, monotone non-increasing across the compass, fundamental from A4
@@ -1597,10 +1591,10 @@ mod tests {
         // Self-calibrated σ_p: an exactly on-model profile deflates to the
         // floor; the ±30 % deviating profile measures its own scatter.
         let on_model = CurveInput::from_profile(&synth_profile(0..88));
-        let bxi = instrument_b_fit(&on_model);
+        let bxi = bass_bridge_fit(&on_model);
         assert!(sigma_prior(&on_model, &bxi) <= 0.02);
         let deviating = CurveInput::from_profile(&synth_profile_deviating(0..88));
-        let bxi_dev = instrument_b_fit(&deviating);
+        let bxi_dev = bass_bridge_fit(&deviating);
         let sp = sigma_prior(&deviating, &bxi_dev);
         assert!((0.1..0.5).contains(&sp), "sigma_prior {sp} not near 0.3/√2");
 
@@ -1740,7 +1734,7 @@ mod tests {
         }
     }
 
-    // ─── Discovery templates ─────────────────────────────────────────────────
+    // ─── The instrument's B curve ────────────────────────────────────────────
 
     /// One trusted capture of `key` with measured B `b` and `partials` partials.
     fn capture(key: u8, b: f32, partials: u32) -> KeyMeasurement {
@@ -1902,32 +1896,106 @@ mod tests {
     };
 
     /// Eq. 29's fit reproduces the recorded pairs bit for bit on their point
-    /// sets, and so does the templates' fit on inputs holding exactly those
+    /// sets, and so does [`bass_bridge_fit`] on inputs holding exactly those
     /// points: the complete profiles, the RWC Steinway's bass bridge (A0–G♯1,
     /// twelve keys) included, while two points closer than twelve keys keep the
     /// default slope and fit the intercept alone.
     // report 0021
     #[test]
-    fn template_b_fit_reproduces_the_recorded_fits() {
+    fn bass_bridge_fit_reproduces_the_recorded_fits() {
         let pair = |bxi: BXi| (bxi.s_b.to_bits(), bxi.y_b.to_bits());
         for set in [&PIANO2, &RWC_YAMAHA, &RWC_BOSENDORFER, &RWC_STEINWAY] {
             assert_eq!(
                 pair(rigaud::fit_b_xi(&set.midi_b(), None).unwrap()),
                 set.pair
             );
-            assert_eq!(pair(template_b_fit(&set.input())), set.pair);
+            assert_eq!(pair(bass_bridge_fit(&set.input())), set.pair);
         }
         for set in [&PIANO2_ADJACENT, &PIANO2_FOUR_APART] {
             assert_eq!(
                 pair(rigaud::fit_b_xi(&set.midi_b(), None).unwrap()),
                 set.pair
             );
-            let fit = template_b_fit(&set.input());
+            let fit = bass_bridge_fit(&set.input());
             assert_eq!(fit.s_b, BXi::DEFAULT_MEDIUM.s_b);
             assert_eq!(
                 Some(fit),
                 rigaud::fit_b_xi(&set.midi_b(), Some(BXi::DEFAULT_MEDIUM.s_b))
             );
+        }
+    }
+
+    /// The tuning curve reads the same pair as the templates: through the path
+    /// every engine starts from, the recorded pairs hold bit for bit on their point
+    /// sets, and two points closer than twelve keys keep the default slope.
+    // report 0022
+    #[test]
+    fn the_curve_reproduces_the_recorded_fits() {
+        let params = CurveParams::default();
+        let pair = |bxi: BXi| (bxi.s_b.to_bits(), bxi.y_b.to_bits());
+        for set in [&PIANO2, &RWC_YAMAHA, &RWC_BOSENDORFER, &RWC_STEINWAY] {
+            assert_eq!(pair(curve_basis(&set.input(), &params).bxi), set.pair);
+        }
+        for set in [&PIANO2_ADJACENT, &PIANO2_FOUR_APART] {
+            assert_eq!(
+                Some(curve_basis(&set.input(), &params).bxi),
+                rigaud::fit_b_xi(&set.midi_b(), Some(BXi::DEFAULT_MEDIUM.s_b))
+            );
+        }
+    }
+
+    /// One fit: on every profile a curve bundle's templates are the B curve of the
+    /// pair every engine starts from.
+    // report 0022
+    #[test]
+    fn the_curve_and_the_templates_share_one_pair() {
+        let params = CurveParams::default();
+        let mut adjacent = InharmonicityProfile::default();
+        for k in [3u8, 4] {
+            adjacent.record(capture(k, 4.0 * get_expected_beta(k), 32));
+        }
+        for profile in [
+            synth_profile_deviating(0..88),
+            synth_profile_deviating(0..27),
+            synth_profile_deviating(27..60),
+            synth_profile_deviating(60..88),
+            adjacent,
+            InharmonicityProfile::default(),
+        ] {
+            let input = CurveInput::from_profile(&profile);
+            let bxi = curve_basis(&input, &params).bxi;
+            let bundle = CurveBundle::compute(&CurveJob {
+                generation: 0,
+                input,
+            });
+            for k in 0..88 {
+                assert_eq!(bundle.template_b[k], bxi.b_at_key(k) as f32, "key {k}");
+            }
+        }
+    }
+
+    /// A profile measured only above the bass bridge, the mid alone or the treble
+    /// alone, leaves the curve on the default pair, so its bass is the bass of the
+    /// curve with nothing measured: engine (a), built from the pair alone, at every
+    /// bass key, and the B every other engine reads there.
+    // report 0022
+    #[test]
+    fn a_profile_off_the_bass_bridge_leaves_the_bass_on_the_default() {
+        let params = CurveParams::default();
+        let nothing = CurveInput::default();
+        let (basis_0, a_0) = (
+            curve_basis(&nothing, &params),
+            rigaud_pure(&nothing, &params),
+        );
+        for keys in [27..60, 60..88] {
+            let input = CurveInput::from_profile(&synth_profile_deviating(keys));
+            let basis = curve_basis(&input, &params);
+            assert_eq!(basis.bxi, BXi::DEFAULT_MEDIUM);
+            let a = rigaud_pure(&input, &params);
+            for k in 0..27 {
+                assert_eq!(a.cents[k], a_0.cents[k], "engine (a) at key {k}");
+                assert_eq!(basis.curve_b[k], basis_0.curve_b[k], "curve B at key {k}");
+            }
         }
     }
 
@@ -1942,7 +2010,7 @@ mod tests {
             let mut profile = InharmonicityProfile::default();
             profile.record(capture(lo, 4.0 * get_expected_beta(lo), 32));
             profile.record(capture(hi, 2.0 * get_expected_beta(hi), 32));
-            template_b_fit(&CurveInput::from_profile(&profile)).s_b
+            bass_bridge_fit(&CurveInput::from_profile(&profile)).s_b
         };
         assert_ne!(slope(0, 11), BXi::DEFAULT_MEDIUM.s_b);
         assert_eq!(slope(0, 10), BXi::DEFAULT_MEDIUM.s_b);
@@ -1963,7 +2031,7 @@ mod tests {
             CurveInput::default(),
             CurveInput::from_profile(&one_bass_and_mids),
         ] {
-            let bxi = template_b_fit(&input);
+            let bxi = bass_bridge_fit(&input);
             assert_eq!(bxi, BXi::DEFAULT_MEDIUM);
             for k in 0..88 {
                 let (t, prior) = (bxi.b_at_key(k) as f32, get_expected_beta(k as u8));
@@ -1975,25 +2043,25 @@ mod tests {
         }
     }
 
-    /// A key is a point from [`TEMPLATE_MIN_B_OVER_TREBLE`] times the treble term
+    /// A key is a point from [`BASS_BRIDGE_MIN_B_OVER_TREBLE`] times the treble term
     /// up, and not below: just above it a second point makes a fit, just below it
     /// the one bass point left keeps the default pair.
     // report 0021
     #[test]
-    fn a_template_point_needs_the_minimum_b_over_treble() {
+    fn a_bass_bridge_point_needs_the_minimum_b_over_treble() {
         let fit_with = |multiple: f64| {
             let treble = (rigaud::S_T * midi_from_key(30) + rigaud::Y_T).exp();
             let mut profile = InharmonicityProfile::default();
             profile.record(capture(0, 4.0 * get_expected_beta(0), 32));
             profile.record(capture(30, (multiple * treble) as f32, 32));
-            template_b_fit(&CurveInput::from_profile(&profile))
+            bass_bridge_fit(&CurveInput::from_profile(&profile))
         };
         assert_ne!(
-            fit_with(1.01 * TEMPLATE_MIN_B_OVER_TREBLE),
+            fit_with(1.01 * BASS_BRIDGE_MIN_B_OVER_TREBLE),
             BXi::DEFAULT_MEDIUM
         );
         assert_eq!(
-            fit_with(0.99 * TEMPLATE_MIN_B_OVER_TREBLE),
+            fit_with(0.99 * BASS_BRIDGE_MIN_B_OVER_TREBLE),
             BXi::DEFAULT_MEDIUM
         );
     }
@@ -2008,12 +2076,12 @@ mod tests {
         let mut profile = InharmonicityProfile::default();
         profile.record(capture(3, 4.0 * get_expected_beta(3), 32));
         assert_eq!(
-            template_b_fit(&CurveInput::from_profile(&profile)),
+            bass_bridge_fit(&CurveInput::from_profile(&profile)),
             BXi::DEFAULT_MEDIUM
         );
 
         profile.record(capture(15, 4.0 * get_expected_beta(15), 32));
-        let bxi = template_b_fit(&CurveInput::from_profile(&profile));
+        let bxi = bass_bridge_fit(&CurveInput::from_profile(&profile));
         for k in 0..16 {
             let ratio = bxi.b_at_key(k) as f32 / get_expected_beta(k as u8);
             assert!((3.5..4.5).contains(&ratio), "key {k} at {ratio}× the prior");
@@ -2028,7 +2096,7 @@ mod tests {
     fn the_fit_reads_each_keys_newest_trusted_capture() {
         let b = |k: u8| 4.0 * get_expected_beta(k);
         let fit_of =
-            |profile: &InharmonicityProfile| template_b_fit(&CurveInput::from_profile(profile));
+            |profile: &InharmonicityProfile| bass_bridge_fit(&CurveInput::from_profile(profile));
         let mut newest = InharmonicityProfile::default();
         let mut older = InharmonicityProfile::default();
         let mut all = InharmonicityProfile::default();
@@ -2048,7 +2116,11 @@ mod tests {
         assert_ne!(fit_of(&older), fit_of(&newest));
         assert_eq!(fit_of(&all), fit_of(&newest));
         // A newest capture under the partial floor leaves its key out.
-        all.record(capture(12, 0.5 * b(12), TEMPLATE_MIN_PARTIALS as u32 - 1));
+        all.record(capture(
+            12,
+            0.5 * b(12),
+            BASS_BRIDGE_MIN_PARTIALS as u32 - 1,
+        ));
         let mut ends = InharmonicityProfile::default();
         for k in [0u8, 24] {
             ends.record(capture(k, b(k), 32));

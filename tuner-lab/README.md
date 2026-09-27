@@ -114,7 +114,7 @@ own Stage-A scan.
 
 | Mode | What it reports | Reproduces | Input |
 | --- | --- | --- | --- |
-| `compare <REGEN> [--json OUT]` | every engine: stretch tables, implied beat rates, leave-one-key-out error, Giordano cross-scoring, curvature, flag counts | reports 0007–0009; the curve-side goldens | a `mat regen` dump |
+| `compare <REGEN> [--json OUT]` | every engine: stretch tables, implied beat rates, leave-one-key-out error, Giordano cross-scoring, curvature, flag counts | reports 0007–0009, 0022; the curve-side goldens | a `mat regen` dump |
 | `auralize <REGEN> [--out DIR]` | each candidate curve rendered to a loudness-matched WAV by offline additive resynthesis | the perceptual selection evidence | a `mat regen` dump |
 
 ## `strobe` — the bank, and the number the panel displays

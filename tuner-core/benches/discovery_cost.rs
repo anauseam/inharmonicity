@@ -73,9 +73,9 @@ fn template_refresh(c: &mut Criterion) {
         });
     }
     c.bench_function("discovery templates, the fit, one bundle", |b| {
-        b.iter(|| black_box(curves::template_b_fit(black_box(&input))))
+        b.iter(|| black_box(curves::bass_bridge_fit(black_box(&input))))
     });
-    let bxi = curves::template_b_fit(&input);
+    let bxi = curves::bass_bridge_fit(&input);
     let template_b: [f32; 88] = core::array::from_fn(|k| bxi.b_at_key(k) as f32);
     c.bench_function(
         "discovery templates, 88 KeyProfile::new, one refresh",

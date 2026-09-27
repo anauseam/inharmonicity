@@ -177,7 +177,8 @@ number is never reused.
 | 0018 | — | one owner for `CaptureState` | `ARCHITECTURE.md` § Decisions |
 | 0019 | [`0019-dc-blocker-corner.md`](retiring/0019-dc-blocker-corner.md) | the DC blocker's 35 Hz corner stays; change the order, not α | `audio.rs` `DC_BLOCK_ALPHA` |
 | 0020 | [`0020-vote-from-onset.md`](0020-vote-from-onset.md) | the lock's window fills from the onset, not from `Stable`; a commit still lands on a `Stable` frame | `ARCHITECTURE.md` § DSP foundations; `engine.rs` `Engine::process` |
-| 0021 | [`0021-curve-seeded-templates.md`](0021-curve-seeded-templates.md) | every discovery template takes the instrument's fitted *B* curve: Rigaud's bass pair on the measured bass-bridge keys, the slope held under twelve keys, no per-key table | `ARCHITECTURE.md` § Decisions; `curves.rs` `template_b_fit` |
+| 0021 | [`0021-curve-seeded-templates.md`](0021-curve-seeded-templates.md) | every discovery template takes the instrument's fitted *B* curve: Rigaud's bass pair on the measured bass-bridge keys, the slope held under twelve keys, no per-key table | `ARCHITECTURE.md` § Decisions; `curves.rs` `bass_bridge_fit` |
+| 0022 | [`0022-curve-bass-bridge-fit.md`](0022-curve-bass-bridge-fit.md) | the tuning curve takes the templates' bass pair, fitted on the bass-bridge keys alone; the fit on every measured key goes | `ARCHITECTURE.md` § Decisions; `curves.rs` `curve_basis` |
 
 Standalone, with no number: [`tuning-curve-grounding.md`](tuning-curve-grounding.md),
 [`nsga2/`](nsga2/README.md) (the sweep's method and its runs), and

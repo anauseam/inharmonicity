@@ -445,6 +445,19 @@ move, so it runs after the step as its own change.
   the fit to the precision blend.
   → [report 0009](reports/0009-repeat-capture-noise-decomposition.md),
   [report 0021](reports/0021-curve-seeded-templates.md)
+- **Which keys' measured B belongs in the tuning curve** — `Investigating`.
+  Engines (b), (c) and (d) blend each measured key's B with the model, weighted by
+  the capture's expected scatter against one per-instrument spread σ_p, which is
+  calibrated on keys measured with ten partials or more. Where σ_p is large, a
+  capture with few partials steers its key: on piano #1 (σ_p 0.21) a five-partial
+  capture in the top octave counts as measurement-dominated, at weight 0.66, where
+  repeats of one key disagree by 27 % at 4–5 partials. A key's deviation from the
+  model reproduces across sessions in the bass and the mid, and not in the treble.
+  Candidates: the blend as it stands, no measured B, the blend only from the fit's
+  partial floor up, and per-key σ_m (the entry above). Any of them moves every
+  curve number, so a measurement comes first.
+  → [report 0009](reports/0009-repeat-capture-noise-decomposition.md),
+  [report 0022](reports/0022-curve-bass-bridge-fit.md)
 - **Does a bass model with more freedom than two asymptotes describe every
   piano?** — `Investigating`. Rigaud's bass asymptote fits the bass keys of the
   upright, the Disklavier and the RWC Yamaha and Steinway within 0.3 in ln B,
@@ -455,19 +468,14 @@ move, so it runs after the step as its own change.
   non-inferior.
   → [report 0021](reports/0021-curve-seeded-templates.md)
 - **`instrument_b_fit` is not identifiable from keys off the bass bridge** —
-  `Planned`, as its own change after the curve-seeding commit. The curve engines
-  fit Rigaud's bass pair on every measured key and hand it to every unmeasured
-  one; fitted on mid keys alone it puts A0 at 25× the default, on treble keys
-  alone at 224× or 0.08×. Discovery's templates are guarded
-  (`curves::template_b_fit`: points at twice the treble term or more, the slope
-  held under twelve keys of them); the engines are not, so a profile measured
-  only above the bass carries a wild bass into the curve. The agreed fix is one
-  fit for both: the engines take `template_b_fit`'s pair and `instrument_b_fit`
-  goes. That moves every curve number (engine (a) uses the fit at every key, the
-  others where a key is unmeasured), so the change carries a before-and-after
-  comparison of the engines' curves on the capture sets, a treble-only profile
-  included.
-  → [report 0021](reports/0021-curve-seeded-templates.md)
+  resolved as one fit for both: the curve engines take the templates' pair,
+  `curves::bass_bridge_fit` (points at twice the treble term or more, the slope
+  held under twelve keys of them), and `instrument_b_fit` is gone. A profile
+  measured only above the bass now leaves the curve's bass on the default pair;
+  fitted on every measured key, such profiles had put A0 at 0.27× to 160× the
+  default.
+  → [report 0021](reports/0021-curve-seeded-templates.md),
+  [report 0022](reports/0022-curve-bass-bridge-fit.md)
 - **What replaces an excluded measurement, and the exclusion on partial
   coverage** — `Investigating`. When the curve's negative-stretch check excludes
   a key's measured B, three things follow that nobody has examined:
@@ -556,6 +564,16 @@ move, so it runs after the step as its own change.
   reached through its module, yet `tuner-lab` imports `get_expected_beta` bare in
   eight files, `curves.rs` imports `rigaud::midi_from_key`, the discovery bench
   `discover`, and several test modules their helpers.
+- **Name the upstream Rust conventions `style.md` defers to** — `Planned`, as its
+  own change. `style.md` says the project follows standard Rust conventions and
+  links none of them, so a departure has nothing to be checked against:
+  `tuner-lab` lays out its six subcommands as `<name>/mod.rs`, a layout the Rust
+  Reference discourages and the other two crates do not use, and no lint caught it
+  (`clippy::mod_module_files` is in the restriction group, off by default). To
+  decide: which documents `style.md` names and links (the Style Guide, the API
+  Guidelines, the Reference, the Book), which lints the workspace turns on, and the
+  six moves.
+  → [`style.md`](docs/internals/style.md)
 - **One type for a key's predicted partial series, `PartialTemplate`** —
   `Planned`, as its own change after the curve-seeding commit (report 0021).
   Discovery's templates (`KeyProfile`: up to 128 partials from the

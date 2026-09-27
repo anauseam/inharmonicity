@@ -352,11 +352,12 @@ modules*.
 
 **Every discovery template takes the instrument's fitted B curve.** The Worker
 fits Rigaud's bass pair to the measured bass-bridge keys with each curve bundle,
-and the frontend pushes all 88 templates whole over crossing 4. No template is
-a key's own measurement: a per-key table leaves holes, where a measured
-neighbour outbids a true key left on the prior. Reopens if a bass the
-two-asymptote form misfits loses locks under the fit.
-→ [report 0021](reports/0021-curve-seeded-templates.md)
+the same pair the tuning curve reads, and the frontend pushes all 88 templates
+whole over crossing 4. No template is a key's own measurement: a per-key table
+leaves holes, where a measured neighbour outbids a true key left on the prior.
+Reopens if a bass the two-asymptote form misfits loses locks under the fit.
+→ [report 0021](reports/0021-curve-seeded-templates.md),
+[report 0022](reports/0022-curve-bass-bridge-fit.md)
 
 ### DSP foundations
 

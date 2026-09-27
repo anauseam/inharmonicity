@@ -7,8 +7,9 @@ which parts of it rest on measurement versus on a model.
 
 The decisions it refers to are recorded in
 [report 0007](0007-tuning-curve-regularization-geometry.md),
-[report 0008](0008-giordano-layer-fidelity-derived-weights.md) and
-[report 0009](0009-repeat-capture-noise-decomposition.md); their evidence
+[report 0008](0008-giordano-layer-fidelity-derived-weights.md),
+[report 0009](0009-repeat-capture-noise-decomposition.md) and
+[report 0022](0022-curve-bass-bridge-fit.md); their evidence
 is in the `reports/` bodies of the same numbers.
 
 Two claims get conflated when people ask whether a tuning curve is "right", and
@@ -47,9 +48,10 @@ that are _not_ instrument-specific.
 **Admission.** A capture enters the curve when it is trusted (manual mode, not a
 partial unison), its $B$ is finite and positive, it carries at least two
 partials, and Rigaud's Eq. 20 can solve an $F_0$ from them. That test is binary
-and it is the only binary test: a 3-partial C8 is admitted exactly as a
-32-partial A1 is. How much each is _believed_ is decided downstream, and
-continuously.
+and it is the only binary test between a key's own $B$ and the blend: a
+3-partial C8 is admitted exactly as a 32-partial A1 is. How much each is
+_believed_ is decided downstream, and continuously. The model's bass pair takes
+its points by a test of its own (Structure 1).
 
 **Structure 1 — the $B_\xi$ model (Rigaud Eqs. 7–8).** Each bridge's $B$ is an
 exponential in key number, so on a log axis each is a straight line, and the
@@ -61,20 +63,25 @@ The treble pair $(s_T, y_T)$ is fixed at the paper's cross-piano values ("Why
 the top octave is modelled, not measured", below). The bass pair is fitted to the
 instrument by least absolute deviations in $\ln B$ (Eq. 29 — an L1 fit, chosen
 by the paper because it behaves like a median: one wild key barely moves it)
-over **every admitted key, with no cutoff.** Treble keys enter and cannot move
-it, not because they are blocked but because the model gives them no lever: a
-key's residual only responds to $(s_B, y_B)$ in proportion to the bass line's
-share of $B_\xi$ there, and on instrument 2 that share is
+over **the keys the measurement places on the bass bridge**: admitted keys whose
+capture holds at least eight partials and whose $B$ is at least twice the treble
+term, where the bass line is at least half of $B$. A key's residual responds to
+$(s_B, y_B)$ only in proportion to the bass line's share of $B_\xi$ there, and on
+instrument 2 that share is
 
 | A0 | A1 | A2 | A#2 | A3 | A4 | A5 | A6 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | 98 % | 90 % | 56 % | 52 % | 16 % | 2.6 % | 0.4 % | 0.1 % |
 
-so the fit is effectively decided by A0–A3 and the crossover sits at B2.
-Admitting everything costs nothing and avoids inventing a register cutoff, which
-[`layering.md`](../docs/internals/layering.md) forbids. With no admitted keys
-at all the model falls back to the medium-piano default pair. Two parameters:
-this is the smooth backbone, not the curve.
+so on instrument 2 the points run from A0 to A2 and the crossover sits at B2. A
+key off the bridge has too little lever to fix the pair, and keys off it alone
+fix it anywhere: fitted on keys above the bass alone, the pair put A0 at 0.27 to
+160 times the default ([report 0022](0022-curve-bass-bridge-fit.md)). The test
+is the model's own boundary, not a register cutoff, so it moves with the
+instrument. Points covering fewer than twelve keys fit the intercept alone at
+the default slope, and with fewer than two points the model falls back to the
+medium-piano default pair. Two parameters: this is the smooth backbone, not the
+curve.
 
 **Structure 2 — the per-key blend (report 0009; ours, not Rigaud's).** Every
 admitted key's curve-side $B$ is the precision-weighted combination of its own
