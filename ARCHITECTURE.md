@@ -451,6 +451,7 @@ The two settings above are what keep it out of the product, and they already do.
 ```text
 tuner-lab/
 ├── src/
+│   ├── audio.rs                  cargo lab audio: the room, through the app's own stream
 │   ├── capture.rs                finds capture sets; names the key a capture belongs to
 │   ├── curve/                    cargo lab curve: the tuning-curve engines
 │   │   ├── auralize.rs           each engine's curve rendered to WAV, to judge by ear
@@ -473,14 +474,14 @@ tuner-lab/
 │   │   ├── ambient.rs            the ambient σ at the three hot-path gates that use it
 │   │   ├── coarse.rs             the coarse read's gate: profile, pfa, refset, verify, ab
 │   │   └── mod.rs                mode list and dispatch
-│   ├── main.rs                   CLI: the six subsystems
+│   ├── main.rs                   CLI: the seven subsystems
 │   ├── mat/                      cargo lab mat: the Worker's (f₀, B) estimator
 │   │   ├── mod.rs                mode list and dispatch
 │   │   ├── recovery.rs           MAT against known synthetic B, 1×–25× the prior
 │   │   ├── regenerate.rs         regen: per-key partials re-derived from kept audio
 │   │   ├── repeats.rs            capture-to-capture noise in what the curves consume
 │   │   └── validate.rs           measured B per key against the prior; also offset
-│   ├── raw.rs                    reads the raw f32 capture dumps
+│   ├── raw.rs                    reads and writes the raw f32 dumps
 │   ├── regen.rs                  the mat regen schema, and the rules for consuming it
 │   ├── strobe/                   cargo lab strobe: the bank and the displayed reading
 │   │   ├── isolation.rs          the unison panel against mute-isolation truth

@@ -31,6 +31,9 @@ diagnostics/
 # No underscore before the index: the sets on disk are named both
 # `diagnostics_piano_1` and `diagnostics_piano2`.
 diagnostics_piano*/
+# Room-silence recordings (`cargo lab audio record`), validation data like the
+# capture sets: kept on disk, never committed.
+silence_*/
 
 # Auralization renders (examples/auralize.rs output — large regenerable WAVs)
 auralize_out/

@@ -3908,8 +3908,10 @@ version = "0.1.0-alpha"
 dependencies = [
  "anyhow",
  "clap",
+ "cpal",
  "plotters",
  "realfft",
+ "ringbuf",
  "rustfft",
  "serde_json",
  "tuner-core",

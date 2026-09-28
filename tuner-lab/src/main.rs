@@ -9,6 +9,7 @@
 //! cargo lab --help
 //! ```
 
+mod audio;
 mod capture;
 mod curve;
 mod engine;
@@ -29,8 +30,9 @@ use clap::{Parser, Subcommand};
     name = "lab",
     about = "Measurement harnesses for the inharmonicity engine",
     long_about = "Offline instruments that replay captured audio through the shipped \
-                  algorithms and report what they saw. Each subcommand names the \
-                  subsystem it measures; `--help` at any level lists its modes.",
+                  algorithms and report what they saw, and a recorder that captures \
+                  the room through the app's own input stream. Each subcommand names \
+                  the subsystem it measures; `--help` at any level lists its modes.",
     version
 )]
 struct Cli {
@@ -52,6 +54,8 @@ enum Subsystem {
     Strobe(strobe::Cmd),
     /// The detection thresholds, which span the engine and the strobe.
     Gates(gates::Cmd),
+    /// Acquisition: recordings through the app's own input stream.
+    Audio(audio::Cmd),
 }
 
 fn main() -> Result<()> {
@@ -62,5 +66,6 @@ fn main() -> Result<()> {
         Subsystem::Curve(c) => curve::run(c),
         Subsystem::Strobe(c) => strobe::run(c),
         Subsystem::Gates(c) => gates::run(c),
+        Subsystem::Audio(c) => audio::run(c),
     }
 }

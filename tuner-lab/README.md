@@ -1,11 +1,11 @@
 # `tuner-lab` — the measurement instruments
 
 Offline harnesses that replay captured audio through the shipped algorithms and
-report what they saw. Development instruments, not user features; they ship in
-nothing.
+report what they saw, and a recorder that captures the room through the app's own
+input stream. Development instruments, not user features; they ship in nothing.
 
 ```bash
-cargo lab --help                    # the six subsystems
+cargo lab --help                    # the seven subsystems
 cargo lab strobe --help             # one subsystem's modes
 cargo lab engine lock               # a mode
 ```
@@ -24,7 +24,7 @@ Most modes read the capture sets in
 whose consumption rules bind: piano #2 is consumed through `mat regen`, never
 raw `analysis.json`. `regen::load` applies the ±200 ¢ plausibility rule.
 
-Why a crate and why six subcommands: the three-homes rule in
+Why a crate and why seven subcommands: the three-homes rule in
 [`style.md`](../docs/internals/style.md). The old-invocation rename map is
 below; the move itself is in git history (2026-09).
 
@@ -155,6 +155,17 @@ OS-CFAR family that could replace it is measured against the same reference.
 `ambient`'s AWGN calibration row (report 0015 §4) needs a synthetic dump directory
 that is not in the repository and has no generator in the tree; it is the one
 reproduce line here that cannot be run from a clean checkout.
+
+## `audio` — acquisition
+
+| Mode | What it reports | Reproduces | Input |
+| --- | --- | --- | --- |
+| `record <OUT_DIR> --seconds <N> [--label <TEXT>]` | the default input device through the app's own stream (DC-blocked, at the negotiated rate) to `audio.raw`, with `recording.json`: start, duration, device, rate, label, and whether the ring ever filled | the noise-floor measurement (pending) | none (the room, live) |
+
+A recording is validation data like the capture sets and lives beside them, in a
+gitignored `silence_*/` directory
+([`capture-sets.md`](../docs/internals/capture-sets.md)). Its `audio.raw` is the
+capture form, so every mode that takes one `.raw` reads it.
 
 ## What a capture writes
 

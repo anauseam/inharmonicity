@@ -546,16 +546,41 @@ move, so it runs after the step as its own change.
 - **Review the `unsafe` byte-slice transmute** in `worker.rs::write_diagnostics`
   — `Deferred`. Functionally correct; worth checking whether `bytemuck` replaces
   it without a performance cost.
-- **Two `style.md` rules have no lint behind them** — `Planned`. Every public
-  `tuner-core` item carries a `///` doc except 18: `GateResult`'s fields (two of
-  them wait on the onset-flag entry above), `CurveJob`'s, `WorkerOutput`'s
+- **Lints: the upstream conventions `style.md` defers to, and the rules it states
+  without one** — `Planned`, as its own change. `style.md` says the project follows
+  standard Rust conventions and links none of them, so a departure has nothing to
+  be checked against: `tuner-lab` lays out its six subcommands as `<name>/mod.rs`,
+  a layout the Rust Reference discourages and the other two crates do not use, and
+  no lint caught it (`clippy::mod_module_files` is in the restriction group, off by
+  default). Two rules `style.md` does state have no lint behind them either. Every
+  public `tuner-core` item carries a `///` doc except 18: `GateResult`'s fields
+  (two of them wait on the onset-flag entry above), `CurveJob`'s, `WorkerOutput`'s
   variants, `WorkerManager`'s two methods, `Engine`'s two public fields, and one
-  field each on `Gatekeeper`, `AudioPipeline` and `CurveBundle`.
+  field each on `Gatekeeper`, `AudioPipeline` and `CurveBundle`;
   `#![warn(missing_docs)]` would hold the rule under clippy's `-D warnings`. And
   `pub(crate)` is the default for shared internals, but `tuner-gui`, a binary
   crate, spells 134 items `pub`; `#![warn(unreachable_pub)]` finds them, with
-  machine-applicable fixes. Keep that sweep out of the item-order pass, whose
-  check needs pure moves.
+  machine-applicable fixes. To decide: which documents `style.md` names and links
+  (the Style Guide, the API Guidelines, the Reference, the Book); whether
+  `clippy::pedantic` becomes the bar, which at `aa4f7c0` reports 1 797 findings and
+  793 once the four lossy-cast lints are excepted (small indices and counts going
+  to floats, which Clippy itself calls "not bad at all"), 619 of them
+  machine-applicable, with every fix on a hot-path file benchmarked first, since an
+  inclusive range can run slower in a loop; which lints the workspace turns on; and
+  whether the clippy line gains `--all-features`, since nothing lints the
+  `telemetry` code today. The naming lints wait for the audit-scheme entry below,
+  and `process_cola_hop`'s length has its own entry. Keep the sweep out of the
+  item-order pass, whose check needs pure moves.
+  → [`style.md`](docs/internals/style.md)
+- **`process_cola_hop`'s shape** — `Deferred`, reopened 2026-09-28. The hop is one
+  flat function of 266 lines, kept that way so one read gives every step in order,
+  each under a banner that mirrors `hot-path.md`'s step table; the capture step is
+  about 200 of those lines. Clippy's `too_many_lines` counts it among 36 functions
+  over its default of 100. Nothing has shipped, so the choice is open again: the
+  alternative is a method per step behind a short driver that keeps the order
+  readable. Either way the hop stays allocation-free, the benches are read before
+  and after, and every lab output stays byte-identical.
+  → [`hot-path.md`](docs/internals/hot-path.md)
 - **Two style sweeps the 2026-09 pass left** — `Deferred`. Neither rule has a lint
   either. A guard states provenance as a sentence saying precisely which part is
   ours, but 22 comments in `tuner-core` and `tuner-gui` still open with the older
@@ -564,16 +589,6 @@ move, so it runs after the step as its own change.
   reached through its module, yet `tuner-lab` imports `get_expected_beta` bare in
   eight files, `curves.rs` imports `rigaud::midi_from_key`, the discovery bench
   `discover`, and several test modules their helpers.
-- **Name the upstream Rust conventions `style.md` defers to** — `Planned`, as its
-  own change. `style.md` says the project follows standard Rust conventions and
-  links none of them, so a departure has nothing to be checked against:
-  `tuner-lab` lays out its six subcommands as `<name>/mod.rs`, a layout the Rust
-  Reference discourages and the other two crates do not use, and no lint caught it
-  (`clippy::mod_module_files` is in the restriction group, off by default). To
-  decide: which documents `style.md` names and links (the Style Guide, the API
-  Guidelines, the Reference, the Book), which lints the workspace turns on, and the
-  six moves.
-  → [`style.md`](docs/internals/style.md)
 - **One type for a key's predicted partial series, `PartialTemplate`** —
   `Planned`, as its own change after the curve-seeding commit (report 0021).
   Discovery's templates (`KeyProfile`: up to 128 partials from the
@@ -592,6 +607,14 @@ move, so it runs after the step as its own change.
   change: the two capacities (a const generic, or one size), and each consumer
   keeping its anchor and precision (f32 on the DSP paths, f64 in `synth`), so the
   lab's lock outputs and the strobe replay stay byte-identical.
+- **A key index as a type, `Key(u8)`** — `Planned`, as its own change. A key is
+  0–87: a `u8` in the models (`KeyMeasurement::key_index`), a `usize` wherever it
+  indexes an array, and `as` casts carry it between the two and into floats across
+  the crates, where Clippy's `cast_precision_loss` flags each `usize → f64`. A
+  newtype makes an out-of-range key unrepresentable and gives every conversion one
+  home (`index()`, `midi()`, and `f64::from` on the `u8`). It changes many
+  signatures; order it against `PartialTemplate`, which reshapes the same key-keyed
+  APIs.
 - **Four algorithm seams become traits, and audits become differential tests** —
   `Planned`, after the structural step. The signal gate (`Gatekeeper`), discovery,
   the `(f₀, B)` estimator (MAT) and the curve engines each get a trait, matching
@@ -605,8 +628,12 @@ move, so it runs after the step as its own change.
   those tests plus metamorphic properties and panic-freedom checks, never
   formal proofs about floating point. Riding with it: `TwmConfig` and `MatOrder`
   become injected parameters (and `MatOrder::Simultaneous` goes once an in-tune
-  instrument clears it), and the hot-path benches. Until then, leave each of the
-  four with one entry point, keep `TwmConfig::default()` in the Engine and
+  instrument clears it), and the hot-path benches. Decided with it: whether
+  Clippy's `similar_names` and `many_single_char_names` apply to ported maths,
+  where they flag the paper's own symbols (Rigaud's B_L and B_U as `b_l` and `b_u`,
+  the Whittaker solver's `y` and `w`), which stay excepted until it decides. Until
+  then, leave each of the four with one entry point, keep `TwmConfig::default()`
+  in the Engine and
   `MatOrder::Serial` in the Worker at their call sites, and keep `algorithms/` and
   `models.rs` free of anything device-shaped. The argument is the 2026-09
   modularity-and-verification investigation, still outside the tree; it becomes

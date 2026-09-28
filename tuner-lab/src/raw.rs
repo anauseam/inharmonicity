@@ -1,9 +1,10 @@
-//! Raw `f32` capture dumps.
+//! Raw `f32` dumps, read and written.
 //!
 //! A capture writes headerless little-endian mono `f32`: `audio.raw` (the
 //! strictly causal buffer the Worker analysed) and `audio_full_event.raw` (the
 //! non-causal record — pre-roll, strike, decay). See
-//! `capture-sets.md`.
+//! `capture-sets.md`. `cargo lab audio record` writes its `audio.raw` in the same
+//! form.
 
 use std::path::Path;
 
@@ -21,6 +22,13 @@ pub fn read(path: &Path) -> Option<Vec<f32>> {
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.as_mut_ptr() as *mut u8, bytes.len());
     }
     Some(out)
+}
+
+/// Writes `samples` as a headerless little-endian `f32` mono dump, the form
+/// [`read`] takes.
+pub fn write(path: &Path, samples: &[f32]) -> std::io::Result<()> {
+    let bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+    std::fs::write(path, bytes)
 }
 
 /// The capture's analysed audio: `audio.raw`.

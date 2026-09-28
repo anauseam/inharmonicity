@@ -31,6 +31,9 @@ Piano **1** has an underscore before its index and piano **2** does not, which
 is why `.gitignore` uses `diagnostics_piano*/`: an earlier
 `diagnostics_piano_*/` silently failed to ignore 315 MB of piano-2 captures.
 
+Room-silence recordings, made by `cargo lab audio record`, live in gitignored
+`silence_*/` directories beside the sets and are validation data like them.
+
 **The mute-isolation set is not interchangeable with the other three.** It is
 the same note recorded once per string in isolation (the others damped with a
 mute) and once open, because nothing in a capture of a multi-strung note can
