@@ -208,6 +208,13 @@ move, so it runs after the step as its own change.
   already evaluates `B_ξ` in `f32` for the discovery prior; the fits (Eqs. 29
   and 31, whose L1 objectives are the paper's but whose grid-search optimizers
   are ours and replaceable by any other technique) stay with the curve engines.
+
+  **The library carries its own license notices.** When the crate is created,
+  each of its source files opens with the three-line notice in `LICENSE`'s
+  Exhibit A, and the crate gets its own copy of `LICENSE`: a library's files and
+  its crates.io tarball travel without the repository, the case
+  [Mozilla's MPL FAQ](https://www.mozilla.org/en-US/MPL/2.0/FAQ/) (Q22) gives
+  for a notice in every file. The app crates stay on the root `LICENSE` alone.
   → [`ARCHITECTURE.md`](ARCHITECTURE.md)
 
 ---
@@ -281,7 +288,12 @@ move, so it runs after the step as its own change.
   carries a `PathBuf` fine, since that channel is crossbeam rather than a
   wait-free ring. Left unbuilt only because no UI changes it yet.
 - **Pre-built binaries** — `Planned`. The tuner should be usable without a Rust
-  toolchain now that the measure → curve → strobe path is complete.
+  toolchain now that the measure → curve → strobe path is complete. A release
+  ships the third-party notices from the command in [`about.toml`](about.toml),
+  with `ignore-dev-dependencies = true` set there first (without it the output
+  also lists `criterion` and its tree, which the binary does not contain); the
+  license of anything it bundles beyond crates (nothing yet); and where to get
+  the source, which MPL-2.0 §3.2(a) requires of a binary.
 - **Reference pitch other than A440** — `Deferred`. `TuningCurve.d_g` already
   carries the offset; only the UI is missing. Settings shows its entry,
   *Tuning Standard*, disabled.

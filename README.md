@@ -187,4 +187,6 @@ harnesses that reproduce the reports, and ships in nothing.
 
 ## License
 
+Copyright © 2025 anauseam.
+
 Mozilla Public License 2.0. See [LICENSE](LICENSE).

@@ -1,0 +1,18 @@
+# Third-party notices for a binary release, from the workspace root:
+#   cargo about generate -m tuner-gui/Cargo.toml -o THIRD_PARTY.html about.hbs
+# Keep the list in step with deny.toml's.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "0BSD",
+    "ISC",
+    "Zlib",
+    "BSL-1.0",
+    "CC0-1.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "MPL-2.0",
+]

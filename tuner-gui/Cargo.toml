@@ -2,6 +2,7 @@
 name = "tuner-gui"
 version.workspace = true
 edition = "2024"
+license.workspace = true
 
 [dependencies]
 tuner-core = { path = "../tuner-core" }

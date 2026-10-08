@@ -113,6 +113,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 # Docs: a broken doc link fails the build
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items
+
+# Dependency licenses, against deny.toml's allow-list
+cargo deny check licenses
 ```
 
 `cargo fmt` is the source of truth for whitespace and import ordering.
@@ -129,3 +132,8 @@ diagnostics directory's path is printed at startup
 instrument and one `key_…` folder per capture, with the capture's `audio.raw`,
 `audio_full_event.raw` and `analysis.json`. Those files make the difference
 between a half-day repro and a five-minute fix.
+
+## License
+
+Contributions are accepted under the Mozilla Public License 2.0, the same
+license as the rest of the project.

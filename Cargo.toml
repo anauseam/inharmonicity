@@ -17,6 +17,7 @@ resolver = "2" # Use the modern feature resolver
 # line. Cargo requires SemVer, hence `-alpha` rather than " alpha".
 [workspace.package]
 version = "0.1.0-alpha"
+license = "MPL-2.0"
 
 # Define common dependencies for the workspace to ensure version consistency
 [workspace.dependencies]
