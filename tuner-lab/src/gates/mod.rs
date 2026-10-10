@@ -10,8 +10,12 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Args, Subcommand};
 
-mod ambient;
+pub(crate) mod ambient;
+pub(crate) mod arms;
 mod coarse;
+mod distribution;
+mod stats;
+mod truth;
 
 /// Options shared by the coarse-gate studies, all defaulting to the shipped
 /// value.
@@ -83,6 +87,62 @@ enum Mode {
         #[arg(long, default_value_t = 1)]
         partial: usize,
     },
+    /// Synthetic truth: the AWGN control (`t1`) and known partials in real
+    /// noise (`t2`), written as dump directories with the exact noise beside
+    /// each capture.
+    Truth(truth::Cmd),
+    /// One candidate noise estimate or detection rule over one or more dump
+    /// sets: per (capture, hop, partial), the estimate, the truth where known,
+    /// the threshold, the decision and the two SNRs, in `ambient`'s columns.
+    Arms {
+        /// The arm: A, A@1e-3, B, C, N, or a candidate by its number or card.
+        #[arg(long)]
+        arm: String,
+        /// A population to score, repeatable: `--set <label> <regen.json> <dump root>`.
+        #[arg(long = "set", num_args = 3, value_names = ["LABEL", "REGEN", "ROOT"], required = true)]
+        sets: Vec<String>,
+        /// Write one CSV of rows per (arm, set) here.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// The operating point: the false-alarm probability every arm is set to.
+        #[arg(long, default_value_t = 1.0e-3)]
+        pfa: f32,
+        /// Fix σ for every capture, in place of each one's recorded value.
+        #[arg(long)]
+        sigma: Option<f32>,
+        /// ν/2 per frame averaged, as Stage B measured it; the analytic Hann
+        /// value otherwise.
+        #[arg(long)]
+        nu_half: Option<f32>,
+        /// Only these consumers, e.g. `G1,G3`.
+        #[arg(long, value_delimiter = ',')]
+        consumers: Option<Vec<String>>,
+        /// How the record is found inside the full event: `aligned` (its opening
+        /// samples matched; nearly every capture) or `strict` (the suffix only;
+        /// report 0015's population).
+        #[arg(long, default_value = "aligned")]
+        preroll: String,
+        /// Read a synthetic set's exact level as T2's is read, the per-hop running
+        /// median of the known noise, even where the generator gives a closed form:
+        /// on T1 this calibrates the T2 truth construction itself.
+        #[arg(long)]
+        exact_median: bool,
+    },
+    /// Stage B: the room's per-bin distribution on the screened pre-roll of
+    /// each set and on any room recording, per bin and pooled per band.
+    Distribution {
+        /// A set's screened pre-roll, repeatable: `--set <label> <dump root> <sigma>`,
+        /// σ the screen's silence threshold, or `-` for each capture's logged one
+        /// (an external store's `calibration_candidates.json`).
+        #[arg(long = "set", num_args = 3, value_names = ["LABEL", "ROOT", "SIGMA"])]
+        sets: Vec<String>,
+        /// A `cargo lab audio record` directory.
+        #[arg(long)]
+        recording: Option<PathBuf>,
+        /// Write one CSV of per-bin statistics per set here.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
 pub fn run(cmd: Cmd) -> Result<()> {
@@ -97,5 +157,39 @@ pub fn run(cmd: Cmd) -> Result<()> {
         Mode::Refset(o) => coarse::refset(&o),
         Mode::Verify(o) => coarse::verify(&o),
         Mode::Ab { opts, partial } => coarse::ab(&opts, partial),
+        Mode::Truth(c) => truth::run(c),
+        Mode::Arms {
+            arm,
+            sets,
+            out,
+            pfa,
+            sigma,
+            nu_half,
+            consumers,
+            preroll,
+            exact_median,
+        } => {
+            let preroll = match preroll.as_str() {
+                "aligned" => arms::Preroll::Aligned,
+                "strict" => arms::Preroll::Strict,
+                other => anyhow::bail!("--preroll takes aligned or strict, not {other}"),
+            };
+            arms::run(
+                &arm,
+                &sets,
+                out.as_deref(),
+                pfa,
+                sigma,
+                nu_half,
+                consumers.as_deref(),
+                preroll,
+                exact_median,
+            )
+        }
+        Mode::Distribution {
+            sets,
+            recording,
+            out,
+        } => distribution::run(&sets, recording.as_deref(), out.as_deref()),
     }
 }

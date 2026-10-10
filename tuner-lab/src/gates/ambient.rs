@@ -27,18 +27,18 @@ use tuner_core::strobe::{MAX_STROBE_REFS, Strobe, StrobeRefUpdate};
 /// (±2·fs/N ≈ ±10.8 Hz) still leaves a gap between A0's 27.5 Hz-spaced
 /// partials; at the 1024- and 4096-sample windows the tracker and strobe gates
 /// use, the lobes tile the bass and no off-partial probe exists at all.
-const NOISE_WIN: usize = BASS_WINDOW_SIZE;
+pub(super) const NOISE_WIN: usize = BASS_WINDOW_SIZE;
 
 /// Zero-padding factor for the probe spectrum: takes the bin grid to 1.35 Hz so
 /// a 6 Hz gap still holds the three bins [`MIN_GAP_BINS`] requires. An integer
 /// factor also makes the unpadded 8192 spectrum a subsequence of this one —
 /// `mag[NOISE_PAD·k]` is bin `k` of the FFT the shipped peak floor thresholds.
-const NOISE_PAD: usize = 4;
+pub(super) const NOISE_PAD: usize = 4;
 
 /// Minimum zero-padded bins an inter-partial gap must hold before it may
 /// contribute a noise sample (report 0015 §1, pre-registered). Below it the row is
 /// unmeasurable and is reported as such rather than defaulted.
-const MIN_GAP_BINS: usize = 3;
+pub(super) const MIN_GAP_BINS: usize = 3;
 
 /// Median magnitude → the P_fa = 10⁻³ threshold, for Rayleigh bins:
 /// `T/median = √(ln(1/P_fa) / ln 2) = 3.157`. This is [`cfar_multiplier`] at the
@@ -49,20 +49,20 @@ const MIN_GAP_BINS: usize = 3;
 /// noise's median, which a correctly specified detector must sit 3.157× above;
 /// omitting it reads the bass threshold as 0.77×, nearly right, when it is ≈ 4×
 /// too low.
-fn threshold_for_median(n_local: f32) -> f32 {
+pub(super) fn threshold_for_median(n_local: f32) -> f32 {
     n_local * cfar_multiplier(0.5)
 }
 
 /// `SNR_gate` below which a partial counts as dead — indistinguishable from
 /// its own neighbourhood in the window the gate actually uses.
-const SNR_DEAD: f32 = 1.0;
+pub(super) const SNR_DEAD: f32 = 1.0;
 
 /// `SNR_gate` at or above which a partial counts as live. Anchored to
 /// report 0014 §8a, which measured the strobe gate closing while partials were
 /// still 3–15× above the noise beside them: 3 is the bottom of a range already
 /// measured on this project's data, not a chosen bar (CONTRIBUTING.md,
 /// "anchor a threshold").
-const SNR_LIVE: f32 = 3.0;
+pub(super) const SNR_LIVE: f32 = 3.0;
 
 /// Onset reference: the first hop reaching −20 dB of the record's loudest
 /// 1024-sample RMS. Dimensionless by construction, so it survives a
@@ -70,12 +70,12 @@ const SNR_LIVE: f32 = 3.0;
 const ONSET_REL_DB: f32 = -20.0;
 
 /// Hann main-lobe half-width (null-to-null / 2) for an `n`-sample window.
-fn lobe_hw_hz(n: usize) -> f32 {
+pub(super) fn lobe_hw_hz(n: usize) -> f32 {
     2.0 * SAMPLE_RATE as f32 / n as f32
 }
 
 /// Stiff-string partial frequency, `fₙ = n·f₀·√(1 + B n²)`.
-fn stiff_partial(f0: f32, b: f32, n: usize) -> f32 {
+pub(super) fn stiff_partial(f0: f32, b: f32, n: usize) -> f32 {
     n as f32 * f0 * (1.0 + b * (n * n) as f32).sqrt()
 }
 
@@ -112,14 +112,14 @@ const GATES: [GateSite; 3] = [GateSite::Peaks, GateSite::Tracker, GateSite::Stro
 /// window length. Noise carries no such invariance — it falls as 1/√N — and
 /// that asymmetry is the processing gain, corrected explicitly wherever a
 /// gate's own window differs from this one (report 0015 §1).
-struct ProbeSpectrum {
-    mag: Vec<f32>,
-    hz_per_bin: f32,
+pub(super) struct ProbeSpectrum {
+    pub(super) mag: Vec<f32>,
+    pub(super) hz_per_bin: f32,
 }
 
 impl ProbeSpectrum {
     /// Largest magnitude in `[lo_hz, hi_hz]`, over every zero-padded bin.
-    fn peak(&self, lo_hz: f32, hi_hz: f32) -> f32 {
+    pub(super) fn peak(&self, lo_hz: f32, hi_hz: f32) -> f32 {
         let lo = (lo_hz / self.hz_per_bin).floor().max(1.0) as usize;
         let hi = ((hi_hz / self.hz_per_bin).ceil() as usize).min(self.mag.len() - 1);
         if lo > hi {
@@ -130,7 +130,7 @@ impl ProbeSpectrum {
 
     /// Largest magnitude in `[lo_hz, hi_hz]` over the unpadded 8192 bins
     /// only — what discovery's peak extractor sees, scalloping loss included.
-    fn peak_coarse(&self, lo_hz: f32, hi_hz: f32) -> f32 {
+    pub(super) fn peak_coarse(&self, lo_hz: f32, hi_hz: f32) -> f32 {
         let lo = (lo_hz / self.hz_per_bin).floor().max(1.0) as usize;
         let hi = ((hi_hz / self.hz_per_bin).ceil() as usize).min(self.mag.len() - 1);
         let mut best = 0.0f32;
@@ -145,7 +145,7 @@ impl ProbeSpectrum {
     /// Appends every bin in `[lo_hz, hi_hz]` to `out` and returns how many. The
     /// caller pools both flanking gaps before taking one median, so a narrow
     /// gap contributes its weight rather than half the answer.
-    fn collect_band(&self, lo_hz: f32, hi_hz: f32, out: &mut Vec<f32>) -> usize {
+    pub(super) fn collect_band(&self, lo_hz: f32, hi_hz: f32, out: &mut Vec<f32>) -> usize {
         let lo = (lo_hz / self.hz_per_bin).ceil().max(1.0) as usize;
         let hi = ((hi_hz / self.hz_per_bin).floor() as usize).min(self.mag.len() - 1);
         if lo > hi {
@@ -158,7 +158,7 @@ impl ProbeSpectrum {
 
 /// The probe spectrum over the freshest `win` samples ending at `end`, in the
 /// `4/win` physical units. `hann` must be `win` long.
-fn probe_spectrum_at(
+pub(super) fn probe_spectrum_at(
     signal: &[f32],
     end: usize,
     win: usize,
@@ -186,7 +186,7 @@ fn probe_spectrum_at(
 }
 
 /// [`probe_spectrum_at`] at the standing [`NOISE_WIN`] probe window.
-fn probe_spectrum(
+pub(super) fn probe_spectrum(
     signal: &[f32],
     end: usize,
     hann: &[f32],
@@ -207,7 +207,7 @@ fn probe_spectrum(
 /// argument).
 ///
 /// `None` where neither gap reaches [`MIN_GAP_BINS`].
-fn partial_probe_at(
+pub(super) fn partial_probe_at(
     spec: &ProbeSpectrum,
     win: usize,
     f_n: f32,
@@ -240,7 +240,7 @@ fn partial_probe_at(
 }
 
 /// [`partial_probe_at`] at the standing [`NOISE_WIN`] probe window.
-fn partial_probe(
+pub(super) fn partial_probe(
     spec: &ProbeSpectrum,
     f_n: f32,
     f_lo: f32,
@@ -252,7 +252,7 @@ fn partial_probe(
 
 /// The two neighbouring partials that bound partial `n`'s noise gaps. Below f₁
 /// there is no partial, so the lower bound is reflected from the f₁–f₂ spacing.
-fn neighbour_bounds(cap: &Capture, f_meas: &[f32], i: usize, n: usize) -> (f32, f32) {
+pub(super) fn neighbour_bounds(cap: &Capture, f_meas: &[f32], i: usize, n: usize) -> (f32, f32) {
     let f_hi = stiff_partial(cap.f0, cap.b, n + 1);
     let f_lo = if n >= 2 {
         stiff_partial(cap.f0, cap.b, n - 1)
@@ -264,7 +264,7 @@ fn neighbour_bounds(cap: &Capture, f_meas: &[f32], i: usize, n: usize) -> (f32, 
 
 /// First sample at which the record reaches [`ONSET_REL_DB`] of its loudest
 /// 1024-sample RMS.
-fn onset_sample(signal: &[f32]) -> usize {
+pub(super) fn onset_sample(signal: &[f32]) -> usize {
     let mut rms = Vec::new();
     let mut c = 0usize;
     while c + HOP_SIZE <= signal.len() {
@@ -294,8 +294,8 @@ fn sigma_grid() -> Vec<f32> {
 
 /// Time-since-onset buckets, in seconds. Coarse early where the decay is fast,
 /// wide late where only the long records reach.
-const T_EDGES: [f32; 8] = [0.05, 0.1, 0.25, 0.5, 1.0, 1.5, 2.5, f32::INFINITY];
-const T_LABELS: [&str; 8] = [
+pub(super) const T_EDGES: [f32; 8] = [0.05, 0.1, 0.25, 0.5, 1.0, 1.5, 2.5, f32::INFINITY];
+pub(super) const T_LABELS: [&str; 8] = [
     "0–.05",
     ".05–.1",
     ".1–.25",
@@ -306,16 +306,16 @@ const T_LABELS: [&str; 8] = [
     "2.5+",
 ];
 
-fn t_bucket(t: f32) -> usize {
+pub(super) fn t_bucket(t: f32) -> usize {
     T_EDGES
         .iter()
         .position(|&e| t < e)
         .unwrap_or(T_EDGES.len() - 1)
 }
 
-const REGISTERS: [&str; 4] = ["bass", "tenor", "treble", "high 76–87"];
+pub(super) const REGISTERS: [&str; 4] = ["bass", "tenor", "treble", "high 76–87"];
 
-fn register_index(key: u8) -> usize {
+pub(crate) fn register_index(key: u8) -> usize {
     REGISTERS
         .iter()
         .position(|&r| r == capture::strobe_register(key))
@@ -487,7 +487,7 @@ impl GateStudy {
 /// from `analysis.json` does not touch what `capture-sets.md` requires `cargo lab mat regen`
 /// for — the stale fields there are `measured_f0`, `calculated_b` and the
 /// partial list, none of which this uses.
-fn recorded_sigma(root: &Path, dir: &str) -> Option<f32> {
+pub(super) fn recorded_sigma(root: &Path, dir: &str) -> Option<f32> {
     let text = std::fs::read_to_string(root.join(dir).join("analysis.json")).ok()?;
     let j: serde_json::Value = serde_json::from_str(&text).ok()?;
     j["metadata"]["noise_floor"].as_f64().map(|v| v as f32)
@@ -498,7 +498,7 @@ fn recorded_sigma(root: &Path, dir: &str) -> Option<f32> {
 /// segment is the file's tail. Verified rather than assumed — a capture
 /// whose tail does not reproduce `audio.raw` is skipped, because a misaligned
 /// slice would score the note as if it were the room.
-fn preroll(root: &Path, dir: &str, kept: &[f32]) -> Option<Vec<f32>> {
+pub(super) fn preroll(root: &Path, dir: &str, kept: &[f32]) -> Option<Vec<f32>> {
     let full = raw::read(&root.join(dir).join("audio_full_event.raw"))?;
     if full.len() <= kept.len() {
         return None;

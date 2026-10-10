@@ -13,6 +13,7 @@ mod dump;
 mod lock;
 mod nsga2;
 mod reach;
+mod replay;
 
 #[derive(Args)]
 pub struct Cmd {
@@ -42,6 +43,32 @@ enum Mode {
     },
     /// Per-frame STFT, peak and TWM dump for one capture, in manual mode.
     Dump(dump::DumpArgs),
+    /// The auto lock replayed at phases of the hop grid, with a G1 arm from
+    /// `gates arms` in place of the shipped peak floor (report 0020's yardstick).
+    Replay {
+        /// Capture-set root.
+        root: PathBuf,
+        /// Phases of the hop grid, equally spaced over one hop.
+        #[arg(long, default_value_t = 16)]
+        phases: usize,
+        /// A G1 arm by name; the shipped floor when absent.
+        #[arg(long)]
+        peak_arm: Option<String>,
+        /// A `mat regen` dump: the templates are the instrument's fitted curve.
+        #[arg(long, value_name = "REGEN")]
+        regen: Option<PathBuf>,
+        /// Write one CSV row per (capture, phase) here.
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
+        /// Give the arm the key's partial spacing, its equal-tempered f0; without
+        /// it the spacing is NaN, as the picker has it.
+        #[arg(long, requires = "peak_arm")]
+        known_key: bool,
+        /// One arm per phase over the whole set in recording order, carrying
+        /// what it learns across captures; a fresh arm per capture otherwise.
+        #[arg(long, requires = "peak_arm")]
+        carry: bool,
+    },
     /// 1 ¢-resolution detuning reach of the discovery lock (report 0006).
     Reach {
         /// Extra candidate configurations, as repeated `name q r rho` quads.
@@ -61,6 +88,25 @@ pub fn run(cmd: Cmd) -> Result<()> {
         Mode::Lock { root, regen } => lock::run(&root, false, regen.as_deref()),
         Mode::FromOnset { root } => lock::run(&root, true, None),
         Mode::Dump(args) => dump::run(args),
+        Mode::Replay {
+            root,
+            phases,
+            peak_arm,
+            regen,
+            out,
+            known_key,
+            carry,
+        } => replay::run(
+            &root,
+            &replay::Options {
+                phases,
+                peak_arm: peak_arm.as_deref(),
+                regen: regen.as_deref(),
+                out: out.as_deref(),
+                known_key,
+                carry,
+            },
+        ),
         Mode::Reach { candidates } => {
             reach::run(&candidates);
             Ok(())

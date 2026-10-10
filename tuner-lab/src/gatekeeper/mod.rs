@@ -8,7 +8,7 @@ use tuner_core::models::InharmonicityProfile;
 
 mod dump;
 mod plot;
-mod replay;
+pub(crate) mod replay;
 mod sparsity;
 
 #[derive(Args)]

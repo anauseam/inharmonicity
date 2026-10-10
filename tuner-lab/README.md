@@ -47,6 +47,7 @@ belongs here.
 | Mode | What it reports | Reproduces | Input |
 | --- | --- | --- | --- |
 | `lock [ROOT] [--regen REGEN]` | end-to-end auto-lock validation, M-of-N included; with `--regen`, on the templates the app would push for the regen dump's profile, named on stderr by a `[TEMPLATES]` line | report 0020; piano-1 **82/87**; with `--regen`, report 0021 | a capture set; a `mat regen` dump of it |
+| `replay <ROOT> [--phases 16] [--peak-arm NAME] [--regen REGEN] [--out CSV] [--known-key] [--carry]` | the lock replayed at phases of the hop grid through the shipped front end: `Engine::process` itself, or the lab's replica of its discovery state machine with a `gates arms` G1 arm's per-bin threshold in place of the peak floor, run beside the engine; pass / no-lock / wrong per cut and register, the yardstick over the cuts, latency on report 0020's clock | report 0020 §The yardstick (566.94 ± 2.16 on piano #2 at 16 phases, the vote from the onset); report 0023 §5 | a capture set; a `mat regen` dump |
 | `from-onset [ROOT]` | Stage-A's winner on every hop from the onset, gate ignored — per-hop identification by register, with the hops the gate calls `Stable` marked | report 0003 (2026-09-02 amendment) | a capture set (needs `audio_full_event.raw`) |
 | `dump <AUDIO>` | per-frame STFT, peaks and TWM scores to `spectrum.csv` / `peaks.csv`; `goertzel.csv` under `cargo lab-telemetry`; `--profile` or `--regen` put the templates the app would push for that profile in place of the prior | report 0002 | one `.raw`; a saved profile or a `mat regen` dump |
 | `reach [NAME Q R RHO]…` | 1 ¢-resolution detuning reach of the lock | report 0006 pitch-raise reach (canonical 78 ¢, conservative 69 ¢) — re-run after the jacobsen fix reproduced both exactly, so the harness is peak-estimator-independent | none (synthetic) |
@@ -151,10 +152,12 @@ OS-CFAR family that could replace it is measured against the same reference.
 | `refset [ROOT]` | reference-set anatomy: valley cell or weak partial's lobe, and what the guard buys (Rohling §V) | audit 13 (T5) | a capture set |
 | `verify [ROOT]` | the shipped gate against the harness's replica of it | report 0015 §4 | a capture set |
 | `ab [ROOT] [--partial N]` | the same bounded read under the shipped ambient-σ gate and four OS-CFAR variants | report 0011 §4, report 0015 | a capture set |
+| `truth t1 <OUT> [--sigma 1e-3] [--snr-db 30] [--per-key 10] [--preroll-hops 43] [--seed S]` | the AWGN control: captures of white noise at a known σ with partials present and partials declared absent, the noise alone beside each, `truth.json` with the exact per-bin level | report 0023 §2 | none (synthetic) |
+| `truth t2 <REGEN> <ROOT> <OUT> [--bed room\|residual] [--long-root DIR --long-regen REGEN] [--per-key N] [--strike-gain-db ×4]` | known partials in real noise: each real capture mirrored at its own frequencies and amplitudes under drawn decays and unison splits, on the set's screened pre-roll (T2a) or the capture's own residual (T2b), with the fidelity tables | report 0023 §3 | a `mat regen` dump and its set; the extended store's dump for the decays |
+| `arms --arm <NAME> --set <LABEL> <REGEN> <ROOT>… [--out DIR] [--pfa 1e-3] [--consumers G1,G3] [--preroll aligned\|strict] [--exact-median]` | one noise estimate or detection rule over every hop and partial of one or more sets, per consumer (the picker, the tracker gate, the strobe gate, the 2¹⁶ window): false alarms per H₀ population against the exact nominal, miss by SNR, the estimate against the truth, T ÷ T_ideal, and the control's check | report 0023 §2 and §5; arm `A` reproduces report 0015 §5–7 | one or more (dump, set root) pairs; a T1 or T2 set carries its truth |
+| `distribution --set <LABEL> <ROOT> <SIGMA>… [--recording DIR] [--out DIR]` | the room's per-bin distribution over a set's screened pre-roll: the within-block law, the level's wander, finite variance, spectral kurtosis, the tail and the location, per band, each against its exact law | report 0023 §4 | one or more set roots (σ, or `-` for the logged one); a `silence_*/` recording |
 
-`ambient`'s AWGN calibration row (report 0015 §4) needs a synthetic dump directory
-that is not in the repository and has no generator in the tree; it is the one
-reproduce line here that cannot be run from a clean checkout.
+`ambient`'s AWGN calibration row (report 0015 §4) runs on a `gates truth t1` set.
 
 ## `audio` — acquisition
 

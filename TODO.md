@@ -219,6 +219,21 @@ move, so it runs after the step as its own change.
 
 ---
 
+- **`tuner-lab` prunes and condenses on its own schedule** — `Planned`, standing,
+  and not tied to QP-04 or QP-05 alone. The lab grew by 17 000 lines in QP-03
+  (report 0023) and grows again in Phases II and III; it is a measurement
+  instrument, not a product, and nothing stays in it without a report that still
+  needs it. Three rules, applied whenever a report closes a question and at least
+  once per phase: a mode, arm or test that no live report cites goes (git history
+  is the archive); several modes, arms or tests that differ only in a parameter
+  become one with an option (the `gates arms --arm NAME` pattern, a parametrised
+  test case, never one file or one `#[test]` per variant); and a harness that has
+  become an assertion or a timing moves to `tests/` or `benches/`. The first
+  scheduled prune is QP-05's close, when Phase II's rejected arms go with their
+  specs, their README cells and their §5 rows marked retired.
+  → [report 0023](reports/0023-noise-and-liveness-measurement.md) §5, `tuner-lab/README.md`,
+  [`docs/internals/style.md`](docs/internals/style.md)
+
 ## User-facing
 
 - **Unison assist: the discriminator is near-silent, and the bass second lines
