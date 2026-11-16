@@ -347,12 +347,12 @@ pub fn run(partials: &Path, out_dir: &Path) -> Result<()> {
             curves::multi_interval(&input, &base, PURE_TWELFTHS_INTERVALS, None),
         ),
         (
-            "d_model-b.wav",
-            "d: multi-interval (balanced, model-B widths)".into(),
+            "d_blend-b.wav",
+            "d: multi-interval (balanced, blend-B widths)".into(),
             curves::multi_interval(
                 &input,
                 &CurveParams {
-                    b_source: CurveBSource::Model,
+                    b_source: CurveBSource::Blend,
                     ..base
                 },
                 BALANCED_INTERVALS,

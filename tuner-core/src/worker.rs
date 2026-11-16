@@ -49,7 +49,7 @@ pub enum WorkerJob {
     SetDumpDir(Option<PathBuf>),
 }
 
-/// Every engine's curve from one [`CurveJob`], so a frontend switches engines
+/// Engines (a) and (d) from one [`CurveJob`], so a frontend switches engines
 /// without a recompute, and discovery's templates from the same input. Derived,
 /// never persisted.
 #[derive(Debug, Clone)]
@@ -57,10 +57,6 @@ pub struct CurveBundle {
     pub generation: u64,
     /// (a) Rigaud-pure.
     pub rigaud_pure: TuningCurve,
-    /// (b) per-key + Whittaker smoothing.
-    pub per_key_smoothed: TuningCurve,
-    /// (c) Giordano sensory-dissonance-calibrated octave type.
-    pub giordano: TuningCurve,
     /// (d) weighted multi-interval least squares, BALANCED preset.
     pub multi_balanced: TuningCurve,
     /// (d) weighted multi-interval least squares, PURE_TWELFTHS preset.
@@ -78,15 +74,12 @@ impl CurveBundle {
     pub fn curve(&self, choice: models::EngineChoice) -> &TuningCurve {
         match choice {
             models::EngineChoice::RigaudPure => &self.rigaud_pure,
-            models::EngineChoice::PerKeySmoothed => &self.per_key_smoothed,
-            models::EngineChoice::GiordanoMean => &self.giordano,
             models::EngineChoice::MultiBalanced => &self.multi_balanced,
             models::EngineChoice::MultiPureTwelfths => &self.multi_pure_twelfths,
         }
     }
 
-    /// Runs every engine at [`CurveParams::default()`]. A cold path: ≈ 1.1 s,
-    /// most of it (c)'s Giordano scans.
+    /// Runs the engines at [`CurveParams::default()`]: a cold path, about 0.1 s.
     pub fn compute(job: &CurveJob) -> Self {
         let input = &job.input;
         let params = CurveParams::default();
@@ -94,8 +87,6 @@ impl CurveBundle {
         Self {
             generation: job.generation,
             rigaud_pure: curves::rigaud_pure(input, &params),
-            per_key_smoothed: curves::per_key_smoothed(input, &params),
-            giordano: curves::giordano_calibrated(input, &params),
             multi_balanced: curves::multi_interval(input, &params, BALANCED_INTERVALS, None),
             multi_pure_twelfths: curves::multi_interval(
                 input,
@@ -592,8 +583,6 @@ mod tests {
         // and no key is flagged as measured (there is no measurement).
         for curve in [
             &bundle.rigaud_pure,
-            &bundle.per_key_smoothed,
-            &bundle.giordano,
             &bundle.multi_balanced,
             &bundle.multi_pure_twelfths,
         ] {

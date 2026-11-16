@@ -309,12 +309,10 @@ pub struct InstrumentIdentity {
 pub enum EngineChoice {
     /// (a) Rigaud-pure prior curve.
     RigaudPure,
-    /// (b) per-key measured B + Whittaker smoothing.
-    PerKeySmoothed,
-    /// (c) Giordano-calibrated, ρ Mean preset.
-    GiordanoMean,
     /// (d) multi-interval BALANCED, the default.
+    // Saved choices of the withdrawn engines (b) and (c) open here.
     #[default]
+    #[serde(alias = "PerKeySmoothed", alias = "GiordanoMean")]
     MultiBalanced,
     /// (d) multi-interval PURE 12ths preset.
     MultiPureTwelfths,
@@ -702,22 +700,25 @@ impl CurveInput {
 pub struct CurveKeyFlags {
     /// A trusted measurement fed the curve at this key.
     pub measured: bool,
-    /// Curve-side B is prior-dominated: the precision-weighted blend of
-    /// measured B toward the B_ξ fit gave the measurement less than half the weight — the treble
+    /// The measured B is above the physical range of piano strings: the capture misread
+    /// its partials.
+    pub b_above_physical_range: bool,
+    /// The blend's grade, whichever engine ran: the precision-weighted blend of measured
+    /// B toward the B_ξ fit gave the measurement less than half the weight — the treble
     /// information floor — or the key carries no measurement at all.
     /// Strobe targets still use the raw measured B.
     // report 0009
     pub curve_b_fallback: bool,
-    /// This key's measured B was excluded by the negative-stretch validity
-    /// detector: its octave pair implied d(m+12) < d(m)
-    /// and this key was the larger prior-deviator. Recapture recommended.
+    /// This key's measured B was excluded from the blend by the negative-stretch
+    /// validity detector: its octave pair implied d(m+12) < d(m)
+    /// and this key was the larger prior-deviator.
     pub excluded: bool,
     /// Engine (c) only: this key's octave pair failed the Giordano
     /// sufficiency gate (edge-hit or < 8 strong cross pairs) and did not
     /// contribute a ρ point.
     pub giordano_excluded: bool,
-    /// The final curve still violates d(m+12) ≥ d(m) at a pair
-    /// involving this key (flagged, never clamped).
+    /// The final curve violates d(m+12) ≥ d(m) at a pair involving this key
+    /// (flagged, never clamped).
     pub negative_stretch: bool,
 }
 
@@ -1355,7 +1356,7 @@ mod tests {
         p.identity.id = "01930000-0000-7000-8000-000000000000".into();
         p.identity.serial = Some("H1234567".into());
         p.identity.kind = InstrumentKind::Guitar;
-        p.settings.engine = EngineChoice::GiordanoMean;
+        p.settings.engine = EngineChoice::MultiPureTwelfths;
         p.settings.reference_mode = ReferenceMode::Et;
         let mut declared = m(11, 61.7, false);
         declared.sounding_strings = Some(
@@ -1379,7 +1380,7 @@ mod tests {
         assert_eq!(back.identity.id, "01930000-0000-7000-8000-000000000000");
         assert_eq!(back.identity.serial.as_deref(), Some("H1234567"));
         assert_eq!(back.identity.kind, InstrumentKind::Guitar);
-        assert_eq!(back.settings.engine, EngineChoice::GiordanoMean);
+        assert_eq!(back.settings.engine, EngineChoice::MultiPureTwelfths);
         assert_eq!(back.settings.reference_mode, ReferenceMode::Et);
         assert_eq!(back.active(11).unwrap().measured_f0, 61.7);
         let strings = back
@@ -1391,5 +1392,14 @@ mod tests {
         assert_eq!(strings.sounding, [true, true, false]);
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A profile saved with engine (b) or (c) chosen opens on the default engine.
+    #[test]
+    fn a_withdrawn_engine_choice_reads_as_the_default() {
+        for saved in ["\"PerKeySmoothed\"", "\"GiordanoMean\""] {
+            let choice: EngineChoice = serde_json::from_str(saved).unwrap();
+            assert_eq!(choice, EngineChoice::default());
+        }
     }
 }

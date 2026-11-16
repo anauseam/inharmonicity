@@ -142,13 +142,15 @@ impl StretchPreset {
 /// Which per-key B engine (d)'s interval widths are computed from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CurveBSource {
-    /// The precision-weighted blend of the key's measured B and the B_ξ
-    /// fit, weighted by each one's variance.
+    /// The instrument's fitted curve, [`bass_bridge_fit`], for every key. The default.
+    // A product judgment: the blend's partial-count law does not calibrate across
+    // instruments, and few-partial B shifts between sittings.
+    // report 0024
     #[default]
-    Blend,
-    /// The Eq.-29 fit B_ξ alone (Rigaud's model; per-key deviations from
-    /// the fit do not enter the widths).
     Model,
+    /// The precision-weighted blend of measured B and the fitted curve, which engines
+    /// (b) and (c) always read.
+    Blend,
 }
 
 /// Parameters shared by all engines.
@@ -162,8 +164,7 @@ pub struct CurveParams {
     /// Global deviation d_g in cents (reference-pitch offset; carried on
     /// the output curve, not baked into its shape).
     pub d_g: f64,
-    /// B the multi-interval widths read (engine (d) only; the chain
-    /// engines always use the blend).
+    /// The B engine (d)'s interval widths read.
     pub b_source: CurveBSource,
 }
 
@@ -173,7 +174,7 @@ impl Default for CurveParams {
             rho: RhoPhi::TYPICAL,
             preset: StretchPreset::Mean,
             d_g: 0.0,
-            b_source: CurveBSource::Blend,
+            b_source: CurveBSource::Model,
         }
     }
 }
@@ -186,9 +187,9 @@ impl CurveParams {
 
 // ─── Curve-B precision-weighted shrinkage ────────────────────────────────────
 //
-// Curve-side B is the precision-weighted (inverse-variance) combination of the
-// key's measurement and the B_ξ fit, the posterior mean of a normal mean under a
-// normal prior:
+// The blend, the curve-side B engines (b) and (c) read, is the precision-weighted
+// (inverse-variance) combination of the key's measurement and the B_ξ fit, the
+// posterior mean of a normal mean under a normal prior:
 //
 //   ln B_curve = ( ln B_meas/σ_m² + ln B_ξ/σ_p² ) / ( 1/σ_m² + 1/σ_p² )
 //              = w·ln B_meas + (1−w)·ln B_ξ,   w = σ_p²/(σ_p² + σ_m²).
@@ -399,6 +400,34 @@ fn lagrange_eval(xs: &[f64], ys: &[f64], x: f64) -> f64 {
 // report 0021
 pub const BASS_BRIDGE_MIN_PARTIALS: usize = 8;
 
+/// Top of the physical range of string B on A0–B2, as ln(B/B₀) over the medium model
+/// B₀ (Conklin 1996, "Design and tone in the mechanoacoustic piano. Part III", JASA
+/// 100(3), Fig. 48).
+// Top edge only: a bottom edge flags captures that move no target.
+// report 0024
+const PHYSICAL_RANGE_TOP_LN_BASS_BRIDGE: f64 = 2.272;
+
+/// As [`PHYSICAL_RANGE_TOP_LN_BASS_BRIDGE`], from C3 up (Conklin 1996, Fig. 48, Eq. A18).
+const PHYSICAL_RANGE_TOP_LN_TREBLE_BRIDGE: f64 = 1.082;
+
+/// Per-note scatter σ of ln B about the Rigaud model, below C5 and from C5 (Rigaud,
+/// David & Daudet 2011, "A parametric model of piano tuning", Proc. DAFx-11).
+const PHYSICAL_RANGE_SCATTER_LN: [f64; 2] = [0.157, 0.116];
+
+/// Whether `b` lies above the physical range at `key`, B₀·e^(top + 3σ): ×15.5 the model
+/// on A0–B2, ×4.73 from C3, ×4.18 from C5.
+fn b_above_physical_range(key: usize, b: f64) -> bool {
+    const C3: usize = 27;
+    const C5: usize = 51;
+    let top = if key < C3 {
+        PHYSICAL_RANGE_TOP_LN_BASS_BRIDGE
+    } else {
+        PHYSICAL_RANGE_TOP_LN_TREBLE_BRIDGE
+    };
+    let sigma = PHYSICAL_RANGE_SCATTER_LN[usize::from(key >= C5)];
+    b.ln() - BXi::DEFAULT_MEDIUM.b_at_key(key).ln() > top + 3.0 * sigma
+}
+
 /// A measured key is a point of [`bass_bridge_fit`] only if its B is at least this
 /// many times the treble term e^(S_T m + Y_T) of the Rigaud B_ξ(m) model (Eqs. 7–8).
 /// The model is a bass term plus a treble term, and the treble term is the same for
@@ -420,20 +449,26 @@ pub const BASS_BRIDGE_MIN_B_OVER_TREBLE: f64 = 2.0;
 // report 0021
 pub const BASS_BRIDGE_SLOPE_SPAN_KEYS: usize = 12;
 
+/// Keys from A4 up never enter [`bass_bridge_fit`].
+// The bass term is under 4 % of B there, so such a key passes the B filter only by
+// misreading high, and far from the bass it can switch on the slope fit.
+// report 0024
+const BASS_BRIDGE_KEY_LIMIT: usize = 48;
+
 /// The instrument's B curve: Rigaud's whole-compass model B_ξ̂(m) (Eqs. 7–8) with the
-/// bass pair ξ̂ = (s_B, y_B) fitted by Eq. 29 to the measured keys on the bass bridge.
-/// It is one curve over the compass whatever subset of keys is measured: the B the
-/// tuning curve weighs a measured key against and gives an unmeasured one, and every
-/// discovery template's B ([`KeyProfile`](crate::models::KeyProfile)), so no template is
-/// a key's own measurement.
+/// bass pair ξ̂ = (s_B, y_B) fitted by Eq. 29 to the measured keys the bass term
+/// dominates. One curve over the compass whatever keys are measured: the B of engines
+/// (a) and (d) and of every discovery template
+/// ([`KeyProfile`](crate::models::KeyProfile)), and what engines (b) and (c) blend toward.
 ///
 /// A key enters the fit through the one measurement [`CurveInput::keys`] holds for
 /// it (from [`CurveInput::from_profile`], its newest trusted capture) when that
 /// carries at least [`BASS_BRIDGE_MIN_PARTIALS`] partials, and is a point of the fit
-/// when its B reaches [`BASS_BRIDGE_MIN_B_OVER_TREBLE`] times the treble term. Fewer
-/// than two points keep [`BXi::DEFAULT_MEDIUM`]; points covering fewer than
-/// [`BASS_BRIDGE_SLOPE_SPAN_KEYS`] keys fit the intercept alone at the default slope,
-/// since two points close together fix the bass term's level and not its slope.
+/// when its B reaches [`BASS_BRIDGE_MIN_B_OVER_TREBLE`] times the treble term and it lies
+/// below A4. Fewer than two points keep [`BXi::DEFAULT_MEDIUM`];
+/// points covering fewer than [`BASS_BRIDGE_SLOPE_SPAN_KEYS`] keys fit the intercept
+/// alone at the default slope, since two points close together fix the bass term's
+/// level and not its slope.
 ///
 /// # References
 /// Rigaud, F., David, B., & Daudet, L. (2013). "A parametric model and estimation
@@ -447,9 +482,9 @@ pub fn bass_bridge_fit(input: &CurveInput) -> BXi {
         .iter()
         .enumerate()
         .filter_map(|(k, d)| {
-            let d = d
-                .as_ref()
-                .filter(|d| d.partials.len() >= BASS_BRIDGE_MIN_PARTIALS)?;
+            let d = d.as_ref().filter(|d| {
+                k < BASS_BRIDGE_KEY_LIMIT && d.partials.len() >= BASS_BRIDGE_MIN_PARTIALS
+            })?;
             let m = midi_from_key(k);
             let treble = (rigaud::S_T * m + rigaud::Y_T).exp();
             (d.b >= BASS_BRIDGE_MIN_B_OVER_TREBLE * treble).then_some((m, d.b))
@@ -501,6 +536,7 @@ fn curve_basis(input: &CurveInput, params: &CurveParams) -> CurveBasis {
                 let w = sigma_p * sigma_p / (sigma_p * sigma_p + sm * sm);
                 curve_b[k] = (w * d.b.ln() + (1.0 - w) * bxi.b_at_key(k).ln()).exp();
                 flags[k].measured = true;
+                flags[k].b_above_physical_range = b_above_physical_range(k, d.b);
                 if w >= 0.5 {
                     b_is_measured[k] = true;
                 } else {
@@ -953,13 +989,12 @@ type IntervalSolve = (Vec<f64>, Vec<f64>);
 ///
 /// a banded SPD system, its half-bandwidth the widest interval, solved by Cholesky.
 /// The beatless widths t_{m,k} read the B named by `params.b_source`. A data row
-/// exists only where both endpoints carry measured curve-B and both coincident
-/// partials are measured, and its weight W_{m,k} is derived: the preset's taste
-/// multiplier times Giordano's width sensitivity ∂D/∂ε at the pair
-/// ([`giordano::pair_width_sensitivity`]), normalized to unit mean. Register
+/// exists only where both coincident partials are measured, and its weight W_{m,k} is
+/// derived: the preset's taste multiplier times Giordano's width sensitivity ∂D/∂ε at
+/// the pair ([`giordano::pair_width_sensitivity`]), normalized to unit mean. Register
 /// follows from the data: in the bass the fundamental is weak and the 6:3 and 4:2
 /// pairs carry the amplitude product, so the wide-stretch rows dominate; in the
-/// treble only the 2:1 pair exists.
+/// treble the rows ending on the upper note's fundamental do.
 ///
 /// A key touched by no data row gets a pseudo-row x_m = 0 at weight w₀ = 4λ/ℓ⁴
 /// ([`REVERSION_LENGTH_KEYS`]), so the curve decays to the prior there.
@@ -1006,9 +1041,6 @@ pub fn multi_interval(
     for spec in intervals {
         for m in 0..(88 - spec.k) {
             let u = m + spec.k;
-            if !(basis.b_is_measured[m] && basis.b_is_measured[u]) {
-                continue;
-            }
             let find = |k: usize, n: u32| {
                 input.keys[k]
                     .as_ref()
@@ -1616,6 +1648,51 @@ mod tests {
         assert!(curve.flags[14].measured, "a measurement did feed the key");
     }
 
+    /// The fitted curve is the default B of engine (d)'s widths.
+    #[test]
+    fn the_default_curve_reads_the_fitted_b() {
+        assert_eq!(CurveParams::default().b_source, CurveBSource::Model);
+        assert_eq!(CurveBSource::default(), CurveBSource::Model);
+    }
+
+    /// Under the default, a key off the fit can read a third of its B and engines (a)
+    /// and (d) move by no bit; the blend's widths do move, so the test has power.
+    #[test]
+    fn a_measured_b_off_the_fit_does_not_move_the_default_curve() {
+        const KEY: u8 = 50;
+        let mut profile = synth_profile(0..88);
+        let before = CurveInput::from_profile(&profile);
+        let m = profile.active_mut(KEY).unwrap();
+        assert!(m.partials.len() >= 10);
+        m.calculated_b = Some(m.calculated_b.unwrap() / 3.0);
+        let after = CurveInput::from_profile(&profile);
+        let b = after.keys[KEY as usize].as_ref().unwrap().b;
+        let treble = (rigaud::S_T * midi_from_key(KEY as usize) + rigaud::Y_T).exp();
+        assert!(b < BASS_BRIDGE_MIN_B_OVER_TREBLE * treble, "key on the fit");
+
+        let params = CurveParams::default();
+        assert!(rigaud_pure(&after, &params).flags[KEY as usize].excluded);
+        assert_eq!(
+            rigaud_pure(&before, &params).cents,
+            rigaud_pure(&after, &params).cents
+        );
+        for intervals in [BALANCED_INTERVALS, PURE_TWELFTHS_INTERVALS] {
+            assert_eq!(
+                multi_interval(&before, &params, intervals, None).cents,
+                multi_interval(&after, &params, intervals, None).cents
+            );
+        }
+
+        let blend = CurveParams {
+            b_source: CurveBSource::Blend,
+            ..params
+        };
+        assert_ne!(
+            multi_interval(&before, &blend, BALANCED_INTERVALS, None).cents,
+            multi_interval(&after, &blend, BALANCED_INTERVALS, None).cents
+        );
+    }
+
     /// Synthetic profile whose true B deviates from the B_ξ model family —
     /// a ±30 % multiplicative sine on the model B — so the residual from
     /// the fitted prior is genuine and cannot be absorbed by the Eq.-29 fit
@@ -2041,6 +2118,73 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A treble reading high enough to pass the B filter changes nothing, slope included.
+    #[test]
+    fn a_treble_reading_never_enters_the_bass_bridge_fit() {
+        let mut bass = InharmonicityProfile::default();
+        bass.record(capture(0, 4.0 * get_expected_beta(0), 32));
+        bass.record(capture(3, 4.0 * get_expected_beta(3), 32));
+        let held = bass_bridge_fit(&CurveInput::from_profile(&bass));
+        assert_eq!(
+            held.s_b,
+            BXi::DEFAULT_MEDIUM.s_b,
+            "two close points hold the slope"
+        );
+
+        const E6: u8 = 67;
+        let treble = (rigaud::S_T * midi_from_key(E6 as usize) + rigaud::Y_T).exp();
+        let b = (2.3 * treble) as f32;
+        assert!(f64::from(b) >= BASS_BRIDGE_MIN_B_OVER_TREBLE * treble);
+        let mut with_treble = bass.clone();
+        with_treble.record(capture(E6, b, 9));
+        assert!(
+            CurveInput::from_profile(&with_treble).keys[E6 as usize]
+                .as_ref()
+                .is_some_and(|d| d.partials.len() >= BASS_BRIDGE_MIN_PARTIALS)
+        );
+        assert_eq!(
+            bass_bridge_fit(&CurveInput::from_profile(&with_treble)),
+            held
+        );
+    }
+
+    /// The physical range flags only above its top edge.
+    #[test]
+    fn the_physical_range_flags_only_above_its_top_edge() {
+        for (key, edge) in [(10usize, 15.5), (40, 4.73), (70, 4.18)] {
+            let model = BXi::DEFAULT_MEDIUM.b_at_key(key);
+            assert!(
+                !b_above_physical_range(key, model),
+                "key {key} at the model"
+            );
+            assert!(
+                !b_above_physical_range(key, 0.99 * edge * model),
+                "key {key} below"
+            );
+            assert!(
+                b_above_physical_range(key, 1.01 * edge * model),
+                "key {key} above"
+            );
+            assert!(
+                !b_above_physical_range(key, model / 100.0),
+                "key {key}: no bottom edge"
+            );
+        }
+        let mut profile = synth_profile(0..88);
+        let m = profile.active_mut(10).unwrap();
+        m.calculated_b = Some(m.calculated_b.unwrap() * 20.0);
+        let curve = rigaud_pure(&CurveInput::from_profile(&profile), &CurveParams::default());
+        assert!(curve.flags[10].b_above_physical_range);
+        assert_eq!(
+            curve
+                .flags
+                .iter()
+                .filter(|f| f.b_above_physical_range)
+                .count(),
+            1
+        );
     }
 
     /// A key is a point from [`BASS_BRIDGE_MIN_B_OVER_TREBLE`] times the treble term

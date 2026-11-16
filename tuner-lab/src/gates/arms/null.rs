@@ -506,7 +506,7 @@ mod tests {
     /// The log-exponential's median `ln ln 2`, from `1 − e^{−e^z} = ½`.
     const Z_MEDIAN: f64 = -0.366_512_920_581_664_35;
     /// Its mean, `−γ`: `E[ln E] = Γ′(1) = −γ` (Euler–Mascheroni).
-    const Z_MEAN: f64 = -0.577_215_664_901_532_9;
+    const Z_MEAN: f64 = -std::f64::consts::EULER_GAMMA;
     /// Its SD, `π/√6`: `Var ln E = ψ′(1) = π²/6`.
     const Z_SD: f64 = 1.282_549_830_161_864;
 

@@ -1,12 +1,6 @@
 # Architecture
 
-How this program is built, for someone contributing. One section per crate:
-`tuner-core` carries the runtime, the codemap, the contracts a change must not
-break, the decisions that shaped it and the methods it stands on; `tuner-gui`
-and `tuner-lab` carry their own maps and the contracts that bind them alone.
-What the program is *for* is the [README](README.md); the full text of each
-contract is in [`docs/internals/`](docs/internals/); the evidence behind
-every number is in [`reports/`](reports/).
+How this program is built, for someone contributing. One section per crate: `tuner-core` carries the runtime, the codemap, the contracts a change must not break, the decisions that shaped it and the methods it stands on; `tuner-gui` and `tuner-lab` carry their own maps and the contracts that bind them alone. What the program is *for* is the [README](README.md); the full text of each contract is in [`docs/internals/`](docs/internals/); the evidence behind every number is in [`reports/`](reports/).
 
 ## Overview
 
@@ -29,32 +23,11 @@ every number is in [`reports/`](reports/).
 
 Each box is a thread, with what paces it on its second line: all threads in the top row are for `tuner-core`, and the bottom row is for `tuner-gui`. No arrow waits for a reply.
 
-Audio in, tuning-targets out. Each hop, the DSP pipeline decides whether a note is
-sounding and has settled, names the key, and reports the strobe's beat phase
-against that key's targets. When a capture is armed, a settled note is recorded
-and handed to a background Worker, which extracts the partials, fits the
-stiff-string equation $f_n = n F_0 \sqrt{1 + B n^2}$ (stiffness lifts a string's
-partials above the harmonic series by the inharmonicity coefficient $B$) and
-records the key's $(F_0, B)$ in the instrument's `InharmonicityProfile`. The
-curve engines turn a profile into per-key targets, and the strobe reads against
-them. The measurement, the strobe and the ET reference mode are
-instrument-agnostic; all current tuning curves are based on Rigaud's dual-bridge
-$B_\xi$ piano model. On a piano $B$ is smallest around the mid bass, rises steeply
-through the treble to more than two orders of magnitude more at the top, and rises
-again into the deep bass; each end is a bridge term in the model.
+Audio in, tuning-targets out. Each hop, the DSP pipeline decides whether a note is sounding and has settled, names the key, and reports the strobe's beat phase against that key's targets. When a capture is armed, a settled note is recorded and handed to a background Worker, which extracts the partials, fits the stiff-string equation $f_n = n F_0 \sqrt{1 + B n^2}$ (stiffness lifts a string's partials above the harmonic series by the inharmonicity coefficient $B$) and records the key's $(F_0, B)$ in the instrument's `InharmonicityProfile`. The curve engines turn a profile into per-key targets, and the strobe reads against them. The measurement, the strobe and the ET reference mode are instrument-agnostic; all current tuning curves are based on Rigaud's dual-bridge $B_\xi$ piano model. On a piano $B$ is smallest around the mid bass, rises steeply through the treble to more than two orders of magnitude more at the top, and rises again into the deep bass; each end is a bridge term in the model.
 
-`tuner-core` is **headless**. No GUI code, no GUI-specific
-types, no dependencies on `iced`, `egui`, or any frontend framework. Any future
-frontend (a CLI, a WebAssembly app, a mobile app, or an alternative GUI) must be able to
-consume the crate as-is. `tuner-gui` depends on `tuner-core`. The reverse never
-holds. `tuner-lab` holds the measurement harnesses, ships in nothing, and depends
-on `tuner-core` only.
+`tuner-core` is **headless**. No GUI code, no GUI-specific types, no dependencies on `iced`, `egui`, or any frontend framework. Any future frontend (a CLI, a WebAssembly app, a mobile app, or an alternative GUI) must be able to consume the crate as-is. `tuner-gui` depends on `tuner-core`. The reverse never holds. `tuner-lab` holds the measurement harnesses, ships in nothing, and depends on `tuner-core` only.
 
-**Four threads, six wait-free crossings.** The audio callback conditions and
-buffers; the analysis thread runs the DSP pipeline once per hop; a single
-background Worker does the heavy, non-real-time measurement; the GUI renders.
-The threads, and what crosses between them (each crossing's contract is in
-[`thread-crossings.md`](docs/internals/thread-crossings.md)):
+**Four threads, six wait-free crossings.** The audio callback conditions and buffers; the analysis thread runs the DSP pipeline once per hop; a single background Worker does the heavy, non-real-time measurement; the GUI renders. The threads, and what crosses between them (each crossing's contract is in [`thread-crossings.md`](docs/internals/thread-crossings.md)):
 
 ```text
 audio::spawn_analysis_thread(source, dump_dir)  →  HostHandle
@@ -83,7 +56,7 @@ audio::spawn_analysis_thread(source, dump_dir)  →  HostHandle
       ┌───────────────────┐
       │ High-res FFT+CSPE │ ← 65536-pt + shifted frame   (captures serviced first;
       │ MAT (f₀,B solver) │ ← partials + inharmonicity     curve recompute when idle)
-      │ Curve engines a–d │ ← CurveBundle (cold, ≈ 1.1 s)
+      │ Curve engines a,d │ ← CurveBundle (cold, ≈ 0.1 s)
       │ Diagnostics I/O   │ ← analysis.json + audio.raw
       └────────┬──────────┘
                │ crossbeam SPSC (WorkerOutput: measurements + curves) → Frontend
@@ -91,36 +64,15 @@ audio::spawn_analysis_thread(source, dump_dir)  →  HostHandle
                ▼
 ```
 
-A host with its own audio thread calls `AudioPipeline::new` directly instead,
-keeps the `PipelinePorts` it returns — the same atomics, receivers and producers,
-plus the `worker_job_tx` the `HostHandle` keeps private — and takes each hop's
-`FrameOutput` from `push_audio`'s return value rather than from a triple buffer.
+A host with its own audio thread calls `AudioPipeline::new` directly instead, keeps the `PipelinePorts` it returns — the same atomics, receivers and producers, plus the `worker_job_tx` the `HostHandle` keeps private — and takes each hop's `FrameOutput` from `push_audio`'s return value rather than from a triple buffer.
 
-The thread split also partitions **state**, and that partition is what makes the
-real-time side safe to reset at any moment:
+The thread split also partitions **state**, and that partition is what makes the real-time side safe to reset at any moment:
 
-- **Threads 1–2 hold transient state.** The Engine's lock and partial trackers; the Gatekeeper's readings and states; the
-  Strobe's accumulated beat phase, its sliding fits and its baseband record; the
-  pipeline's own `CaptureState`. We call it the *transient* state because it is
-  **re-derivable from the audio**. The next note rebuilds it within a few hops, so
-  losing it costs nothing but a moment's display. Silence resets the Engine's lock
-  and trackers and the Gatekeeper's verdict. The Strobe deliberately holds its
-  accumulated phase and rate, which only a change of reference clears. An armed
-  capture stays armed until triggered or cancelled.
-- **Thread 3 holds none.** The Worker is the one genuinely stateless stage. Each
-  capture and each curve job is a pure function of its payload. Its only
-  standing field is the dump directory the frontend hands it.
-- **Thread 4 holds the persistent state.** The `InharmonicityProfile`, the app
-  settings, and the open session are the program's memory, and are the one
-  thing no other thread can reconstruct. A measurement not written down means
-  striking the string again with the piano still in front of you. It reaches disk
-  through autosave, which performs an atomic file write and takes one `.bak` file per session.
+- **Threads 1–2 hold transient state.** The Engine's lock and partial trackers; the Gatekeeper's readings and states; the Strobe's accumulated beat phase, its sliding fits and its baseband record; the pipeline's own `CaptureState`. We call it the *transient* state because it is **re-derivable from the audio**. The next note rebuilds it within a few hops, so losing it costs nothing but a moment's display. Silence resets the Engine's lock and trackers and the Gatekeeper's verdict. The Strobe deliberately holds its accumulated phase and rate, which only a change of reference clears. An armed capture stays armed until triggered or cancelled.
+- **Thread 3 holds none.** The Worker is the one genuinely stateless stage. Each capture and each curve job is a pure function of its payload. Its only standing field is the dump directory the frontend hands it.
+- **Thread 4 holds the persistent state.** The `InharmonicityProfile`, the app settings, and the open session are the program's memory, and are the one thing no other thread can reconstruct. A measurement not written down means striking the string again with the piano still in front of you. It reaches disk through autosave, which performs an atomic file write and takes one `.bak` file per session.
 
-As mentioned previously the Worker has a dump directory. It writes files regarding each capture's raw audio and analysis. These are
-**diagnostic output, not program state**. Nothing in the app reads one back and they only exist for the offline harnesses (`tuner-lab/`). The frontend
-can switch them off by handing the Worker `None`. Where they land is thread-4
-policy (`WorkerJob::SetDumpDir`), so `tuner-core` stays headless and resolves no
-paths of its own.
+As mentioned previously the Worker has a dump directory. It writes files regarding each capture's raw audio and analysis. These are **diagnostic output, not program state**. Nothing in the app reads one back and they only exist for the offline harnesses (`tuner-lab/`). The frontend can switch them off by handing the Worker `None`. Where they land is thread-4 policy (`WorkerJob::SetDumpDir`), so `tuner-core` stays headless and resolves no paths of its own.
 
 ## `tuner-core`
 
@@ -155,15 +107,9 @@ The pipeline, hop by hop:
   CapturePayload → Worker         triple buffer → GUI
 ```
 
-Every arrow inside the box is `AudioPipeline` handing one component's return
-value to the next; no component calls another. The numbers are the steps of the
-per-hop table in [`hot-path.md`](docs/internals/hot-path.md). Capture takes the Engine's key and its f₀, which seeds MAT. Not
-drawn: steps 0, 2 and 4 (the queues, the config atomics, the magnitude spectra),
-and capture's other two inputs, the hop's Arm / Cancel and the Worker's in-flight
-flag.
+Every arrow inside the box is `AudioPipeline` handing one component's return value to the next; no component calls another. The numbers are the steps of the per-hop table in [`hot-path.md`](docs/internals/hot-path.md). Capture takes the Engine's key and its f₀, which seeds MAT. Not drawn: steps 0, 2 and 4 (the queues, the config atomics, the magnitude spectra), and capture's other two inputs, the hop's Arm / Cancel and the Worker's in-flight flag.
 
-**The Gatekeeper and the Engine.** What the gate's verdict does to the Engine,
-each hop:
+**The Gatekeeper and the Engine.** What the gate's verdict does to the Engine, each hop:
 
 ```text
 ┌─ 3 Gatekeeper ───────────────┐ GateResult   ┌─ 5 Engine ─────────────────────┐
@@ -179,15 +125,9 @@ each hop:
 └──────────────────────────────┘              └────────────────────────────────┘
 ```
 
-The pipeline hands the Engine two things from each hop's `GateResult`: whether it
-is Silence, and its onset flag. Silence sends the Engine back to discovery with
-its trackers cleared; an onset drops the lock and skips its hop. Unstable and
-Stable hops both vote, and once the lock lands every hop that is neither silent
-nor an onset is tracked. A key the user selects skips the vote and locks at
-once. The full state rules are in `gatekeeper.rs`'s module doc.
+The pipeline hands the Engine two things from each hop's `GateResult`: whether it is Silence, and its onset flag. Silence sends the Engine back to discovery with its trackers cleared; an onset drops the lock and skips its hop. Unstable and Stable hops both vote, and once the lock lands every hop that is neither silent nor an onset is tracked. A key the user selects skips the vote and locks at once. The full state rules are in `gatekeeper.rs`'s module doc.
 
-**The Gatekeeper and capture.** What the same verdicts do to the capture
-lifecycle:
+**The Gatekeeper and capture.** What the same verdicts do to the capture lifecycle:
 
 ```text
 ┌─ 3 Gatekeeper ─┐      ┌─ 6 capture lifecycle · CaptureState ─────────────────┐
@@ -209,13 +149,9 @@ lifecycle:
 └────────────────┘      └──────────────────────────────────────────────────────┘
 ```
 
-Capture fills two buffers from the pool: the diagnostic record, which is only
-ever written to disk, and the measured record, the one MAT analyses. Unstable
-changes nothing here, and a Cancel from the GUI sends Armed or Recording back to
-Idle.
+Capture fills two buffers from the pool: the diagnostic record, which is only ever written to disk, and the measured record, the one MAT analyses. Unstable changes nothing here, and a Cancel from the GUI sends Armed or Recording back to Idle.
 
-**How the hot path stays allocation-free.** Every buffer it touches is allocated
-once, up front, and none of this relies on the OS raising the thread's priority:
+**How the hot path stays allocation-free.** Every buffer it touches is allocated once, up front, and none of this relies on the OS raising the thread's priority:
 
 - **The Elastic Ring Buffer:** A lock-free circular buffer connecting Thread 1 and Thread 2. Acts as an elastic shock absorber if the OS briefly suspends the processing thread. Audio keeps accumulating for up to ≈ 371 ms (`RING_BUFFER_CAPACITY`); past that the callback drops samples rather than block. In normal running the analysis thread drains it as fast as the callback fills it, so the capacity adds no delay; it only sets how long a stall can last before audio drops, for 64 KiB of memory.
 - **Lock-Free Object Pool (`AudioPool`):** Pre-allocated pool of `Box<[f32]>` buffers, each sized to `CAPTURE_MAX_SAMPLES` (5 s at 44.1 kHz) so a runtime change to the capture length never allocates on the audio thread. A capture borrows two: one at the onset for the diagnostic full-event record (pre-roll, strike and decay), and one at `Stable` for the note itself, filled to the current target (1.5 s by default). Both pass to the background Worker, which recycles them into the pool when finished.
@@ -224,8 +160,7 @@ once, up front, and none of this relies on the OS raising the thread's priority:
 
 ### Codemap
 
-The pipeline and its components sit at the top of `src/`; `algorithms/` holds
-the stateless DSP math they call.
+The pipeline and its components sit at the top of `src/`; `algorithms/` holds the stateless DSP math they call.
 
 ```text
 tuner-core/
@@ -267,105 +202,51 @@ tuner-core/
 
 ### Invariants (briefly)
 
-The contracts a change must not break. The full text of
-each lives where it binds.
+The contracts a change must not break. The full text of each lives where it binds.
 
-**The hot path is allocation-free and non-blocking.** Everything reached from
-`AudioPipeline::process_cola_hop`: Gatekeeper, Engine, Strobe and every
-`algorithms/*` call, plus the audio callback. The Worker and the GUI may
-allocate freely. → [`hot-path.md`](docs/internals/hot-path.md)
+**The hot path is allocation-free and non-blocking.** Everything reached from `AudioPipeline::process_cola_hop`: Gatekeeper, Engine, Strobe and every `algorithms/*` call, plus the audio callback. The Worker and the GUI may allocate freely. → [`hot-path.md`](docs/internals/hot-path.md)
 
-**One entry point, pure components.** Every hop runs exactly one function,
-`process_cola_hop`; the components return by value and only the pipeline syncs
-to the atomics. `audio.rs` calling into `Engine` is what this prevents.
+**One entry point, pure components.** Every hop runs exactly one function, `process_cola_hop`; the components return by value and only the pipeline syncs to the atomics. `audio.rs` calling into `Engine` is what this prevents.
 → [`hot-path.md`](docs/internals/hot-path.md)
 
-**The chain is sacred; taps are deletable.** FFT front end → Gatekeeper →
-Engine → `FrameOutput`, with the capture limb to the Worker, has one shape;
-inserting a stage needs a design note and a *Decisions* entry. Everything else
-in the hop is a tap, and removing one must leave gating, detection and
-measurement bit-identical. The Strobe is a tap.
+**The chain is sacred; taps are deletable.** FFT front end → Gatekeeper → Engine → `FrameOutput`, with the capture limb to the Worker, has one shape; inserting a stage needs a design note and a *Decisions* entry. Everything else in the hop is a tap, and removing one must leave gating, detection and measurement bit-identical. The Strobe is a tap.
 → [`hot-path.md`](docs/internals/hot-path.md)
 
-**Six crossings, and no seventh by accident.** Cross-thread state moves only
-over the six wait-free crossings; a second payload of the same class is a new
-message type, never a new channel.
+**Six crossings, and no seventh by accident.** Cross-thread state moves only over the six wait-free crossings; a second payload of the same class is a new message type, never a new channel.
 → [`thread-crossings.md`](docs/internals/thread-crossings.md)
 
-**Split / Handle.** The `split()` convention `ringbuf` and `crossbeam_channel`
-share: construction hands back one half that moves to the analysis thread —
-`AudioPipeline`, which owns every real-time component and is the only thing
-that mutates them — and one the caller keeps, `PipelinePorts`, or the
-`HostHandle` that `spawn_analysis_thread` folds them into. Neither side needs
-the other's internals.
+**Split / Handle.** The `split()` convention `ringbuf` and `crossbeam_channel` share: construction hands back one half that moves to the analysis thread — `AudioPipeline`, which owns every real-time component and is the only thing that mutates them — and one the caller keeps, `PipelinePorts`, or the `HostHandle` that `spawn_analysis_thread` folds them into. Neither side needs the other's internals.
 → [`thread-crossings.md`](docs/internals/thread-crossings.md)
 
-**Layering.** Stateless DSP math lives in `algorithms/`, domain types in
-`models.rs`, and cross-hop state on the component that owns it.
+**Layering.** Stateless DSP math lives in `algorithms/`, domain types in `models.rs`, and cross-hop state on the component that owns it.
 → [`layering.md`](docs/internals/layering.md)
 
 ### Decisions
 
-The choices that shape the system as a whole: what was decided, why, what would
-reopen it, and where the evidence is. An entry that cites no report rests on the
-argument at its pointer. The complete decision log, constants included,
-is the report index in [`reports/README.md`](reports/README.md).
+The choices that shape the system as a whole: what was decided, why, what would reopen it, and where the evidence is. An entry that cites no report rests on the argument at its pointer. The complete decision log, constants included, is the report index in [`reports/README.md`](reports/README.md).
 
-**Scope is struck and plucked stiff-string instruments.** Every current subsystem
-relies on two things about the sound: a decaying excitation, and partials that
-follow the stiff-string equation, of which the ideal string is the $B = 0$ case.
-An instrument that breaks either needs a subsystem replaced. Reopens if the
-program takes on sustained excitation (bowed, blown) or modal percussion, whose
-modes are no stretched harmonic series; each is its own decision.
+**Scope is struck and plucked stiff-string instruments.** Every current subsystem relies on two things about the sound: a decaying excitation, and partials that follow the stiff-string equation, of which the ideal string is the $B = 0$ case. An instrument that breaks either needs a subsystem replaced. Reopens if the program takes on sustained excitation (bowed, blown) or modal percussion, whose modes are no stretched harmonic series; each is its own decision.
 → [report 0004](reports/retiring/0004-instrument-scope.md)
 
-**Heavy DSP runs off-thread, on one Worker.** MAT, the high-resolution FFT and
-the curve engines would exceed the real-time budget inline; one thread suffices
-because captures are serialised at the source. →
-[`thread-crossings.md`](docs/internals/thread-crossings.md) §5, and the Worker's
-own module doc.
+**Heavy DSP runs off-thread, on one Worker.** MAT, the high-resolution FFT and the curve engines would exceed the real-time budget inline; one thread suffices because captures are serialised at the source. → [`thread-crossings.md`](docs/internals/thread-crossings.md) §5, and the Worker's own module doc.
 
-**The pipeline is locked to 44.1 kHz.** Buffer sizes, window lengths and every
-gate's timing are dimensioned for it; a dynamic rate is a planned overhaul, not
-a parameter. → [`hot-path.md`](docs/internals/hot-path.md), *Sample-rate handling*.
+**The pipeline is locked to 44.1 kHz.** Buffer sizes, window lengths and every gate's timing are dimensioned for it; a dynamic rate is a planned overhaul, not a parameter. → [`hot-path.md`](docs/internals/hot-path.md), *Sample-rate handling*.
 
-**Two FFTs run every hop: 2048 for the treble, 8192 for the bass.** Frequency
-resolution is bought with time: the 8192-sample window separates the bass
-partials, and lags the sound by 186 ms; the 2048-sample window keeps the gate
-and the display within 46 ms of it. The cost is that latency, not the compute,
-and both run every hop so the hop's control flow never varies. Reopens if what
-reads the bass spectrum no longer needs that resolution.
+**Two FFTs run every hop: 2048 for the treble, 8192 for the bass.** Frequency resolution is bought with time: the 8192-sample window separates the bass partials, and lags the sound by 186 ms; the 2048-sample window keeps the gate and the display within 46 ms of it. The cost is that latency, not the compute, and both run every hop so the hop's control flow never varies. Reopens if what reads the bass spectrum no longer needs that resolution.
 
-**`CaptureState` has one owner.** The pipeline holds the capture's state as a
-plain `enum` and makes every transition itself; the GUI asks for one
-(crossing 4) and reads the result (crossing 2), and the Worker clears one
-`AtomicBool` when its work is done (crossing 5). One writer means no transition
-can race another, and every move is in one function to read. Reopens if a
-lifecycle operation ever needs a synchronous answer. The chain is walked in
-[`thread-crossings.md`](docs/internals/thread-crossings.md).
+**`CaptureState` has one owner.** The pipeline holds the capture's state as a plain `enum` and makes every transition itself; the GUI asks for one (crossing 4) and reads the result (crossing 2), and the Worker clears one `AtomicBool` when its work is done (crossing 5). One writer means no transition can race another, and every move is in one function to read. Reopens if a lifecycle operation ever needs a synchronous answer. The chain is walked in [`thread-crossings.md`](docs/internals/thread-crossings.md).
 
-**`synth` is cold-path; audio-out is a future seventh crossing.** Resynthesis
-runs on no pipeline thread and owns no stream; when playback is built, the
-output stream lives in `audio`, not the GUI. →
-[`thread-crossings.md`](docs/internals/thread-crossings.md), *Cold-path
-modules*.
+**`synth` is cold-path; audio-out is a future seventh crossing.** Resynthesis runs on no pipeline thread and owns no stream; when playback is built, the output stream lives in `audio`, not the GUI. → [`thread-crossings.md`](docs/internals/thread-crossings.md), *Cold-path modules*.
 
-**Every discovery template takes the instrument's fitted B curve.** The Worker
-fits Rigaud's bass pair to the measured bass-bridge keys with each curve bundle,
-the same pair the tuning curve reads, and the frontend pushes all 88 templates
-whole over crossing 4. No template is a key's own measurement: a per-key table
-leaves holes, where a measured neighbour outbids a true key left on the prior.
-Reopens if a bass the two-asymptote form misfits loses locks under the fit.
-→ [report 0021](reports/0021-curve-seeded-templates.md),
-[report 0022](reports/0022-curve-bass-bridge-fit.md)
+**Every discovery template takes the instrument's fitted B curve.** The Worker fits Rigaud's bass pair to the measured bass-bridge keys with each curve bundle, the same pair the tuning curve reads, and the frontend pushes all 88 templates whole over crossing 4. No template is a key's own measurement: a per-key table leaves holes, where a measured neighbour outbids a true key left on the prior. Reopens if a bass the two-asymptote form misfits loses locks under the fit.
+→ [report 0021](reports/0021-curve-seeded-templates.md), [report 0022](reports/0022-curve-bass-bridge-fit.md)
+
+**The tuning curve reads the fitted B curve for every key.** Engine (d)'s interval widths, like engine (a)'s chain, take each key's B from the instrument's fitted curve; a key's own measurement reaches the curve only as a point of that fit, and keys from A4 up never are one. The precision blend of measured and fitted B is withheld: five pre-registered measurements advanced no form of it, its partial-count law does not calibrate across instruments, and few-partial B shifts between sittings of one piano. Engines (b) and (c), which read the blend, leave the app. A capture's B still sets its strobe references and its red ✗, which marks a B above the physical range of piano strings. Reopens if a weighting calibrates on instruments beyond those the report analysed and the few-partial recording bias is explained.
+→ [report 0024](reports/0024-curve-fitted-b-default.md)
 
 ### DSP foundations
 
-Published methods, used as published: where a mechanism or a constant is ours,
-its guard comment says so, states what it rests on and cites the report. Where
-a method was chosen over rivals, its entry says why and what would reopen it.
-The rule, and the test any added heuristic must pass, is in
-[`layering.md`](docs/internals/layering.md).
+Published methods, used as published: where a mechanism or a constant is ours, its guard comment says so, states what it rests on and cites the report. Where a method was chosen over rivals, its entry says why and what would reopen it. The rule, and the test any added heuristic must pass, is in [`layering.md`](docs/internals/layering.md).
 
 The major DSP components and their foundations:
 
@@ -386,8 +267,7 @@ The major DSP components and their foundations:
 
 ## `tuner-gui`
 
-The reference frontend. It is the half that separates if the crate split happens;
-where that boundary falls is still open (`TODO.md`).
+The reference frontend. It is the half that separates if the crate split happens; where that boundary falls is still open (`TODO.md`).
 
 ### Codemap
 
@@ -427,24 +307,14 @@ tuner-gui/src/
 
 ### Invariants
 
-**GUI layering.** The widgets are stateless renderers, the views compose them,
-and `app` is the state hub with no DSP in it. This half binds the frontend
-only, and travels with it if the crate split happens (`TODO.md`).
+**GUI layering.** The widgets are stateless renderers, the views compose them, and `app` is the state hub with no DSP in it. This half binds the frontend only, and travels with it if the crate split happens (`TODO.md`).
 → [`layering.md`](docs/internals/layering.md)
 
 ## `tuner-lab`
 
-The measurement instruments; every mode and what it reproduces is in
-[`tuner-lab/README.md`](tuner-lab/README.md).
+The measurement instruments; every mode and what it reproduces is in [`tuner-lab/README.md`](tuner-lab/README.md).
 
-`tuner-lab` holds the measurement harnesses: a harness that asserts is a test, one
-that times is a bench, and one that reports lives here
-([`style.md`](docs/internals/style.md), *Where tests live*). It ships in nothing —
-`publish = false`, and the workspace's `default-members` leave it out of a plain
-`cargo build`. It stays a member of this workspace rather than becoming a repository of its
-own: it drives `tuner-core`'s public API and reproduces the reports here, so a
-separate repository would pin it to a commit and turn every API change into two.
-The two settings above are what keep it out of the product, and they already do.
+`tuner-lab` holds the measurement harnesses: a harness that asserts is a test, one that times is a bench, and one that reports lives here ([`style.md`](docs/internals/style.md), *Where tests live*). It ships in nothing — `publish = false`, and the workspace's `default-members` leave it out of a plain `cargo build`. It stays a member of this workspace rather than becoming a repository of its own: it drives `tuner-core`'s public API and reproduces the reports here, so a separate repository would pin it to a commit and turn every API change into two. The two settings above are what keep it out of the product, and they already do.
 
 ### Codemap
 
@@ -502,23 +372,14 @@ tuner-lab/
 
 ### Invariants
 
-**The lab reads `tuner-core`'s public API, and never `tuner-gui`.** A harness
-that reached into `tuner-gui` would measure the frontend's copy of a decision
-rather than the core's: a decision worth replaying offline belongs in
-`tuner-core`, where the app and the lab read the one implementation. A harness
-that needs something private has found a `tuner-core` API question.
+**The lab reads `tuner-core`'s public API, and never `tuner-gui`.** A harness that reached into `tuner-gui` would measure the frontend's copy of a decision rather than the core's: a decision worth replaying offline belongs in `tuner-core`, where the app and the lab read the one implementation. A harness that needs something private has found a `tuner-core` API question.
 
-**The capture sets are validation-only.** Two instruments cannot select a
-configuration, and only `capture-sets.md`, the reports and the audits quote a
-raw tally; this file, the README and the rest of `docs/internals/` state results
-without one. The one contract that binds claims rather than code.
-→ [`capture-sets.md`](docs/internals/capture-sets.md),
-[`CONTRIBUTING.md`](CONTRIBUTING.md)
+**The capture sets are validation-only.** Two instruments cannot select a configuration, and only `capture-sets.md`, the reports and the audits quote a raw tally; this file, the README and the rest of `docs/internals/` state results without one. The one contract that binds claims rather than code.
+→ [`capture-sets.md`](docs/internals/capture-sets.md), [`CONTRIBUTING.md`](CONTRIBUTING.md)
 
 ## Status
 
-How settled each module is, and whether more work is expected. Every one is built
-and running; what each is waiting on is in [TODO.md](TODO.md).
+How settled each module is, and whether more work is expected. Every one is built and running; what each is waiting on is in [TODO.md](TODO.md).
 
 | Module | Status |
 | --- | --- |
@@ -533,22 +394,9 @@ and running; what each is waiting on is in [TODO.md](TODO.md).
 | `algorithms/twm.rs` — Two-Way Mismatch scoring | 🔬 R&D |
 | `app.rs` + `app/` — GUI state hub | 🧩 Extensible |
 
-**Legend** — **Mature**: solved, unlikely to change · 🟢 **Stable**: complete for
-its role · 📐 **Provisional**: functional now, but a required feature is not built
-on it yet · 🧩 **Extensible**: works today, could grow, no commitment either way ·
-🚧 **In Development**: functional, more features actively coming · 🔬 **R&D**:
-algorithm still being developed and validated. (The two "done" tiers follow the
-PyPI convention, where Mature ranks above Stable.)
+**Legend** — **Mature**: solved, unlikely to change · 🟢 **Stable**: complete for its role · 📐 **Provisional**: functional now, but a required feature is not built on it yet · 🧩 **Extensible**: works today, could grow, no commitment either way · 🚧 **In Development**: functional, more features actively coming · 🔬 **R&D**: algorithm still being developed and validated. (The two "done" tiers follow the PyPI convention, where Mature ranks above Stable.)
 
-Orchestration is settled. The **curve layer** and the **strobe** are complete and
-wired together, and stay Provisional until a professional tuner has judged the
-result on an instrument. **synth** is cold-path: it renders a curve to audio
-offline and owns no audio stream. The **Engine** and **twm** are the open research front — discovery
-locks reliably, but the deep bass is inharmonicity-limited and gated on an in-tune
-instrument ([report 0006](reports/0006-discovery-refinement-validation.md)). The
-**Gatekeeper** is stable, with three open items in `TODO.md`: its onset and bypass
-flags are one signal, silence closes it off from its own metrics, and the silence
-threshold standing in for a noise floor is the next major piece of work.
+Orchestration is settled. The **curve layer** and the **strobe** are complete and wired together, and stay Provisional until a professional tuner has judged the result on an instrument. **synth** is cold-path: it renders a curve to audio offline and owns no audio stream. The **Engine** and **twm** are the open research front — discovery locks reliably, but the deep bass is inharmonicity-limited and gated on an in-tune instrument ([report 0006](reports/0006-discovery-refinement-validation.md)). The **Gatekeeper** is stable, with three open items in `TODO.md`: its onset and bypass flags are one signal, silence closes it off from its own metrics, and the silence threshold standing in for a noise floor is the next major piece of work.
 
 ## Pointers
 

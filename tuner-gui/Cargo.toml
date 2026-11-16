@@ -14,4 +14,4 @@ serde_json = { workspace = true }
 triple_buffer = { workspace = true }
 # Instrument identity (UUIDv7 — time-ordered, so dump directories sort by
 # creation). Already in the tree via iced; the v7 feature is what we add.
-uuid = { version = "1.24.1", features = ["v7"] }
+uuid = { version = "1.29.2", features = ["v7"] }

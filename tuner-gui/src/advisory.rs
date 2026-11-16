@@ -3,10 +3,9 @@
 //! Which flags mark a measurement as suspect and which are informational, and
 //! the words for each, so a flag reads the same wherever it is shown.
 //
-// Only `excluded` and `negative_stretch` are suspect. Over both capture sets
-// that pair fires on no key, while `curve_b_fallback` marks 21–22 of 88 (20 of
-// them treble, plus every unmeasured key) and `giordano_excluded` 39–40: styled
-// as errors, those two would paint most of the keyboard red.
+// Only `b_above_physical_range` and `negative_stretch` are suspect; the blend's
+// `excluded` marks keys whose B moves no target.
+// report 0024
 
 use tuner_core::models::CurveKeyFlags;
 
@@ -31,12 +30,11 @@ pub struct Advisory {
 
 /// Whether this key's measurement is doubted — the red-✗ predicate.
 pub fn is_suspect(flags: &CurveKeyFlags) -> bool {
-    flags.excluded || flags.negative_stretch
+    flags.b_above_physical_range || flags.negative_stretch
 }
 
-/// The suspect flag to show first, or `None` when the key is fine. Both flags
-/// at once is the ordinary case (an exclusion the final curve still violates),
-/// and `excluded` is the more actionable of the two.
+/// The suspect flag to show first, or `None` when the key is fine. The physical range
+/// comes first: it names the capture.
 pub fn suspect(flags: &CurveKeyFlags) -> Option<Advisory> {
     advisories(flags)
         .into_iter()
@@ -46,36 +44,24 @@ pub fn suspect(flags: &CurveKeyFlags) -> Option<Advisory> {
 /// Every advisory for a key, suspect ones first.
 pub fn advisories(flags: &CurveKeyFlags) -> Vec<Advisory> {
     let mut out = Vec::new();
-    if flags.excluded {
+    if flags.b_above_physical_range {
         out.push(Advisory {
             severity: Severity::Suspect,
-            reason: "Measured B excluded — its octave implies a negative stretch.",
+            reason: "Measured B is above what real strings reach: the capture misread its partials.",
             hint: Some("Recapture this key."),
         });
     }
     if flags.negative_stretch {
         out.push(Advisory {
             severity: Severity::Suspect,
-            reason: "The curve still runs backwards across this key's octave.",
+            reason: "The curve runs backwards across this key's octave.",
             hint: Some("Recapture this key and its octave partner."),
         });
     }
-    if flags.curve_b_fallback {
+    if !flags.measured {
         out.push(Advisory {
             severity: Severity::Informational,
-            reason: if flags.measured {
-                "Curve B is prior-dominated here — normal in the treble, where \
-                 few partials survive."
-            } else {
-                "No measurement yet; the curve uses the instrument's B fit."
-            },
-            hint: None,
-        });
-    }
-    if flags.giordano_excluded {
-        out.push(Advisory {
-            severity: Severity::Informational,
-            reason: "Contributed no ρ point to engine (c)'s calibration.",
+            reason: "No measurement yet; the strobe reads the fundamental only.",
             hint: None,
         });
     }
@@ -91,34 +77,32 @@ pub fn suspect_keys(flags: &[CurveKeyFlags; 88]) -> [bool; 88] {
 mod tests {
     use super::*;
 
-    /// The informational flags must never reach the red ✗, however they
-    /// combine: they cover most of the treble and every unmeasured key.
+    /// The blend's flags never reach the red ✗, however they combine.
     #[test]
     fn only_the_two_suspect_flags_mark_a_key() {
-        let informational = CurveKeyFlags {
+        let quiet = CurveKeyFlags {
             measured: true,
             curve_b_fallback: true,
+            excluded: true,
             giordano_excluded: true,
             ..CurveKeyFlags::default()
         };
-        assert!(!is_suspect(&informational));
-        assert!(suspect(&informational).is_none());
-        assert_eq!(advisories(&informational).len(), 2);
+        assert!(!is_suspect(&quiet));
+        assert!(suspect(&quiet).is_none());
+        assert!(advisories(&quiet).is_empty());
 
-        let unmeasured = CurveKeyFlags {
-            curve_b_fallback: true,
-            ..CurveKeyFlags::default()
-        };
+        let unmeasured = CurveKeyFlags::default();
         assert!(!is_suspect(&unmeasured));
+        assert_eq!(advisories(&unmeasured).len(), 1);
 
         for flags in [
             CurveKeyFlags {
-                excluded: true,
-                ..informational
+                b_above_physical_range: true,
+                ..quiet
             },
             CurveKeyFlags {
                 negative_stretch: true,
-                ..informational
+                ..quiet
             },
         ] {
             assert!(is_suspect(&flags));

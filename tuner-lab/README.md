@@ -1,8 +1,6 @@
 # `tuner-lab` — the measurement instruments
 
-Offline harnesses that replay captured audio through the shipped algorithms and
-report what they saw, and a recorder that captures the room through the app's own
-input stream. Development instruments, not user features; they ship in nothing.
+Offline harnesses that replay captured audio through the shipped algorithms and report what they saw, and a recorder that captures the room through the app's own input stream. Development instruments, not user features; they ship in nothing.
 
 ```bash
 cargo lab --help                    # the seven subsystems
@@ -10,31 +8,17 @@ cargo lab strobe --help             # one subsystem's modes
 cargo lab engine lock               # a mode
 ```
 
-`cargo lab` runs in `--release`: a debug build drops audio and changes every
-availability figure. `cargo lab-telemetry` adds `--features telemetry`, which
-`engine dump` needs for `goertzel.csv`; the two share one binary path, so re-run
-it after any plain `cargo lab`.
+`cargo lab` runs in `--release`: a debug build drops audio and changes every availability figure. `cargo lab-telemetry` adds `--features telemetry`, which `engine dump` needs for `goertzel.csv`; the two share one binary path, so re-run it after any plain `cargo lab`.
 
-A mode that draws writes PNG in the platform's own sans-serif font. On Linux the
-lab needs fontconfig's development files to build, beyond what the app needs
-(`libfontconfig1-dev` on Debian and Ubuntu, `fontconfig-devel` on Fedora).
+A mode that draws writes PNG in the platform's own sans-serif font. On Linux the lab needs fontconfig's development files to build, beyond what the app needs (`libfontconfig1-dev` on Debian and Ubuntu, `fontconfig-devel` on Fedora).
 
-Most modes read the capture sets in
-[`../docs/internals/capture-sets.md`](../docs/internals/capture-sets.md),
-whose consumption rules bind: piano #2 is consumed through `mat regen`, never
-raw `analysis.json`. `regen::load` applies the ±200 ¢ plausibility rule.
+Most modes read the capture sets in [`../docs/internals/capture-sets.md`](../docs/internals/capture-sets.md), whose consumption rules bind: piano #2 is consumed through `mat regen`, never raw `analysis.json`. `regen::load` applies the ±200 ¢ plausibility rule.
 
-Why a crate and why seven subcommands: the three-homes rule in
-[`style.md`](../docs/internals/style.md). The old-invocation rename map is
-below; the move itself is in git history (2026-09).
+Why a crate and why seven subcommands: the three-homes rule in [`style.md`](../docs/internals/style.md). The old-invocation rename map is below; the move itself is in git history (2026-09).
 
 ## What is *not* here
 
-A mode that **asserts** a number a report states is an integration test in
-[`../tuner-core/tests/`](../tuner-core/tests); a mode that **times** the hot
-path is a criterion bench in
-[`../tuner-core/benches/`](../tuner-core/benches). Only a mode that *reports*
-belongs here.
+A mode that **asserts** a number a report states is an integration test in [`../tuner-core/tests/`](../tuner-core/tests); a mode that **times** the hot path is a criterion bench in [`../tuner-core/benches/`](../tuner-core/benches). Only a mode that *reports* belongs here.
 
 | Where | What | Reproduces |
 | --- | --- | --- |
@@ -55,9 +39,7 @@ belongs here.
 
 ### Running the NSGA-II sweep
 
-The methodology, the synthetic signal model, and the threats-to-validity audit
-are [`reports/nsga2/README.md`](../reports/nsga2/README.md); this is how to
-drive it.
+The methodology, the synthetic signal model, and the threats-to-validity audit are [`reports/nsga2/README.md`](../reports/nsga2/README.md); this is how to drive it.
 
 ```bash
 # 1. Build the evaluator (release; the sweep is hours even parallelised).
@@ -86,8 +68,7 @@ The evaluator can also be driven directly (one trial per stdin line):
 - [ ] Sanity: M&B default → overall prod_fl ≈ 0.308 (asserted by the orchestrator).
 - [ ] `twm_nsga2.db` absent (fresh) or `--resume` intended.
 - [ ] Python deps: `pip install optuna==4.9.0` (Optuna pinned) in the .venv.
-- [ ] Final config decided on **real** captures (overall pass-count, no register
-      regressed), not synthetic hypervolume.
+- [ ] Final config decided on **real** captures (overall pass-count, no register regressed), not synthetic hypervolume.
 
 ## `gatekeeper` — the signal validator
 
@@ -97,9 +78,7 @@ The evaluator can also be driven directly (one trial per stdin line):
 | `plot <PATH>` | the gate's verdict drawn per capture to `gatekeeper.png` — the waveform shaded by state; NHWRSF, RMS and sustain stability against their thresholds — and the wait from onset to `Stable` per register | — | one capture or a set; `--profile`, `--silence`, `--nhwrsf`, `--sustain` and `--out` |
 | `sparsity [ROOT]` | our sustain-stability gate against faithful Mounir NINOS² variants | faithfulness audit 05 | a capture set |
 
-The third gatekeeper measurement — how well Stage-A names the key on each hop
-before and after `Stable` — is `engine from-onset`, which needs the engine's
-own Stage-A scan.
+The third gatekeeper measurement — how well Stage-A names the key on each hop before and after `Stable` — is `engine from-onset`, which needs the engine's own Stage-A scan.
 
 ## `mat` — the Worker's (f₀, B) estimator
 
@@ -107,7 +86,7 @@ own Stage-A scan.
 | --- | --- | --- | --- |
 | `validate [ROOT]` | measured B against the Rigaud prior for both trajectory orders, plus goodness-of-fit | report 0006; discrete **76/87**, refined **77/87** | a capture set |
 | `offset [ROOT] --offsets <MS>` | each capture re-measured at offsets from the *physical* onset, paired and read against the set's repeat scatter | report 0009 analysis 9 | a capture set (needs `audio_full_event.raw`) |
-| `repeats <REGEN>` | repeat-capture noise decomposition: σ_lnB, ρ reproducibility, strike strength | report 0009 | a `mat regen` dump |
+| `repeats <REGEN>` | repeat-capture noise decomposition: σ_lnB, ρ reproducibility, strike strength | report 0009 (its engine (d) rows at `58b6b80`) | a `mat regen` dump |
 | `regen [ROOT]` | per-key partials re-derived from the kept audio, one JSON dump on stdout | **the required entry point for piano #2** (`capture-sets.md`) | a capture set |
 | `recovery` | MAT against known synthetic B, swept 1×–25× the prior, with and without a fundamental | report 0006 (its assertion is `tuner-core/tests/`) | none (synthetic) |
 
@@ -115,7 +94,7 @@ own Stage-A scan.
 
 | Mode | What it reports | Reproduces | Input |
 | --- | --- | --- | --- |
-| `compare <REGEN> [--json OUT]` | every engine: stretch tables, implied beat rates, leave-one-key-out error, Giordano cross-scoring, curvature, flag counts | reports 0007–0009, 0022; the curve-side goldens | a `mat regen` dump |
+| `compare <REGEN> [--json OUT]` | every engine, and engine (d) on the blend: stretch tables, implied beat rates, leave-one-key-out error, Giordano cross-scoring, curvature, flag counts | report 0024; reports 0007–0009 and 0022 for engines (a)–(c), and for engine (d) at `58b6b80`; the curve-side goldens | a `mat regen` dump |
 | `auralize <REGEN> [--out DIR]` | each candidate curve rendered to a loudness-matched WAV by offline additive resynthesis | the perceptual selection evidence | a `mat regen` dump |
 
 ## `strobe` — the bank, and the number the panel displays
@@ -139,10 +118,7 @@ own Stage-A scan.
 
 ## `gates` — the detection thresholds
 
-`config.silence_threshold` is calibrated once and thresholded at three hot-path
-detectors, two in `engine.rs` and one in `strobe.rs`
-([report 0015](../reports/retiring/0015-ambient-sigma-gates-measured.md) §Context); the
-OS-CFAR family that could replace it is measured against the same reference.
+`config.silence_threshold` is calibrated once and thresholded at three hot-path detectors, two in `engine.rs` and one in `strobe.rs` ([report 0015](../reports/retiring/0015-ambient-sigma-gates-measured.md) §Context); the OS-CFAR family that could replace it is measured against the same reference.
 
 | Mode | What it reports | Reproduces | Input |
 | --- | --- | --- | --- |
@@ -165,22 +141,13 @@ OS-CFAR family that could replace it is measured against the same reference.
 | --- | --- | --- | --- |
 | `record <OUT_DIR> --seconds <N> [--label <TEXT>]` | the default input device through the app's own stream (DC-blocked, at the negotiated rate) to `audio.raw`, with `recording.json`: start, duration, device, rate, label, and whether the ring ever filled | the noise-floor measurement (pending) | none (the room, live) |
 
-A recording is validation data like the capture sets and lives beside them, in a
-gitignored `silence_*/` directory
-([`capture-sets.md`](../docs/internals/capture-sets.md)). Its `audio.raw` is the
-capture form, so every mode that takes one `.raw` reads it.
+A recording is validation data like the capture sets and lives beside them, in a gitignored `silence_*/` directory ([`capture-sets.md`](../docs/internals/capture-sets.md)). Its `audio.raw` is the capture form, so every mode that takes one `.raw` reads it.
 
 ## What a capture writes
 
-Every capture produces three files in a subdirectory named
-`key_<index>_<note>_<timestamp>` (e.g. `key_001_A#0_1752264903/`). The timestamp
-suffix means repeat captures of one key are all retained rather than overwriting
-each other, which is what the repeat-capture experiments consume.
+Every capture produces three files in a subdirectory named `key_<index>_<note>_<timestamp>` (e.g. `key_001_A#0_1752264903/`). The timestamp suffix means repeat captures of one key are all retained rather than overwriting each other, which is what the repeat-capture experiments consume.
 
-Those sit under the instrument's own dump directory — `diagnostics/<instrument
-id>/`, keyed on the opaque `identity.id`, so two instruments never share a
-directory and renaming an instrument moves nothing. Each carries an
-`instrument.json` (id, name, make, model, serial, kind).
+Those sit under the instrument's own dump directory — `diagnostics/<instrument id>/`, keyed on the opaque `identity.id`, so two instruments never share a directory and renaming an instrument moves nothing. Each carries an `instrument.json` (id, name, make, model, serial, kind).
 
 | File | Contents |
 | --- | --- |
@@ -188,22 +155,11 @@ directory and renaming an instrument moves nothing. Each carries an
 | `audio_full_event.raw` | The non-causal diagnostic buffer: ~348 ms of pre-roll, the hammer strike, and the decay. Always 1.5 s — the capture-duration control moves the stable record only. |
 | `analysis.json` | The Worker's analytical telemetry for that capture. |
 
-A longer `audio.raw` is **stored** audio, not measured audio: the Worker
-analyses the first `CAPTURE_ANALYSIS_SAMPLES` (1.5 s) whatever the record's
-length, so measurements stay comparable across the sets. `mat regen` bounds
-itself the same way, deliberately — reproducing the shipped measurement is its
-job. A harness that wants the whole record (decay τ, deep-bass resolution) reads
-the file directly and says so.
+A longer `audio.raw` is **stored** audio, not measured audio: the Worker analyses the first `CAPTURE_ANALYSIS_SAMPLES` (1.5 s) whatever the record's length, so measurements stay comparable across the sets. `mat regen` bounds itself the same way, deliberately — reproducing the shipped measurement is its job. A harness that wants the whole record (decay τ, deep-bass resolution) reads the file directly and says so.
 
-`analysis.json`'s `metadata.sounding_strings` carries the operator's declaration
-of which of the key's strings were sounding, or `null` where none was made —
-which is every capture outside the mute-isolation set. `mat regen` passes it
-through.
+`analysis.json`'s `metadata.sounding_strings` carries the operator's declaration of which of the key's strings were sounding, or `null` where none was made — which is every capture outside the mute-isolation set. `mat regen` passes it through.
 
-`metadata.noise_floor`, `nhwrsf_threshold` and `sustain_stability_threshold` are
-the gate's three thresholds as the capture ran. Captures taken before the last
-two were logged carry only `noise_floor`, so `gatekeeper plot` fills the others
-from `--profile` or the gate's defaults and prints which it used.
+`metadata.noise_floor`, `nhwrsf_threshold` and `sustain_stability_threshold` are the gate's three thresholds as the capture ran. Captures taken before the last two were logged carry only `noise_floor`, so `gatekeeper plot` fills the others from `--profile` or the gate's defaults and prints which it used.
 
 ## Shared plumbing
 
@@ -215,25 +171,15 @@ from `--profile` or the gate's defaults and prints which it used.
 | `regen` | the `mat regen` schema, and the piano-2 ±200 ¢ rule as a function the caller cannot forget |
 | `truth` | the hi-res DFT reference, YIN, synthetic tones, and the gate models read through them |
 
-Three register splits exist and each names its consumer:
-`capture::strobe_register` (four-band, the unison summaries),
-`capture::curve_register` (three-band, the curve tables), and a third private
-to `gatekeeper::sparsity`'s AUC table. Two `median` conventions likewise —
-averaging the middle pair (`curve compare`, `strobe isolation`) versus the upper
-element (everything else) — each private to its module.
+Three register splits exist and each names its consumer: `capture::strobe_register` (four-band, the unison summaries), `capture::curve_register` (three-band, the curve tables), and a third private to `gatekeeper::sparsity`'s AUC table. Two `median` conventions likewise — averaging the middle pair (`curve compare`, `strobe isolation`) versus the upper element (everything else) — each private to its module.
 
-The ±200 ¢ rule guards a *cached* `measured_f0`, so it lives in `regen::load`,
-the one path that reads cached values. `mat validate` seeds MAT from the ET
-frequency and `gatekeeper sparsity` reads audio and a key index, so neither
-consumes the field it guards.
+The ±200 ¢ rule guards a *cached* `measured_f0`, so it lives in `regen::load`, the one path that reads cached values. `mat validate` seeds MAT from the ET frequency and `gatekeeper sparsity` reads audio and a key index, so neither consumes the field it guards.
 
 ## Rename map — the old `--example` invocations
 
-Kept because a reader coming from a pre-2026-09 record, script or note needs
-to find the mode again.
+Kept because a reader coming from a pre-2026-09 record, script or note needs to find the mode again.
 
-Reference for the migration, not part of the decision: every old
-invocation and what replaces it.
+Reference for the migration, not part of the decision: every old invocation and what replaces it.
 
 | Old | New |
 | --- | --- |
@@ -278,5 +224,4 @@ invocation and what replaces it.
 | `--example twm_breakdown` | **removed** in the 2026-09 crate move |
 | `--example joint_b_refine_diagnostic` | **removed** in the 2026-09 crate move |
 
-`--keys`, `--span`, `--min-bins` and `--fft` are unchanged in name and default
-wherever they applied before.
+`--keys`, `--span`, `--min-bins` and `--fft` are unchanged in name and default wherever they applied before.

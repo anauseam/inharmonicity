@@ -438,8 +438,8 @@ fn create_strobe_panel(
     } else {
         (s.coarse_cents, true)
     };
-    // The coarse read names its partial, which can differ from the title's. The
-    // cents agree either way, but the reader should not have to assume so.
+    // The coarse read names its partial, which can differ from the title's; in the
+    // bass the two reads can differ by a few cents, as one B per string is approximate.
     let readout = match cents {
         Some(c) if coarse => format!("{c:+.1} ¢ (coarse · partial {})", s.coarse_n),
         Some(c) => format!("{c:+.1} ¢ vs target"),

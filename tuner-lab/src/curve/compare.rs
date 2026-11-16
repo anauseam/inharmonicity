@@ -120,10 +120,10 @@ fn engines(params: CurveParams) -> Vec<(&'static str, Engine)> {
             }),
         ),
         (
-            "d: model-B widths",
+            "d: blend-B widths",
             Box::new(move |i: &CurveInput| {
                 let p = CurveParams {
-                    b_source: CurveBSource::Model,
+                    b_source: CurveBSource::Blend,
                     ..params
                 };
                 curves::multi_interval(i, &p, BALANCED_INTERVALS, None)
@@ -230,15 +230,16 @@ pub fn run(partials: &Path, json_out: Option<&Path>) -> Result<()> {
     // ── 4. Flags ──
     println!("\n── flag counts ──");
     println!(
-        "{:<24}{:>10}{:>10}{:>12}{:>14}",
-        "engine", "neg-str", "excluded", "b-fallback", "giordano-excl"
+        "{:<24}{:>10}{:>10}{:>10}{:>12}{:>14}",
+        "engine", "above-rng", "neg-str", "excluded", "b-fallback", "giordano-excl"
     );
     for (name, curve) in &runs {
         let count = |f: fn(&tuner_core::models::CurveKeyFlags) -> bool| {
             curve.flags.iter().filter(|k| f(k)).count()
         };
         println!(
-            "{name:<24}{:>10}{:>10}{:>12}{:>14}",
+            "{name:<24}{:>10}{:>10}{:>10}{:>12}{:>14}",
+            count(|f| f.b_above_physical_range),
             count(|f| f.negative_stretch),
             count(|f| f.excluded),
             count(|f| f.curve_b_fallback),
@@ -323,11 +324,12 @@ pub fn run(partials: &Path, json_out: Option<&Path>) -> Result<()> {
     }
 
     // ── 5b. Engine (d): model-B widths vs blend widths ──
+    // Each arm picks its own λ, so a difference can be a λ step, not B (report 0024).
     // The 0.02 ¢ per-key listing threshold is report 0009 analysis 4's
     // (d)-Balanced curve-noise SD: below it, a difference is draw noise.
-    if let (Some((_, blend)), Some((_, model))) = (
+    if let (Some((_, model)), Some((_, blend))) = (
         runs.iter().find(|(n, _)| *n == "d: multi-interval"),
-        runs.iter().find(|(n, _)| *n == "d: model-B widths"),
+        runs.iter().find(|(n, _)| *n == "d: blend-B widths"),
     ) {
         println!("\n── engine (d): |model-B − blend-B| curves (¢; median / max / argmax key) ──");
         for reg in ["bass", "mid", "treble"] {
@@ -511,6 +513,7 @@ pub fn run(partials: &Path, json_out: Option<&Path>) -> Result<()> {
                     "name": name,
                     "cents": cents,
                     "flags": {
+                        "b_above_physical_range": flag_keys(|f| f.b_above_physical_range),
                         "negative_stretch": flag_keys(|f| f.negative_stretch),
                         "excluded": flag_keys(|f| f.excluded),
                         "curve_b_fallback": flag_keys(|f| f.curve_b_fallback),

@@ -51,6 +51,7 @@ docs/design/next-chats-handoff.md
 
 # User-specific files
 .venv/
+.vscode/
 docs/old
 resources/
 tuning_profile.json*

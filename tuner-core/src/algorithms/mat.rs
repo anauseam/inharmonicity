@@ -85,12 +85,14 @@ const F0_REL_TOL: f32 = 1e-4;
 /// Relative change in $B$ below which the trajectory is considered converged.
 const B_REL_TOL: f32 = 1e-2;
 
-/// Lowest physically plausible $B$ (a little negative is allowed for sub-bin jitter).
+/// Floor on each pair's $B$ estimate (Eq. 8), dropped before the median. Slightly negative,
+/// for frequency error on low partials.
+// Ours, not derived: without it mis-numbered pairs pull readings to 0 (see TODO.md).
 const B_MIN: f32 = -1e-3;
 
-/// Highest physically plausible $B$: generous, since the Rigaud prior reaches ~0.026 at C8
-/// (DAFx-09 Fig. 10's treble rise), and there only to drop nonsensical pairs before the
-/// median.
+/// Ceiling on each pair's $B$ estimate (Eq. 8), dropped before the median.
+// Ours, not derived: about twice the Rigaud model at C8; without it treble readings drift
+// from their repeats (see TODO.md).
 const B_MAX: f32 = 5e-2;
 
 /// Partial-buffer capacity: the most partials any order can track. The paper grows the

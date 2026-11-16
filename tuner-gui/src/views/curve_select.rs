@@ -15,8 +15,7 @@ use tuner_core::worker::CurveBundle;
 /// Muted ink for deferred/disabled affordances (house Disabled grey).
 const INK_DISABLED: Color = Color::from_rgb(0.6, 0.6, 0.6);
 
-/// The engines offered as tuning targets. (b) and (c) are computed, but
-/// withheld while their validity is open.
+/// The engines offered as tuning targets; (b) and (c) show as cards without a curve.
 // the tuning-curve grounding analysis
 const GALLERY_ENGINES: [EngineChoice; 3] = [
     EngineChoice::RigaudPure,
@@ -24,17 +23,10 @@ const GALLERY_ENGINES: [EngineChoice; 3] = [
     EngineChoice::MultiPureTwelfths,
 ];
 
-/// Whether the gallery offers `choice` as a tuning target.
-fn is_offered(choice: EngineChoice) -> bool {
-    GALLERY_ENGINES.contains(&choice)
-}
-
 /// A curve engine's full name, as a title shows it.
 pub(crate) fn engine_label(engine: EngineChoice) -> &'static str {
     match engine {
         EngineChoice::RigaudPure => "(a) Rigaud prior",
-        EngineChoice::PerKeySmoothed => "(b) Per-key + Whittaker",
-        EngineChoice::GiordanoMean => "(c) Giordano · ρ Mean",
         EngineChoice::MultiBalanced => "(d) Multi-interval · Balanced",
         EngineChoice::MultiPureTwelfths => "(d) Multi-interval · Pure 12ths",
     }
@@ -45,8 +37,6 @@ pub(crate) fn engine_label(engine: EngineChoice) -> &'static str {
 fn engine_short_label(engine: EngineChoice) -> &'static str {
     match engine {
         EngineChoice::RigaudPure => "Rigaud prior",
-        EngineChoice::PerKeySmoothed => "Per-key smoothed",
-        EngineChoice::GiordanoMean => "ρ Mean",
         EngineChoice::MultiBalanced => "Balanced",
         EngineChoice::MultiPureTwelfths => "Pure 12ths",
     }
@@ -87,13 +77,13 @@ fn create_gallery(bundle: &CurveBundle, selected: EngineChoice) -> Element<'stat
         ),
         section(
             "(b) Per-key + Whittaker",
-            thumb(bundle, EngineChoice::PerKeySmoothed, selected, range, true),
+            placeholder_thumb("withheld", "Per-key smoothed", true),
         ),
         section(
             "(c) Giordano-calibrated octave type",
             row![
                 deferred_thumb("ρ Low"),
-                thumb(bundle, EngineChoice::GiordanoMean, selected, range, false),
+                placeholder_thumb("withheld", "ρ Mean", false),
                 deferred_thumb("ρ High"),
             ]
             .spacing(10)
@@ -190,8 +180,7 @@ fn create_detail(
     .into()
 }
 
-/// A clickable sparkline card, or a greyed card for an engine not offered.
-/// `wide` is the card of a section holding one engine.
+/// A clickable sparkline card. `wide` is the card of a section holding one engine.
 fn thumb(
     bundle: &CurveBundle,
     choice: EngineChoice,
@@ -199,10 +188,6 @@ fn thumb(
     y_range: (f32, f32),
     wide: bool,
 ) -> Element<'static, Message> {
-    if !is_offered(choice) {
-        return placeholder_thumb("withheld", engine_short_label(choice), wide);
-    }
-
     let (cents, measured, suspect) = plot_inputs(bundle.curve(choice));
     let (w, h) = card_size(wide);
 
